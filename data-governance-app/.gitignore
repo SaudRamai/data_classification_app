@@ -1,0 +1,31 @@
+# Security: never commit secrets
+.env
+*.env
+.env.*
+.env.local
+.env.development
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# Test/coverage
+.pytest_cache/
+htmlcov/
+.coverage*
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Streamlit local state
+.streamlit/secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db

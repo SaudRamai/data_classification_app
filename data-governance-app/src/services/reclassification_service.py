@@ -10,11 +10,15 @@ import uuid
 
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
+from src.services.governance_db_resolver import resolve_governance_db
+try:
+    import streamlit as st
+except Exception:  # allow service use outside Streamlit
+    st = None
 
 logger = logging.getLogger(__name__)
 
-DB = settings.SNOWFLAKE_DATABASE
-SCHEMA = "DATA_GOVERNANCE"
+SCHEMA = "DATA_GOVERNANCE"  # default; will be overridden by session if provided
 TABLE = "RECLASSIFICATION_REQUESTS"
 
 
@@ -23,50 +27,138 @@ class ReclassificationService:
         self.connector = snowflake_connector
         self._ensure_table()
 
+    def _schema(self) -> str:
+        """Resolve governance schema: session → default."""
+        try:
+            if st is not None:
+                v = st.session_state.get("governance_schema")
+                if v and str(v).strip():
+                    return str(v).strip()
+        except Exception:
+            pass
+        return SCHEMA
+
+    def _get_db(self) -> Optional[str]:
+        """Resolve active database: session → settings → CURRENT_DATABASE()."""
+        # Try dynamic governance DB resolver first
+        try:
+            db_res = resolve_governance_db()
+            if db_res and str(db_res).strip():
+                return str(db_res).strip()
+        except Exception:
+            pass
+        # Session
+        try:
+            if st is not None:
+                db = st.session_state.get("sf_database")
+                # Treat common placeholders as invalid
+                if db and str(db).strip() and str(db).strip().upper() not in {"NONE", "NULL", "UNKNOWN", "(NONE)"}:
+                    return str(db).strip()
+        except Exception:
+            pass
+        # Settings fallback
+        try:
+            dbs = getattr(settings, "SNOWFLAKE_DATABASE", None)
+            if dbs:
+                vv = str(dbs).strip()
+                if vv and vv.upper() not in {"NONE", "NULL", "UNKNOWN", "(NONE)"}:
+                    return vv
+        except Exception:
+            pass
+        # Query CURRENT_DATABASE() last
+        try:
+            row = self.connector.execute_query("SELECT CURRENT_DATABASE() AS DB") or []
+            dbq = row[0].get("DB") if row else None
+            if dbq:
+                vv = str(dbq).strip()
+                # Guard against placeholder values like 'NONE'
+                if vv and vv.upper() not in {"NONE", "NULL", "UNKNOWN", "(NONE)"}:
+                    return vv
+        except Exception:
+            pass
+        # Fallback: pick the first available database and set context
+        try:
+            rows = self.connector.execute_query("SHOW DATABASES") or []
+            first = None
+            for r in rows:
+                n = r.get("name") or r.get("NAME")
+                if n and str(n).strip() and str(n).strip().upper() not in {"NONE", "NULL", "UNKNOWN", "(NONE)"}:
+                    first = str(n).strip()
+                    break
+            if first:
+                try:
+                    self.connector.execute_non_query(f"USE DATABASE {first}")
+                except Exception:
+                    pass
+                try:
+                    if st is not None:
+                        st.session_state['sf_database'] = first
+                except Exception:
+                    pass
+                return first
+        except Exception:
+            pass
+        return None
+
+    def _tasks_name(self) -> str:
+        """Resolve tasks table/view name: session override → default."""
+        try:
+            if st is not None:
+                v = st.session_state.get("governance_tasks_view")
+                if v and str(v).strip():
+                    return str(v).strip()
+        except Exception:
+            pass
+        return "CLASSIFICATION_TASKS"
+
     def _ensure_table(self) -> None:
         try:
-            self.connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {DB}.{SCHEMA}")
+            db = self._get_db()
+            if not db:
+                # No active DB context; skip ensure without failing
+                return
+            self.connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {db}.{self._schema()}")
             self.connector.execute_non_query(
                 f"""
-                CREATE TABLE IF NOT EXISTS {DB}.{SCHEMA}.{TABLE} (
-                    ID STRING,
-                    ASSET_FULL_NAME STRING,
-                    TRIGGER_TYPE STRING,
-                    CURRENT_CLASSIFICATION STRING,
-                    CURRENT_C NUMBER,
-                    CURRENT_I NUMBER,
-                    CURRENT_A NUMBER,
-                    PROPOSED_CLASSIFICATION STRING,
-                    PROPOSED_C NUMBER,
-                    PROPOSED_I NUMBER,
-                    PROPOSED_A NUMBER,
-                    STATUS STRING,
-                    VERSION NUMBER,
-                    JUSTIFICATION STRING,
-                    CREATED_BY STRING,
-                    APPROVED_BY STRING,
-                    CREATED_AT TIMESTAMP_NTZ,
-                    UPDATED_AT TIMESTAMP_NTZ
+                CREATE TABLE IF NOT EXISTS {db}.{self._schema()}.{TABLE} (
+                    ID VARCHAR(16777216),
+                    ASSET_FULL_NAME VARCHAR(16777216),
+                    TRIGGER_TYPE VARCHAR(16777216),
+                    CURRENT_CLASSIFICATION VARCHAR(16777216),
+                    CURRENT_C NUMBER(38,0),
+                    CURRENT_I NUMBER(38,0),
+                    CURRENT_A NUMBER(38,0),
+                    PROPOSED_CLASSIFICATION VARCHAR(16777216),
+                    PROPOSED_C NUMBER(38,0),
+                    PROPOSED_I NUMBER(38,0),
+                    PROPOSED_A NUMBER(38,0),
+                    STATUS VARCHAR(16777216),
+                    VERSION NUMBER(38,0),
+                    JUSTIFICATION VARCHAR(16777216),
+                    CREATED_BY VARCHAR(16777216),
+                    APPROVED_BY VARCHAR(16777216),
+                    CREATED_AT TIMESTAMP_NTZ(9),
+                    UPDATED_AT TIMESTAMP_NTZ(9)
                 )
                 """
             )
             # Backfill missing columns if the table pre-existed with an older schema
             try:
                 cols = self.connector.execute_query(
-                    f"DESCRIBE TABLE {DB}.{SCHEMA}.{TABLE}"
+                    f"DESCRIBE TABLE {db}.{self._schema()}.{TABLE}"
                 )
                 existing = {str(c.get("name") or c.get("NAME") or "").upper() for c in (cols or [])}
                 # Add CREATED_AT if missing
                 if "CREATED_AT" not in existing:
                     self.connector.execute_non_query(
-                        f"ALTER TABLE {DB}.{SCHEMA}.{TABLE} ADD COLUMN CREATED_AT TIMESTAMP_NTZ"
+                        f"ALTER TABLE {db}.{self._schema()}.{TABLE} ADD COLUMN CREATED_AT TIMESTAMP_NTZ"
                     )
                 if "UPDATED_AT" not in existing:
                     self.connector.execute_non_query(
-                        f"ALTER TABLE {DB}.{SCHEMA}.{TABLE} ADD COLUMN UPDATED_AT TIMESTAMP_NTZ"
+                        f"ALTER TABLE {db}.{self._schema()}.{TABLE} ADD COLUMN UPDATED_AT TIMESTAMP_NTZ"
                     )
             except Exception as ie:
-                logger.warning(f"Column backfill check failed for {DB}.{SCHEMA}.{TABLE}: {ie}")
+                logger.warning(f"Column backfill check failed for {self._schema()}.{TABLE}: {ie}")
         except Exception as e:
             logger.error(f"Failed to ensure reclassification table: {e}")
 
@@ -83,9 +175,28 @@ class ReclassificationService:
         cls, c, i, a = (current or (None, None, None, None))
         pcls, pc, pi, pa = proposed
         try:
+            db = self._get_db()
+            if not db:
+                # Derive DB from asset_full_name (DB.SCHEMA.TABLE) and set session context
+                try:
+                    db = asset_full_name.split('.')[0]
+                    # Validate derived DB against placeholder values
+                    if db and str(db).strip().upper() not in {"NONE", "NULL", "UNKNOWN", "(NONE)"}:
+                        self.connector.execute_non_query(f"USE DATABASE {db}")
+                        try:
+                            if st is not None:
+                                st.session_state['sf_database'] = db
+                        except Exception:
+                            pass
+                    else:
+                        db = None
+                except Exception:
+                    db = None
+            if not db:
+                raise RuntimeError("No active database. Provide a DB in session/settings or use a fully qualified asset name.")
             self.connector.execute_non_query(
                 f"""
-                INSERT INTO {DB}.{SCHEMA}.{TABLE}
+                INSERT INTO {db}.{self._schema()}.{TABLE}
                 (ID, ASSET_FULL_NAME, TRIGGER_TYPE, CURRENT_CLASSIFICATION, CURRENT_C, CURRENT_I, CURRENT_A,
                  PROPOSED_CLASSIFICATION, PROPOSED_C, PROPOSED_I, PROPOSED_A, STATUS, VERSION, JUSTIFICATION, CREATED_BY,
                  CREATED_AT, UPDATED_AT)
@@ -119,8 +230,11 @@ class ReclassificationService:
 
     def approve(self, request_id: str, approver: str) -> None:
         # Fetch request
+        db = self._get_db()
+        if not db:
+            raise RuntimeError("No active database. Set session sf_database or default SNOWFLAKE_DATABASE.")
         rows = self.connector.execute_query(
-            f"SELECT * FROM {DB}.{SCHEMA}.{TABLE} WHERE ID = %(id)s",
+            f"SELECT * FROM {db}.{self._schema()}.{TABLE} WHERE ID = %(id)s",
             {"id": request_id},
         )
         if not rows:
@@ -145,7 +259,7 @@ class ReclassificationService:
         # Update request
         self.connector.execute_non_query(
             f"""
-            UPDATE {DB}.{SCHEMA}.{TABLE}
+            UPDATE {db}.{self._schema()}.{TABLE}
             SET STATUS = 'Approved', APPROVED_BY = %(ap)s, UPDATED_AT = CURRENT_TIMESTAMP
             WHERE ID = %(id)s
             """,
@@ -174,9 +288,12 @@ class ReclassificationService:
     def reject(self, request_id: str, approver: str, justification: Optional[str] = None) -> None:
         # Local import to avoid import-time cycles/issues
         from src.services.audit_service import audit_service
+        db = self._get_db()
+        if not db:
+            raise RuntimeError("No active database. Set session sf_database or default SNOWFLAKE_DATABASE.")
         self.connector.execute_non_query(
             f"""
-            UPDATE {DB}.{SCHEMA}.{TABLE}
+            UPDATE {db}.{self._schema()}.{TABLE}
             SET STATUS = 'Rejected', APPROVED_BY = %(ap)s, JUSTIFICATION = COALESCE(JUSTIFICATION, '') || ' | ' || %(just)s,
                 UPDATED_AT = CURRENT_TIMESTAMP
             WHERE ID = %(id)s
@@ -190,34 +307,138 @@ class ReclassificationService:
         Return count created.
         """
         created = 0
-        # Unclassified assets older than 5 days
-        rows = self.connector.execute_query(
-            f"""
-            SELECT FULL_NAME
-            FROM {DB}.{SCHEMA}.ASSET_INVENTORY
-            WHERE COALESCE(CLASSIFIED, FALSE) = FALSE
-              AND FIRST_DISCOVERED < DATEADD(day, -5, CURRENT_TIMESTAMP)
-            LIMIT 100
-            """
-        )
-        for r in rows:
-            full = r["FULL_NAME"]
+        db = self._get_db()
+        if not db:
+            return 0
+
+        # Helper: add N business days (Mon-Fri)
+        def _add_business_days(start: datetime, days: int) -> datetime:
+            cur = start
+            added = 0
+            while added < int(days):
+                cur += timedelta(days=1)
+                if cur.weekday() < 5:
+                    added += 1
+            return cur
+
+        # Load unclassified assets and compute business-day SLA in Python
+        try:
+            inv_rows = self.connector.execute_query(
+                f"""
+                SELECT FULL_NAME, FIRST_DISCOVERED, OWNER
+                FROM {db}.{self._schema()}.ASSET_INVENTORY
+                WHERE COALESCE(CLASSIFIED, FALSE) = FALSE
+                LIMIT 1000
+                """
+            ) or []
+        except Exception as e:
+            logger.warning(f"Inventory fetch failed: {e}")
+            inv_rows = []
+
+        now = datetime.utcnow()
+        to_escalate: List[Dict[str, Any]] = []
+        for r in inv_rows:
+            full = r.get("FULL_NAME")
+            fd = r.get("FIRST_DISCOVERED")
             try:
-                self.submit_request(
-                    full,
-                    ("Internal", 1, 1, 1),
-                    justification="Auto-trigger: Overdue classification (SLA 5 days)",
-                    created_by="system",
-                    trigger_type="SLA_OVERDUE",
+                first_discovered = fd if isinstance(fd, datetime) else datetime.fromisoformat(str(fd)) if fd else None
+            except Exception:
+                first_discovered = None
+            if not first_discovered:
+                continue
+            due_5 = _add_business_days(first_discovered, 5)
+            due_10 = _add_business_days(first_discovered, 10)
+            # Create overdue request if past 5 business days
+            if now > due_5:
+                try:
+                    self.submit_request(
+                        full,
+                        ("Internal", 1, 1, 1),
+                        justification="Auto-trigger: Overdue classification (SLA 5 business days)",
+                        created_by="system",
+                        trigger_type="SLA_OVERDUE",
+                    )
+                    created += 1
+                except Exception as e:
+                    logger.warning(f"Failed to submit overdue trigger for {full}: {e}")
+                # Auto-assign a task to the data owner
+                try:
+                    owner = (r.get("OWNER") or "").strip()
+                    tasks = self._tasks_name()
+                    # Ensure tasks table and upsert assignment
+                    self.connector.execute_non_query(
+                        f"""
+                        create table if not exists {db}.{self._schema()}.{tasks} (
+                          ASSET_FULL_NAME string,
+                          ASSIGNED_TO string,
+                          STATUS string,
+                          DUE_DATE date,
+                          CLASSIFICATION_LEVEL string
+                        );
+                        """
+                    )
+                    self.connector.execute_non_query(
+                        f"""
+                        merge into {db}.{self._schema()}.{tasks} t
+                        using (select %(full)s as ASSET_FULL_NAME) s
+                        on t.ASSET_FULL_NAME = s.ASSET_FULL_NAME
+                        when matched then update set ASSIGNED_TO = %(assignee)s, STATUS = 'Pending', DUE_DATE = %(due)s
+                        when not matched then insert (ASSET_FULL_NAME, ASSIGNED_TO, STATUS, DUE_DATE)
+                        values (%(full)s, %(assignee)s, 'Pending', %(due)s)
+                        """,
+                        {"full": full, "assignee": owner or "", "due": due_5.date()}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to assign task for {full}: {e}")
+            # Queue escalation notifications if past 10 business days
+            if now > due_10:
+                to_escalate.append({"FULL_NAME": full, "OWNER": (r.get("OWNER") or "").strip()})
+                # Mark task as Overdue
+                try:
+                    tasks = self._tasks_name()
+                    self.connector.execute_non_query(
+                        f"""
+                        update {db}.{self._schema()}.{tasks}
+                        set STATUS = 'Overdue'
+                        where ASSET_FULL_NAME = %(full)s
+                        """,
+                        {"full": full},
+                    )
+                except Exception:
+                    pass
+
+        # Send escalation notifications
+        for er in to_escalate:
+            owner = er.get("OWNER")
+            full = er.get("FULL_NAME")
+            subj = "Escalation: Classification Overdue >10 business days"
+            body = f"Asset {full} remains unclassified beyond 10 business days. Please classify immediately or request an exception."
+            if owner:
+                try:
+                    self.connector.execute_non_query(
+                        f"""
+                        INSERT INTO {db}.DATA_GOVERNANCE.NOTIFICATIONS_OUTBOX (ID, CHANNEL, TARGET, SUBJECT, BODY)
+                        SELECT %(id)s, 'EMAIL', %(target)s, %(sub)s, %(body)s
+                        """,
+                        {"id": str(uuid.uuid4()), "target": owner, "sub": subj, "body": body},
+                    )
+                except Exception:
+                    pass
+            try:
+                self.connector.execute_non_query(
+                    f"""
+                    INSERT INTO {db}.DATA_GOVERNANCE.NOTIFICATIONS_OUTBOX (ID, CHANNEL, TARGET, SUBJECT, BODY)
+                    SELECT %(id)s, 'SLACK', '', %(sub)s, %(body)s
+                    """,
+                    {"id": str(uuid.uuid4()), "sub": subj, "body": body},
                 )
-                created += 1
-            except Exception as e:
-                logger.warning(f"Failed to submit overdue trigger for {full}: {e}")
-        # DDL changes in last day -> re-evaluate
+            except Exception:
+                pass
+
         rows2 = self.connector.execute_query(
             f"""
             SELECT FULL_NAME
-            FROM {DB}.{SCHEMA}.ASSET_INVENTORY
+            FROM {db}.{self._schema()}.ASSET_INVENTORY
             WHERE LAST_DDL_TIME > DATEADD(day, -1, CURRENT_TIMESTAMP)
             LIMIT 100
             """
@@ -238,14 +459,17 @@ class ReclassificationService:
         return created
 
     def list_requests(self, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        db = self._get_db()
+        if not db:
+            return []
+        lim = int(limit or 100)
         if status:
             return self.connector.execute_query(
-                f"SELECT * FROM {DB}.{SCHEMA}.{TABLE} WHERE STATUS = %(st)s ORDER BY CREATED_AT DESC LIMIT %(lim)s",
-                {"st": status, "lim": limit},
+                f"SELECT * FROM {db}.{self._schema()}.{TABLE} WHERE STATUS = %(st)s ORDER BY CREATED_AT DESC LIMIT {lim}",
+                {"st": status},
             )
         return self.connector.execute_query(
-            f"SELECT * FROM {DB}.{SCHEMA}.{TABLE} ORDER BY CREATED_AT DESC LIMIT %(lim)s",
-            {"lim": limit},
+            f"SELECT * FROM {db}.{self._schema()}.{TABLE} ORDER BY CREATED_AT DESC LIMIT {lim}",
         )
 
 class _LazyReclassificationService:

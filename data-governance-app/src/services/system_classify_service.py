@@ -11,7 +11,7 @@ validating values against CLASSIFICATION_METADATA.ALLOWED_TAG_VALUES when presen
 """
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import uuid
 import json
 import logging
@@ -33,9 +33,9 @@ TARGET_SCHEMAS = [
 class SystemClassifyService:
     def __init__(self) -> None:
         self.connector = snowflake_connector
-        self._ia_rules: list[dict] | None = None  # cached optional rules from DB
+        self._ia_rules: Optional[List[Dict]] = None  # cached optional rules from DB
 
-    def _load_ia_rules(self) -> list[dict]:
+    def _load_ia_rules(self) -> List[Dict]:
         """Load optional I/A inference rules from {DB}.DATA_GOVERNANCE.IA_RULES.
         Expected columns: TYPE, PATTERN, I_LEVEL, A_LEVEL, PRIORITY (optional)
         - TYPE can correlate to detected categories (e.g., 'FINANCIAL','PII','AUTH','PHI','PCI')
@@ -63,7 +63,7 @@ class SystemClassifyService:
         return self._ia_rules
 
     # --- Policy-aligned helpers for I/A inference ---
-    def _infer_ia_levels(self, asset_full_name: str, categories: list[str]) -> tuple[int, int, str, bool]:
+    def _infer_ia_levels(self, asset_full_name: str, categories: List[str]) -> Tuple[int, int, str, bool]:
         """Infer Integrity (I) and Availability (A) using data-driven rules when available.
         Returns: (I, A, rationale, provisional)
         Rule sources (in order):

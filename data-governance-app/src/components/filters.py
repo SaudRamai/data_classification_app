@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 try:
     from src.connectors.snowflake_connector import snowflake_connector as _conn
@@ -14,7 +14,7 @@ except Exception:  # During docs/build
     _conn = None
 
 
-def _safe_query(sql: str, params: Dict | None = None) -> List[Dict]:
+def _safe_query(sql: str, params: Optional[Dict] = None) -> List[Dict]:
     try:
         if _conn is None:
             return []
@@ -32,42 +32,63 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
     """
     st.markdown("**Filters**")
 
-    # Databases (best-effort)
+    # Databases (best-effort) with 'All'
     db_rows = _safe_query("SHOW DATABASES")
     dbs = [r.get("name") or r.get("NAME") for r in db_rows if (r.get("name") or r.get("NAME"))]
-    sel_db = st.selectbox(
+    db_options = (["All"] + dbs) if dbs else ["All"]
+    prev_db = st.session_state.get(f"{key_prefix}_db") or "All"
+    try:
+        db_index = db_options.index(prev_db) if prev_db in db_options else 0
+    except Exception:
+        db_index = 0
+    sel_db_raw = st.selectbox(
         "Database",
-        options=dbs,
-        index=(dbs.index(st.session_state.get(f"{key_prefix}_db")) if st.session_state.get(f"{key_prefix}_db") in dbs else 0) if dbs else None,
+        options=db_options,
+        index=db_index,
         key=f"{key_prefix}_db",
-    ) if dbs else ""
+    )
+    sel_db = "" if sel_db_raw == "All" else sel_db_raw
 
-    # Schemas
+    # Schemas with 'All'
     schemas = []
     if sel_db:
         schemas = [r.get("name") or r.get("NAME") for r in _safe_query(f"SHOW SCHEMAS IN DATABASE {sel_db}") if (r.get("name") or r.get("NAME"))]
-    sel_schema = st.selectbox(
+    schema_options = (["All"] + schemas) if schemas else ["All"]
+    prev_schema = st.session_state.get(f"{key_prefix}_schema") or "All"
+    try:
+        schema_index = schema_options.index(prev_schema) if prev_schema in schema_options else 0
+    except Exception:
+        schema_index = 0
+    sel_schema_raw = st.selectbox(
         "Schema",
-        options=schemas,
-        index=(schemas.index(st.session_state.get(f"{key_prefix}_schema")) if st.session_state.get(f"{key_prefix}_schema") in schemas else 0) if schemas else None,
+        options=schema_options,
+        index=schema_index,
         key=f"{key_prefix}_schema",
-    ) if schemas else ""
+    )
+    sel_schema = "" if sel_schema_raw == "All" else sel_schema_raw
 
-    # Tables
+    # Tables with 'All'
     tables = []
     if sel_db and sel_schema:
         trows = _safe_query(f"SHOW TABLES IN {sel_db}.{sel_schema}")
         # Include views as well for broader coverage
         vrows = _safe_query(f"SHOW VIEWS IN {sel_db}.{sel_schema}")
         tables = [r.get("name") or r.get("NAME") for r in (trows + vrows) if (r.get("name") or r.get("NAME"))]
-    sel_table = st.selectbox(
+    table_options = (["All"] + tables) if tables else ["All"]
+    prev_table = st.session_state.get(f"{key_prefix}_table") or "All"
+    try:
+        table_index = table_options.index(prev_table) if prev_table in table_options else 0
+    except Exception:
+        table_index = 0
+    sel_table_raw = st.selectbox(
         "Table / View",
-        options=tables,
-        index=(tables.index(st.session_state.get(f"{key_prefix}_table")) if st.session_state.get(f"{key_prefix}_table") in tables else 0) if tables else None,
+        options=table_options,
+        index=table_index,
         key=f"{key_prefix}_table",
-    ) if tables else ""
+    )
+    sel_table = "" if sel_table_raw == "All" else sel_table_raw
 
-    # Columns
+    # Columns with 'All'
     columns: List[str] = []
     if sel_db and sel_schema and sel_table:
         crow = _safe_query(
@@ -75,12 +96,19 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
             {"s": sel_schema, "t": sel_table},
         )
         columns = [c.get("COLUMN_NAME") for c in crow]
-    sel_col = st.selectbox(
+    col_options = (["All"] + columns) if columns else ["All"]
+    prev_col = st.session_state.get(f"{key_prefix}_column") or "All"
+    try:
+        col_index = col_options.index(prev_col) if prev_col in col_options else 0
+    except Exception:
+        col_index = 0
+    sel_col_raw = st.selectbox(
         "Column (optional)",
-        options=columns,
-        index=(columns.index(st.session_state.get(f"{key_prefix}_column")) if st.session_state.get(f"{key_prefix}_column") in columns else 0) if columns else None,
+        options=col_options,
+        index=col_index,
         key=f"{key_prefix}_column",
-    ) if columns else ""
+    )
+    sel_col = "" if sel_col_raw == "All" else sel_col_raw
 
     # Compliance helpers area (small inline actions)
     with st.expander("Compliance helpers", expanded=False):

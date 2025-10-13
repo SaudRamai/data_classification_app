@@ -6,7 +6,9 @@ Snowflake Tagging Service
 - Adds lifecycle review tags (LAST_CLASSIFIED_DATE, LAST_REVIEW_DATE, REVIEW_STATUS) and auto-populates
   LAST_CLASSIFIED_DATE/REVIEW_STATUS when classification/CIA tags are applied.
 """
-from typing import Dict, List, Optional
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
 import logging
 from datetime import date
 import re
@@ -56,12 +58,12 @@ class TaggingService:
         self.connector = snowflake_connector
 
     # --- Identifier helpers ---
-    def _split_fqn(self, fq: str) -> tuple[str, str, str]:
+    def _split_fqn(self, fq: str) -> Tuple[str, str, str]:
         s = str(fq or "")
         if not s:
             raise ValueError("Empty FQN")
-        parts: list[str] = []
-        buf: list[str] = []
+        parts: List[str] = []
+        buf: List[str] = []
         in_q = False
         for ch in s:
             if in_q:
@@ -90,7 +92,7 @@ class TaggingService:
         return '"' + ident.replace('"', '""') + '"'
 
     # --- Policy 5.5 enforcement helper ---
-    def _required_minimums(self, asset_full_name: str) -> tuple[int, str]:
+    def _required_minimums(self, asset_full_name: str) -> Tuple[int, str]:
         """Return (min_confidentiality_level, min_label) based on asset name heuristics.
         Heuristics mirror UI logic and Policy 5.5 for PII/Financial/SOX.
         """
@@ -125,6 +127,19 @@ class TaggingService:
             # If parse fails, let validate_tags() handle
             return
         req_c, req_label = self._required_minimums(asset_full_name)
+        # Regulatory-driven overrides: enforce stronger minimums when special/compliance categories indicate PCI/PHI/HIPAA
+        try:
+            special = (tags.get("SPECIAL_CATEGORY") or "").strip()
+            compliance = (tags.get("COMPLIANCE_CATEGORY") or "").strip()
+            # Normalize to set for easy checks (COMPLIANCE_CATEGORY may be CSV)
+            special_set = {s.strip() for s in special.split(',') if s.strip()}
+            compliance_set = {c.strip() for c in compliance.split(',') if c.strip()}
+        except Exception:
+            special_set, compliance_set = set(), set()
+        # If PCI/PHI explicitly present, or HIPAA/PCI DSS compliance present, require C>=3 Confidential
+        if ({"PCI", "PHI"} & special_set) or ({"HIPAA", "PCI DSS"} & compliance_set):
+            req_c = max(req_c, 3)
+            req_label = "Confidential"
         if c_val < req_c or ALLOWED_CLASSIFICATIONS.index(proposed_cls) < ALLOWED_CLASSIFICATIONS.index(req_label):
             raise ValueError(
                 f"Proposed classification below policy minimums for {asset_full_name}. "

@@ -5,6 +5,7 @@ from __future__ import annotations
 import typing as t
 import pandas as pd
 from dataclasses import dataclass
+from typing import List, Optional
 import re
 
 from src.connectors.snowflake_connector import snowflake_connector
@@ -13,22 +14,22 @@ from src.config.settings import settings
 
 @dataclass
 class LineageFilters:
-    root: str | None = None
+    root: Optional[str] = None
     depth: int = 2
     direction: str = "both"  # "upstream", "downstream", "both"
-    classification: list[str] | None = None
-    risk_levels: list[str] | None = None
-    quality_dims: list[str] | None = None
-    owner: str | None = None
-    custodian: str | None = None
-    transform_types: list[str] | None = None
-    issue_status: list[str] | None = None
-    time_range: str | None = None  # "24h", "7d", "30d", "90d"
+    classification: Optional[List[str]] = None
+    risk_levels: Optional[List[str]] = None
+    quality_dims: Optional[List[str]] = None
+    owner: Optional[str] = None
+    custodian: Optional[str] = None
+    transform_types: Optional[List[str]] = None
+    issue_status: Optional[List[str]] = None
+    time_range: Optional[str] = None  # "24h", "7d", "30d", "90d"
 
 
 class lineage_service:
     @staticmethod
-    def get_edges(root: str | None = None, depth: int = 2, direction: str = "both") -> pd.DataFrame:
+    def get_edges(root: Optional[str] = None, depth: int = 2, direction: str = "both") -> pd.DataFrame:
         """Return lineage edges (SRC -> TGT). Best-effort using INFORMATION_SCHEMA.OBJECT_DEPENDENCIES.
         Columns: SRC_FULL_NAME, TGT_FULL_NAME, RELATIONSHIP, LAST_ALTERED
         """
@@ -54,7 +55,7 @@ class lineage_service:
         return pd.DataFrame(columns=["SRC_FULL_NAME","TGT_FULL_NAME","RELATIONSHIP","LAST_ALTERED"])
 
     @staticmethod
-    def get_asset_metadata(full_names: list[str]) -> pd.DataFrame:
+    def get_asset_metadata(full_names: List[str]) -> pd.DataFrame:
         if not full_names:
             return pd.DataFrame()
         db = settings.SNOWFLAKE_DATABASE
@@ -84,7 +85,7 @@ class lineage_service:
             })
 
     @staticmethod
-    def get_quality(full_names: list[str]) -> pd.DataFrame:
+    def get_quality(full_names: List[str]) -> pd.DataFrame:
         if not full_names:
             return pd.DataFrame()
         db = settings.SNOWFLAKE_DATABASE
@@ -207,7 +208,7 @@ class lineage_service:
             return pd.DataFrame(columns=["FULL_NAME","EVENT","USER_NAME","START_TIME","QUERY_TEXT"])
 
     @staticmethod
-    def ai_recommendations(meta: pd.DataFrame, edges: pd.DataFrame, quality: pd.DataFrame, risk_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    def ai_recommendations(meta: pd.DataFrame, edges: pd.DataFrame, quality: pd.DataFrame, risk_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """Generate lightweight, rule-based recommendations based on CIA, lineage fan-out, and quality issues.
         Columns: FULL_NAME, RECOMMENDATION, SEVERITY, RATIONALE
         """
@@ -215,7 +216,7 @@ class lineage_service:
             return pd.DataFrame(columns=["FULL_NAME","RECOMMENDATION","SEVERITY","RATIONALE"])
 
     @staticmethod
-    def get_object_columns(full_names: list[str]) -> pd.DataFrame:
+    def get_object_columns(full_names: List[str]) -> pd.DataFrame:
         """Fetch columns for the given objects from INFORMATION_SCHEMA.COLUMNS and enrich with tag hits when available.
         Returns columns: FULL_NAME, COLUMN_NAME, DATA_TYPE, TAGS (optional)
         """

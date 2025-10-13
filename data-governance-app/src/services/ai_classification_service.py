@@ -365,13 +365,13 @@ class AIClassificationService:
         """
         try:
             v = (value or "").strip()
-            types: list[str] = []
+            types: List[str] = []
             conf: float = 0.0
             signals: Dict[str, Any] = {}
             pats = self._sensitivity_patterns()
             import re
             # Regex-based
-            def _rx_any(rx_list: list[str]) -> bool:
+            def _rx_any(rx_list: List[str]) -> bool:
                 for rx in rx_list or []:
                     try:
                         if re.match(rx, v):
@@ -573,7 +573,7 @@ class AIClassificationService:
         except Exception:
             return {}
         # Select text-like columns
-        text_cols: list[str] = []
+        text_cols: List[str] = []
         try:
             # Fetch columns again to filter textual
             db = table_meta.get('TABLE_CATALOG') or table_meta.get('TABLE_CATALOG')
@@ -597,7 +597,7 @@ class AIClassificationService:
             # No explicit textual columns; take first few columns as text
             text_cols = sample_df.columns[:3].tolist()
 
-        corpus: list[str] = []
+        corpus: List[str] = []
         try:
             # Build corpus from column names and up to 10 sample values per text col
             corpus.extend([str(c) for c in text_cols])

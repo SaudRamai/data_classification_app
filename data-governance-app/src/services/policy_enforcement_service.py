@@ -1,4 +1,4 @@
-﻿"""
+"""
 Policy Enforcement Service
 
 Creates and applies Snowflake masking and row access policies based on
@@ -11,7 +11,7 @@ Notes:
 """
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
@@ -69,7 +69,7 @@ class PolicyEnforcementService:
         """
         snowflake_connector.execute_non_query(sql)
 
-    def apply_row_access_policy(self, table: str, fully_qualified_policy: str, columns: Optional[list[str]] = None) -> None:
+    def apply_row_access_policy(self, table: str, fully_qualified_policy: str, columns: Optional[List[str]] = None) -> None:
         # Row access policies require explicit column mapping corresponding to the policy signature
         if not columns or not [str(c).strip() for c in columns]:
             raise ValueError("Row access policy application requires one or more column names matching the policy signature.")
@@ -223,7 +223,7 @@ class PolicyEnforcementService:
         }
 
         # Lookup column data types for the table
-        def _get_column_type_map(fq_table: str) -> dict[str, str]:
+        def _get_column_type_map(fq_table: str) -> Dict[str, str]:
             try:
                 db, schema, table_only = fq_table.split('.')
             except ValueError:
@@ -241,7 +241,7 @@ class PolicyEnforcementService:
         type_map = _get_column_type_map(table)
 
         # Determine masking exemptions via TAG_REFERENCES for this table/columns
-        exempt_cols: set[str] = set()
+        exempt_cols: Set[str] = set()
         table_exempt: bool = False
         try:
             db, schema, tbl = table.split('.')

@@ -14,11 +14,13 @@ import streamlit as st
 import plotly.io as pio
 import plotly.graph_objects as go
 from src.ui.theme import apply_global_theme
+from src.components.filters import render_data_filters
 from datetime import datetime
 from src.config.settings import settings
 from src.models.data_models import User
 from src.services.authorization_service import authz
 from src.services.oidc_service import oidc_service
+from src.connectors.snowflake_connector import snowflake_connector
 
 # Initialize session state
 if 'user' not in st.session_state:
@@ -157,28 +159,12 @@ def _login_section():
     )
     user = st.text_input("User", value=st.session_state.get("sf_user", ""))
 
-    # Authentication method selector
-    auth_method = st.selectbox(
-        "Authentication method",
-        options=["Password", "External Browser"],
-        index=0 if (st.session_state.get("sf_auth_method", "password").lower() == "password") else 1,
+    # Password input (default login method)
+    pwd = st.text_input(
+        "Password",
+        type="password",
+        value=st.session_state.get("sf_password", ""),
     )
-
-    # Conditional inputs
-    pwd = ""
-    authenticator = st.session_state.get("sf_authenticator", "")
-    if auth_method == "Password":
-        pwd = st.text_input(
-            "Password",
-            type="password",
-            value=st.session_state.get("sf_password", ""),
-        )
-    else:
-        authenticator = st.text_input(
-            "Authenticator (optional URL)",
-            value=authenticator,
-            help="Leave blank to use default externalbrowser; or paste your IdP authenticator URL.",
-        )
 
     # Removed optional session context (Warehouse/DB/Schema/Role/Org/Host). These can be set post-login in sidebar.
 
@@ -189,8 +175,8 @@ def _login_section():
     if _login_clicked:
         if not (acct and user):
             st.error("Please provide Account and User")
-        elif auth_method == "Password" and not pwd:
-            st.error("Please provide Password for Password authentication")
+        elif not pwd:
+            st.error("Please provide Password")
         else:
             acct_norm, acct_host = _parse_account_input(acct)
             # Persist selections into session state (consumed by AuthorizationService._session_connection)
@@ -199,9 +185,9 @@ def _login_section():
             if acct_host:
                 st.session_state["sf_host"] = acct_host
             st.session_state["sf_user"] = user
-            st.session_state["sf_auth_method"] = "password" if auth_method == "Password" else "externalbrowser"
-            st.session_state["sf_password"] = pwd if auth_method == "Password" else ""
-            st.session_state["sf_authenticator"] = authenticator if auth_method != "Password" else ""
+            st.session_state["sf_auth_method"] = "password"
+            st.session_state["sf_password"] = pwd
+            st.session_state["sf_authenticator"] = ""
             # Optional session context removed from login; Warehouse/Role can be set in sidebar after login.
 
             # Test connection and fetch identity
@@ -230,6 +216,34 @@ def _login_section():
                     err = str(e).lower()
                 except Exception:
                     err = ""
+                # Detect account lockouts and provide an immediate SSO retry option
+                if any(k in err for k in ["lock", "temporarily locked", "is locked"]):
+                    st.warning(
+                        "Your Snowflake user appears locked. Use External Browser (SSO) or contact your admin to unlock/reset your password."
+                    )
+                    if st.button("Switch to SSO and Retry", key="btn_login_sso_quick", type="primary"):
+                        st.session_state["sf_auth_method"] = "externalbrowser"
+                        st.session_state["sf_password"] = ""
+                        if not st.session_state.get("sf_authenticator"):
+                            st.session_state["sf_authenticator"] = "externalbrowser"
+                        try:
+                            ident2 = authz.get_current_identity()
+                            st.session_state.user = User(
+                                id=f"sf_{ident2.user}",
+                                username=ident2.user,
+                                email=f"{ident2.user}@snowflake",
+                                role=ident2.current_role or "",
+                                created_at=datetime.utcnow(),
+                            )
+                            try:
+                                if hasattr(st, "switch_page"):
+                                    st.switch_page("pages/1_Dashboard.py")
+                                else:
+                                    raise AttributeError("switch_page not available")
+                            except Exception:
+                                st.rerun()
+                        except Exception as e2:
+                            st.error(f"SSO login failed: {e2}")
                 if (st.session_state.get("sf_auth_method", "password").lower() == "password"):
                     with st.expander("Trouble logging in? Try External Browser (SSO)", expanded=True):
                         st.caption("If your account is locked or password auth is restricted for your user, use SSO.")
@@ -338,7 +352,8 @@ if st.session_state.user is None:
         /* Ensure containers are transparent and compact */
         div[data-testid="stTextInput"],
         div[data-testid="stPassword"],
-        div[data-baseweb="input"] {
+        div[data-baseweb="input"],
+        div[data-baseweb="select"] {
             background-color: transparent !important;
             width: 100% !important;
             max-width: 460px !important;
@@ -352,6 +367,26 @@ if st.session_state.user is None:
             background-color: transparent !important;
             border: none !important;
             border-radius: 4px !important;
+            box-shadow: none !important;
+        }
+        /* BaseWeb select (Streamlit selectbox) styling to match inputs */
+        div[data-baseweb="select"] {
+            background-color: transparent !important;
+            border: none !important;
+            border-radius: 4px !important;
+            box-shadow: none !important;
+        }
+        div[data-baseweb="select"] > div {
+            background-color: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+        div[data-baseweb="select"] div[role="combobox"] {
+            background-color: transparent !important;
+            color: var(--input-text) !important;
+            border: none !important;
+            padding: 8px 4px !important;
+            font-size: 14px !important;
             box-shadow: none !important;
         }
         /* Fallback: any plain text/password inputs */
@@ -412,7 +447,7 @@ else:
 
     with st.sidebar:
         # Role & Session (in sidebar)
-        with st.expander("🔧 Role & Session", expanded=True):
+        with st.expander("Role & Session", expanded=True):
             try:
                 from src.connectors.snowflake_connector import snowflake_connector as _conn
                 user_upper = ident.user if 'ident' in locals() and ident and ident.user else None
@@ -453,6 +488,23 @@ else:
                     st.session_state["sf_warehouse"] = sel_wh
                     st.success(f"Warehouse set to {sel_wh}.")
                     st.rerun()
+                # Database selector (best-effort)
+                databases = []
+                try:
+                    db_rows = _conn.execute_query("SHOW DATABASES") or []
+                    databases = [d.get('name') or d.get('NAME') for d in db_rows if (d.get('name') or d.get('NAME'))]
+                except Exception:
+                    databases = []
+                current_db = st.session_state.get("sf_database", "")
+                sel_db = st.selectbox("Active Database", options=[current_db] + [d for d in databases if d != current_db] if current_db else databases, key="sel_db")
+                if st.button("Set Database", key="btn_set_db") and sel_db:
+                    try:
+                        _ = _conn.execute_non_query(f"USE DATABASE {sel_db}")
+                    except Exception:
+                        pass
+                    st.session_state["sf_database"] = sel_db
+                    st.success(f"Database set to {sel_db}.")
+                    st.rerun()
                 try:
                     info = _conn.execute_query("select current_user() as U, current_role() as R, current_warehouse() as W, current_region() as RG") or []
                     if info:
@@ -460,15 +512,32 @@ else:
                 except Exception:
                     pass
             except Exception as e:
-                st.warning(f"Role discovery failed: {e}")
+                st.warning(f"Role & Session panel failed: {e}")
 
-        # Logout control moved to Dashboard sidebar (pages/1_Dashboard.py)
+        # Explicit Logout control (only logs out when clicked)
+        st.markdown("---")
+        if st.button("Logout", key="btn_logout", type="secondary"):
+            try:
+                # Clear app-level user and OIDC info
+                st.session_state.user = None
+                for k in [
+                    "oidc_token", "oidc_userinfo",
+                    "sf_account", "sf_user", "sf_password", "sf_auth_method",
+                    "sf_authenticator", "sf_host", "sf_warehouse", "sf_database",
+                    "sf_schema", "sf_role", "sf_organization"
+                ]:
+                    if k in st.session_state:
+                        del st.session_state[k]
+            except Exception:
+                pass
+            st.success("You have been logged out.")
+            st.rerun()
 
     # MAIN PAGE: Welcome text and Quick Links
     st.markdown(
         """
         <div style="padding: 0 0 6px 0; display:flex; align-items:center; justify-content:center;">
-            <div style="max-width:960px; width:100%; text-align:center;">
+            <div style="display:flex; flex-direction:column; align-items:center;">
                 <div style="font-size:28px;font-weight:800;">Welcome to Data Classification App</div>
                 <div style="color:#9ca3af;font-size:15px;margin-top:6px;">Navigate to the section you need. Access is tailored to your Snowflake role.</div>
             </div>
@@ -491,13 +560,13 @@ else:
     st.markdown("**Quick Links**")
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("📊 Dashboard", use_container_width=True):
+        if st.button("Dashboard", use_container_width=True):
             try:
                 st.switch_page("pages/1_Dashboard.py")
             except Exception:
                 st.rerun()
     with c2:
-        if can_data and st.button("📁 Data Assets", use_container_width=True):
+        if can_data and st.button("Data Assets", use_container_width=True):
             try:
                 st.switch_page("pages/2_Data_Assets.py")
             except Exception:
@@ -505,14 +574,14 @@ else:
         elif not can_data:
             st.caption("")
     with c3:
-        if can_classify and st.button("🔖 Classification", use_container_width=True):
+        if can_classify and st.button("Classification", use_container_width=True):
             try:
                 st.switch_page("pages/3_Classification.py")
             except Exception:
                 st.rerun()
         elif not can_classify:
             st.caption("")
-        if can_compliance and st.button("✅ Compliance", use_container_width=True):
+        if can_compliance and st.button("Compliance", use_container_width=True):
             try:
                 st.switch_page("pages/4_Compliance.py")
             except Exception:
@@ -521,15 +590,16 @@ else:
             st.caption("")
     c3, c4 = st.columns(2)
     with c3:
-        if can_discovery and st.button("🔎 Data Discovery", use_container_width=True):
+        if can_discovery and st.button("Data Discovery", use_container_width=True):
             try:
-                st.switch_page("pages/11_Data_Discovery.py")
+                # Redirect to the unified Classification module (Discovery tab lives there)
+                st.switch_page("pages/3_Classification.py")
             except Exception:
                 st.rerun()
         elif not can_discovery:
             st.caption("")
     with c4:
-        if can_admin and st.button("⚙️ Administration", use_container_width=True):
+        if can_admin and st.button("Administration", use_container_width=True):
             try:
                 st.switch_page("pages/10_Administration.py")
             except Exception:

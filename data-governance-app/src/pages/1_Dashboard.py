@@ -20,6 +20,8 @@ if _project_root not in sys.path:
 from src.connectors.snowflake_connector import snowflake_connector
 from src.ui.theme import apply_global_theme
 from src.config.settings import settings
+from src.services.metrics_service import metrics_service
+from src.services.tag_drift_service import analyze_tag_drift
 try:
     from src.services.authorization_service import authz as _authz
 except Exception:
@@ -29,6 +31,9 @@ except Exception:
 # Real-time Dashboard (embedded)
 # ==============================
 DEFAULT_TTL = int(os.getenv("DASHBOARD_CACHE_TTL", "120"))
+# Feature flag to revert recent advanced additions for a simpler dashboard view
+# Set to True to hide Compliance Diagnostics and High-Risk/High-Cost sections
+REVERT_SIMPLE_DASHBOARD = True
 
 @st.cache_data(ttl=DEFAULT_TTL, show_spinner=False)
 def _rt_run_query(sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -221,145 +226,107 @@ def render_realtime_dashboard():
     T_RISK = f"{active_db}.{_SCHEMA}.RISK_ASSESSMENTS"
     T_DQ = f"{active_db}.{_SCHEMA}.DATA_QUALITY_METRICS"
 
+    # Global Filters sidebar (restored)
+    _rt_ensure_session_context()
     with st.sidebar:
-        st.header("Global Filters")
-        _rt_ensure_session_context()
-
-        # Business Unit
+        st.header("filters")
+        # Load selectable options from Snowflake (best-effort)
         try:
-            bu_rows = _rt_run_query(
-                f"""
-                select distinct BUSINESS_UNIT as BU
-                from {T_ASSETS}
-                order by 1
-                """
-            )
-            bu_options = [r.get("BU") for r in (bu_rows or []) if r.get("BU")]
-        except Exception:
-            bu_options = []
-        sel_bu = st.selectbox("Business Unit", options=["All"] + bu_options, index=0, key="rt_bu")
-
-        # Time period
-        tp = st.selectbox("Time Period", ["Real-time", "Today", "Week", "Month", "Quarter", "Custom"], index=0, key="rt_tp")
-        start_date: Optional[datetime] = None
-        end_date: Optional[datetime] = None
-        now = datetime.utcnow()
-        if tp == "Today":
-            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_date = now
-        elif tp == "Week":
-            start_date = now - timedelta(days=7)
-            end_date = now
-        elif tp == "Month":
-            start_date = now - timedelta(days=30)
-            end_date = now
-        elif tp == "Quarter":
-            start_date = now - timedelta(days=90)
-            end_date = now
-        elif tp == "Custom":
-            c1, c2 = st.columns(2)
-            with c1:
-                start_date = st.date_input("Start", value=now.date() - timedelta(days=7), key="rt_start")
-            with c2:
-                end_date = st.date_input("End", value=now.date(), key="rt_end")
-            if start_date and not isinstance(start_date, datetime):
-                start_date = datetime.combine(start_date, datetime.min.time())
-            if end_date and not isinstance(end_date, datetime):
-                end_date = datetime.combine(end_date, datetime.max.time())
-
-        # Database/Schema
-        try:
-            db_rows = _rt_run_query("show databases")
-            db_opts = [r.get("name") or r.get("NAME") for r in (db_rows or []) if (r.get("name") or r.get("NAME"))]
+            db_rows = snowflake_connector.execute_query("SHOW DATABASES") or []
+            db_opts = [r.get("name") or r.get("NAME") for r in db_rows if (r.get("name") or r.get("NAME"))]
         except Exception:
             db_opts = []
-        sel_db = st.selectbox("Database", options=[st.session_state.get("sf_database", "")] + [d for d in db_opts if d != st.session_state.get("sf_database", "")], key="rt_db")
 
-        # Warehouse selection (applies at session level)
+        # Database
+        cur_db = st.session_state.get("sf_database") or (db_opts[0] if db_opts else None)
+        sel_db = st.selectbox("Database", options=db_opts or ([cur_db] if cur_db else []), index=((db_opts.index(cur_db)) if (cur_db in db_opts) else 0) if (db_opts) else None, key="rt_db")
+
+        # Schemas for selected database
         try:
-            wh_rows = _rt_run_query("SHOW WAREHOUSES") or []
-            wh_opts = [w.get('name') or w.get('NAME') for w in wh_rows if (w.get('name') or w.get('NAME'))]
+            sch_rows = snowflake_connector.execute_query(f"SELECT SCHEMA_NAME FROM {sel_db}.INFORMATION_SCHEMA.SCHEMATA ORDER BY 1") if sel_db else []
+            schema_opts = ["All"] + [r.get("SCHEMA_NAME") for r in (sch_rows or []) if r.get("SCHEMA_NAME")]
         except Exception:
-            wh_opts = []
-        cur_wh = st.session_state.get("sf_warehouse", "")
-        sel_wh = st.selectbox("Warehouse", options=[cur_wh] + [w for w in wh_opts if w != cur_wh] if cur_wh else wh_opts, key="rt_wh")
-        if st.button("Set Warehouse", key="btn_rt_set_wh") and sel_wh:
+            schema_opts = ["All"]
+        sel_schema = st.selectbox("Schema", options=schema_opts, index=0, key="rt_schema")
+
+        # Business Unit options from ASSETS
+        try:
+            bu_rows = snowflake_connector.execute_query(f"SELECT DISTINCT BUSINESS_UNIT FROM {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE BUSINESS_UNIT IS NOT NULL ORDER BY 1") if sel_db else []
+            bu_opts = ["All"] + [r.get("BUSINESS_UNIT") for r in (bu_rows or []) if r.get("BUSINESS_UNIT")]
+        except Exception:
+            bu_opts = ["All"]
+        sel_bu = st.selectbox("Business Unit", options=bu_opts, index=0, key="rt_bu")
+
+        # Asset Type from ASSETS (TABLE_TYPE or ASSET_TYPE)
+        try:
+            # Prefer TABLE_TYPE
+            at_rows = snowflake_connector.execute_query(
+                f"""
+                with s as (
+                  select distinct TABLE_TYPE as T from {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS where TABLE_TYPE is not null
+                  union
+                  select distinct ASSET_TYPE as T from {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS where ASSET_TYPE is not null
+                ) select T from s order by 1
+                """
+            ) if sel_db else []
+            at_opts = ["All"] + [r.get("T") for r in (at_rows or []) if r.get("T")]
+        except Exception:
+            at_opts = ["All"]
+        sel_asset_type = st.selectbox("Asset Type", options=at_opts, index=0, key="rt_asset_type")
+
+        # Classification Status
+        sel_class_status = st.selectbox("Classification Status", options=["All", "Classified", "Unclassified"], index=0, key="rt_cls_status")
+
+        # Risk Level from ASSETS
+        try:
+            rk_rows = snowflake_connector.execute_query(f"SELECT DISTINCT RISK_LEVEL FROM {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE RISK_LEVEL IS NOT NULL ORDER BY 1") if sel_db else []
+            rk_opts = ["All"] + [r.get("RISK_LEVEL") for r in (rk_rows or []) if r.get("RISK_LEVEL")]
+        except Exception:
+            rk_opts = ["All"]
+        sel_risk = st.selectbox("Risk Level", options=rk_opts, index=0, key="rt_risk")
+
+        # Date range (optional)
+        tp = st.radio("Time", options=["All", "Date range"], horizontal=True, index=0, key="rt_timepick")
+        start_date: Optional[datetime] = None
+        end_date: Optional[datetime] = None
+        if tp == "Date range":
+            dr = st.date_input("Date range", value=(datetime.today() - timedelta(days=30), datetime.today()))
             try:
-                # Best-effort resume then use
-                try:
-                    snowflake_connector.execute_non_query(f"ALTER WAREHOUSE {sel_wh} RESUME")
-                except Exception:
-                    pass
-                snowflake_connector.execute_non_query(f"USE WAREHOUSE {sel_wh}")
-                st.session_state["sf_warehouse"] = sel_wh
-                st.success(f"Warehouse set to {sel_wh}.")
-                st.rerun()
-            except Exception as _wh_err:
-                st.warning(f"Failed to set warehouse: {_wh_err}")
+                if isinstance(dr, tuple) and len(dr) == 2:
+                    start_date, end_date = dr[0], dr[1]
+            except Exception:
+                start_date, end_date = None, None
 
-        try:
-            sc_rows = _rt_run_query("show schemas")
-            sc_opts = [r.get("name") or r.get("NAME") for r in (sc_rows or []) if (r.get("name") or r.get("NAME"))]
-        except Exception:
-            sc_opts = []
-        sel_schema = st.selectbox("Schema", options=["All"] + sc_opts, index=0, key="rt_schema")
+        # Save current selections to session
+        st.session_state["sf_database"] = sel_db
+        st.session_state["rt_filters"] = {
+            "bu": sel_bu,
+            "db": sel_db,
+            "schema": sel_schema,
+            "atype": sel_asset_type,
+            "cstatus": sel_class_status,
+            "risk": sel_risk,
+            "start": start_date,
+            "end": end_date,
+        }
 
-        # Asset Type / Class Status / Risk
-        try:
-            at_rows = _rt_run_query(f"select distinct TABLE_TYPE as AT from {T_ASSETS} order by 1")
-            asset_types = [r.get("AT") for r in (at_rows or []) if r.get("AT")]
-        except Exception:
-            asset_types = []
-        sel_asset_type = st.selectbox("Asset Type", options=["All"] + asset_types, index=0, key="rt_at")
-        sel_class_status = st.selectbox("Classification Status", options=["All", "Classified", "Unclassified"], index=0, key="rt_cls")
-        sel_risk = st.selectbox("Risk Level", options=["All", "Low", "Medium", "High", "Critical"], index=0, key="rt_risk")
+        # Compliance filter defaults remain All
+        st.session_state.setdefault("rt_framework", "All")
+        st.session_state.setdefault("rt_cstatus", "All")
 
-        # Compliance filters (Framework, Status)
-        try:
-            fw_rows = _rt_run_query(f"select distinct FRAMEWORK_NAME as FW from {T_CMAP} order by 1")
-            fw_opts = [r.get("FW") for r in (fw_rows or []) if r.get("FW")]
-        except Exception:
-            fw_opts = []
-        # Ensure common frameworks are always offered (including SOC)
-        common_fw = ["SOC", "SOC 2", "GDPR", "HIPAA", "PCI DSS", "SOX"]
-        fw_all = sorted({*(fw_opts or []), *common_fw})
-        sel_framework = st.selectbox("Compliance Framework", options=["All"] + fw_all, index=0, key="rt_framework")
-
-        # Dynamic Compliance Status options from mapping table
-        try:
-            st_rows = _rt_run_query(f"select distinct upper(coalesce(COMPLIANCE_STATUS,'')) as S from {T_CMAP} order by 1")
-            # Normalize common variants
-            raw_status = [r.get("S") for r in (st_rows or []) if r.get("S")]
-            cstatus_opts = ["All"] + sorted(set(raw_status))
-        except Exception:
-            cstatus_opts = ["All", "COMPLIANT", "PARTIAL", "NON-COMPLIANT"]
-        sel_cstatus = st.selectbox("Compliance Status", options=cstatus_opts, index=0, key="rt_cstatus")
-
-        # Compliance Diagnostics
-        with st.expander("Compliance Diagnostics", expanded=False):
-            fw_disp = st.session_state.get("rt_framework", "All") or "All"
-            cs_disp = st.session_state.get("rt_cstatus", "All") or "All"
-            st.caption(f"Selected Framework: {fw_disp} | Status: {cs_disp}")
-
-            # Build compliance-only filter and show counts/top ASSET_IDs
-            try:
-                where_diag, params_diag = _rt_apply_compliance_filter("", {}, "ASSET_ID", T_CMAP)
-                cnt_rows = _rt_run_query(f"select count(*) as CNT from {T_ASSETS} {where_diag}", params_diag)
-                cnt = int(cnt_rows[0].get("CNT", 0)) if cnt_rows else 0
-                st.metric("Matching Assets", f"{cnt:,}")
-                if cnt > 0:
-                    ids = _rt_run_query(f"select ASSET_ID from {T_ASSETS} {where_diag} limit 10", params_diag)
-                    id_list = [r.get("ASSET_ID") for r in (ids or []) if r.get("ASSET_ID")]
-                    st.dataframe(pd.DataFrame({"ASSET_ID": id_list}), use_container_width=True, hide_index=True)
-                else:
-                    st.info("No assets match the current compliance filter.")
-            except Exception as _diag_err:
-                st.warning(f"Diagnostics unavailable: {_diag_err}")
-
-        refresh = st.button("Refresh Now", type="primary")
+        # Refresh / apply actions
+        colA1, colA2 = st.columns(2)
+        refresh = colA1.button("Apply / Refresh")
+        if colA2.button("Clear Cache"):
+            st.cache_data.clear()
+            refresh = True
 
     if refresh:
         st.cache_data.clear()
+        try:
+            st.rerun()
+        except Exception:
+            pass
 
     # If user selected a database filter, switch session and rebuild FQNs
     try:
@@ -390,8 +357,11 @@ def render_realtime_dashboard():
     pl_compliance = st.container()
     pl_risk = st.container()
     pl_kpis = st.container()
+    pl_sot = st.container()
     pl_alerts = st.container()
+    pl_priority_cost = st.container()
     pl_quick = st.container()
+    pl_tag_drift = st.container()
 
     # Component 1: Health (from ASSETS)
     try:
@@ -514,6 +484,63 @@ def render_realtime_dashboard():
     except Exception as e:
         with pl_unclassified:
             _rt_show_error("Failed to load Unclassified Priority", e)
+
+    # Component 3b: High-Risk/High-Cost Unclassified Priority (hidden when REVERT_SIMPLE_DASHBOARD is True)
+    if not REVERT_SIMPLE_DASHBOARD:
+        try:
+            with pl_priority_cost:
+                st.subheader("High-Risk / High-Cost Unclassified")
+                # Build base where with global filters + unclassified
+                where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+                                                      start_date, end_date,
+                                                      T_ASSETS, ["UPDATED_TIMESTAMP", "CREATED_TIMESTAMP", "LAST_MODIFIED_DATE"])
+                where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
+                where_u = (where + ((" AND " if where else " WHERE ") + "coalesce(CLASSIFICATION_TAG,'') = ''"))
+
+                cols = _rt_get_table_columns(T_ASSETS)
+                has_cost = "ESTIMATED_MONTHLY_COST" in cols
+                has_storage = "STORAGE_BYTES" in cols
+                # Cost term selection: prefer ESTIMATED_MONTHLY_COST, else rough from STORAGE_BYTES
+                if has_cost:
+                    cost_term = "coalesce(ESTIMATED_MONTHLY_COST,0)"
+                elif has_storage:
+                    # 0.023 $/GB-month heuristic
+                    cost_term = "round(nvl(STORAGE_BYTES,0)/power(1024,3)*0.023,6)"
+                else:
+                    cost_term = "0.0"
+
+                # Risk numeric mapping (fallback to 0)
+                risk_score = (
+                    "case upper(coalesce(RISK_LEVEL,'')) when 'CRITICAL' then 4 when 'HIGH' then 3 when 'MEDIUM' then 2 when 'LOW' then 1 else 0 end"
+                    if "RISK_LEVEL" in cols else "0"
+                )
+
+                # Priority score combining risk and cost (scaled)
+                sql = f"""
+                    select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, TABLE_TYPE,
+                           {risk_score} as RISK_SCORE,
+                           {cost_term} as MONTHLY_COST,
+                           ({risk_score} * 2 + least(5, {cost_term}/100.0)) as PRIORITY_SCORE
+                    from {T_ASSETS}
+                    {where_u}
+                    qualify row_number() over (order by PRIORITY_SCORE desc) <= 500
+                """
+                rows = _rt_run_query(sql, params)
+                df = pd.DataFrame(rows or [])
+                c1, c2 = st.columns([3,1])
+                with c1:
+                    if df.empty:
+                        st.info("No unclassified assets with risk/cost signals.")
+                    else:
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                with c2:
+                    if not df.empty:
+                        # Quick summary
+                        st.metric("Avg Cost", f"${float(df['MONTHLY_COST'].mean()):,.2f}")
+                        st.metric("Avg Risk Score", f"{float(df['RISK_SCORE'].mean()):.2f}")
+        except Exception as e:
+            with pl_priority_cost:
+                _rt_show_error("Failed to load High-Risk/High-Cost Priorities", e)
 
     # Component 4: Compliance Status (from COMPLIANCE_MAPPING)
     try:
@@ -638,6 +665,75 @@ def render_realtime_dashboard():
     except Exception as e:
         with pl_kpis:
             _rt_show_error("Failed to load KPIs", e)
+
+    # Component 6b: Source-of-Truth Metrics (Tags + Governance Tables)
+    try:
+        with pl_sot:
+            st.subheader("Source-of-Truth Metrics (Tags + Governance)")
+            cov = metrics_service.classification_coverage(database=active_db)
+            fw_counts = metrics_service.framework_counts(database=active_db)
+            hist = metrics_service.historical_classifications(database=active_db, days=30)
+            overdue = metrics_service.overdue_unclassified(database=active_db)
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Inventoried Assets", f"{int(cov.get('total_assets',0)):,}")
+            k2.metric("Tagged Assets", f"{int(cov.get('tagged_assets',0)):,}")
+            k3.metric("Coverage (Tags)", f"{cov.get('coverage_pct',0.0)}%")
+            k4.metric("Overdue Unclassified (\u22655d)", f"{int(overdue):,}")
+
+            # Framework counts table (best-effort from COMPLIANCE_CATEGORY)
+            import pandas as _pd
+            fdf = _pd.DataFrame([fw_counts])
+            st.caption("Framework Counts (from COMPLIANCE_CATEGORY tag)")
+            st.dataframe(fdf, use_container_width=True, hide_index=True)
+
+            # Classification decisions time series (last 30 days)
+            try:
+                if hist:
+                    hdf = _pd.DataFrame(hist)
+                    import plotly.express as _px
+                    fig = _px.line(hdf, x="DAY", y="DECISIONS", title="Classification Decisions (30d)")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No recent classification decisions recorded.")
+            except Exception:
+                pass
+    except Exception as e:
+        with pl_sot:
+            _rt_show_error("Failed to load Source-of-Truth Metrics", e)
+
+    # Component 6c: Tag Drift & Sync Status (ASSETS vs Snowflake tag references)
+    try:
+        with pl_tag_drift:
+            st.subheader("Tag Drift & Sync Status")
+            with st.spinner("Analyzing tag drift..."):
+                drift = analyze_tag_drift(database=active_db, limit=1000)
+            summary = drift.get("summary", {}) if drift else {}
+            items = drift.get("items", []) if drift else []
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Assets Sampled", f"{int(summary.get('total_assets_sampled', 0)):,}")
+            c2.metric("Tagged Assets", f"{int(summary.get('tagged_assets', 0)):,}")
+            c3.metric("Drifted Assets", f"{int(summary.get('drift_assets', 0)):,}")
+            c4.metric("Drift %", f"{float(summary.get('drift_pct', 0.0)):.2f}%")
+            if items:
+                df = pd.DataFrame(items)
+                # Filters
+                fcol1, fcol2 = st.columns([1.2, 1.2])
+                with fcol1:
+                    only_drift = st.checkbox("Show drift only", value=True, key="td_only")
+                with fcol2:
+                    schema_sel = st.selectbox("Schema", options=["All"] + sorted(df["schema"].dropna().unique().tolist()))
+                fdf = df.copy()
+                if only_drift:
+                    fdf = fdf[fdf["drift"] == True]
+                if schema_sel and schema_sel != "All":
+                    fdf = fdf[fdf["schema"] == schema_sel]
+                st.dataframe(fdf, use_container_width=True, hide_index=True)
+            else:
+                st.info("No items to display or insufficient privileges to read tag references.")
+    except Exception as e:
+        with pl_tag_drift:
+            _rt_show_error("Failed to analyze Tag Drift", e)
 
     # Component 7: Alerts (from ALERT_LOGS)
     try:

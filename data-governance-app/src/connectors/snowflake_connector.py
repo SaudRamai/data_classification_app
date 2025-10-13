@@ -3,6 +3,7 @@ Snowflake connector module with improved security and connection management.
 """
 import snowflake.connector
 from snowflake.connector import DictCursor
+from snowflake.connector.errors import DatabaseError, InterfaceError
 from typing import Optional, Dict, Any
 import logging
 from contextlib import contextmanager
@@ -70,6 +71,41 @@ class SnowflakeConnector:
             # If settings is partially configured, leave whatever we could set
             pass
         
+    @staticmethod
+    def _is_token_expired_error(err: Exception) -> bool:
+        """Return True if the exception looks like a Snowflake auth/session expiration.
+        Checks common error codes and message fragments.
+        """
+        try:
+            msg = str(err) or ""
+            code = getattr(err, "errno", None)
+            sqlstate = getattr(err, "sqlstate", "")
+            # 390114/08001: Authentication token has expired. The user must authenticate again.
+            if code in (390114, 390100, 390111):
+                return True
+            if isinstance(err, DatabaseError) and ("token has expired" in msg.lower() or "session is expired" in msg.lower()):
+                return True
+            if isinstance(err, InterfaceError) and ("connection" in msg.lower() and "closed" in msg.lower()):
+                # Sometimes manifests as interface error after expiry
+                return True
+            if sqlstate and sqlstate.upper() == "08001":
+                # General connection error; combine with message check
+                if "token has expired" in msg.lower():
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _reset_cached_connections():
+        """Clear cached Snowflake connections to force a fresh login/handshake."""
+        try:
+            if st is not None:
+                # Clears all cached resources, including our cached connection factory
+                st.cache_resource.clear()
+        except Exception:
+            pass
+
     @contextmanager
     def get_connection(self):
         """Context manager for one-off database connections (non-cached)."""
@@ -226,6 +262,7 @@ class SnowflakeConnector:
         """
         conn = self._get_cached_connection()
         cursor = conn.cursor(DictCursor)
+        tried_reconnect = False
         try:
             if params:
                 cursor.execute(query, params)
@@ -233,10 +270,33 @@ class SnowflakeConnector:
                 cursor.execute(query)
             return cursor.fetchall()
         except Exception as e:
+            # Detect token/session expiration and attempt a single reconnect-retry
+            if self._is_token_expired_error(e) and not tried_reconnect:
+                tried_reconnect = True
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                # Clear cached resources and rebuild connection
+                self._reset_cached_connections()
+                conn = self._get_cached_connection()
+                cursor = conn.cursor(DictCursor)
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                return cursor.fetchall()
             logger.error(f"Error executing query: {e}")
             raise
         finally:
-            cursor.close()
+            try:
+                cursor.close()
+            except Exception:
+                pass
     
     def execute_non_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> int:
         """
@@ -251,6 +311,7 @@ class SnowflakeConnector:
         """
         conn = self._get_cached_connection()
         cursor = conn.cursor()
+        tried_reconnect = False
         try:
             if params:
                 cursor.execute(query, params)
@@ -258,10 +319,31 @@ class SnowflakeConnector:
                 cursor.execute(query)
             return cursor.rowcount
         except Exception as e:
+            if self._is_token_expired_error(e) and not tried_reconnect:
+                tried_reconnect = True
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._reset_cached_connections()
+                conn = self._get_cached_connection()
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                return cursor.rowcount
             logger.error(f"Error executing statement: {e}")
             raise
         finally:
-            cursor.close()
+            try:
+                cursor.close()
+            except Exception:
+                pass
 
 # Create a global instance
 snowflake_connector = SnowflakeConnector()

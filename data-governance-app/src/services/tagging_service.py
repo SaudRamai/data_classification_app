@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 ALLOWED_CLASSIFICATIONS = ["Public", "Internal", "Restricted", "Confidential"]
 ALLOWED_CIA = ["0", "1", "2", "3"]  # store as strings in tags
 ALLOWED_SPECIAL_CATEGORIES = [
-    "PII", "PHI", "PCI", "Financial", "Auth", "Confidential", "Other"
+    "PII", "PHI", "PCI", "SOX", "Financial", "Auth", "Confidential", "Other"
 ]
 ALLOWED_COMPLIANCE_CATEGORIES = [
     "GDPR", "CCPA", "HIPAA", "SOX", "PCI DSS", "SOC", "Internal/Other"

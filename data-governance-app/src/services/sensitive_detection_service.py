@@ -34,6 +34,55 @@ SIGNAL_TYPES = ["EMAIL", "PHONE", "SSN_US", "CREDIT_CARD", "IPV4", "PII"]
 
 
 class SensitiveDetectionService:
+    def _load_dynamic_keywords(self) -> Dict[str, list[tuple[str, float]]]:
+        """Load detection keywords from CLASSIFICATION_METADATA.DETECTION_KEYWORDS.
+        Returns: {tag: [(keyword, weight), ...], ...}
+        """
+        out: Dict[str, list[tuple[str, float]]] = {}
+        try:
+            rows = snowflake_connector.execute_query(
+                """
+                SELECT TAG, KEYWORD, COALESCE(WEIGHT, 0.5) AS WEIGHT
+                FROM CLASSIFICATION_METADATA.DETECTION_KEYWORDS
+                """
+            ) or []
+            for r in rows:
+                tag = str(r.get("TAG") or "").upper()
+                kw = str(r.get("KEYWORD") or "").upper()
+                wt = float(r.get("WEIGHT") or 0.5)
+                if not tag or not kw:
+                    continue
+                out.setdefault(tag, []).append((kw, wt))
+        except Exception:
+            pass
+        return out
+
+    def _load_dynamic_patterns(self) -> Dict[str, list[tuple[re.Pattern, float]]]:
+        """Load detection regex patterns from CLASSIFICATION_METADATA.DETECTION_PATTERNS.
+        Returns: {tag: [(compiled_regex, weight), ...], ...}
+        """
+        out: Dict[str, list[tuple[re.Pattern, float]]] = {}
+        try:
+            rows = snowflake_connector.execute_query(
+                """
+                SELECT TAG, REGEX, COALESCE(WEIGHT, 0.5) AS WEIGHT
+                FROM CLASSIFICATION_METADATA.DETECTION_PATTERNS
+                """
+            ) or []
+            for r in rows:
+                tag = str(r.get("TAG") or "").upper()
+                rx = str(r.get("REGEX") or "")
+                wt = float(r.get("WEIGHT") or 0.5)
+                if not tag or not rx:
+                    continue
+                try:
+                    cre = re.compile(rx)
+                except Exception:
+                    continue
+                out.setdefault(tag, []).append((cre, wt))
+        except Exception:
+            pass
+        return out
     def _split_fqn(self, full_name: str) -> tuple[str, str, str]:
         parts = full_name.split(".")
         if len(parts) != 3:
@@ -68,7 +117,8 @@ class SensitiveDetectionService:
 
         findings: List[Dict[str, Any]] = []
 
-        # Column-name heuristics
+        # Column-name heuristics (built-in + dynamic dictionary)
+        dynamic_kw = self._load_dynamic_keywords()
         for c in cols:
             cname = str(c.get("COLUMN_NAME", ""))
             up = cname.upper()
@@ -81,8 +131,21 @@ class SensitiveDetectionService:
                         "confidence": 0.6,
                         "source": "HEURISTIC_NAME",
                     })
+            # Dynamic tags -> treat tag as coarse category (PII/PHI/Financial/Auth)
+            for tag, pairs in dynamic_kw.items():
+                if any(tok in up for tok, _w in pairs):
+                    # Simple confidence aggregation using max weight
+                    max_w = max([w for _tok, w in pairs if _tok in up] or [0.5])
+                    findings.append({
+                        "column": cname,
+                        "signal_type": tag,  # normalize to category
+                        "evidence": "dynamic_keyword",
+                        "confidence": float(min(1.0, max(0.5, max_w))),
+                        "source": "HEURISTIC_DICT",
+                    })
 
-        # Regex on samples (string-like)
+        # Regex on samples (string-like) — built-in + dynamic patterns
+        dynamic_rx = self._load_dynamic_patterns()
         for row in samples:
             for cname, val in row.items():
                 sval = "" if val is None else str(val)
@@ -101,6 +164,18 @@ class SensitiveDetectionService:
                             "confidence": 0.8,
                             "source": "REGEX",
                         })
+                # Dynamic patterns by tag
+                for tag, pairs in dynamic_rx.items():
+                    for cre, w in pairs:
+                        if cre.search(sval):
+                            findings.append({
+                                "column": cname,
+                                "signal_type": tag,
+                                "evidence": "dynamic_regex",
+                                "sample": sval[:128],
+                                "confidence": float(min(1.0, max(0.5, w))),
+                                "source": "REGEX_DICT",
+                            })
 
         # Optional: AISQL summarization for hints
         if use_ai:
@@ -157,10 +232,18 @@ class SensitiveDetectionService:
               EVIDENCE STRING,
               SAMPLE STRING,
               DETECTED_AT TIMESTAMP_NTZ,
+              SOURCE STRING,
               DETAILS VARIANT
             )
             """
         )
+        # Ensure SOURCE column exists for older deployments
+        try:
+            snowflake_connector.execute_non_query(
+                f"ALTER TABLE {database}.DATA_GOVERNANCE.ASSET_SIGNALS ADD COLUMN IF NOT EXISTS SOURCE STRING"
+            )
+        except Exception:
+            pass
 
     def persist_findings(self, database: str, asset_full_name: str, findings: List[Dict[str, Any]]) -> int:
         if not findings:
@@ -177,10 +260,11 @@ class SensitiveDetectionService:
             conf = float(f.get("confidence") or 0.5)
             evidence = f.get("evidence") or ""
             sample = (f.get("sample") or "")[:512]
+            source = (f.get("source") or "HEURISTIC").upper()
             sql = f"""
                 INSERT INTO {database}.DATA_GOVERNANCE.ASSET_SIGNALS
-                (ID, ASSET_FULL_NAME, COLUMN_NAME, SIGNAL_TYPE, CONFIDENCE, EVIDENCE, SAMPLE, DETECTED_AT, DETAILS)
-                SELECT UUID_STRING(), '{asset_full_name}', '{col}', '{stype}', {conf}, '{evidence}', '{sample.replace("'","''")}', CURRENT_TIMESTAMP,
+                (ID, ASSET_FULL_NAME, COLUMN_NAME, SIGNAL_TYPE, CONFIDENCE, EVIDENCE, SAMPLE, DETECTED_AT, SOURCE, DETAILS)
+                SELECT UUID_STRING(), '{asset_full_name}', '{col}', '{stype}', {conf}, '{evidence}', '{sample.replace("'","''")}', CURRENT_TIMESTAMP, '{source}',
                        PARSE_JSON('{dj}')
             """
             snowflake_connector.execute_non_query(sql)

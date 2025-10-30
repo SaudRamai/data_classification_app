@@ -24,7 +24,7 @@ from src.config.settings import settings
 logger = logging.getLogger(__name__)
 
 DB = settings.SNOWFLAKE_DATABASE
-SCHEMA = "DATA_GOVERNANCE"
+SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 
 TABLE_SCHEDULES = "REVIEW_SCHEDULES"
 TABLE_REPORTS = "COMPLIANCE_REPORTS"

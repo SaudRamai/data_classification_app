@@ -1,7 +1,7 @@
 """
 Classification Center - Centralized, policy-aligned implementation
 
-Implements Avendra Data Classification Policy (AVD-DWH-DCLS-001)
+Implements Data Classification Policy (DWH-DCLS-001)
 - Section 5.2 CIA Scales (C0–C3, I0–I3, A0–A3)
 - Section 5.3 Overall Risk Classification (risk mapping from CIA)
 - Section 6.1 Guided Workflow (Steps 1–6)
@@ -322,398 +322,66 @@ def _stepper_ui():
             st.success("Classification applied and audited.")
 
 
-def _ai_assistance_panel():
-    """AI Classification Assistant
-    - Automated sensitive detection (tables/columns)
-    - AI-suggested CIA at table/column level
-    - Policy validation with badges and SLA indicators
-    - Editable suggestions and apply/review with audit trail
-    - Bulk actions
-    """
-    st.subheader("AI Classification Assistant")
-
-    # Context
-    db = _get_current_db()
-    if not db:
-        st.info("Select a database in Filters to begin.")
-        return
-    else:
-        # Ensure Snowflake session context matches selected DB
-        try:
-            snowflake_connector.execute_non_query(f"USE DATABASE {db}")
-        except Exception:
-            pass
-
-    # Controls
-    col_l, col_r = st.columns([3, 1])
-    with col_l:
-        tables = _list_tables(limit=500)
-        asset = st.selectbox("Dataset", options=tables if tables else ["No assets available"], index=0, key="ai_asset")
-    with col_r:
-        limit_tbls = st.slider("Scan limit", 10, 500, 100, 10, key="ai_scan_limit")
-
+    # Keyword management: allow users to add or update sensitive detection keywords
     st.markdown("---")
-    st.markdown("### Sensitive Tables Overview")
-
-    # Build sensitive table list with AI CIA and policy compliance
-    # Pull Global Filters from session and apply to overview
-    gf = {}
-    try:
-        gf = st.session_state.get("global_filters") or {}
-    except Exception:
-        gf = {}
-    sel_schema = str(gf.get("schema") or "").strip()
-    sel_table = str(gf.get("table") or "").strip()
-    sel_schema_up = sel_schema.upper() if sel_schema and sel_schema != "All" else ""
-    sel_table_up = sel_table.upper() if sel_table and sel_table != "All" else ""
-
-    def _ci(row: dict, *keys: str):
-        for k in keys:
-            if k in row and row[k] is not None:
-                return row[k]
-        # try case-insensitive fallback
-        lower_map = {str(k).lower(): v for k, v in row.items()}
-        for k in keys:
-            v = lower_map.get(str(k).lower())
-            if v is not None:
-                return v
-        return None
-
-    rows = []
-    inv = []
-    try:
-        inv = snowflake_connector.execute_query(
-            f"""
-            SELECT FULL_NAME, COALESCE(ROW_COUNT,0) AS ROW_COUNT, FIRST_DISCOVERED, CLASSIFIED,
-                   COALESCE(CIA_CONF,0) AS CIA_C, COALESCE(CIA_INT,0) AS CIA_I, COALESCE(CIA_AVAIL,0) AS CIA_A
-            FROM {db}.DATA_GOVERNANCE.ASSET_INVENTORY
-            ORDER BY COALESCE(ROW_COUNT,0) DESC
-            LIMIT {int(limit_tbls)}
-            """
-        ) or []
-    except Exception:
-        inv = []
-    # Show active scope for transparency
-    scope_note = f"DB={db}"
-    if sel_schema_up:
-        scope_note += f", Schema={sel_schema_up}"
-    if sel_table_up:
-        scope_note += f", Table={sel_table_up}"
-    st.caption(f"Active scope: {scope_note}")
-    for r in inv:
-        full = _ci(r, "FULL_NAME")
-        # Detect categories quickly (best-effort)
-        try:
-            if not full:
-                continue
-            # Apply schema/table filters against FULL_NAME
-            full_up = str(full).upper()
-            if sel_schema_up and f".{sel_schema_up}." not in full_up:
-                continue
-            if sel_table_up and not full_up.endswith(f".{sel_table_up}"):
-                continue
-            det = ai_classification_service.detect_sensitive_columns(full, sample_size=30) or []
-            cats = sorted({c for d in det for c in (d.get('categories') or [])})
-        except Exception:
-            cats = []
-        # Normalize categories for display/policy
-        allowed = {"PII", "Financial", "SOX"}
-        out = []
-        for c in cats:
-            if c in allowed:
-                out.append("SOC/SOX" if c == "SOX" else c)
-        # AI CIA suggestion (table-level): use max of inventory CIA and suggestion by dominant type
-        dominant = next((p for p in ["PCI","PHI","PII","Financial","Auth"] if p in cats), None)
-        cia_sug = ai_classification_service._suggest_cia_from_type(dominant or "")
-        try:
-            c0 = int(_ci(r, "CIA_C") or 0)
-            i0 = int(_ci(r, "CIA_I") or 0)
-            a0 = int(_ci(r, "CIA_A") or 0)
-        except Exception:
-            c0 = i0 = a0 = 0
-        c = max(c0, int(cia_sug.get("C", 0)))
-        i = max(i0, int(cia_sug.get("I", 0)))
-        a = max(a0, int(cia_sug.get("A", 0)))
-        # Map to label via risk
-        risk = CIA(c, i, a).risk_level()
-        label = "Confidential" if c >= 3 else ("Restricted" if c >= 2 else ("Internal" if c >= 1 else "Public"))
-        # SLA due and overdue
-        fd = _ci(r, "FIRST_DISCOVERED")
-        try:
-            due = _sla_due(pd.to_datetime(fd).to_pydatetime()) if fd else None
-        except Exception:
-            due = None
-        overdue = False
-        try:
-            classified = bool(_ci(r, "CLASSIFIED") or False)
-            overdue = (not classified) and (due is not None) and (due < datetime.utcnow())
-        except Exception:
-            overdue = False
-        rows.append({
-            "Table Name": full,
-            "Detected Types": ", ".join(sorted(out)) if out else "",
-            "Row Count": int(_ci(r, "ROW_COUNT") or 0),
-            "AI C": c, "AI I": i, "AI A": a,
-            "Label": label, "Risk": risk,
-            "SLA Due": due.strftime("%Y-%m-%d") if due else "",
-            "Overdue": "Yes" if overdue else "No",
-            "Classified": bool(_ci(r, "CLASSIFIED") or False),
-        })
-
-    if rows:
-        df = pd.DataFrame(rows)
-        # Allow users to restrict to sensitive-only
-        only_sensitive = st.checkbox("Show only sensitive tables", value=True, key="ai_only_sensitive")
-        if only_sensitive and not df.empty and "Detected Types" in df.columns:
-            df = df[df["Detected Types"].astype(str).str.len() > 0]
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.caption("Badges: Overdue=Yes indicates violation of 5-business-day SLA if not yet classified.")
-    else:
-        # Fallback: build from INFORMATION_SCHEMA.TABLES when inventory is empty or filtered out
-        try:
-            where = []
-            if sel_schema_up:
-                where.append("TABLE_SCHEMA = %(s)s")
-            if sel_table_up:
-                where.append("TABLE_NAME = %(t)s")
-            w = (" where " + " and ".join(where)) if where else ""
-            params = {"s": sel_schema_up, "t": sel_table_up}
-            alt = snowflake_connector.execute_query(
-                f"""
-                select TABLE_CATALOG as DB, TABLE_SCHEMA as SCH, TABLE_NAME as NAME, coalesce(ROW_COUNT,0) as ROW_COUNT
-                from {db}.INFORMATION_SCHEMA.TABLES
-                {w}
-                order by ROW_COUNT desc
-                limit {int(limit_tbls)}
-                """,
-                params if (sel_schema_up or sel_table_up) else None,
-            ) or []
-        except Exception:
-            alt = []
-        for r in alt:
+    with st.expander("Manage Sensitive Keywords (improves future scans)", expanded=False):
+        st.caption("Add or update keywords used by the sensitive data detector. These are stored in governance tables and used in subsequent scans.")
+        kw_col1, kw_col2, kw_col3, kw_col4 = st.columns([2,2,1,1])
+        with kw_col1:
+            kw_category = st.text_input("Category", placeholder="e.g., PII, Financial, PHI", key=f"kw_cat_{asset}")
+        with kw_col2:
+            kw_value = st.text_input("Keyword", placeholder="e.g., SSN, PAN, Account", key=f"kw_val_{asset}")
+        with kw_col3:
+            kw_priority = st.number_input("Priority", min_value=0, max_value=1000, value=0, step=1, key=f"kw_pri_{asset}")
+        with kw_col4:
+            kw_active = st.checkbox("Active", value=True, key=f"kw_act_{asset}")
+        if st.button("Add/Update Keyword", key=f"kw_add_{asset}"):
             try:
-                full = f"{r.get('DB')}.{r.get('SCH')}.{r.get('NAME')}"
-                det = ai_classification_service.detect_sensitive_columns(full, sample_size=30) or []
-                cats = sorted({c for d in det for c in (d.get('categories') or [])})
-                allowed = {"PII", "Financial", "SOX"}
-                out = ["SOC/SOX" if c == "SOX" else c for c in cats if c in allowed]
-                dominant = next((p for p in ["PCI","PHI","PII","Financial","Auth"] if p in cats), None)
-                cia_sug = ai_classification_service._suggest_cia_from_type(dominant or "")
-                c = int(cia_sug.get("C", 0)); i = int(cia_sug.get("I", 0)); a = int(cia_sug.get("A", 0))
-                risk = CIA(c, i, a).risk_level()
-                label = "Confidential" if c >= 3 else ("Restricted" if c >= 2 else ("Internal" if c >= 1 else "Public"))
-                rows.append({
-                    "Table Name": full,
-                    "Detected Types": ", ".join(sorted(out)) if out else "",
-                    "Row Count": int(r.get("ROW_COUNT") or 0),
-                    "AI C": c, "AI I": i, "AI A": a,
-                    "Label": label, "Risk": risk,
-                    "SLA Due": "",
-                    "Overdue": "No",
-                    "Classified": False,
-                })
-            except Exception:
-                continue
-        if rows:
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            st.caption("Showing INFORMATION_SCHEMA fallback because ASSET_INVENTORY had no rows for this scope.")
-        else:
-            st.info(f"No sensitive tables found for the selected scope in {db}. Consider widening filters or seeding ASSET_INVENTORY.")
-
-    st.markdown("---")
-    st.markdown("### Column-level Suggestions and Edits")
-    if not asset or asset == "No assets available":
-        return
-
-    # Detect columns and build editable grid
-    try:
-        detections = ai_classification_service.detect_sensitive_columns(asset, sample_size=60) or []
-    except Exception as e:
-        detections = []
-        st.warning(f"Column detection unavailable: {e}")
-
-    # Prepare initial DF
-    initial = []
-    for d in detections:
-        col = d.get("column")
-        cats = d.get("categories") or []
-        dominant = next((p for p in ["PCI","PHI","PII","Financial","Auth"] if p in cats), None)
-        cia = ai_classification_service._suggest_cia_from_type(dominant or "")
-        C, I, A = int(cia.get("C", 0)), int(cia.get("I", 0)), int(cia.get("A", 0))
-        label = "Confidential" if C >= 3 else ("Restricted" if C >= 2 else ("Internal" if C >= 1 else "Public"))
-        initial.append({
-            "Column Name": col,
-            "Sensitivity Types": ",".join(sorted(cats)) if cats else "",
-            "Label": label,
-            "C": C, "I": I, "A": A,
-        })
-    col_df = pd.DataFrame(initial)
-
-    # Editable grid
-    edited = st.data_editor(
-        col_df if not col_df.empty else pd.DataFrame(columns=["Column Name","Sensitivity Types","Label","C","I","A"]),
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        column_config={
-            "Column Name": st.column_config.TextColumn(disabled=True),
-            "Sensitivity Types": st.column_config.TextColumn(disabled=True),
-            "Label": st.column_config.SelectboxColumn(options=["Public","Internal","Restricted","Confidential"]),
-            "C": st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-            "I": st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-            "A": st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-        },
-        key=f"ai_cols_{asset}",
-    )
-
-    # Table-level derived suggestion (editable)
-    if not edited.empty:
-        tC, tI, tA = int(max(edited["C"].max(), 0)), int(max(edited["I"].max(), 0)), int(max(edited["A"].max(), 0))
-    else:
-        tC = tI = tA = 0
-    tLabel = "Confidential" if tC >= 3 else ("Restricted" if tC >= 2 else ("Internal" if tC >= 1 else "Public") )
-    st.markdown("**Table-level Classification (editable)**")
-    table_init = pd.DataFrame([{ "Table Name": asset, "Label": tLabel, "C": tC, "I": tI, "A": tA }])
-    table_edit = st.data_editor(
-        table_init,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        column_config={
-            "Table Name": st.column_config.TextColumn(disabled=True),
-            "Label": st.column_config.SelectboxColumn(options=["Public","Internal","Restricted","Confidential"]),
-            "C": st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-            "I": st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-            "A": st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-        },
-        key=f"ai_tbl_{asset}"
-    )
-    try:
-        tLabel = str(table_edit.iloc[0]['Label'])
-        tC = int(table_edit.iloc[0]['C']); tI = int(table_edit.iloc[0]['I']); tA = int(table_edit.iloc[0]['A'])
-    except Exception:
-        pass
-
-    # Policy validation badges
-    val_issues = []
-    try:
-        tagging_service.validate_tags({
-            'DATA_CLASSIFICATION': tLabel,
-            'CONFIDENTIALITY_LEVEL': str(tC),
-            'INTEGRITY_LEVEL': str(tI),
-            'AVAILABILITY_LEVEL': str(tA),
-        })
-        tagging_service._enforce_policy_minimums(asset, {
-            'DATA_CLASSIFICATION': tLabel,
-            'CONFIDENTIALITY_LEVEL': str(tC),
-        })
-        st.success("Table classification passes policy validation.")
-    except Exception as e:
-        st.warning(f"Table policy: {e}")
-
-    for _, row in edited.iterrows():
-        try:
-            tagging_service.validate_tags({
-                'DATA_CLASSIFICATION': row['Label'],
-                'CONFIDENTIALITY_LEVEL': str(int(row['C'])),
-                'INTEGRITY_LEVEL': str(int(row['I'])),
-                'AVAILABILITY_LEVEL': str(int(row['A'])),
-            })
-            tagging_service._enforce_policy_minimums(asset, {
-                'DATA_CLASSIFICATION': row['Label'],
-                'CONFIDENTIALITY_LEVEL': str(int(row['C'])),
-            })
-        except Exception as e:
-            val_issues.append({ 'column': row['Column Name'], 'error': str(e) })
-    if val_issues:
-        st.error({'policy_issues': val_issues})
-    else:
-        st.info("All column suggestions meet minimum policy requirements.")
-
-    # Decision support: rationale & business impact
-    rationale = st.text_area("Rationale & Business Impact (for audit)", key=f"ai_rat_{asset}")
-    user_id = str(st.session_state.get('user') or 'system')
-
-    col_b1, col_b2, col_b3 = st.columns(3)
-    with col_b1:
-        if st.button("Apply classification and log", key=f"apply_{asset}"):
-            apply_errors = []
-            try:
-                tagging_service.apply_tags_to_object(asset, "TABLE", {
-                    'DATA_CLASSIFICATION': tLabel,
-                    'CONFIDENTIALITY_LEVEL': str(tC),
-                    'INTEGRITY_LEVEL': str(tI),
-                    'AVAILABILITY_LEVEL': str(tA),
-                })
-                classification_decision_service.record(
-                    asset_full_name=asset,
-                    decision_by=user_id,
-                    source="AI_ASSISTANT",
-                    status="Applied",
-                    label=tLabel,
-                    c=int(tC), i=int(tI), a=int(tA),
-                    rationale=rationale or "AI Assistant apply",
-                    details={'source': 'AI Assistant'},
-                )
-                audit_service.log(user_id, "UI_APPLY", "ASSET", asset, { 'label': tLabel, 'C': tC, 'I': tI, 'A': tA })
-            except Exception as e:
-                apply_errors.append(f"TABLE: {e}")
-            # Column tags
-            for _, row in edited.iterrows():
+                sc = None
+                # Resolve governance schema FQN using the AI service helper
                 try:
-                    tagging_service.apply_tags_to_column(asset, row['Column Name'], {
-                        'DATA_CLASSIFICATION': row['Label'],
-                        'CONFIDENTIALITY_LEVEL': str(int(row['C'])),
-                        'INTEGRITY_LEVEL': str(int(row['I'])),
-                        'AVAILABILITY_LEVEL': str(int(row['A'])),
-                    })
-                    classification_decision_service.record(
-                        asset_full_name=f"{asset}.{row['Column Name']}",
-                        decision_by=user_id,
-                        source="AI_ASSISTANT",
-                        status="Applied",
-                        label=row['Label'],
-                        c=int(row['C']), i=int(row['I']), a=int(row['A']),
-                        rationale=rationale or "AI Assistant apply",
-                        details={'source': 'AI Assistant'},
-                    )
-                    audit_service.log(user_id, "UI_APPLY", "COLUMN", f"{asset}.{row['Column Name']}", {
-                        'label': row['Label'], 'C': int(row['C']), 'I': int(row['I']), 'A': int(row['A'])
-                    })
-                except Exception as e:
-                    apply_errors.append(f"{row['Column Name']}: {e}")
-            if apply_errors:
-                st.error({'apply_errors': apply_errors})
-            else:
-                st.success("Classification applied and logged.")
-    with col_b2:
-        if st.button("Submit for review", key=f"review_{asset}"):
-            try:
-                reclassification_service.submit_request(
-                    asset_full_name=asset,
-                    proposed=(tLabel, int(tC), int(tI), int(tA)),
-                    justification=rationale or "AI Assistant submission",
-                    created_by=user_id,
-                    trigger_type="AI_ASSISTANT",
+                    sc = ai_classification_service._gov_schema_fqn()
+                except Exception:
+                    sc = None
+                if not sc:
+                    raise RuntimeError("Unable to resolve governance schema.")
+                # Upsert: delete existing then insert
+                snowflake_connector.execute_non_query(
+                    f"delete from {sc}.SENSITIVE_KEYWORDS where upper(category)=upper(%(c)s) and upper(keyword)=upper(%(k)s)",
+                    {"c": kw_category, "k": kw_value},
                 )
-                audit_service.log(user_id, "CLASSIFY_SUBMIT", "ASSET", asset, { 'label': tLabel, 'C': tC, 'I': tI, 'A': tA })
-                st.success("Submitted for review.")
-            except Exception as e:
-                st.error(f"Submit failed: {e}")
-    with col_b3:
-        if st.button("Notify (overdue/non-compliant)"):
+                snowflake_connector.execute_non_query(
+                    f"insert into {sc}.SENSITIVE_KEYWORDS (category, keyword, priority, is_active) values (%(c)s, %(k)s, %(p)s, %(a)s)",
+                    {"c": kw_category, "k": kw_value, "p": int(kw_priority), "a": bool(kw_active)},
+                )
+                # Refresh config cache
+                try:
+                    ai_classification_service.load_sensitivity_config(force_refresh=True)
+                except Exception:
+                    pass
+                st.success("Keyword added/updated successfully. Future scans will use this input.")
+            except Exception as _kw_err:
+                st.error(f"Keyword update failed: {_kw_err}")
+
+    with st.expander("Admin: Seed Sensitivity Config", expanded=False):
+        seed_db = st.text_input("Target Database (optional)", value=st.session_state.get("sf_database") or "")
+        if st.button("Run Seed and Refresh", key="btn_seed_refresh"):
             try:
-                if notifier_service:
-                    notifier_service.notify("Classification Alert", f"{asset} requires attention", recipients=None)
-                audit_service.log(user_id, "CLASSIFY_NOTIFY", "ASSET", asset, { 'reason': 'overdue/non-compliant' })
-                st.success("Notification recorded (audit).")
+                if seed_db and seed_db.strip():
+                    snowflake_connector.execute_non_query(f"USE DATABASE {seed_db}")
+                path = os.path.join(_project_root, "sql", "011_seed_sensitivity_config.sql")
+                with open(path, "r", encoding="utf-8") as f:
+                    sql_text = f.read()
+                stmts = [s.strip() for s in sql_text.split(";") if s.strip()]
+                for stmt in stmts:
+                    snowflake_connector.execute_non_query(stmt)
+                try:
+                    ai_classification_service.load_sensitivity_config(force_refresh=True)
+                except Exception:
+                    pass
+                st.success("Seed executed and configuration refreshed.")
             except Exception as e:
-                st.error(f"Notify failed: {e}")
+                st.error(f"Seed execution failed: {e}")
 
     st.markdown("---")
     st.markdown("### Bulk Actions")

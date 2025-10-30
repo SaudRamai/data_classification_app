@@ -1,7 +1,8 @@
 -- 001_governance_schema.sql
 -- Create core governance schema, inventory, audit, and compliance tables
 
-USE DATABASE IDENTIFIER($DATABASE);
+set DB = coalesce($DATABASE, current_database(), 'DATA_CLASSIFICATION_DB');
+use database identifier($DB);
 
 CREATE SCHEMA IF NOT EXISTS DATA_GOVERNANCE;
 

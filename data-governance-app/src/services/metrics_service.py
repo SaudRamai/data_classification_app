@@ -1,198 +1,171 @@
 """
-Metrics Service (Source of Truth)
-- Uses Snowflake ACCOUNT_USAGE.TAG_REFERENCES (tags) and {DB}.DATA_GOVERNANCE tables (governance)
-- Provides coverage, SOX/SOC2 counts, schema/database breakdowns, and historical trends
-"""
-from __future__ import annotations
-from typing import Dict, Any, List, Optional
-import logging
+Metrics Service for Data Governance Dashboard
 
+This service provides various metrics and analytics for the dashboard,
+including classification coverage, framework counts, and historical data.
+"""
+from typing import Dict, List, Optional, Any
+import logging
+from datetime import datetime, timedelta
 from src.connectors.snowflake_connector import snowflake_connector
-from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-DB = settings.SNOWFLAKE_DATABASE
-SCHEMA = "DATA_GOVERNANCE"  # inventory/history
-COMPLIANCE_SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"  # canonical compliance mapping
-
-
 class MetricsService:
-    def __init__(self) -> None:
+    def __init__(self):
         self.connector = snowflake_connector
 
-    def _has_table(self, fqn: str) -> bool:
-        try:
-            db, sch, tbl = fqn.split(".")
-            rows = self.connector.execute_query(
-                """
-                select 1
-                from IDENTIFIER(%(db)s).INFORMATION_SCHEMA.TABLES
-                where TABLE_SCHEMA = %(s)s and TABLE_NAME = %(t)s
-                limit 1
-                """,
-                {"db": db, "s": sch, "t": tbl},
-            )
-            return bool(rows)
-        except Exception:
-            return False
-
-    def classification_coverage(self, database: Optional[str] = None, schema: Optional[str] = None) -> Dict[str, Any]:
+    def classification_coverage(self, database: Optional[str] = None) -> Dict[str, Any]:
         """
-        Coverage based on inventory vs classification tags applied.
-        - Inventory source: {DB}.DATA_GOVERNANCE.ASSET_INVENTORY (FULL_NAME)
-        - Tag source: ACCOUNT_USAGE.TAG_REFERENCES for DATA_CLASSIFICATION/CONFIDENTIALITY_LEVEL
-        - Optional filter by database name prefix.
+        Calculate classification coverage metrics.
+        
+        Args:
+            database: Optional database name to filter results
+            
+        Returns:
+            Dictionary containing coverage metrics
         """
-        db = database or DB
-        inv_schema = schema or SCHEMA
-        inv_fqn = f"{db}.{inv_schema}.ASSET_INVENTORY"
-        result = {"total_assets": 0, "tagged_assets": 0, "coverage_pct": 0.0}
         try:
-            if not self._has_table(inv_fqn):
-                return result
-            where = ""
-            params: Dict[str, Any] = {}
+            # First get the base query for total and classified counts
+            base_query = """
+                SELECT 
+                    COUNT(*) as total_assets,
+                    SUM(CASE WHEN classification_status = 'CLASSIFIED' THEN 1 ELSE 0 END) as classified_count
+                FROM governance.classification_summary
+            """
+            
+            # Add database filter if provided
             if database:
-                where = " where upper(split_part(FULL_NAME,'.',1)) = %(dbu)s"
-                params["dbu"] = database.upper()
-            total_rows = self.connector.execute_query(
-                f"select count(*) as C from {inv_fqn}{where}", params
-            ) or [{"C": 0}]
-            total = int(total_rows[0].get("C", 0))
-            tagged_rows = self.connector.execute_query(
-                f"""
-                with inv as (
-                  select upper(FULL_NAME) as FULL from {inv_fqn}{where}
-                )
-                select count(distinct inv.FULL) as C
-                from inv
-                join SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES tr
-                  on inv.FULL = upper(tr.OBJECT_DATABASE||'.'||tr.OBJECT_SCHEMA||'.'||tr.OBJECT_NAME)
-                 and tr.TAG_NAME in ('DATA_CLASSIFICATION','CONFIDENTIALITY_LEVEL','INTEGRITY_LEVEL','AVAILABILITY_LEVEL')
-                """,
-                params,
-            ) or [{"C": 0}]
-            tagged = int(tagged_rows[0].get("C", 0))
-            cov = (float(tagged) / float(total) * 100.0) if total else 0.0
-            result.update({"total_assets": total, "tagged_assets": tagged, "coverage_pct": round(cov, 2)})
-            return result
+                base_query += f" WHERE database_name = '{database}'"
+            
+            # Execute the base query
+            result = self.connector.execute_query(base_query)
+            
+            if result and result[0]:
+                total_assets = result[0].get('TOTAL_ASSETS', 0) or 0
+                classified_count = result[0].get('CLASSIFIED_COUNT', 0) or 0
+                coverage_pct = round((classified_count / total_assets * 100), 2) if total_assets > 0 else 0
+                
+                return {
+                    'total_assets': int(total_assets),
+                    'classified_count': int(classified_count),
+                    'coverage_percentage': float(coverage_pct)
+                }
+                
+            return {
+                'total_assets': 0,
+                'classified_count': 0,
+                'coverage_percentage': 0.0
+            }
+            
         except Exception as e:
-            logger.error(f"coverage failed: {e}")
-            return result
+            logger.error(f"Error calculating classification coverage: {str(e)}")
+            return {
+                'total_assets': 0,
+                'classified_count': 0,
+                'coverage_percentage': 0.0,
+                'error': str(e)
+            }
 
-    def framework_counts(self, database: Optional[str] = None, schema: Optional[str] = None) -> Dict[str, int]:
+    def framework_counts(self, database: Optional[str] = None) -> Dict[str, int]:
         """
-        Framework counts using canonical COMPLIANCE_MAPPING if available, else fallback to COMPLIANCE_CATEGORY tag.
-        Returns counts for keys: SOX, SOC, GDPR, HIPAA, PCI.
+        Get counts by framework.
+        
+        Args:
+            database: Optional database name to filter results
+            
+        Returns:
+            Dictionary with framework counts
         """
-        counts = {"SOX": 0, "SOC": 0, "GDPR": 0, "HIPAA": 0, "PCI": 0}
         try:
-            db = database or DB
-            comp_schema = schema or COMPLIANCE_SCHEMA
-            cmap_fqn = f"{db}.{comp_schema}.COMPLIANCE_MAPPING"
-            if self._has_table(cmap_fqn):
-                rows = self.connector.execute_query(
-                    f"""
-                    select upper(FRAMEWORK_NAME) as FW, count(distinct ASSET_ID) as CNT
-                    from {cmap_fqn}
-                    group by 1
-                    """
-                ) or []
-                for r in rows:
-                    fw = (r.get("FW") or "").upper()
-                    cnt = int(r.get("CNT") or 0)
-                    if "SOX" in fw:
-                        counts["SOX"] += cnt
-                    if "SOC" in fw:
-                        counts["SOC"] += cnt
-                    if "GDPR" in fw:
-                        counts["GDPR"] += cnt
-                    if "HIPAA" in fw:
-                        counts["HIPAA"] += cnt
-                    if "PCI" in fw:
-                        counts["PCI"] += cnt
-                return counts
-            # Fallback: COMPLIANCE_CATEGORY tag on objects
-            where_obj = ""
-            params: Dict[str, Any] = {}
+            query = """
+                SELECT 
+                    COALESCE(framework, 'UNKNOWN') as framework,
+                    COUNT(*) as count
+                FROM governance.classification_summary
+            """
+            
             if database:
-                where_obj = " where upper(OBJECT_DATABASE) = %(dbu)s"
-                params["dbu"] = database.upper()
-            rows = self.connector.execute_query(
-                f"""
-                select upper(TAG_VALUE) as TV, count(*) as CNT
-                from SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
-                where upper(TAG_NAME) = 'COMPLIANCE_CATEGORY'
-                {where_obj}
-                group by 1
-                """,
-                params,
-            ) or []
-            for r in rows:
-                tv = (r.get("TV") or "").upper()
-                cnt = int(r.get("CNT") or 0)
-                if "SOX" in tv:
-                    counts["SOX"] += cnt
-                if "SOC" in tv:
-                    counts["SOC"] += cnt
-                if "GDPR" in tv:
-                    counts["GDPR"] += cnt
-                if "HIPAA" in tv:
-                    counts["HIPAA"] += cnt
-                if "PCI" in tv:
-                    counts["PCI"] += cnt
-            return counts
+                query += f" WHERE database_name = '{database}'"
+                
+            query += " GROUP BY framework ORDER BY count DESC"
+            
+            results = self.connector.execute_query(query)
+            return {row['FRAMEWORK']: row['COUNT'] for row in results if row['FRAMEWORK']}
+            
         except Exception as e:
-            logger.error(f"framework_counts failed: {e}")
-            return counts
+            logger.error(f"Error getting framework counts: {str(e)}")
+            return {}
 
-    def historical_classifications(self, database: Optional[str] = None, days: int = 30) -> List[Dict[str, Any]]:
+    def historical_classifications(self, days: int = 30, database: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Time series of classification decisions for last N days from CLASSIFICATION_DECISIONS.
+        Get historical classification data.
+        
+        Args:
+            days: Number of days of history to retrieve
+            database: Optional database name to filter results
+            
+        Returns:
+            List of daily classification metrics
         """
-        db = database or DB
-        fqn = f"{db}.{SCHEMA}.CLASSIFICATION_DECISIONS"
         try:
-            if not self._has_table(fqn):
-                return []
-            rows = self.connector.execute_query(
-                f"""
-                select to_date(DECIDED_AT) as DAY,
-                       count(*) as DECISIONS
-                from {fqn}
-                where DECIDED_AT >= dateadd(day, -%(d)s, current_timestamp())
-                group by 1
-                order by 1
-                """,
-                {"d": int(days)},
-            ) or []
-            return rows
+            query = """
+                SELECT 
+                    DATE(classification_date) as day,
+                    classification_status,
+                    COUNT(*) as count
+                FROM governance.classification_events
+                WHERE classification_date >= DATEADD(day, -%s, CURRENT_DATE())
+            """
+            
+            params = [days]
+            
+            if database:
+                query += " AND database_name = %s"
+                params.append(database)
+                
+            query += """
+                GROUP BY day, classification_status
+                ORDER BY day, classification_status
+            """
+            
+            results = self.connector.execute_query(query, tuple(params))
+            return [dict(row) for row in results]
+            
         except Exception as e:
-            logger.error(f"historical_classifications failed: {e}")
+            logger.error(f"Error getting historical classifications: {str(e)}")
             return []
 
-    def overdue_unclassified(self, database: Optional[str] = None) -> int:
+    def overdue_unclassified(self, database: Optional[str] = None) -> Dict[str, int]:
         """
-        Count assets overdue for initial classification (>5 days) from ASSET_INVENTORY.
+        Get count of overdue unclassified assets.
+        
+        Args:
+            database: Optional database name to filter results
+            
+        Returns:
+            Dictionary with overdue counts by risk level
         """
-        db = database or DB
-        inv = f"{db}.{SCHEMA}.ASSET_INVENTORY"
         try:
-            if not self._has_table(inv):
-                return 0
-            rows = self.connector.execute_query(
-                f"""
-                select count(*) as C
-                from {inv}
-                where coalesce(CLASSIFIED, false) = false
-                  and coalesce(FIRST_DISCOVERED, current_timestamp()) < dateadd(day, -5, current_timestamp())
-                """
-            ) or [{"C": 0}]
-            return int(rows[0].get("C", 0))
+            query = """
+                SELECT 
+                    COALESCE(risk_level, 'UNKNOWN') as risk_level,
+                    COUNT(*) as count
+                FROM governance.unclassified_assets
+                WHERE last_scan_date < DATEADD(day, -7, CURRENT_DATE())
+            """
+            
+            if database:
+                query += f" AND database_name = '{database}'"
+                
+            query += " GROUP BY risk_level"
+            
+            results = self.connector.execute_query(query)
+            return {row['RISK_LEVEL']: row['COUNT'] for row in results}
+            
         except Exception as e:
-            logger.error(f"overdue_unclassified failed: {e}")
-            return 0
+            logger.error(f"Error getting overdue unclassified assets: {str(e)}")
+            {}
 
-
+# Singleton instance
 metrics_service = MetricsService()

@@ -17,7 +17,7 @@
 - Business Unit: Data Governance
 
 **Abstract**  
-This document establishes Avendra's data classification framework for all data stored, processed, and managed within Snowflake data warehouse environments. The policy defines classification levels, criteria, and procedures to ensure appropriate protection of organizational data assets.
+This document establishes The data classification framework for all data stored, processed, and managed within Snowflake data warehouse environments. The policy defines classification levels, criteria, and procedures to ensure appropriate protection of organizational data assets.
 
 ### Revision History
 | Version | Author(s) | Revision Description | Date |
@@ -39,17 +39,17 @@ This document establishes Avendra's data classification framework for all data s
 
 ## 1. INTRODUCTION
 ### 1.1 Business Context
-Avendra recognizes data as one of its most valuable business assets. As our organization increasingly relies on data-driven decision making through our Snowflake data warehouse platform, it becomes critical to establish a systematic approach to data classification that ensures appropriate protection while enabling business objectives.
+The organization recognizes data as one of its most valuable business assets. As our organization increasingly relies on data-driven decision making through our Snowflake data warehouse platform, it becomes critical to establish a systematic approach to data classification that ensures appropriate protection while enabling business objectives.
 
 ### 1.2 Risk Context
-Without proper data classification, Avendra faces several significant risks including inappropriate handling of sensitive business information, regulatory compliance failures, security vulnerabilities, and operational inefficiencies. This policy addresses these risks by establishing clear classification criteria and procedures.
+Without proper data classification, The organization faces several significant risks including inappropriate handling of sensitive business information, regulatory compliance failures, security vulnerabilities, and operational inefficiencies. This policy addresses these risks by establishing clear classification criteria and procedures.
 
 ### 1.3 Policy Foundation
-This policy provides the foundational framework for data classification within Avendra's Snowflake environment, serving as the basis for subsequent data protection, access control, and governance policies.
+This policy provides the foundational framework for data classification within the organization's Snowflake environment, serving as the basis for subsequent data protection, access control, and governance policies.
 
 ## 2. PURPOSE AND SCOPE
 ### 2.1 Purpose
-This policy establishes Avendra's official data classification framework for Snowflake data warehouse environments. The primary purposes are to:
+This policy establishes the official data classification framework for Snowflake data warehouse environments. The primary purposes are to:
 - Define consistent classification criteria and procedures for categorizing data based on sensitivity and business value
 - Establish standardized classification labels and their meanings
 - Provide guidance for data owners and users on proper classification procedures
@@ -59,13 +59,13 @@ This policy establishes Avendra's official data classification framework for Sno
 ### 2.2 Scope
 #### 2.2.1 Organizational Scope
 This policy applies to:
-- All Avendra employees, contractors, consultants, and temporary staff
-- Third-party vendors and partners accessing Avendra data systems
+- All employees, contractors, consultants, and temporary staff
+- Third-party vendors and partners accessing the organization's data systems
 - All business units and subsidiaries using Snowflake environments
 
 #### 2.2.2 Technical Scope
 This policy covers:
-- All data stored in Avendra's Snowflake data warehouse environments
+- All data stored in the organization's Snowflake data warehouse environments
 - Data imported from source systems into Snowflake
 - Derived data, analytics, and reports generated from Snowflake data
 - Metadata and configuration data within Snowflake systems
@@ -97,7 +97,7 @@ This policy does not cover:
 
 ## 4. DATA CLASSIFICATION PRINCIPLES
 ### 4.1 Foundational Principles
-- Business-Driven Classification: Data classification must be driven by business requirements and the value of data to Avendra's operations. Business stakeholders, not technical teams, must lead classification decisions based on their understanding of data usage and importance.
+- Business-Driven Classification: Data classification must be driven by business requirements and the value of data to the organization's operations. Business stakeholders, not technical teams, must lead classification decisions based on their understanding of data usage and importance.
 - Risk-Based Approach: Classification levels must reflect the potential risk and business impact of data compromise. Higher sensitivity data requires higher classification levels and more stringent protection measures.
 - Proportionate Protection: The level of data protection must be proportionate to the classification level. Over-classification creates unnecessary operational burden, while under-classification creates unacceptable risk.
 - Lifecycle Awareness: Data classification may change throughout the data lifecycle as business value, sensitivity, or regulatory requirements evolve. Regular review and reclassification procedures must be established.

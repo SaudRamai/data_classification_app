@@ -1,14 +1,4 @@
-"""
-Classification Center (policy-aligned wrapper)
-
-This page delegates entirely to the centralized Classification Center implementation,
-which conforms to Avendra's Data Classification Policy (AVD-DWH-DCLS-001).
-
-Non-policy and legacy fallback UI previously present in this file has been removed to
-ensure only mandated components are exposed from this page. Please see
-`src/pages/_classification_center.py` for the guided workflow, management, bulk tools,
-and compliance reporting.
-"""
+from pathlib import Path as _Path
 import sys
 import os
 
@@ -22,7 +12,7 @@ if _project_root not in sys.path:
 import streamlit as st
 import pandas as pd
 from datetime import date, datetime, timedelta
-from typing import Optional, List, Dict, Tuple, Set, Union
+from typing import Optional, List, Dict, Tuple, Set, Union, Any
 from src.ui.theme import apply_global_theme
 from src.components.filters import render_data_filters
 from src.connectors.snowflake_connector import snowflake_connector
@@ -43,6 +33,7 @@ from src.services.my_tasks_service import (
     update_or_submit_classification as my_update_submit,
 )
 from src.ui.classification_history_tab import render_classification_history_tab
+from src.services.seed_governance_service import refresh_governance
 try:
     from src.services.classification_review_service import list_reviews as cr_list_reviews
 except Exception:
@@ -64,6 +55,11 @@ try:
     from src.services.compliance_service import compliance_service
 except Exception:
     compliance_service = None
+
+try:
+    from src.config.settings import settings
+except Exception:
+    settings = None
 
 # No local services/helpers; all functionality is encapsulated in the centralized
 # Classification Center to ensure a single policy-aligned implementation.
@@ -93,30 +89,67 @@ except Exception as _top_auth_err:
     st.stop()
 
 
+# Ensure AI service is properly initialized
+try:
+    ai_classification_service.set_mode(True)
+    _db_init = st.session_state.get("sf_database") or resolve_governance_db()
+    if _db_init:
+        _sc_fqn_init = f"{_db_init}.DATA_CLASSIFICATION_GOVERNANCE"
+        try:
+            # Initialize with empty config first to prevent errors
+            ai_classification_service._sensitivity_config = {
+                "patterns": {},
+                "keywords": {},
+                "categories": {},
+                "bundles": {},
+                "internal_patterns": {},
+                "compliance_mapping": {},
+                "model_metadata": {},
+                "name_tokens": {}
+            }
+            # Try to load the real config
+            try:
+                ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn_init)
+            except Exception as e:
+                st.warning(f"Warning: Could not load sensitivity config: {str(e)}. Using default configuration.")
+        except Exception as e:
+            st.warning(f"Warning: Could not initialize sensitivity config: {str(e)}. Some features may be limited.")
+except Exception as e:
+    st.warning(f"Warning: Could not fully initialize AI service: {str(e)}. Some features may be limited.")
+    # Ensure we have at least an empty config
+    if not hasattr(ai_classification_service, '_sensitivity_config'):
+        ai_classification_service._sensitivity_config = {
+            "patterns": {},
+            "keywords": {},
+            "categories": {},
+            "bundles": {},
+            "internal_patterns": {},
+            "compliance_mapping": {},
+            "model_metadata": {},
+            "name_tokens": {}
+        }
+
+# Add verification of AI service readiness
+def verify_ai_service_ready():
+    """Check if AI service is properly configured"""
+    try:
+        if not ai_classification_service:
+            return False
+        # Use the pre-loaded config instead of calling load_sensitivity_config again
+        cfg = getattr(ai_classification_service, '_sensitivity_config', {})
+        # If we have patterns or keywords, consider it ready
+        return bool(cfg.get('patterns') or cfg.get('keywords'))
+    except Exception:
+        return False
+
 # Show resolved governance database and allow re-detection (DB + Schema)
 try:
     col_db1, col_db2, col_db3 = st.columns([3,1,1])
     with col_db1:
         _db_resolved = resolve_governance_db()
-        # Auto-detect governance schema (prefer DATA_CLASSIFICATION_GOVERNANCE)
+        # Auto-detect governance schema (force DATA_CLASSIFICATION_GOVERNANCE)
         def _auto_detect_governance_schema(active_db: str) -> str:
-            try:
-                rows = snowflake_connector.execute_query(
-                    f"""
-                    select upper(schema_name) as SCHEMA_NAME
-                    from {active_db}.information_schema.schemata
-                    where upper(schema_name) in ('DATA_CLASSIFICATION_GOVERNANCE','DATA_GOVERNANCE')
-                    order by case upper(schema_name)
-                             when 'DATA_CLASSIFICATION_GOVERNANCE' then 0 else 1 end
-                    limit 1
-                    """
-                ) or []
-                if rows:
-                    sch = str(rows[0].get("SCHEMA_NAME") or "").strip()
-                    return sch or "DATA_GOVERNANCE"
-            except Exception:
-                pass
-            return "DATA_GOVERNANCE"
+            return "DATA_CLASSIFICATION_GOVERNANCE"
 
         # Initialize or refresh schema in session
         try:
@@ -126,6 +159,10 @@ try:
                     st.session_state["governance_schema"] = _auto_detect_governance_schema(_active_db)
         except Exception:
             pass
+
+    # (Removed) Sidebar scanning options
+
+    
         # Hidden: previously displayed resolved governance schema
     with col_db2:
         if st.button("Re-detect DB", key="btn_redetect_db"):
@@ -153,6 +190,11 @@ except Exception:
 # Global Filters (sidebar) and driver for tabs
 with st.sidebar.expander("🌐 Global Filters", expanded=True):
     global_sel = render_data_filters(key_prefix="global")
+    try:
+        if "virtual_mode" not in st.session_state:
+            st.session_state["virtual_mode"] = False
+    except Exception:
+        pass
     # Persist the selected database to session to drive services that rely on it
     if global_sel.get("database"):
         _db_sel = str(global_sel.get("database") or "").strip()
@@ -160,8 +202,24 @@ with st.sidebar.expander("🌐 Global Filters", expanded=True):
             st.session_state["sf_database"] = _db_sel
             try:
                 snowflake_connector.execute_non_query(f"USE DATABASE {_db_sel}")
+            except Exception as _e_use_db:
+                try:
+                    st.warning(f"Failed to set database context: {_e_use_db}")
+                except Exception:
+                    pass
+            try:
+                ai_classification_service.set_mode(True)
+                _sc_fqn_sel = f"{_db_sel}.DATA_CLASSIFICATION_GOVERNANCE"
+                ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn_sel)
             except Exception:
                 pass
+    # Persist selected schema to session if provided
+    try:
+        _sc_sel = str(global_sel.get("schema") or "").strip()
+        if _sc_sel and _sc_sel.upper() not in {"ALL", "NONE", "(NONE)", "NULL", "UNKNOWN"}:
+            st.session_state["sf_schema"] = _sc_sel
+    except Exception:
+        pass
     # Persist all filters for downstream queries
     try:
         st.session_state["global_filters"] = {
@@ -179,36 +237,20 @@ except NameError:
     # Function defined later in the module during initial import; ignore on first pass
     pass
 
-# Advanced: allow dynamic override of governance schema and objects used by services
-with st.sidebar.expander("⚙️ Advanced: Governance Objects", expanded=False):
+# Apply Snowflake context (DB/Schema) to settings and verify permissions
+try:
+    _apply_snowflake_context()
+    _verify_information_schema_permissions()
     try:
-        gv_schema = st.text_input(
-            "Governance schema",
-            value=str(st.session_state.get("governance_schema") or "DATA_GOVERNANCE"),
-            help="Schema containing governance tables/views (e.g., DATA_GOVERNANCE)",
-            key="adv_gov_schema",
-        )
-        gv_tasks = st.text_input(
-            "Tasks table/view",
-            value=str(st.session_state.get("governance_tasks_view") or "CLASSIFICATION_TASKS"),
-            help="Name of tasks table or view (e.g., CLASSIFICATION_TASKS)",
-            key="adv_gov_tasks",
-        )
-        gv_dec = st.text_input(
-            "Decisions table",
-            value=str(st.session_state.get("governance_decisions_table") or "CLASSIFICATION_DECISIONS"),
-            help="Name of decisions/history table (e.g., CLASSIFICATION_DECISIONS)",
-            key="adv_gov_decisions",
-        )
-        # Persist
-        st.session_state["governance_schema"] = (gv_schema or "DATA_GOVERNANCE").strip()
-        st.session_state["governance_tasks_view"] = (gv_tasks or "CLASSIFICATION_TASKS").strip()
-        st.session_state["governance_decisions_table"] = (gv_dec or "CLASSIFICATION_DECISIONS").strip()
-        st.caption(
-            f"Using {st.session_state.get('sf_database') or '[Select DB]'}.{st.session_state['governance_schema']}.{st.session_state['governance_tasks_view']} and {st.session_state['governance_schema']}.{st.session_state['governance_decisions_table']}"
-        )
-    except Exception as _adv_err:
-        st.warning(f"Advanced object override unavailable: {_adv_err}")
+        _sel_table = (st.session_state.get("global_filters") or {}).get("table")
+        if _sel_table and _sel_table.count(".") == 2:
+            _compute_and_store_table_stats(_sel_table)
+    except Exception:
+        pass
+except Exception:
+    pass
+
+# (Removed) Sidebar advanced governance objects
 
 def _active_db_from_filter() -> Optional[str]:
     """Resolve active DB for this page, prioritizing the sidebar selection.
@@ -237,18 +279,312 @@ def _set_db_from_filters_if_available() -> None:
             st.session_state["sf_database"] = db
             try:
                 snowflake_connector.execute_non_query(f"USE DATABASE {db}")
-            except Exception:
-                # Best-effort: do not fail the UI
-                pass
+            except Exception as _e_use_db2:
+                try:
+                    st.warning(f"Failed to set database context: {_e_use_db2}")
+                except Exception:
+                    pass
     except Exception:
         pass
+
+def _apply_snowflake_context() -> None:
+    try:
+        try:
+            ai_classification_service.set_mode(True)
+        except Exception:
+            pass
+
+        db = st.session_state.get("sf_database")
+        sc = st.session_state.get("sf_schema") or (st.session_state.get("global_filters") or {}).get("schema")
+        if settings is not None:
+            try:
+                if db:
+                    setattr(settings, "SCAN_CATALOG_DB", str(db))
+                    # Use the database for SNOWFLAKE_DATABASE (not the schema)
+                    setattr(settings, "SNOWFLAKE_DATABASE", str(db))
+            except Exception:
+                pass
+        # Utilities: one-click refresh/seed of governance config for selected DB
+        c1, c2 = st.columns([1,3])
+        with c1:
+            if st.button("Refresh governance (seed/update)", type="secondary", help="Creates tables if missing, upserts default seeds, and refreshes AI config"):
+                db_f = st.session_state.get("sf_database") or resolve_governance_db()
+                if not db_f:
+                    st.warning("Select a Database first in Global Filters")
+                else:
+                    try:
+                        res = refresh_governance(database=db_f)
+                        # Force-refresh config for active DB/schema
+                        try:
+                            _sc_fqn = f"{db_f}.DATA_CLASSIFICATION_GOVERNANCE"
+                            ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn)
+                        except Exception:
+                            pass
+                        # Feedback
+                        failures = res.get("failures") or []
+                        counts = res.get("counts") or {}
+                        st.success(
+                            f"Governance refresh complete for {db_f}: statements ok={res.get('success_statements',0)}, failures={res.get('failure_count',0)}"
+                        )
+                        if counts:
+                            try:
+                                df_counts = pd.DataFrame([{"TABLE": k, "ROW_COUNT": v} for k, v in counts.items()])
+                                st.dataframe(df_counts, hide_index=True, use_container_width=True)
+                            except Exception:
+                                st.write(counts)
+                        if failures:
+                            st.warning("Some statements failed. See details below.")
+                            for f in failures[:10]:
+                                st.caption(str(f))
+                    except Exception as _seed_ex:
+                        st.error(f"Refresh failed: {_seed_ex}")
+        with c2:
+            st.caption("")
+        try:
+            if db and sc:
+                snowflake_connector.execute_non_query(f"USE SCHEMA {db}.{sc}")
+            elif sc:
+                snowflake_connector.execute_non_query(f"USE SCHEMA {sc}")
+        except Exception as _e_use_schema:
+            try:
+                st.warning(f"Failed to set schema context: {_e_use_schema}")
+            except Exception:
+                pass
+        
+    except Exception:
+        pass
+
+def _verify_information_schema_permissions() -> None:
+    try:
+        db = st.session_state.get("sf_database") or _active_db_from_filter()
+        sc = st.session_state.get("sf_schema")
+        if not db:
+            return
+        issues = []
+        try:
+            snowflake_connector.execute_query(f"SELECT 1 FROM {db}.INFORMATION_SCHEMA.TABLES LIMIT 1")
+        except Exception as e:
+            issues.append("TABLES")
+        try:
+            if sc:
+                snowflake_connector.execute_query(
+                    f"SELECT 1 FROM {db}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=%(s)s LIMIT 1",
+                    {"s": sc},
+                )
+            else:
+                snowflake_connector.execute_query(f"SELECT 1 FROM {db}.INFORMATION_SCHEMA.COLUMNS LIMIT 1")
+        except Exception:
+            issues.append("COLUMNS")
+        try:
+            snowflake_connector.execute_query(f"SELECT 1 FROM {db}.INFORMATION_SCHEMA.CONSTRAINTS LIMIT 1")
+        except Exception:
+            issues.append("CONSTRAINTS")
+        if issues:
+            st.warning(
+                "Insufficient privileges for INFORMATION_SCHEMA: " + ", ".join(issues) + ". Please grant SELECT on these views to the active role."
+            )
+        else:
+            st.caption("INFORMATION_SCHEMA access verified for current role.")
+    except Exception:
+        pass
+
+def _compute_and_store_table_stats(table_fqn: str) -> None:
+    try:
+        if not table_fqn or table_fqn.count(".") != 2:
+            return
+        db, sc, tb = table_fqn.split(".")
+        if not db:
+            db = st.session_state.get("sf_database") or ""
+        snowflake_connector.execute_non_query(
+            f"""
+            CREATE SCHEMA IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE;
+            CREATE TABLE IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE.COLUMN_STATS (
+              TABLE_CATALOG STRING,
+              TABLE_SCHEMA STRING,
+              TABLE_NAME STRING,
+              COLUMN_NAME STRING,
+              ROW_COUNT NUMBER,
+              NULL_COUNT NUMBER,
+              UNIQUE_COUNT NUMBER,
+              COMPUTED_AT TIMESTAMP_NTZ,
+              COMPUTED_BY STRING,
+              SESSION_ID STRING
+            )
+            """
+        )
+        try:
+            snowflake_connector.execute_non_query(
+                f"ALTER TABLE {db}.DATA_CLASSIFICATION_GOVERNANCE.COLUMN_STATS ADD COLUMN IF NOT EXISTS COMPUTED_BY STRING"
+            )
+        except Exception:
+            pass
+        try:
+            snowflake_connector.execute_non_query(
+                f"ALTER TABLE {db}.DATA_CLASSIFICATION_GOVERNANCE.COLUMN_STATS ADD COLUMN IF NOT EXISTS SESSION_ID STRING"
+            )
+        except Exception:
+            pass
+        rows = snowflake_connector.execute_query(
+            f"SELECT COLUMN_NAME FROM {db}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=%(s)s AND TABLE_NAME=%(t)s ORDER BY ORDINAL_POSITION",
+            {"s": sc, "t": tb},
+        ) or []
+        total = 0
+        try:
+            rci = snowflake_connector.execute_query(
+                f"SELECT COALESCE(ROW_COUNT,0) AS RC FROM {db}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=%(s)s AND TABLE_NAME=%(t)s LIMIT 1",
+                {"s": sc, "t": tb},
+            ) or []
+            total = int(rci[0].get("RC") or 0) if rci else 0
+        except Exception:
+            total = 0
+        if total <= 0:
+            try:
+                rc = snowflake_connector.execute_query(f"SELECT COUNT(*) AS C FROM {db}.{sc}.{tb}") or []
+                total = int(list(rc[0].values())[0]) if rc else 0
+            except Exception:
+                total = 0
+        try:
+            refresh = bool(st.session_state.get("refresh_column_stats"))
+        except Exception:
+            refresh = False
+        try:
+            if not refresh:
+                ex = snowflake_connector.execute_query(
+                    f"SELECT MAX(COMPUTED_AT) AS TS FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.COLUMN_STATS WHERE TABLE_CATALOG=%(dc)s AND TABLE_SCHEMA=%(sc)s AND TABLE_NAME=%(tb)s",
+                    {"dc": db, "sc": sc, "tb": tb},
+                ) or []
+                ts = ex[0].get("TS") if ex else None
+                if ts:
+                    # Skip recomputation if within 24h
+                    staleness_ok = True
+                    try:
+                        import pandas as _pdx
+                        age = (pd.to_datetime("now") - pd.to_datetime(ts)).total_seconds()
+                        staleness_ok = age > 24*3600
+                    except Exception:
+                        staleness_ok = False
+                    if not staleness_ok:
+                        return
+        except Exception:
+            pass
+        user_id = None
+        session_id = None
+        try:
+            ident = authz.get_current_identity()
+            user_id = ident.user
+        except Exception:
+            user_id = None
+        try:
+            session_id = st.session_state.get("session_id") or st.session_state.get("_session_id")
+        except Exception:
+            session_id = None
+        for r in rows:
+            col = r.get("COLUMN_NAME")
+            if not col:
+                continue
+            try:
+                qn = f'"{db}"."{sc}"."{tb}"'
+                qcol = '"' + str(col).replace('"','""') + '"'
+                if total and total > 5000000:
+                    res = snowflake_connector.execute_query(
+                        f"SELECT COUNT(*) AS N, COUNT({qcol}) AS NN, APPROX_COUNT_DISTINCT({qcol}) AS UDIST FROM {qn}"
+                    ) or []
+                else:
+                    res = snowflake_connector.execute_query(
+                        f"SELECT COUNT(*) AS N, COUNT({qcol}) AS NN, COUNT(DISTINCT {qcol}) AS UDIST FROM {qn}"
+                    ) or []
+                n = int(res[0].get("N") or 0) if res else total
+                nn = int(res[0].get("NN") or 0) if res else 0
+                ud = int(res[0].get("UDIST") or 0) if res else 0
+                nulls = max(0, n - nn)
+                snowflake_connector.execute_non_query(
+                    f"""
+                    MERGE INTO {db}.DATA_CLASSIFICATION_GOVERNANCE.COLUMN_STATS t
+                    USING (SELECT %(dc)s AS DC, %(sc)s AS SC, %(tb)s AS TB, %(col)s AS CN) s
+                    ON t.TABLE_CATALOG=s.DC AND t.TABLE_SCHEMA=s.SC AND t.TABLE_NAME=s.TB AND t.COLUMN_NAME=s.CN
+                    WHEN MATCHED THEN UPDATE SET ROW_COUNT=%(rc)s, NULL_COUNT=%(nc)s, UNIQUE_COUNT=%(uc)s, COMPUTED_AT=CURRENT_TIMESTAMP, COMPUTED_BY=%(by)s, SESSION_ID=%(sid)s
+                    WHEN NOT MATCHED THEN INSERT (TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ROW_COUNT, NULL_COUNT, UNIQUE_COUNT, COMPUTED_AT, COMPUTED_BY, SESSION_ID)
+                    VALUES (%(dc)s, %(sc)s, %(tb)s, %(col)s, %(rc)s, %(nc)s, %(uc)s, CURRENT_TIMESTAMP, %(by)s, %(sid)s)
+                    """,
+                    {"dc": db, "sc": sc, "tb": tb, "col": col, "rc": n, "nc": nulls, "uc": ud, "by": user_id, "sid": session_id},
+                )
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+def _ensure_governance_objects(db: str) -> None:
+    try:
+        snowflake_connector.execute_non_query(
+            f"CREATE SCHEMA IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE"
+        )
+        # Only create table if an object with the same name does not already exist as a VIEW
+        try:
+            exists_view = snowflake_connector.execute_query(
+                f"SELECT 1 FROM {db}.INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA='DATA_CLASSIFICATION_GOVERNANCE' AND TABLE_NAME='ASSET_INVENTORY' LIMIT 1"
+            ) or []
+        except Exception:
+            exists_view = []
+        if not exists_view:
+            snowflake_connector.execute_non_query(
+                f"""
+                CREATE TABLE IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSET_INVENTORY (
+                  FULL_NAME STRING,
+                  OBJECT_DOMAIN STRING,
+                  FIRST_DISCOVERED TIMESTAMP_NTZ,
+                  CLASSIFIED BOOLEAN,
+                  PII_DETECTED BOOLEAN,
+                  FINANCIAL_DATA_DETECTED BOOLEAN,
+                  REGULATED_DATA_DETECTED BOOLEAN
+                )
+                """
+            )
+        snowflake_connector.execute_non_query(
+            f"""
+            CREATE TABLE IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_TASKS (
+              TASK_ID STRING,
+              ASSET_FULL_NAME STRING,
+              STATUS STRING,
+              CREATED_AT TIMESTAMP_NTZ,
+              UPDATED_AT TIMESTAMP_NTZ,
+              DETAILS VARIANT
+            )
+            """
+        )
+        snowflake_connector.execute_non_query(
+            f"""
+            CREATE TABLE IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS (
+              ID STRING,
+              ASSET_FULL_NAME STRING,
+              USER_ID STRING,
+              ACTION STRING,
+              CLASSIFICATION_LEVEL STRING,
+              CIA_CONF NUMBER,
+              CIA_INT NUMBER,
+              CIA_AVAIL NUMBER,
+              RATIONALE STRING,
+              CREATED_AT TIMESTAMP_NTZ,
+              DETAILS VARIANT
+            )
+            """
+        )
+    except Exception:
+        pass
+
+try:
+    _db_ctx = _active_db_from_filter()
+    if _db_ctx:
+        _apply_snowflake_context()
+        _ensure_governance_objects(_db_ctx)
+except Exception:
+    pass
 
 def _gv_schema() -> str:
     """Governance schema from session with default."""
     try:
-        return str(st.session_state.get("governance_schema") or "DATA_GOVERNANCE")
+        return str(st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE")
     except Exception:
-        return "DATA_GOVERNANCE"
+        return "DATA_CLASSIFICATION_GOVERNANCE"
 
 def _where_from_filters_for_fqn(column_name: str, sel: dict) -> Tuple[List[str], dict]:
     """Build WHERE fragments/params to filter a fully-qualified name column (DATABASE.SCHEMA.OBJECT)
@@ -338,6 +674,7 @@ def render_live_feed():
     import time as _time
 
     st.caption("Realtime Snowflake feed. Uses the active database from the sidebar filters.")
+    _apply_snowflake_context()
     db = _active_db_from_filter()
     if not db:
         st.info("Select a database from the Global Filters to enable live data.")
@@ -419,7 +756,7 @@ def render_live_feed():
     if df_live.empty:
         st.info("No rows returned for the selected source/filters.")
     else:
-        st.dataframe(df_live, use_container_width=True)
+        st.dataframe(df_live, width='stretch')
 
     # Simple auto-refresh loop (blocking) only when enabled
     if auto:
@@ -433,12 +770,17 @@ def render_live_feed():
         placeholder.empty()
         st.rerun()
 
+# (Removed) Sidebar scanning options (pre-tabs)
+
 # Primary tabs per requirements
 tab_new, tab_tasks, tab_qa = st.tabs([
     "New Classification",
     "Classification Management",
     "Quality Assurance (QA)",
 ])
+
+with tab_new:
+    pass
 
 with tab_qa:
     st.subheader("Quality Assurance (QA)")
@@ -498,12 +840,12 @@ with tab_qa:
                 inconsistent = grp[grp["distinct_classes"] > 1]
                 if not inconsistent.empty:
                     st.warning(f"Found {len(inconsistent)} inconsistent name group(s)")
-                    st.dataframe(inconsistent.sort_values(["distinct_classes","samples"], ascending=False), use_container_width=True)
+                    st.dataframe(inconsistent.sort_values(["distinct_classes","samples"], ascending=False), width='stretch')
                     # Expand one group for detail preview
                     pick = st.selectbox("Inspect group", options=inconsistent["KEY"].tolist(), key="qa_consistency_pick")
                     if pick:
                         detail = df[df["KEY"] == pick].copy()
-                        st.dataframe(detail[["DATABASE_NAME","SCHEMA_NAME","ASSET_NAME","CLASSIFICATION","C","I","A"]], use_container_width=True)
+                        st.dataframe(detail[["DATABASE_NAME","SCHEMA_NAME","ASSET_NAME","CLASSIFICATION","C","I","A"]], width='stretch')
                 else:
                     st.success("No cross-dataset classification inconsistencies detected in the sample.")
             else:
@@ -521,7 +863,7 @@ with tab_qa:
                     if not drift_items.empty:
                         st.markdown("---")
                         st.markdown("##### Governance vs Tag Drift")
-                        st.dataframe(drift_items, use_container_width=True)
+                        st.dataframe(drift_items, width='stretch')
                         st.caption(f"Drift %: {drift.get('summary',{}).get('drift_pct', 0)} across {drift.get('summary',{}).get('total_assets_sampled', 0)} assets")
                     else:
                         st.info("No drift items detected in the sample.")
@@ -573,7 +915,7 @@ with tab_qa:
                     pdf["age_days"] = pdf["age_days"].round(1)
                 except Exception:
                     pdf["age_days"] = None
-            st.dataframe(pdf[[c for c in ["database","schema","asset_name","classification","c_level","created_by","change_timestamp","age_days"] if c in pdf.columns]], use_container_width=True)
+            st.dataframe(pdf[[c for c in ["database","schema","asset_name","classification","c_level","created_by","change_timestamp","age_days"] if c in pdf.columns]], width='stretch')
 
             # Aging chart
             try:
@@ -697,7 +1039,7 @@ with tab_qa:
             with sc1:
                 st.metric("PII Assets", value=(pii_cnt if pii_cnt is not None else "N/A"))
             with sc2:
-                st.metric("Financial Assets", value=(fin_cnt if fin_cnt is not None else "N/A"))
+                st.metric("SOX Assets", value=(fin_cnt if fin_cnt is not None else "N/A"))
             with sc3:
                 st.metric("Regulatory Assets", value=(reg_cnt if reg_cnt is not None else "N/A"))
 
@@ -736,7 +1078,7 @@ with tab_qa:
 
 with tab_new:
     st.subheader("New Classification")
-    sub_guided, sub_ai, sub_bulk = st.tabs(["Guided Workflow", "AI Assistant", "Bulk Upload"])
+    sub_guided, sub_bulk, sub_ai = st.tabs(["Guided Workflow", "Bulk Upload", "AI Assistant"])
 
     # Guided Workflow
     with sub_guided:
@@ -779,29 +1121,40 @@ with tab_new:
                     where.append("POSITION('.' || UPPER(%(w_s)s) || '.' IN UPPER(FULL_NAME)) > 0"); params["w_s"] = ssch
                 if stab:
                     where.append("(UPPER(FULL_NAME) LIKE UPPER(%(w_t1)s) OR RIGHT(UPPER(FULL_NAME), LENGTH(%(w_t2)s)) = UPPER(%(w_t2)s))"); params["w_t1"] = f"%.{stab}"; params["w_t2"] = f".{stab}"
-                sql = f"""
-                    SELECT FULL_NAME,
-                           COALESCE(ASSET_TYPE, OBJECT_TYPE) AS ASSET_TYPE,
-                           COALESCE(DATA_DOMAIN, OBJECT_DOMAIN) AS DATA_DOMAIN,
-                           COALESCE(OWNER, CUSTODIAN) AS OWNER,
-                           SOURCE_SYSTEM,
-                           FIRST_DISCOVERED,
-                           CLASSIFIED
-                    FROM {db}.{gv_schema}.ASSET_INVENTORY
-                    {('WHERE ' + ' AND '.join(where)) if where else ''}
-                    ORDER BY COALESCE(FIRST_DISCOVERED, CURRENT_TIMESTAMP()) DESC
-                    LIMIT 2000
-                """
-                rows = snowflake_connector.execute_query(sql, params) or []
-                return rows
+                fqn_candidates = [
+                    f"{db}.{gv_schema}.ASSET_INVENTORY" if db and gv_schema else None,
+                    "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSET_INVENTORY",
+                ]
+                fqn_candidates = [x for x in fqn_candidates if x]
+                for fqn in fqn_candidates:
+                    sql = f"""
+                        SELECT FULL_NAME,
+                               COALESCE(ASSET_TYPE, OBJECT_TYPE) AS ASSET_TYPE,
+                               COALESCE(DATA_DOMAIN, OBJECT_DOMAIN) AS DATA_DOMAIN,
+                               COALESCE(OWNER, CUSTODIAN) AS OWNER,
+                               SOURCE_SYSTEM,
+                               FIRST_DISCOVERED,
+                               CLASSIFIED
+                        FROM {fqn}
+                        {('WHERE ' + ' AND '.join(where)) if where else ''}
+                        ORDER BY COALESCE(FIRST_DISCOVERED, CURRENT_TIMESTAMP()) DESC
+                        LIMIT 2000
+                    """
+                    try:
+                        rows = snowflake_connector.execute_query(sql, params) or []
+                        if rows:
+                            return rows
+                    except Exception:
+                        continue
+                return []
             except Exception:
                 return []
 
         # Inventory-backed selection, ordered by FIRST_DISCOVERED (recent first)
         _db_active = _active_db_from_filter()
-        _gv = st.session_state.get("governance_schema") or "DATA_GOVERNANCE"
+        _gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
         _gf = st.session_state.get("global_filters") or {}
-        inv_rows = _inventory_assets(_db_active, _gv, _gf) if _db_active else []
+        inv_rows = _inventory_assets(_db_active, _gv, _gf)
         inv_options_real = [r.get("FULL_NAME") for r in (inv_rows or [])]
         placeholder = "— Select an asset —"
         inv_options = ([placeholder] + inv_options_real) if inv_options_real else ["No assets available"]
@@ -902,6 +1255,245 @@ with tab_new:
                 except Exception:
                     pass
 
+        # --- Virtual Mode (Offline / Uploaded datasets) ---
+        st.markdown("---")
+        st.markdown("#### Virtual Mode (Offline / Uploaded)")
+        vm_col1, vm_col2 = st.columns([1,1])
+        with vm_col1:
+            use_virtual = st.toggle("Use Virtual Mode (disable Snowflake)", value=False, key="vm_toggle")
+        try:
+            from src.services.ai_classification_service import ai_classification_service as _ai
+            if use_virtual:
+                try:
+                    _ai.set_mode(False)
+                except Exception:
+                    pass
+            else:
+                try:
+                    _ai.set_mode(True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        with vm_col2:
+            virt_name = st.text_input("Virtual table name (DB.SCHEMA.TABLE)", value="VIRTUAL_DB.PUBLIC.UPLOAD", key="vm_table_name")
+        up = st.file_uploader("Upload sample file (CSV)", type=["csv"], key="vm_upload")
+        if up is not None and virt_name:
+            try:
+                import pandas as _pdu
+                df_up = _pdu.read_csv(up)
+                ai_classification_service.register_uploaded_dataframe(virt_name, df_up)
+                st.success(f"Registered virtual table: {virt_name} with {len(df_up)} rows.")
+            except Exception as e:
+                st.warning(f"Upload failed: {e}")
+        with st.expander("Sensitive Table Scan (AI/ML)", expanded=False):
+            left, right, r2, r3 = st.columns([1,1,1,1])
+            with left:
+                try:
+                    _db_active = _active_db_from_filter()
+                except Exception:
+                    _db_active = ""
+                scan_db = st.text_input("Database", value=str(_db_active or ""))
+            with right:
+                try:
+                    _wh_active = _active_wh_from_filter()
+                except Exception:
+                    _wh_active = ""
+                scan_wh = st.text_input("Warehouse", value=str(_wh_active or ""))
+            with right:
+                scan_schema = st.text_input("Schema (optional)", value="")
+            with r2:
+                threshold = st.slider("Sensitive threshold", min_value=0.5, max_value=0.9, value=0.7, step=0.01, key="sens_tbl_thr")
+            with r3:
+                sample_n = st.number_input("Sample rows", min_value=100, max_value=2000, value=1000, step=100, key="sens_tbl_samp")
+            run_scan = st.button("Run Sensitive Table Scan", type="primary", key="run_sens_tbl_scan")
+            if run_scan:
+                try:
+                    from src.services.ai_classification_service import ai_classification_service as _svc
+                    try:
+                        _svc.set_mode(False if use_virtual else True)
+                    except Exception:
+                        pass
+                    # Apply context from filters/inputs
+                    try:
+                        if scan_wh:
+                            st.session_state["sf_warehouse"] = scan_wh
+                        if scan_db:
+                            st.session_state["sf_database"] = scan_db
+                        _apply_snowflake_context()
+                    except Exception:
+                        pass
+                    try:
+                        _svc.initialize_sensitive_detection()
+                    except Exception:
+                        pass
+                    # Ensure dynamic sensitivity config is loaded
+                    try:
+                        _svc.load_sensitivity_config(force_refresh=True)
+                    except Exception:
+                        pass
+                    candidates = []
+                    if use_virtual:
+                        try:
+                            candidates = list(getattr(_svc, "_virtual_catalog", {}).keys())
+                        except Exception:
+                            candidates = []
+                    else:
+                        try:
+                            # Prefer service discovery to merge inventory flags and apply filters
+                            disc = _svc.discover_candidate_tables(
+                                include_schemas=[scan_schema] if scan_schema else None,
+                                min_row_count=0,
+                            )
+                            candidates = [str(r.get("FULL_NAME")) for r in (disc or []) if r.get("FULL_NAME")]
+                        except Exception:
+                            candidates = []
+                    import pandas as _pd
+                    results = []
+                    for fqn in candidates:
+                        try:
+                            # Unified path: classify and persist, then read features
+                            cls = _svc.classify_and_persist(fqn, sample_size=int(sample_n)) or {}
+                            feats = (cls.get('features') or {})
+                            score = float(feats.get('table_sensitivity_score') or 0.0)
+                            dominant = feats.get('dominant_table_category') or ''
+                            multi = feats.get('sensitivity_multi') or ''
+                            bundles = int(feats.get('table_composite_bundles', 0) or 0)
+                            review = bool(score >= (threshold - 0.05) and score < threshold)
+                            results.append({
+                                "Table": fqn,
+                                "Score": round(score, 3),
+                                "Sensitive": bool(score >= threshold),
+                                "Review": review,
+                                "Categories": multi or dominant,
+                                "Bundles": bundles,
+                            })
+                        except Exception:
+                            continue
+                    if results:
+                        df_scan = _pd.DataFrame(results).sort_values(by=["Score","Table"], ascending=[False, True])
+                        st.dataframe(df_scan, width='stretch')
+                        sel = st.selectbox("Drill down table", options=[r["Table"] for r in results], key="sens_tbl_sel")
+                        if sel:
+                            # Use unified classification output for consistency
+                            cls = _svc.classify_and_persist(sel, sample_size=min(1000, int(sample_n))) or {}
+                            feats = (cls.get('features') or {})
+                            cols = (feats.get('column_detections') or [])
+                            try:
+                                tdf = _pd.DataFrame([{
+                                    "table_name": sel,
+                                    "classification_label": cls.get("classification"),
+                                    "table_sensitivity_score": feats.get("table_sensitivity_score"),
+                                    "dominant_table_category": feats.get("dominant_table_category"),
+                                    "sensitivity_multi": feats.get("sensitivity_multi"),
+                                    "ai_confidence_avg": feats.get("ai_confidence_avg"),
+                                }])
+                                st.dataframe(tdf, width='stretch')
+                            except Exception:
+                                pass
+                            if cols:
+                                try:
+                                    # Normalize columns for editor compatibility
+                                    norm_cols = []
+                                    for r in cols:
+                                        norm_cols.append({
+                                            "column_name": r.get("column"),
+                                            "dominant_category": r.get("dominant_category"),
+                                            "confidence_score": int(r.get("confidence") or 0),
+                                            "CIA (C/I/A)": r.get("suggested_cia") or {},
+                                            "bundles_detected": r.get("bundles_detected"),
+                                        })
+                                    cdf = _pd.DataFrame(norm_cols)
+                                    st.dataframe(cdf, width='stretch')
+                                    # Column-level override editor
+                                    try:
+                                        st.markdown("###### Edit column types")
+                                        for idx, row in cdf.iterrows():
+                                            col_name = str(row.get("column_name"))
+                                            dom = str(row.get("sensitive_type") or row.get("dominant_category") or "")
+                                            conf = int(row.get("confidence_score") or 0)
+                                            kbase = f"ai_col_{sel}_{col_name}"
+                                            e1, e2 = st.columns([2,1])
+                                            with e1:
+                                                new_cat = st.text_input("Type", value=dom, key=f"{kbase}_cat")
+                                            with e2:
+                                                new_conf = st.slider("Conf", 0, 100, conf, 1, key=f"{kbase}_conf")
+                                            if st.button("Override", key=f"{kbase}_btn"):
+                                                try:
+                                                    st.session_state.setdefault("ai_overrides", {}).setdefault("columns", {}).setdefault(sel, {})[col_name] = {
+                                                        "category": new_cat,
+                                                        "confidence": int(new_conf),
+                                                    }
+                                                    st.success(f"Override saved for {col_name}")
+                                                except Exception:
+                                                    st.warning("Failed to save column override")
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                            
+                                # Actions area for table
+                                st.markdown("###### Actions")
+                                o_tbl = (st.session_state.get("ai_overrides", {}) or {}).get("tables", {}).get(sel) or {}
+                                # Derive effective label/CIA from overrides or detection
+                                eff_label = o_tbl.get("classification_label") or (det.get("table", {}) or {}).get("classification_label") or "Internal"
+                                eff_C = int(o_tbl.get("C", (det.get("table", {}) or {}).get("C") or 1))
+                                eff_I = int(o_tbl.get("I", (det.get("table", {}) or {}).get("I") or 1))
+                                eff_A = int(o_tbl.get("A", (det.get("table", {}) or {}).get("A") or 1))
+                                ac1, ac2 = st.columns([1,1])
+                                with ac1:
+                                    if st.button("Apply Tags (Override)", type="primary", key=f"ai_apply_tags_{sel}"):
+                                        try:
+                                            _sf_apply_tags(sel, {
+                                                "data_classification": eff_label,
+                                                "confidentiality_level": f"C{eff_C}",
+                                                "integrity_level": f"I{eff_I}",
+                                                "availability_level": f"A{eff_A}",
+                                            })
+                                            _sf_audit_log_classification(sel, "AI_OVERRIDE_APPLIED", {
+                                                "label": eff_label,
+                                                "C": eff_C, "I": eff_I, "A": eff_A,
+                                                "overrides": o_tbl,
+                                            })
+                                            st.success("Tags applied and audit logged.")
+                                        except Exception as _e:
+                                            st.warning(f"Failed to apply tags: {_e}")
+                                with ac2:
+                                    if st.button("Mark as Reviewed", key=f"ai_mark_reviewed_{sel}"):
+                                        try:
+                                            _sf_audit_log_classification(sel, "AI_REVIEWED", {})
+                                            st.success("Review recorded in audit.")
+                                        except Exception as _e:
+                                            st.warning(f"Failed to record review: {_e}")
+                            # Render JSON views
+                            import json as _json
+                            st.markdown("##### Table-level JSON")
+                            st.code(_json.dumps(det.get("table", {}), indent=2), language="json")
+                            st.markdown("##### Column-level JSON")
+                            st.code(_json.dumps(det.get("columns", []), indent=2), language="json")
+                            _tbl = det.get("table", {}) or {}
+                            st.markdown("##### Enhanced Detector Summary")
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.metric("Table Sensitive (sd)", str(bool(_tbl.get("sd_sensitive", False))))
+                            with c2:
+                                st.metric("Table Sensitivity Score (sd)", float(_tbl.get("sd_score", 0.0)))
+                            _rows = []
+                            for r in (det.get("columns", []) or []):
+                                cia = r.get("cia") or {}
+                                _rows.append({
+                                    "column": r.get("column_name"),
+                                    "sd_sensitive": bool(r.get("sd_sensitive", False)),
+                                    "sd_probability": float(r.get("sd_probability", 0.0)),
+                                    "sensitivity_prob": float(r.get("sensitivity_prob", 0.0)),
+                                    "C": int(cia.get("C", 0)),
+                                    "I": int(cia.get("I", 0)),
+                                    "A": int(cia.get("A", 0)),
+                                })
+                            if _rows:
+                                st.dataframe(_rows, width='stretch')
+                except Exception:
+                    pass
                 # Step 2: C, Step 3: I, Step 4: A
                 st.markdown("##### Step 2: Confidentiality (C0–C3)")
                 st.caption("C0: Public | C1: Internal | C2: Restricted (PII/Financial) | C3: Confidential/Highly Sensitive")
@@ -1141,23 +1733,59 @@ with tab_new:
                         pass
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Submission failed: {e}")
+                    pass
 
     # AI Assistant
     with sub_ai:
-        st.markdown("#### AI Classification Assistant")
-        # --- Inventory-backed database and table selection ---
-        @st.cache_data(ttl=30)
-        def _inv_databases(db: str, gv_schema: str) -> List[str]:
+        st.caption("AI Assistant: Global scan and per-table column detection")
+        # --- Controls & dynamic configuration ---
+        try:
+            st.session_state.setdefault("ai_overrides", {"tables": {}, "columns": {}})
+        except Exception:
+            pass
+        c_cfg1, c_cfg2, c_cfg3 = st.columns([1,1,1])
+        with c_cfg1:
             try:
+                _def_sample = int(st.session_state.get("ai_table_sample_size") or 200)
+            except Exception:
+                _def_sample = 200
+            sample_sz = st.number_input(
+                "AI sample size (rows)", min_value=50, max_value=2000, value=int(_def_sample), step=50, key="ai_cfg_sample_rows"
+            )
+            try:
+                st.session_state["ai_table_sample_size"] = int(sample_sz)
+            except Exception:
+                pass
+        with c_cfg2:
+            legacy = st.toggle("Enable legacy regex profiling", value=bool(st.session_state.get("ai_enable_legacy_regex", False)), key="ai_cfg_legacy")
+            try:
+                st.session_state["ai_enable_legacy_regex"] = bool(legacy)
+            except Exception:
+                pass
+        with c_cfg3:
+            full_scan_priority = st.toggle("Allow full-table scan (small tables)", value=False, help="May increase accuracy and cost", key="ai_cfg_fullscan")
+        def _get_all_tables_for_ai_assist() -> List[str]:
+            """Return a list of fully-qualified table names for AI Assist selection.
+            Governance-first: read from DATA_CLASSIFICATION_GOVERNANCE.ASSETS only.
+            """
+            try:
+                gv_db = resolve_governance_db() or _active_db_from_filter()
+                # Optional default DB override from settings
+                try:
+                    if (gv_db is None) and (settings is not None):
+                        gv_db = settings.get("DEFAULT_DATABASE") or settings.get("CATALOG_DATABASE")
+                except Exception:
+                    pass
                 rows = snowflake_connector.execute_query(
                     f"""
-                    SELECT DISTINCT SPLIT_PART(FULL_NAME, '.', 1) AS DB
-                    FROM {db}.{gv_schema}.ASSET_INVENTORY
-                    ORDER BY 1
+                    select DATABASE_NAME||'.'||SCHEMA_NAME||'.'||TABLE_NAME as FULL_NAME
+                    from {gv_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                    where coalesce(IS_ACTIVE, true)
+                    order by coalesce(RISK_SCORE,0) desc, coalesce(ROW_COUNT,0) desc, coalesce(LAST_MODIFIED_DATE, to_timestamp_ntz('1970-01-01')) desc, 1
+                    limit 5000
                     """
                 ) or []
-                return [r.get("DB") for r in rows]
+                return [str(r.get("FULL_NAME")) for r in rows if r.get("FULL_NAME")]
             except Exception:
                 return []
 
@@ -1189,9 +1817,10 @@ with tab_new:
             try:
                 db = _active_db_from_filter() or resolve_governance_db()
                 if db:
+                    import json as _json
                     snowflake_connector.execute_non_query(
-                        f"INSERT INTO {db}.DATA_GOVERNANCE.CLASSIFICATION_AUDIT (RESOURCE_ID, ACTION, DETAILS) VALUES (%(r)s, %(a)s, %(d)s)",
-                        {"r": asset_full_name, "a": action, "d": str(details)},
+                        f"INSERT INTO {db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AUDIT (RESOURCE_ID, ACTION, DETAILS) VALUES (%(r)s, %(a)s, PARSE_JSON(%(j)s))",
+                        {"r": asset_full_name, "a": action, "j": _json.dumps(details or {}, default=str)},
                     )
                     return
             except Exception:
@@ -1201,26 +1830,10 @@ with tab_new:
             except Exception:
                 pass
 
-        def _soc_sox_flags(detections: List[Dict]) -> Dict:
-            cats = {str(c) for d in (detections or []) for c in (d.get('categories') or [])}
-            # Map via simple heuristics and service mapping
-            soc = False; sox = False
-            try:
-                from src.services.ai_classification_service import ai_classification_service as _svc
-                frs = set()
-                for c in list(cats):
-                    for f in (_svc.map_compliance_categories(str(c)) or []):
-                        frs.add(str(f).upper())
-                soc = ('SOC' in frs)
-                sox = ('SOX' in frs)
-            except Exception:
-                # Fallback: Financial -> SOX, Auth/Confidential -> SOC
-                sox = ('FINANCIAL' in {s.upper() for s in cats})
-                soc = any(x in {s.upper() for s in cats} for x in ['AUTH','CONFIDENTIAL'])
-            return {"SOC": bool(soc), "SOX": bool(sox)}
+        # Removed legacy SOC/SOX heuristic flags in favor of dynamic compliance mapping from AI outputs
 
         def _suggest_cia_from_flags(signals: Dict, flags: Dict) -> Tuple[int,int,int,int,str]:
-            # Reuse previous heuristic and elevate per flags
+            # Reuse previous heuristic and elevat per flags
             cols = list(signals.keys())
             n = len(cols) or 1
             sensitive = [c for c, s in signals.items() if s.get("pii") or s.get("financial") or s.get("regulatory")]
@@ -1248,12 +1861,76 @@ with tab_new:
 
         @st.cache_data(ttl=30)
         def _inv_sensitive_tables(db: str, gv_schema: str, target_db: str, schema_f: Optional[str], table_f: Optional[str]) -> List[Dict]:
-            """List sensitive tables from INVENTORY_ASSETS view for a given database using flags.
-            Attempts a rich flag query first (PII/FIN/IP/SOC/SOX). If it fails, falls back to PII/FIN only.
+            """Dynamic sensitive table discovery combining:
+            1) Inventory flags from ASSET_INVENTORY (existing behavior)
+            2) Heuristics from INFORMATION_SCHEMA (name/token matches)
+            3) Lightweight sampling-based detection via AI service
+            4) Optional AI table-level probability from classify_sensitive
+
+            Returns a ranked list of dicts with at least FULL_NAME and SCORE.
             """
-            # Only require target_db (selected in Global Filters). The view is fully qualified.
             if not target_db:
                 return []
+
+            # Configurable sensitivity threshold (0..100)
+            try:
+                sens_threshold = int(st.session_state.get("ai_sens_threshold", 60))
+            except Exception:
+                sens_threshold = 60
+
+            # Helper to compute a combined score for a table
+            def _score_table(fqn: str, flags: Dict[str, bool], name_hits: int, col_name_hits: int,
+                             sample_conf: Optional[float], ai_prob: Optional[float]) -> int:
+                score = 0.0
+                try:
+                    # Inventory flags are a strong signal
+                    if any(flags.values()):
+                        score += 60.0
+                        # Extra weight if regulatory flags present
+                        if flags.get("SOX") or flags.get("SOC"):
+                            score += 10.0
+                    # Heuristic name matches (table + columns)
+                    score += min(30.0, float(name_hits) * 10.0)  # table name tokens
+                    score += min(30.0, float(col_name_hits) * 5.0)  # column name tokens
+                    # Sampling-based confidence (0..1) -> up to 40 points
+                    if isinstance(sample_conf, (int, float)) and sample_conf is not None:
+                        score += max(0.0, min(40.0, float(sample_conf) * 40.0))
+                    # AI probability (0..1) -> up to 30 points
+                    if isinstance(ai_prob, (int, float)) and ai_prob is not None:
+                        score += max(0.0, min(30.0, float(ai_prob) * 30.0))
+                except Exception:
+                    pass
+                return int(max(0.0, min(100.0, score)))
+
+            # Sensitive tokens for names/columns from dynamic configuration only
+            sensitive_tokens: list[str] = []
+            try:
+                _cfg = st.session_state.get("sensitivity_config") if hasattr(st, "session_state") else None
+                if isinstance(_cfg, dict):
+                    _kw = _cfg.get("keywords_flat") or _cfg.get("keywords") or []
+                    # Support both list-of-dicts and dict-of-category->list
+                    if isinstance(_kw, dict):
+                        _iter = []
+                        for _cat, _items in (_kw or {}).items():
+                            for _it in (_items or []):
+                                _iter.append(_it)
+                    else:
+                        _iter = list(_kw)
+                    for it in _iter:
+                        try:
+                            tok = str((getattr(it, "get", lambda *_: None)("token")
+                                       or getattr(it, "get", lambda *_: None)("keyword")
+                                       or "")).strip().lower()
+                            if tok:
+                                sensitive_tokens.append(tok)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+                sensitive_tokens = []
+            tokens_up = {t.upper() for t in (sensitive_tokens or [])}
+
+            # 1) Inventory flags
             base_where = ["SPLIT_PART(FULL_NAME, '.', 1) = %(db)s"]
             params = {"db": target_db}
             if schema_f:
@@ -1261,40 +1938,193 @@ with tab_new:
             if table_f:
                 base_where.append("SPLIT_PART(FULL_NAME, '.', 3) = %(tb)s"); params["tb"] = table_f
             where_sql = ' AND '.join(base_where)
-            # Prefer environment-governed FQN if available; fallback to hardcoded inventory location.
             fqn_candidates = [
                 f"{db}.{gv_schema}.ASSET_INVENTORY" if db and gv_schema else None,
                 "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSET_INVENTORY",
             ]
             fqn_candidates = [x for x in fqn_candidates if x]
-            # Rich flags filter
-            for _fqn in fqn_candidates:
+
+            inv_rows: List[Dict[str, object]] = []
+            try:
+                for _fqn in fqn_candidates:
+                    try:
+                        q = f"""
+                            SELECT FULL_NAME,
+                                   COALESCE(PII_DETECTED, FALSE)              AS PII,
+                                   COALESCE(FINANCIAL_DATA_DETECTED, FALSE)    AS FIN,
+                                   COALESCE(IP_DATA_DETECTED, FALSE)           AS IP,
+                                   COALESCE(SOC_RELEVANT, FALSE)               AS SOC,
+                                   COALESCE(SOX_RELEVANT, FALSE)               AS SOX
+                            FROM {_fqn}
+                            WHERE {where_sql}
+                        """
+                        _rows = snowflake_connector.execute_query(q, params) or []
+                        if _rows:
+                            inv_rows = _rows
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                inv_rows = []
+
+            # 2) Heuristic discovery from INFORMATION_SCHEMA: table and column name tokens
+            heur_tables: Dict[str, Dict[str, object]] = {}
+            try:
+                # Table-level name match
+                q_tbl = f"""
+                    select table_catalog, table_schema, table_name
+                    from {target_db}.information_schema.tables
+                    where 1=1
+                    {" and upper(table_schema)=%(sc)s" if schema_f else ""}
+                    {" and upper(table_name)=%(tb)s" if table_f else ""}
+                """
+                rows_tbl = snowflake_connector.execute_query(q_tbl, {k:v for k,v in {"sc": schema_f, "tb": table_f}.items() if v}) or []
+                for r in rows_tbl:
+                    fqn = f"{r.get('TABLE_CATALOG')}.{r.get('TABLE_SCHEMA')}.{r.get('TABLE_NAME')}"
+                    up = fqn.upper()
+                    hits = sum(1 for tok in tokens_up if tok in up)
+                    if hits > 0:
+                        heur_tables[fqn] = {"FULL_NAME": fqn, "name_hits": hits, "col_hits": 0}
+            except Exception:
+                pass
+            try:
+                # Column-level name match
+                q_col = f"""
+                    select table_catalog, table_schema, table_name, column_name
+                    from {target_db}.information_schema.columns
+                    where 1=1
+                    {" and upper(table_schema)=%(sc)s" if schema_f else ""}
+                    {" and upper(table_name)=%(tb)s" if table_f else ""}
+                """
+                rows_col = snowflake_connector.execute_query(q_col, {k:v for k,v in {"sc": schema_f, "tb": table_f}.items() if v}) or []
+                for r in rows_col:
+                    fqn = f"{r.get('TABLE_CATALOG')}.{r.get('TABLE_SCHEMA')}.{r.get('TABLE_NAME')}"
+                    col = str(r.get('COLUMN_NAME') or "").upper()
+                    if any(tok in col for tok in tokens_up):
+                        if fqn not in heur_tables:
+                            heur_tables[fqn] = {"FULL_NAME": fqn, "name_hits": 0, "col_hits": 1}
+                        else:
+                            heur_tables[fqn]["col_hits"] = heur_tables[fqn].get("col_hits", 0) + 1
+            except Exception:
+                pass
+
+            # 3) Lightweight sampling-based detection for non-inventory candidates
+            # Run only for a bounded set to limit cost
+            sample_conf_map: Dict[str, float] = {}
+            try:
+                from src.services.ai_classification_service import ai_classification_service as _svc
+            except Exception:
+                _svc = None  # type: ignore
+            try:
+                sample_size = int(st.session_state.get("ai_table_sample_size", 200)) if hasattr(st, "session_state") else 200
+            except Exception:
+                sample_size = 200
+            try:
+                to_sample = [fqn for fqn in heur_tables.keys() if fqn and not any((r.get("FULL_NAME") or "").upper() == fqn.upper() for r in (inv_rows or []))]
+                # Cap number of sampled tables to avoid heavy scans
+                to_sample = to_sample[:50]
+                for fqn in to_sample:
+                    conf = 0.0
+                    try:
+                        if _svc is not None:
+                            cols = _svc.detect_sensitive_columns(fqn, sample_size=sample_size) or []
+                            # Use aggregated average confidence across detected columns (0..1)
+                            if cols:
+                                avg = sum([float((c.get('confidence') or 0))/100.0 for c in cols]) / float(len(cols))
+                                conf = float(max(0.0, min(1.0, avg)))
+                    except Exception:
+                        conf = 0.0
+                    sample_conf_map[fqn] = conf
+            except Exception:
+                pass
+
+            # 4) Optional AI probability using unified classify_table features
+            ai_prob_map: Dict[str, float] = {}
+            try:
+                if _svc is not None:
+                    # Evaluate a small set: inventory + top heuristics
+                    eval_set = set([str(r.get("FULL_NAME")) for r in (inv_rows or []) if r.get("FULL_NAME")]) | set(list(heur_tables.keys())[:50])
+                    for fqn in list(eval_set)[:100]:
+                        try:
+                            cls = _svc.classify_table(str(fqn)) or {}
+                            feats = (cls.get("features") or {})
+                            ts = float(feats.get("table_sensitivity_score") or 0.0)
+                            ai_prob_map[str(fqn)] = float(max(0.0, min(1.0, ts)))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            # Merge and score
+            out_map: Dict[str, Dict[str, object]] = {}
+            # Seed with inventory rows
+            for r in (inv_rows or []):
                 try:
-                    q = f"""
-                        SELECT FULL_NAME,
-                               COALESCE(PII_DETECTED, FALSE)              AS PII,
-                               COALESCE(FINANCIAL_DATA_DETECTED, FALSE)    AS FIN,
-                               COALESCE(IP_DATA_DETECTED, FALSE)           AS IP,
-                               COALESCE(SOC_RELEVANT, FALSE)               AS SOC,
-                               COALESCE(SOX_RELEVANT, FALSE)               AS SOX
-                        FROM {_fqn}
-                        WHERE {where_sql}
-                          AND (
-                            COALESCE(PII_DETECTED,FALSE)
-                            OR COALESCE(FINANCIAL_DATA_DETECTED,FALSE)
-                            OR COALESCE(IP_DATA_DETECTED,FALSE)
-                            OR COALESCE(SOC_RELEVANT,FALSE)
-                            OR COALESCE(SOX_RELEVANT,FALSE)
-                          )
-                        ORDER BY FULL_NAME
-                    """
-                    rows = snowflake_connector.execute_query(q, params) or []
-                    if rows:
-                        return rows
+                    fqn = str(r.get("FULL_NAME"))
+                    flags = {k: bool(r.get(k)) for k in ("PII","FIN","IP","SOC","SOX")}
+                    name_hits = 0
+                    col_hits = heur_tables.get(fqn, {}).get("col_hits", 0)
+                    sc = _score_table(
+                        fqn,
+                        flags,
+                        name_hits,
+                        col_hits,
+                        sample_conf_map.get(fqn),
+                        ai_prob_map.get(fqn),
+                    )
+                    out_map[fqn] = {"FULL_NAME": fqn, "SCORE": sc, **flags}
                 except Exception:
-                    pass
-            # As a last resort, return empty, preserving original behavior.
-            return []
+                    continue
+            # Add heuristic-only tables
+            for fqn, meta in heur_tables.items():
+                if fqn in out_map:
+                    # Already present; keep max score
+                    try:
+                        prev = out_map[fqn].get("SCORE", 0)
+                        flags = {k: bool(out_map[fqn].get(k, False)) for k in ("PII","FIN","IP","SOC","SOX")}
+                        sc = _score_table(
+                            fqn,
+                            flags,
+                            int(meta.get("name_hits", 0)),
+                            int(meta.get("col_hits", 0)),
+                            sample_conf_map.get(fqn),
+                            ai_prob_map.get(fqn),
+                        )
+                        out_map[fqn]["SCORE"] = max(prev, sc)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        sc = _score_table(
+                            fqn,
+                            {"PII": False, "FIN": False, "IP": False, "SOC": False, "SOX": False},
+                            int(meta.get("name_hits", 0)),
+                            int(meta.get("col_hits", 0)),
+                            sample_conf_map.get(fqn),
+                            ai_prob_map.get(fqn),
+                        )
+                        out_map[fqn] = {"FULL_NAME": fqn, "SCORE": sc}
+                    except Exception:
+                        continue
+
+            # Filter and rank by threshold
+            rows = [v for v in out_map.values() if int(v.get("SCORE", 0)) >= int(sens_threshold)]
+            try:
+                rows.sort(key=lambda x: int(x.get("SCORE", 0)), reverse=True)
+            except Exception:
+                pass
+
+            # If nothing found, fallback to simple inventory FULL_NAME listing to preserve legacy behavior
+            if not rows:
+                for _fqn in fqn_candidates:
+                    try:
+                        q = f"SELECT FULL_NAME FROM {_fqn} WHERE {where_sql} ORDER BY FULL_NAME LIMIT 1000"
+                        _rows = snowflake_connector.execute_query(q, params) or []
+                        if _rows:
+                            return _rows
+                    except Exception:
+                        continue
+            return rows
 
         # Session state containers
         st.session_state.setdefault("ai_sensitive_cols", {})
@@ -1359,63 +2189,243 @@ with tab_new:
             st.session_state["ai_compliance_flags"] = {}
             st.session_state["ai_suggestions"] = {}
             st.session_state[last_db_key] = (db_f or "")
+            # Refresh AI sensitivity configuration so patterns/keywords/weights reflect the active DB
+            try:
+                _sel_db = (db_f or st.session_state.get("db_filter") or st.session_state.get("global_db_filter"))
+                _sc_fqn = (f"{_sel_db}.DATA_CLASSIFICATION_GOVERNANCE" if _sel_db else None)
+                ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn)
+            except Exception:
+                pass
         # Helper: compute table-level suggestions and compliance
         def _compute_table_ai(fqn: str) -> dict:
             try:
-                dets = ai_classification_service.detect_sensitive_columns(fqn) if ai_classification_service else []
-                st.session_state["ai_sensitive_cols"][fqn] = dets
-                # Union of detected categories
-                cats = sorted({c for d in (dets or []) for c in (d.get('categories') or [])})
-                # SOX/SOC flags
-                flags = _soc_sox_flags(dets)
-                st.session_state["ai_compliance_flags"][fqn] = flags
-                # Suggest CIA from categories/flags
-                c = 1; i = 1; a = 1
-                uc = {str(x).upper() for x in cats}
-                if any(x in uc for x in ["PII","PHI","FINANCIAL","PCI"]):
-                    c = max(c, 2)
-                if "PHI" in uc:
-                    c = max(c, 3)
-                if ("FINANCIAL" in uc) or flags.get("SOX"):
-                    i = max(i, 2)
-                if flags.get("SOX"):
-                    c = max(c, 3)
-                # A heuristic: elevate A for many sensitive columns
+                _ssz = 200
                 try:
-                    sens_cols_ratio = 0.0
-                    if dets:
-                        sens_cols = len([d for d in dets if d.get('categories')])
-                        sens_cols_ratio = sens_cols / max(1, len(dets))
-                    if sens_cols_ratio >= 0.3:
-                        a = max(a, 2)
+                    _ssz = int(st.session_state.get("ai_table_sample_size", 200))
+                except Exception:
+                    _ssz = 200
+                # Ensure latest patterns/keywords are loaded prior to detection
+                try:
+                    _sel_db = (st.session_state.get("db_filter") or st.session_state.get("global_db_filter") or db_f)
+                    _sc_fqn = (f"{_sel_db}.DATA_CLASSIFICATION_GOVERNANCE" if _sel_db else None)
+                    ai_classification_service.load_sensitivity_config(force_refresh=False, schema_fqn=_sc_fqn)
                 except Exception:
                     pass
-                label = ["Public","Internal","Restricted","Confidential"][min(max(c,0),3)]
-                st.session_state["ai_suggestions"][fqn] = {"C": c, "I": i, "A": a, "label": label, "confidence": int(60 + 40*min(1.0, (len(dets) or 0)/10.0))}
-                # Policy compliance via decision matrix validation
-                ok_ai, reasons_ai = dm_validate(label, c, i, a)
+                dets = ai_classification_service.detect_sensitive_columns(fqn, sample_size=_ssz) if ai_classification_service else []
+                st.session_state["ai_sensitive_cols"][fqn] = dets
+                # Unified: prefer classify_and_persist output
+                cls = ai_classification_service.classify_and_persist(fqn, sample_size=_ssz) if ai_classification_service else {}
+                t = {"table_name": fqn, "table_sensitivity_score": (cls.get("features") or {}).get("table_sensitivity_score")}
+                cls_feats = (cls or {}).get('features') or {}
+                ai_conf_avg = cls_feats.get('ai_confidence_avg')
+                sens_cols = cls_feats.get('sensitive_columns_count')
+                # Map AI outputs to legacy grid fields
+                try:
+                    t['classification_label'] = cls.get('classification')
+                    t['confidence_score'] = int(round(float((cls_feats.get('table_sensitivity_score') or 0.0)) * 100))
+                    t['predominant_type'] = cls_feats.get('dominant_table_category')
+                except Exception:
+                    pass
+                # Apply table-level overrides if present
+                try:
+                    tbl_ovr = (st.session_state.get("ai_overrides", {}) or {}).get("tables", {}).get(fqn)
+                except Exception:
+                    tbl_ovr = None
+                if isinstance(tbl_ovr, dict):
+                    # Override classification and CIA
+                    t['classification_label'] = tbl_ovr.get('classification_label') or t.get('classification_label')
+                    t['C'] = int(tbl_ovr.get('C')) if tbl_ovr.get('C') is not None else t.get('C')
+                    t['I'] = int(tbl_ovr.get('I')) if tbl_ovr.get('I') is not None else t.get('I')
+                    t['A'] = int(tbl_ovr.get('A')) if tbl_ovr.get('A') is not None else t.get('A')
+                    if tbl_ovr.get('policy_suggestion'):
+                        t['policy_suggestion'] = tbl_ovr.get('policy_suggestion')
+                # Persist light summary for other parts of the page
+                st.session_state["ai_suggestions"][fqn] = {
+                    "C": int(t.get("C", 0)),
+                    "I": int(t.get("I", 0)),
+                    "A": int(t.get("A", 0)),
+                    "label": t.get("classification_label"),
+                    "confidence": int(t.get("confidence_score") or 0),
+                }
                 return {
-                    "FULL_NAME": fqn,
-                    "SENSITIVITY": ", ".join(cats) if cats else "",
-                    "ROW_COUNT": next((r.get("ROW_COUNT") for r in (sensitive_rows or []) if r.get("FULL_NAME") == fqn), None),
-                    "C": c, "I": i, "A": a,
-                    "LABEL": label,
-                    "POLICY_OK": bool(ok_ai),
-                    "POLICY_ISSUES": "; ".join(reasons_ai or []) if not ok_ai else "",
+                    "FULL_NAME": str(t.get("fullname") or fqn),
+                    "SENSITIVITY": str(t.get("predominant_type") or ""),
+                    "ROW_COUNT": t.get("row_count"),
+                    "C": int(t.get("C", 0)), "I": int(t.get("I", 0)), "A": int(t.get("A", 0)),
+                    "LABEL": t.get("classification_label"),
+                    "POLICY_OK": bool(t.get("policy_ok", True)),
+                    "POLICY_ISSUES": "",
+                    "AI_CONFIDENCE": int(t.get("confidence_score") or 0),
+                    # Display fields from classify_table()
+                    "SENSITIVITY_LEVEL": str((cls or {}).get('classification') or ''),
+                    "AI_CONFIDENCE_AVG": (int(round(float(ai_conf_avg)*100)) if isinstance(ai_conf_avg, (int,float)) else None),
+                    "SENSITIVE_COLUMNS": (int(sens_cols) if isinstance(sens_cols, (int,float)) else None),
+                    "POLICY_SUGGESTION": t.get("policy_suggestion"),
+                    "REASONING": t.get("reasoning"),
+                    "REQUIRES_REVIEW": bool(t.get("requires_review", False)),
                 }
             except Exception as e:
                 return {"FULL_NAME": fqn, "SENSITIVITY": "", "ROW_COUNT": None, "C": 1, "I": 1, "A": 1, "LABEL": "Internal", "POLICY_OK": False, "POLICY_ISSUES": str(e)}
-        # Compute summaries if not present
+        # Compute summaries (force recompute to avoid stale cached outputs)
         if sensitive_options:
+            st.session_state.setdefault("ai_table_summary", {})
             for fqn in sensitive_options:
-                if fqn not in (st.session_state.get("ai_table_summary") or {}):
-                    st.session_state.setdefault("ai_table_summary", {})[fqn] = _compute_table_ai(fqn)
+                st.session_state["ai_table_summary"][fqn] = _compute_table_ai(fqn)
         # Render sensitive tables summary
         import pandas as _pd
         sum_rows = list((st.session_state.get("ai_table_summary") or {}).values())
         sum_df = _pd.DataFrame(sum_rows)
+        # Augment with aggregated table-level detection (label, confidence) via classify_table()
+        try:
+            from src.services.ai_classification_service import ai_classification_service as _svc
+            st.session_state.setdefault("ai_table_agg", {})
+            names = [str(r.get("FULL_NAME")) for r in sum_rows if r.get("FULL_NAME")]
+            new_agg = {}
+            for fqn in names:
+                if fqn in st.session_state["ai_table_agg"]:
+                    continue
+                try:
+                    cls = _svc.classify_table(fqn)
+                    feats = (cls.get("features") or {})
+                    new_agg[fqn] = {
+                        "overall_classification_label": cls.get("classification"),
+                        "confidence_score": float(feats.get("table_sensitivity_score") or 0.0),
+                        "requires_review": False,
+                    }
+                except Exception:
+                    continue
+            if new_agg:
+                st.session_state["ai_table_agg"].update(new_agg)
+            if not sum_df.empty:
+                def _map_agg(fqn: str, key: str):
+                    try:
+                        return (st.session_state.get("ai_table_agg", {}) or {}).get(fqn, {}).get(key)
+                    except Exception:
+                        return None
+                sum_df = sum_df.copy()
+                sum_df["Agg Label"] = sum_df["FULL_NAME"].map(lambda n: _map_agg(n, "T_LABEL"))
+                sum_df["Agg Confidence"] = sum_df["FULL_NAME"].map(lambda n: _map_agg(n, "T_CONF"))
+                sum_df["Agg C"] = sum_df["FULL_NAME"].map(lambda n: _map_agg(n, "T_C"))
+                sum_df["Agg I"] = sum_df["FULL_NAME"].map(lambda n: _map_agg(n, "T_I"))
+                sum_df["Agg A"] = sum_df["FULL_NAME"].map(lambda n: _map_agg(n, "T_A"))
+                sum_df["Agg Requires Review"] = sum_df["FULL_NAME"].map(lambda n: _map_agg(n, "T_REQ_REVIEW"))
+                sum_df["Agg Policy"] = sum_df["FULL_NAME"].map(lambda n: _map_agg(n, "T_POLICY"))
+                sum_df["Agg Name Semantic"] = sum_df["FULL_NAME"].map(lambda n: _map_agg(n, "T_SEM"))
+                sum_df["Agg Sensitive Ratio"] = sum_df["FULL_NAME"].map(lambda n: _map_agg(n, "T_SENS_RATIO"))
+        except Exception:
+            pass
+        # Removed legacy table keyword heuristics and policy suggestions; rely on live AI detection output exclusively
+
+        # Statistical Profiling + Metadata Heuristics for table-level confidence
+        try:
+            USE_LEGACY_AI_CONFIDENCE = False
+            st.session_state.setdefault("ai_table_profile", {})
+            def _profile_table(fqn: str) -> dict:
+                if fqn in st.session_state["ai_table_profile"]:
+                    return st.session_state["ai_table_profile"][fqn]
+                out = {"email":0, "phone":0, "ssn":0, "card":0, "hash":0, "rows":0, "null_ratio":0.0, "distinct_ratio":0.0}
+                try:
+                    # pick up to 5 candidate columns (VARCHAR/STRING) for quick profiling
+                    parts = fqn.split('.')
+                    if len(parts) == 3:
+                        db, sch, tbl = parts
+                        cols = snowflake_connector.execute_query(
+                            f"select column_name, data_type from {db}.information_schema.columns where table_schema='{sch}' and table_name='{tbl}' order by ordinal_position limit 10"
+                        ) or []
+                    else:
+                        cols = []
+                    cand = [c.get('COLUMN_NAME') for c in cols if str(c.get('DATA_TYPE','')).upper().startswith(('VARCHAR','STRING','TEXT'))][:5]
+                    # sample up to 1000 rows to compute pattern prevalence per column using dynamic patterns
+                    from src.services.ai_classification_service import ai_classification_service as _svc
+                    from src.services.sensitive_detection import regex_screen as _rx_screen
+                    import pandas as _pdx
+                    _cfg = _svc.load_sensitivity_config() if _svc else {}
+                    total_rows = 0
+                    nulls_total = 0
+                    distinct_total = 0
+                    for c in cand:
+                        try:
+                            rs = snowflake_connector.execute_query(
+                                f"select {c} as V from {fqn} where {c} is not null limit 1000"
+                            ) or []
+                            vals = [list(r.values())[0] for r in rs if r]
+                            total_rows += len(vals)
+                            # crude null/unique from this sample scope
+                            nulls_total += 0  # filtered non-nulls above
+                            distinct_total += len(set([str(v) for v in vals]))
+                            # dynamic regex screen per column sample
+                            ser = _pdx.Series([str(v) for v in vals]) if vals else _pdx.Series([], dtype=str)
+                            rx_probs = _rx_screen(ser, max_rows=1000, cfg=_cfg)
+                            # Map common keys for summary view if present
+                            out['email'] += int(round((rx_probs.get('email') or 0.0) * len(vals)))
+                            out['phone'] += int(round((rx_probs.get('phone') or 0.0) * len(vals)))
+                            out['ssn'] += int(round((rx_probs.get('ssn') or 0.0) * len(vals)))
+                            out['card'] += int(round((rx_probs.get('credit_card') or 0.0) * len(vals)))
+                        except Exception:
+                            continue
+                    out['rows'] = total_rows
+                    # approximate ratios based on sample across columns
+                    if total_rows > 0 and cand:
+                        out['distinct_ratio'] = min(1.0, distinct_total / float(total_rows * len(cand)))
+                        out['null_ratio'] = 0.0
+                except Exception:
+                    pass
+                st.session_state["ai_table_profile"][fqn] = out
+                return out
+
+            def _profile_score(p: dict) -> int:
+                score = 0
+                score += 10 if p.get('email',0) > 0 else 0
+                score += 10 if p.get('phone',0) > 0 else 0
+                score += 15 if (p.get('ssn',0) > 0 or p.get('card',0) > 0) else 0
+                score += 10 if p.get('hash',0) > 0 else 0
+                if p.get('distinct_ratio',0.0) > 0.7:
+                    score += 5
+                return min(40, score)
+
+            def _meta_boost(fqn: str) -> int:
+                up = fqn.upper()
+                boost = 0
+                if any(k in up for k in ['AUDIT','SOX','LEDGER','PAYROLL','HR','CUSTOMER','VENDOR']):
+                    boost += 10
+                return boost
+
+            if not sum_df.empty and USE_LEGACY_AI_CONFIDENCE:
+                updated = []
+                for idx, row in sum_df.iterrows():
+                    fqn = str(row.get('FULL_NAME'))
+                    prof = _profile_table(fqn)
+                    prof_score = _profile_score(prof)
+                    boost = _meta_boost(fqn)
+                    base = int(row.get('AI_CONFIDENCE') or 50)
+                    combined = max(0, min(100, base + prof_score + boost))
+                    row['AI_CONFIDENCE'] = combined
+                    row['POLICY_SUGGESTION'] = row.get('POLICY_SUGGESTION') or (
+                        'Row Access Policy + Dynamic Masking (strong)' if prof.get('card',0) or prof.get('ssn',0) else (
+                        'Dynamic Masking: partial; steward override' if prof.get('email',0) or prof.get('phone',0) else 'Tags only')
+                    )
+                    updated.append(row)
+                sum_df = _pd.DataFrame(updated)
+        except Exception:
+            pass
+        try:
+            if not sum_df.empty and "AI_CONFIDENCE" in sum_df.columns:
+                min_conf = st.slider("Minimum sensitivity confidence", min_value=0, max_value=100, value=0, step=1, key="ai_min_conf")
+                if int(min_conf) > 0:
+                    _before = len(sum_df)
+                    sum_df = sum_df[sum_df["AI_CONFIDENCE"] >= int(min_conf)].copy()
+                    _hidden = _before - len(sum_df)
+                    if _hidden > 0:
+                        st.caption(f"Filtered {_hidden} table(s) below {int(min_conf)/100.0:.1f} sensitivity confidence")
+        except Exception:
+            pass
         if not sum_df.empty:
-            display_cols = [c for c in ["FULL_NAME","SENSITIVITY","ROW_COUNT","C","I","A","LABEL","POLICY_OK"] if c in sum_df.columns]
+            # Prefer service-driven fields; hide legacy Agg columns by default
+            preferred = [
+                "FULL_NAME","SENSITIVITY","AI_CONFIDENCE","ROW_COUNT",
+                "C","I","A","LABEL","POLICY_SUGGESTION","POLICY_OK","REQUIRES_REVIEW","REASONING",
+            ]
+            display_cols = [c for c in preferred if c in sum_df.columns]
             def _style_row(row):
                 try:
                     ok = str(row.get('POLICY_OK')).lower() in ('true','1','yes')
@@ -1426,6 +2436,38 @@ with tab_new:
                 except Exception:
                     return ['' for _ in row]
             st.markdown("##### Sensitive Tables — AI Suggestions")
+            # Compute and display Actual Row Count for each sensitive table (auto)
+            st.session_state.setdefault("ai_actual_counts", {})
+            try:
+                names = sum_df["FULL_NAME"].tolist()
+                def _valid_db_from_fqn(_f: str) -> bool:
+                    try:
+                        dbtok = str((_f or '').split('.')[0]).strip().upper()
+                        return dbtok and dbtok not in {"NONE","(NONE)","NULL","UNKNOWN"}
+                    except Exception:
+                        return False
+                names = [n for n in names if _valid_db_from_fqn(n)]
+                new_counts = {}
+                for fqn in names:
+                    if fqn in st.session_state["ai_actual_counts"]:
+                        continue
+                    try:
+                        rs = snowflake_connector.execute_query(f"select count(*) as CNT from {fqn}") or []
+                        cnt = int((rs[0] or {}).get("CNT", 0)) if rs else 0
+                        new_counts[fqn] = cnt
+                    except Exception:
+                        new_counts[fqn] = None
+                if new_counts:
+                    st.session_state["ai_actual_counts"].update(new_counts)
+                sum_df = sum_df.copy()
+                sum_df["Actual Row Count"] = sum_df["FULL_NAME"].map(lambda n: st.session_state["ai_actual_counts"].get(n))
+                # Ensure only Actual Row Count is shown (no metadata ROW_COUNT)
+                if "ROW_COUNT" in display_cols:
+                    display_cols = [c for c in display_cols if c != "ROW_COUNT"]
+                if "Actual Row Count" not in display_cols:
+                    display_cols.insert(2, "Actual Row Count")
+            except Exception:
+                pass
             st.dataframe(
                 sum_df[display_cols]
                     .style
@@ -1436,103 +2478,167 @@ with tab_new:
                         {"selector": "td", "props": "color: #000000;"},
                     ])
                     .hide(axis="index"),
-                use_container_width=True,
+                width='stretch',
             )
+            try:
+                names = sum_df["FULL_NAME"].dropna().astype(str).tolist()
+                if names:
+                    sel = st.selectbox("Select a sensitive table for drilldown", options=names, key="ai_drill_table")
+                    if sel:
+                        cls = ai_classification_service.classify_and_persist(sel, sample_size=300) if ai_classification_service else {}
+                        cols = ((cls.get("features") or {}).get("column_detections") or [])
+                        if cols:
+                            import pandas as _pdx
+                            cdf = _pdx.DataFrame([
+                                {
+                                    "Column Name": r.get("column_name"),
+                                    "Detected Category": r.get("sensitive_type"),
+                                    "Confidence": float(int(r.get("confidence_score", 0)))/100.0,
+                                    "CIA": f"{int((r.get('CIA (C/I/A)') or {}).get('C',0))},{int((r.get('CIA (C/I/A)') or {}).get('I',0))},{int((r.get('CIA (C/I/A)') or {}).get('A',0))}",
+                                    "Recommended Policies": r.get("policy_suggestion"),
+                                    "Review Flag": "Yes" if int(r.get("confidence_score",0)) < 75 else "No",
+                                }
+                                for r in cols
+                            ])
+                            try:
+                                # Apply any existing approved column-level overrides from session state
+                                _over = (st.session_state.get("ai_column_overrides", {}) or {}).get(sel)
+                                if _over:
+                                    _omap = {str(o.get("column")): o for o in _over}
+                                    def _apply_override_row(row):
+                                        oc = _omap.get(str(row["Column Name"]))
+                                        if not oc:
+                                            return row
+                                        row["Detected Category"] = oc.get("dominant_category") or row.get("Detected Category")
+                                        row["Confidence"] = float(int(oc.get("confidence", 0)))/100.0
+                                        row["CIA"] = f"{int((oc.get('suggested_cia') or {}).get('C',0))},{int((oc.get('suggested_cia') or {}).get('I',0))},{int((oc.get('suggested_cia') or {}).get('A',0))}"
+                                        return row
+                                    cdf = cdf.apply(_apply_override_row, axis=1)
+                            except Exception:
+                                pass
+                            try:
+                                ups = [str(u).upper() for u in cdf["Column Name"].tolist()]
+                                present = set(ups)
+                                def _has_any(tokens):
+                                    for u in present:
+                                        for t in tokens:
+                                            if t in u:
+                                                return True
+                                    return False
+                                def _first_any(tokens):
+                                    for u in present:
+                                        for t in tokens:
+                                            if t in u:
+                                                return u
+                                    return None
+                                bundles = {}
+                                if _has_any(["FIRST_NAME","GIVEN_NAME","FNAME"]) and _has_any(["LAST_NAME","SURNAME","LNAME"]) and _has_any(["DOB","DATE_OF_BIRTH","BIRTH","BIRTHDATE"]):
+                                    a = _first_any(["FIRST_NAME","GIVEN_NAME","FNAME"]); b = _first_any(["LAST_NAME","SURNAME","LNAME"]); c = _first_any(["DOB","DATE_OF_BIRTH","BIRTH","BIRTHDATE"])
+                                    for x in [a,b,c]:
+                                        if x:
+                                            bundles.setdefault(x, []).append("Identity")
+                                if (_has_any(["CARD","CARD_NO","PAN"]) and (_has_any(["EXP","EXPIRY","EXPIRE","MMYY","MM_YY"]) or _has_any(["CVV","CVC"]))):
+                                    a = _first_any(["CARD","CARD_NO","PAN"]); b = _first_any(["EXP","EXPIRY","EXPIRE","MMYY","MM_YY"]); c = _first_any(["CVV","CVC"]) or b
+                                    for x in [a,b,c]:
+                                        if x:
+                                            bundles.setdefault(x, []).append("Payment")
+                                if _has_any(["ACCOUNT","ACCT"]) and _has_any(["ROUTING","SWIFT","IFSC","SORT_CODE"]):
+                                    a = _first_any(["ACCOUNT","ACCT"]); b = _first_any(["ROUTING","SWIFT","IFSC","SORT_CODE"])
+                                    for x in [a,b]:
+                                        if x:
+                                            bundles.setdefault(x, []).append("Payment")
+                                if _has_any(["ADDRESS","ADDR","STREET"]) and (_has_any(["CITY"]) or _has_any(["STATE","PROVINCE"]) or _has_any(["ZIP","POSTAL"])):
+                                    a = _first_any(["ADDRESS","ADDR","STREET"]); b = _first_any(["CITY"]) or _first_any(["STATE","PROVINCE"]) or _first_any(["ZIP","POSTAL"]) 
+                                    for x in [a,b]:
+                                        if x:
+                                            bundles.setdefault(x, []).append("Address")
+                                def _bundle_for(name):
+                                    u = str(name).upper()
+                                    return ", ".join(sorted(set(bundles.get(u, [])))) if u in bundles else ""
+                                cdf["Bundle"] = cdf["Column Name"].map(_bundle_for)
+                            except Exception:
+                                pass
+                            try:
+                                # Split CIA into C/I/A numeric fields for editing
+                                def _parse_cia(s: str):
+                                    try:
+                                        parts = [int(p.strip()) for p in str(s or "0,0,0").split(",")[:3]]
+                                        while len(parts) < 3:
+                                            parts.append(0)
+                                        return parts[0], parts[1], parts[2]
+                                    except Exception:
+                                        return 0, 0, 0
+                                cdf[["C","I","A"]] = cdf["CIA"].apply(lambda x: _parse_cia(x)).apply(_pdx.Series)
+                                editable_cols = [
+                                    "Column Name","Detected Category","Confidence","C","I","A","Recommended Policies","Review Flag","Bundle"
+                                ]
+                                # Ensure confidence stays within 0..1 in the editor
+                                cdf["Confidence"] = cdf["Confidence"].clip(lower=0.0, upper=1.0)
+                                st.markdown("###### Review and edit column classifications")
+                                edited = st.data_editor(
+                                    cdf[editable_cols],
+                                    use_container_width=True,
+                                    key=f"ai_edit_drill_{sel}",
+                                )
+                                if st.button(f"Approve and Apply for {sel}", type="primary", key=f"ai_approve_{sel}"):
+                                    try:
+                                        # Build column_rows payload expected by persist_scan_results
+                                        col_rows = []
+                                        for _, rr in edited.iterrows():
+                                            dom = str(rr.get("Detected Category") or "")
+                                            conf_pct = int(round(float(rr.get("Confidence") or 0.0) * 100))
+                                            c_val = int(rr.get("C") or 0)
+                                            i_val = int(rr.get("I") or 0)
+                                            a_val = int(rr.get("A") or 0)
+                                            col_rows.append({
+                                                "column": rr.get("Column Name"),
+                                                "dominant_category": dom,
+                                                "categories": [dom] if dom else [],
+                                                "confidence": conf_pct,
+                                                "suggested_cia": {"C": c_val, "I": i_val, "A": a_val},
+                                                "regex_hits": [],
+                                                "token_hits": [],
+                                            })
+                                        # Simple table metrics aggregation
+                                        try:
+                                            avg_conf = float(sum(int(r.get("confidence",0)) for r in col_rows)) / max(1, len(col_rows))
+                                        except Exception:
+                                            avg_conf = 0.0
+                                        dom_tbl = None
+                                        try:
+                                            cats = [r.get("dominant_category") for r in col_rows if r.get("dominant_category")]
+                                            freq = {}
+                                            for c in cats:
+                                                freq[c] = freq.get(c, 0) + 1
+                                            dom_tbl = max(freq, key=freq.get) if freq else None
+                                        except Exception:
+                                            dom_tbl = None
+                                        table_metrics = {
+                                            "table_sensitivity_score": round(float(avg_conf)/100.0, 2),
+                                            "dominant_table_category": dom_tbl,
+                                            "table_categories": list({r.get("dominant_category") for r in col_rows if r.get("dominant_category")} ),
+                                            "sensitive_columns_count": len([r for r in col_rows if r.get("dominant_category")]),
+                                        }
+                                        # Persist and refresh
+                                        try:
+                                            # Stash approved edits in session for immediate refresh-friendly view
+                                            st.session_state.setdefault("ai_column_overrides", {})[sel] = col_rows
+                                            ai_classification_service.persist_scan_results(sel, col_rows, table_metrics)
+                                        except Exception:
+                                            pass
+                                        st.success("Classification approved and applied. Refreshing results...")
+                                        st.rerun()
+                                    except Exception:
+                                        st.warning("Failed to apply updated classifications.")  
+                            except Exception:
+                                # Fallback read-only view
+                                show_cols = ["Column Name","Detected Category","Confidence","CIA","Recommended Policies","Review Flag","Bundle"]
+                                st.dataframe(cdf[show_cols], width='stretch')
+            except Exception:
+                pass
         else:
             st.caption("No sensitive tables found for the selected scope.")
-        # Select a table for column-level drilldown
-        sel_table = st.selectbox("Select a table for drilldown", options=[""] + sensitive_options, index=0, key="ncai_tbl_drill")
-        if sel_table:
-            kid = _keyify(sel_table)
-            # Ensure detections present
-            if sel_table not in st.session_state.get("ai_sensitive_cols", {}):
-                st.session_state["ai_table_summary"][sel_table] = _compute_table_ai(sel_table)
-            dets = st.session_state["ai_sensitive_cols"].get(sel_table) or []
-            # Fetch column metadata for data types
-            try:
-                cm = ai_classification_service.get_column_metadata(sel_table) if ai_classification_service else []
-                dtype_map = {str(r.get('COLUMN_NAME')): str(r.get('DATA_TYPE')) for r in (cm or [])}
-            except Exception:
-                dtype_map = {}
-            # Build per-column suggestion map
-            det_map = {str(d.get('column')): sorted(set(d.get('categories') or [])) for d in (dets or [])}
-            col_rows = []
-            for col_name, cats in det_map.items():
-                up = {str(x).upper() for x in cats}
-                c = 1; i = 1; a = 1
-                if any(x in up for x in ["PII","PHI","FINANCIAL","PCI"]):
-                    c = max(c, 2)
-                if "PHI" in up:
-                    c = max(c, 3)
-                if ("FINANCIAL" in up):
-                    i = max(i, 2)
-                col_rows.append({
-                    "COLUMN": col_name,
-                    "DATA_TYPE": dtype_map.get(col_name),
-                    "SENSITIVITY": ", ".join(cats),
-                    "C": c, "I": i, "A": a,
-                })
-            cdf = _pd.DataFrame(col_rows)
-            st.markdown("###### Sensitive Columns — AI Suggestions (editable)")
-            if not cdf.empty:
-                edited = st.data_editor(cdf, use_container_width=True, num_rows="fixed", key=f"ncai_editor_{kid}")
-                # Validate per-column suggestions against policy (PII/FIN => C>=2; PHI => C>=3)
-                violations = []
-                for _, r in edited.iterrows():
-                    cats_up = {s.strip().upper() for s in str(r.get("SENSITIVITY") or "").split(',') if s}
-                    c_val = int(r.get("C") or 0)
-                    if any(x in cats_up for x in ["PII","FINANCIAL","PCI"]) and c_val < 2:
-                        violations.append(f"{r.get('COLUMN')}: C must be >=2 for PII/Financial")
-                    if "PHI" in cats_up and c_val < 3:
-                        violations.append(f"{r.get('COLUMN')}: C must be >=3 for PHI")
-                if violations:
-                    for v in violations:
-                        st.error(v)
-                # Apply button
-                if st.button("Approve & Apply (Table + Columns)", type="primary", key=f"ncai_apply_all_{kid}", disabled=bool(violations)):
-                    try:
-                        # Apply table-level tags from summary
-                        t_s = (st.session_state.get("ai_table_summary") or {}).get(sel_table) or {}
-                        flags = (st.session_state.get("ai_compliance_flags") or {}).get(sel_table) or {"SOC": False, "SOX": False}
-                        _sf_apply_tags(sel_table, {
-                            "data_classification": t_s.get("LABEL") or "Internal",
-                            "confidentiality_level": f"C{int(t_s.get('C') or 1)}",
-                            "integrity_level": f"I{int(t_s.get('I') or 1)}",
-                            "availability_level": f"A{int(t_s.get('A') or 1)}",
-                            "soc_relevant": str(bool(flags.get('SOC'))).lower(),
-                            "sox_relevant": str(bool(flags.get('SOX'))).lower(),
-                        })
-                        # Apply column-level tags
-                        try:
-                            from src.services.tagging_service import tagging_service as _ts
-                            for _, r in edited.iterrows():
-                                _ts.apply_tags_to_column(
-                                    sel_table,
-                                    str(r.get("COLUMN")),
-                                    {
-                                        "DATA_CLASSIFICATION": (t_s.get("LABEL") or "Internal"),
-                                        "CONFIDENTIALITY_LEVEL": str(int(r.get("C") or 0)),
-                                        "INTEGRITY_LEVEL": str(int(r.get("I") or 0)),
-                                        "AVAILABILITY_LEVEL": str(int(r.get("A") or 0)),
-                                        "SPECIAL_CATEGORY": (str(r.get("SENSITIVITY") or "") or "Other"),
-                                    },
-                                )
-                        except Exception:
-                            pass
-                        # Audit log
-                        _sf_audit_log_classification(
-                            sel_table,
-                            action="AI_CLASSIFICATION_APPLIED",
-                            details={
-                                "table": t_s,
-                                "columns": edited.to_dict(orient="records"),
-                            },
-                        )
-                        st.success("Applied table and column tags; audit recorded.")
-                    except Exception as e:
-                        st.error(f"Failed to apply: {e}")
-            else:
-                st.caption("No sensitive columns detected by AI.")
+        # (AI Assist drilldown UI removed)
 
     # Bulk Upload
     with sub_bulk:
@@ -1590,6 +2696,8 @@ with tab_new:
                         try:
                             dets = ai_classification_service.detect_sensitive_columns(full)
                             det_types = sorted({t for d in (dets or []) for t in (d.get('categories') or [])})
+                            # Display rename: Financial -> SOX
+                            det_types = ["SOX" if str(t).upper() == "FINANCIAL" else t for t in det_types]
                         except Exception:
                             det_types = []
                         # Suggest label based on C (highest-of-CIA mapping)
@@ -1614,7 +2722,7 @@ with tab_new:
                             "ISSUE": issue,
                         })
                     vdf = _pd.DataFrame(view)
-                    st.dataframe(vdf, use_container_width=True)
+                    st.dataframe(vdf, width='stretch')
 
                     # Block submission until all pass validation
                     can_submit = (violations == 0 and not vdf.empty)
@@ -1902,11 +3010,11 @@ with tab_tasks:
             st.dataframe(
                 disp[final_cols]
                 .style
-                .applymap(_style_tag, subset=[c for c in ["Tag"] if c in disp.columns])
-                .applymap(_style_deadline, subset=[c for c in ["Deadline Status"] if c in disp.columns])
-                .applymap(_style_compliance, subset=[c for c in ["Policy Compliance"] if c in disp.columns])
+                .map(_style_tag, subset=[c for c in ["Tag"] if c in disp.columns])
+                .map(_style_deadline, subset=[c for c in ["Deadline Status"] if c in disp.columns])
+                .map(_style_compliance, subset=[c for c in ["Policy Compliance"] if c in disp.columns])
                 .hide(axis="index"),
-                use_container_width=True,
+                width='stretch',
             )
 
             # Click-to-open wizard
@@ -2125,7 +3233,7 @@ with tab_tasks:
             ] if c in view.columns]
             if not disp_cols:
                 disp_cols = list(view.columns)
-            st.dataframe(view[disp_cols].style.applymap(_style_status, subset=[c for c in ["Tag"] if c in view.columns]).hide(axis="index"), use_container_width=True)
+            st.dataframe(view[disp_cols].style.map(_style_status, subset=[c for c in ["Tag"] if c in view.columns]).hide(axis="index"), width='stretch')
 
             # Actions: Approve / Request Changes / Reject
             sel_id_col = "review_id" if "review_id" in view.columns else None
@@ -2389,7 +3497,7 @@ with tab_tasks:
                     "PREVIOUS_AVAILABILITY","NEW_AVAILABILITY",
                     "CHANGED_BY","CHANGE_REASON","CHANGE_TIMESTAMP"
                 ] if c in d1.columns]
-                st.dataframe(d1[show_cols] if show_cols else d1, use_container_width=True)
+                st.dataframe(d1[show_cols] if show_cols else d1, width='stretch')
                 try:
                     csv = (d1[show_cols] if show_cols else d1).to_csv(index=False).encode("utf-8")
                     st.download_button("Download Change Log (CSV)", data=csv, file_name="classification_change_log.csv", mime="text/csv")
@@ -2403,7 +3511,7 @@ with tab_tasks:
                 st.info("No audit activity for the selected period.")
             else:
                 show_cols = [c for c in ["RESOURCE_ID","ACTION","DETAILS","CREATED_AT","UPDATED_AT"] if c in d2.columns]
-                st.dataframe(d2[show_cols] if show_cols else d2, use_container_width=True)
+                st.dataframe(d2[show_cols] if show_cols else d2, width='stretch')
                 try:
                     csv = (d2[show_cols] if show_cols else d2).to_csv(index=False).encode("utf-8")
                     st.download_button("Download Audit Trail (CSV)", data=csv, file_name="classification_audit_trail.csv", mime="text/csv")
@@ -2428,7 +3536,7 @@ with tab_tasks:
                         cnts = bx.groupby(key).size().reset_index(name='VERSION_COUNT')
                         view = latest.merge(cnts, on=key, how='left')
                         cols_show = [c for c in [key, 'NEW_CLASSIFICATION','NEW_CONFIDENTIALITY','NEW_INTEGRITY','NEW_AVAILABILITY', ts, 'VERSION_COUNT'] if c in view.columns]
-                        st.dataframe(view[cols_show] if cols_show else view, use_container_width=True)
+                        st.dataframe(view[cols_show] if cols_show else view, width='stretch')
                         try:
                             csv = (view[cols_show] if cols_show else view).to_csv(index=False).encode("utf-8")
                             st.download_button("Download Versions (CSV)", data=csv, file_name="classification_versions.csv", mime="text/csv")
@@ -2439,7 +3547,7 @@ with tab_tasks:
                             timeline = bx[bx[key] == sel].sort_values(ts, ascending=True)
                             tcols = [c for c in [ts,'PREVIOUS_CLASSIFICATION','NEW_CLASSIFICATION','CHANGED_BY','CHANGE_REASON'] if c in timeline.columns]
                             st.markdown("**Timeline**")
-                            st.dataframe(timeline[tcols] if tcols else timeline, use_container_width=True)
+                            st.dataframe(timeline[tcols] if tcols else timeline, width='stretch')
                 except Exception as e:
                     st.info(f"Version history unavailable: {e}")
 
@@ -2551,7 +3659,7 @@ with tab_tasks:
 
         # Display table
         show_cols = ["DATASET", "CIA_SCORES", "OVERALL_CLASSIFICATION", "REVIEWER", "STATUS", "DUE_DATE"]
-        st.dataframe(df[show_cols] if not df.empty else pd.DataFrame(columns=show_cols), use_container_width=True)
+        st.dataframe(df[show_cols] if not df.empty else pd.DataFrame(columns=show_cols), width='stretch')
 
         # Action panel for a selected review
         if not df.empty:
@@ -2817,7 +3925,7 @@ with tab_tasks:
 
             # Present unified view (read-only for now); keep bulk actions minimal
             show_cols = [c for c in ["Asset Name","Type","Due Date","Priority2","Assignment","Task Type","Status","Source"] if c in df.columns]
-            st.dataframe(df[show_cols].rename(columns={"Priority2":"Priority"}), use_container_width=True)
+            st.dataframe(df[show_cols].rename(columns={"Priority2":"Priority"}), width='stretch')
 
     st.markdown("---")
     st.caption("Use the New Classification wizard for detailed workflows. This My Tasks table supports quick updates and submissions.")
@@ -2874,7 +3982,7 @@ if False:
         if rdf.empty:
             st.info("No review items for current filters.")
         else:
-            st.dataframe(rdf, use_container_width=True, hide_index=True)
+            st.dataframe(rdf, width='stretch', hide_index=True)
             # Reviewer actions
             sel_asset_rev = st.selectbox("Select asset to review", options=rdf.get("asset_name", _pd.Series(dtype=str)).dropna().unique().tolist() if "asset_name" in rdf.columns else [])
             colrv1, colrv2, colrv3 = st.columns(3)
@@ -2989,7 +4097,7 @@ if False:
             df = df[df["STATUS"].isin(f_status2)] if "STATUS" in df.columns else df
         if f_scope:
             df = df[df.apply(lambda r: f_scope.lower() in str(r.get("ASSET_FULL_NAME") or r.get("ASSET") or r.get("FULL_NAME") or "").lower(), axis=1)]
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width='stretch', hide_index=True)
         # Bulk ops
         st.markdown("---")
         sel_ids = st.multiselect("Select requests for bulk action", df["ID"].tolist() if "ID" in df.columns else [])
@@ -3127,7 +4235,7 @@ if False:
     if hdf.empty:
         st.info("No history for current filters.")
     else:
-        st.dataframe(hdf, use_container_width=True, hide_index=True)
+        st.dataframe(hdf, width='stretch', hide_index=True)
 
 if False:
     st.subheader("Snowflake Tag Management")
@@ -3514,6 +4622,36 @@ def _ai_assistance_panel():
     ai_ss = st.session_state.setdefault("ai_detect", {"db": db, "tables": pd.DataFrame(), "columns": {}})
     ai_ss["db"] = db
 
+    # Ensure dynamic sensitivity config is loaded and available in session
+    try:
+        cfg = ai_classification_service.load_sensitivity_config()
+        try:
+            st.session_state["sensitivity_config"] = cfg
+        except Exception:
+            pass
+    except Exception:
+        cfg = {}
+
+    # Admin control: seed sensitivity config and refresh in-memory cache
+    with st.expander("Admin: Seed Sensitivity Config", expanded=False):
+        seed_db = st.text_input("Target Database (optional)", value=st.session_state.get("sf_database") or "", key="seed_db_aiassist")
+        if st.button("Run Seed and Refresh", key="btn_seed_refresh_aiassist"):
+            try:
+                if seed_db and seed_db.strip():
+                    snowflake_connector.execute_non_query(f"USE DATABASE {seed_db}")
+                path = os.path.join(_project_root, "sql", "011_seed_sensitivity_config.sql")
+                with open(path, "r", encoding="utf-8") as f:
+                    sql_text = f.read()
+                for stmt in [s.strip() for s in sql_text.split(";") if s.strip()]:
+                    snowflake_connector.execute_non_query(stmt)
+                try:
+                    ai_classification_service.load_sensitivity_config(force_refresh=True)
+                except Exception:
+                    pass
+                st.success("Seed executed and configuration refreshed.")
+            except Exception as e:
+                st.error(f"Seed execution failed: {e}")
+
     # Controls
     c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1])
     with c1:
@@ -3529,97 +4667,117 @@ def _ai_assistance_panel():
         st.session_state.pop("ai_detect", None)
         st.experimental_rerun()
 
-    # Helper: build detection DF
+    # Helper: build detection DF using dynamic catalog + exclusions + live AI
     def _run_detection(db_name: str, max_rows: int, sample_size: int) -> pd.DataFrame:
-        gv = _gv_schema() if ' _gv_schema' in globals() or True else "DATA_GOVERNANCE"
-        # Source tables from ASSET_INVENTORY; fallback to INFORMATION_SCHEMA
-        rows = []
+        # 1) Candidate tables from governed ASSETS
         try:
             rows = snowflake_connector.execute_query(
                 f"""
-                SELECT FULL_NAME, COALESCE(ROW_COUNT,0) AS ROW_COUNT
-                FROM {db_name}.{gv}.ASSET_INVENTORY
-                WHERE SPLIT_PART(FULL_NAME,'.',1) = %(db)s
-                ORDER BY FULL_NAME
-                LIMIT {int(max(1, min(5000, max_rows)))}
-                """,
-                {"db": db_name},
+                select DATABASE_NAME||'.'||SCHEMA_NAME||'.'||TABLE_NAME as FULL_NAME
+                from {{db}}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                where coalesce(IS_ACTIVE, true) and upper(DATABASE_NAME)=upper(%(db)s)
+                order by coalesce(RISK_SCORE,0) desc, coalesce(ROW_COUNT,0) desc, coalesce(LAST_MODIFIED_DATE, to_timestamp_ntz('1970-01-01')) desc, 1
+                limit %(lim)s
+                """.replace('{db}', db_name),
+                {"db": db_name, "lim": int(max_rows)},
             ) or []
+            candidates = [str(r.get("FULL_NAME")) for r in rows if r.get("FULL_NAME")]
         except Exception:
-            rows = []
-        if not rows:
-            try:
-                rows = snowflake_connector.execute_query(
-                    f"""
-                    SELECT "TABLE_CATALOG" || '.' || "TABLE_SCHEMA" || '.' || "TABLE_NAME" AS FULL_NAME,
-                           0 AS ROW_COUNT
-                    FROM {db_name}.INFORMATION_SCHEMA.TABLES
-                    WHERE "TABLE_SCHEMA" NOT IN ('INFORMATION_SCHEMA')
-                    ORDER BY 1
-                    LIMIT {int(max(1, min(5000, max_rows)))}
-                    """
-                ) or []
-            except Exception:
-                rows = []
-        df = pd.DataFrame(rows)
-        if df.empty or 'FULL_NAME' not in df.columns:
+            candidates = []
+
+        # 2) Dynamic exclusions
+        exclude_tokens: Set[str] = set()
+        exclude_exact: Set[str] = set()
+        try:
+            kws = (cfg.get("keywords") or [])
+            for it in kws:
+                try:
+                    if str(it.get("category")).upper() == "EXCLUDE_TABLE_TOKEN":
+                        tok = str(it.get("token") or it.get("keyword") or "").strip().upper()
+                        if tok:
+                            exclude_tokens.add(tok)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # Governance SENSITIVE_EXCLUSIONS (best-effort: support EXCLUDE_PATTERN or TABLE_NAME/FULL_NAME)
+        try:
+            gv_db = resolve_governance_db() or db_name
+            rows = snowflake_connector.execute_query(
+                f"""
+                select coalesce(FULL_NAME, TABLE_NAME) as NAME, EXCLUDE_PATTERN
+                from {gv_db}.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_EXCLUSIONS
+                """
+            ) or []
+            for r in rows:
+                nm = (r.get("NAME") or "").strip()
+                pat = (r.get("EXCLUDE_PATTERN") or "").strip()
+                if nm:
+                    exclude_exact.add(nm.upper())
+                if pat:
+                    exclude_tokens.add(pat.upper())
+        except Exception:
+            pass
+
+        def _excluded(fqn: str) -> bool:
+            up = (fqn or "").upper()
+            if up in exclude_exact:
+                return True
+            return any(tok and tok in up for tok in exclude_tokens)
+
+        tables = [t for t in candidates if not _excluded(t)]
+        if not tables:
             return pd.DataFrame(columns=[
-                'Table Name','Detected Sensitivity Types','Row Count','AI_C','AI_I','AI_A','Policy Compliance','_FQN'
+                'Table Name','Detected Sensitivity Types','Row Count','AI_C','AI_I','AI_A','Compliance','_FQN'
             ])
 
         det_rows = []
-        for _, r in df.iterrows():
-            fq = str(r.get('FULL_NAME'))
-            row_count = int(r.get('ROW_COUNT') or 0)
-            # Detect sensitive columns per table
-            cats = []
-            columns_detail = []
+        for fq in tables:
+            # 3) Live detection per table
             try:
-                det = ai_classification_service.detect_sensitive_columns(fq, sample_size=sample_size) or []
-                columns_detail = det
-                cats = sorted({c for d in det for c in (d.get('categories') or [])})
+                col_rows = ai_classification_service.detect_sensitive_columns(fq, sample_size=sample_size) or []
             except Exception:
-                cats = []
-                columns_detail = []
-            # Normalize SOC/SOX
-            cats_out = list(cats)
-            if 'Financial' in cats_out and 'SOX' not in cats_out:
-                cats_out.append('SOX')
-            # CIA suggestion from strongest category
-            pref = ['PCI','PHI','PII','Financial','Auth','SOX']
-            chosen = next((p for p in pref if p in cats_out), None) or ''
+                col_rows = []
+            # Aggregate table-level
+            agg = ai_classification_service.aggregate_table_sensitivity(col_rows) if col_rows else {"table_sensitivity_score": 0.0, "dominant_table_category": None, "table_categories": []}
+            # Table CIA as max across columns
+            tC = max([int((r.get('suggested_cia') or {}).get('C', 0)) for r in (col_rows or [])] + [0])
+            tI = max([int((r.get('suggested_cia') or {}).get('I', 0)) for r in (col_rows or [])] + [0])
+            tA = max([int((r.get('suggested_cia') or {}).get('A', 0)) for r in (col_rows or [])] + [0])
+            # Compliance mapping from dominant categories
             try:
-                cia = ai_classification_service._suggest_cia_from_type(chosen)
+                dom = agg.get('dominant_table_category')
+                frameworks = ai_classification_service.map_compliance_categories(dom) if dom else []
             except Exception:
-                cia = {"C": 0, "I": 0, "A": 0}
-            c_val = int(cia.get('C', 0)); i_val = int(cia.get('I', 0)); a_val = int(cia.get('A', 0))
-            # Policy compliance
-            compliant = True
+                frameworks = []
+            # Persist audit and AI outputs
             try:
-                tagging_service.validate_tags({
-                    'DATA_CLASSIFICATION': 'Confidential' if c_val >= 3 else ('Restricted' if c_val >= 2 else ('Internal' if c_val >= 1 else 'Public')),
-                    'CONFIDENTIALITY_LEVEL': str(c_val),
-                    'INTEGRITY_LEVEL': str(i_val),
-                    'AVAILABILITY_LEVEL': str(a_val),
-                })
-                # Enforce minimums for key types
-                if any(t in cats_out for t in ['PII','PHI','PCI']):
-                    compliant = compliant and (c_val >= 3)
-                if 'Financial' in cats_out or 'SOX' in cats_out:
-                    compliant = compliant and (i_val >= 2)
+                table_metrics = {
+                    "table_sensitivity_score": agg.get("table_sensitivity_score"),
+                    "dominant_table_category": agg.get("dominant_table_category"),
+                    "table_categories": agg.get("table_categories"),
+                    "sensitive_columns_count": len(col_rows or []),
+                    "table_cia_minimum": f"C{tC}/I{tI}/A{tA}",
+                    "compliance_frameworks": frameworks,
+                }
+                ai_classification_service.persist_scan_results(fq, col_rows, table_metrics, sample_info={"sampling_method": "auto", "sample_size": int(sample_size)})
             except Exception:
-                compliant = False
+                # best-effort; also log via audit_service
+                try:
+                    audit_service.log("UI", "PERSIST_FAIL", {"table": fq})
+                except Exception:
+                    pass
 
             det_rows.append({
                 'Table Name': fq,
-                'Detected Sensitivity Types': ','.join(sorted(cats_out)) if cats_out else '',
-                'Row Count': row_count,
-                'AI_C': c_val,
-                'AI_I': i_val,
-                'AI_A': a_val,
-                'Policy Compliance': '✅' if compliant else '❌',
+                'Detected Sensitivity Types': ','.join(sorted({c for d in (col_rows or []) for c in (d.get('categories') or [])})) if col_rows else '',
+                'Row Count': None,
+                'AI_C': tC,
+                'AI_I': tI,
+                'AI_A': tA,
+                'Compliance': ",".join(frameworks) if frameworks else '',
                 '_FQN': fq,
-                '_columns': columns_detail,
+                '_columns': col_rows,
             })
         return pd.DataFrame(det_rows)
 
@@ -3639,12 +4797,11 @@ def _ai_assistance_panel():
         st.info("No tables detected or ASSET_INVENTORY unavailable.")
         return
 
-    # Interactive table with policy highlighting
+    # Interactive table
     st.markdown("### Detected Sensitive Tables")
-    styled = tdf.style.apply(lambda s: ['background-color: #ffe6e6' if (s.get('Policy Compliance') == '❌') else '' for _ in s], axis=1)
     st.dataframe(
         tdf[[
-            'Table Name','Detected Sensitivity Types','Row Count','AI_C','AI_I','AI_A','Policy Compliance'
+            'Table Name','Detected Sensitivity Types','AI_C','AI_I','AI_A','Compliance'
         ]],
         use_container_width=True,
         hide_index=True,
@@ -3655,53 +4812,34 @@ def _ai_assistance_panel():
     if not sel_tbl:
         return
 
-    # Build column-level DataFrame; allow edits to CIA
+    # Build column-level DataFrame; display live detection outputs
     raw_cols = ai_ss.get('columns', {}).get(sel_tbl, []) or []
     col_rows = []
     for c in raw_cols:
         cname = c.get('column') or c.get('name')
         ctype = c.get('type') or c.get('data_type') or ''
         cats = ','.join(sorted(c.get('categories') or []))
-        # initial CIA per column by category strength
-        pref = ['PCI','PHI','PII','Financial','Auth','SOX']
-        chosen = next((p for p in pref if p in (c.get('categories') or [])), None) or ''
-        try:
-            cia = ai_classification_service._suggest_cia_from_type(chosen)
-        except Exception:
-            cia = {"C": 0, "I": 0, "A": 0}
+        cia = c.get('suggested_cia') or {"C": 0, "I": 0, "A": 0}
         col_rows.append({
-            'Column Name': cname,
+            'Column': cname,
             'Data Type': ctype,
-            'Sensitivity Types': cats,
-            'Label': 'Confidential' if int(cia.get('C',0)) >= 3 else ('Restricted' if int(cia.get('C',0)) >= 2 else ('Internal' if int(cia.get('C',0)) >= 1 else 'Public')),
-            'C': int(cia.get('C',0)),
-            'I': int(cia.get('I',0)),
-            'A': int(cia.get('A',0)),
+            'Categories': cats,
+            'Dominant': c.get('dominant_category'),
+            'Confidence': int(c.get('confidence') or 0),
+            'CIA': f"C{int(cia.get('C',0))}/I{int(cia.get('I',0))}/A{int(cia.get('A',0))}",
+            'BundleBoost': bool(c.get('bundle_boost', False)),
+            'Bundles': ",".join([str(x) for x in (c.get('bundles_detected') or [])]),
         })
     cols_df = pd.DataFrame(col_rows)
 
-    st.markdown("### Column-Level Drilldown (editable)")
-    edit_key = f"ai_cols_{sel_tbl}"
-    edited_df = st.data_editor(
+    st.markdown("### Column-Level Detection (live)")
+    st.dataframe(
         cols_df,
         use_container_width=True,
-        num_rows="fixed",
         hide_index=True,
-        column_config={
-            'Column Name': st.column_config.TextColumn(disabled=True),
-            'Data Type': st.column_config.TextColumn(disabled=True),
-            'Sensitivity Types': st.column_config.TextColumn(disabled=True),
-            'Label': st.column_config.SelectboxColumn(options=["Public","Internal","Restricted","Confidential"]),
-            'C': st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-            'I': st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-            'A': st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-        },
-        key=edit_key,
-    ) if not cols_df.empty else cols_df
-
-    # Persist edited columns state
-    ai_ss.setdefault('columns_edited', {})
-    ai_ss['columns_edited'][sel_tbl] = edited_df.copy() if not edited_df.empty else cols_df
+    )
+    # Only show live detection; skip legacy editing UI
+    return
 
     # Table-level suggestion (max across columns) with policy check
     if not edited_df.empty:
@@ -5043,18 +6181,22 @@ with tab1:
     # Auto-suggest CIA and Level
     def suggest_levels(name: str):
         up = (name or "").upper()
-        # Start from neutral (0) and elevate based on detected cues to reduce bias
         c, i, a = 0, 0, 0
-        if any(k in up for k in ["SSN","EMAIL","PHONE","ADDRESS","DOB","PII","CUSTOMER","PERSON","EMPLOYEE"]):
-            c = max(c, 2)
-        if any(k in up for k in ["FINANCE","GL","LEDGER","INVOICE","PAYROLL","AR","AP","REVENUE","EXPENSE"]):
-            c = max(c, 2); i = max(i, 2)
-        if any(k in up for k in ["SOX","FINANCIAL_REPORT","GAAP","IFRS","AUDIT"]):
-            c = max(c, 3); i = max(i, 3)
-        if any(k in up for k in ["REALTIME","ORDERS","OPERATIONS","SUPPORT"]):
-            a = max(a, 2)
-        if any(k in up for k in ["CRITICAL","ALERT","EMERGENCY"]):
-            a = max(a, 3)
+        try:
+            from src.services.ai_classification_service import ai_classification_service as _svc
+            cfg = _svc.load_sensitivity_config()
+            kws = (cfg.get("keywords") or [])
+            cats = (cfg.get("categories") or {})
+            for kw in kws:
+                token = str(kw.get("token") or "").upper()
+                cat = str(kw.get("category") or "")
+                if token and token in up:
+                    m = cats.get(cat) or {}
+                    c = max(int(c), int(m.get("C") or 0))
+                    i = max(int(i), int(m.get("I") or 0))
+                    a = max(int(a), int(m.get("A") or 0))
+        except Exception:
+            pass
         highest = max(c, i, a)
         level = "Confidential" if highest == 3 else ("Restricted" if highest == 2 else ("Public" if highest == 0 else "Internal"))
         return c, i, a, level
@@ -5604,19 +6746,25 @@ with tab1:
         suggestions = {}
         if table_full:
             try:
-                det = ai_classification_service.detect_sensitive_columns(table_full)
-                # Expecting det like {"columns": {"EMAIL": {"label":"Restricted","c":2,...}}}
-                if isinstance(det, dict):
+                det = ai_classification_service.detect_sensitive_columns(table_full, sample_size=200) or []
+                colmap = {}
+                if isinstance(det, list):
+                    for d in det:
+                        cname = str(d.get("column") or d.get("COLUMN_NAME") or "").upper()
+                        if not cname:
+                            continue
+                        cat = d.get("dominant_category") or ((d.get("categories") or [None])[0])
+                        conf = int(d.get("confidence") or 0)
+                        colmap[cname] = {
+                            "label": cat or "Internal",
+                            "c": int((ai_classification_service._suggest_cia_from_type(cat or "").get("C") if cat else 1) or 1),
+                            "i": int((ai_classification_service._suggest_cia_from_type(cat or "").get("I") if cat else 1) or 1),
+                            "a": int((ai_classification_service._suggest_cia_from_type(cat or "").get("A") if cat else 1) or 1),
+                            "reason": f"detected by AI; confidence={conf}",
+                        }
+                elif isinstance(det, dict):
                     colmap = det.get("columns") or det
-                    for k, v in colmap.items():
-                        if isinstance(v, dict):
-                            suggestions[str(k).upper()] = {
-                                "label": v.get("label") or v.get("classification") or "Internal",
-                                "c": int(v.get("c", 1)),
-                                "i": int(v.get("i", 1)),
-                                "a": int(v.get("a", 1)),
-                                "reason": v.get("reason") or v.get("explanation") or "",
-                            }
+                suggestions = colmap
             except Exception:
                 pass
 

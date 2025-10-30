@@ -218,3 +218,87 @@ from inv, pii, alerts, tasks;
 -- Provide ASSETS in DATA_GOVERNANCE by referencing the canonical table in DATA_CLASSIFICATION_GOVERNANCE
 create or replace view identifier($dbname)||'.'||identifier($sch)||'.ASSETS' as
 select * from identifier($dbname)||'.DATA_CLASSIFICATION_GOVERNANCE.ASSETS';
+
+-- =============================
+-- Views - Sensitivity insights (Table summary and Column details)
+-- =============================
+create or replace view identifier($dbname)||'.'||identifier($sch)||'.VW_SENSITIVE_TABLE_SUMMARY' as
+with aud as (
+  select 
+    table_name,
+    column_name,
+    upper(coalesce(category,'UNKNOWN')) as category,
+    try_to_double(confidence) as confidence
+  from identifier($dbname)||'.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_AUDIT'
+  where category is not null
+),
+tbl as (
+  select 
+    table_name,
+    count(*) as total_hits,
+    count(distinct column_name) as columns_flagged,
+    max(confidence) as max_confidence,
+    avg(confidence) as avg_confidence,
+    array_agg_distinct(category) as categories
+  from aud
+  group by table_name
+),
+topcat as (
+  select table_name, category, cat_hits, cat_max_conf,
+         row_number() over (partition by table_name order by cat_hits desc, cat_max_conf desc, category) as rn
+  from (
+    select 
+      table_name,
+      category,
+      count(*) as cat_hits,
+      max(confidence) as cat_max_conf
+    from aud
+    group by table_name, category
+  ) x
+)
+select 
+  t.table_name,
+  t.columns_flagged,
+  t.total_hits,
+  t.max_confidence,
+  t.avg_confidence,
+  t.categories,
+  tc.category as top_category,
+  sc.C as CIA_C,
+  sc.I as CIA_I,
+  sc.A as CIA_A,
+  case 
+    when greatest(coalesce(sc.C,0), coalesce(sc.I,0), coalesce(sc.A,0)) >= 3 then 'C3'
+    when greatest(coalesce(sc.C,0), coalesce(sc.I,0), coalesce(sc.A,0)) >= 2 then 'C2'
+    else 'C1'
+  end as classification_label,
+  case 
+    when greatest(coalesce(sc.C,0), coalesce(sc.I,0), coalesce(sc.A,0)) >= 3 then 'red'
+    when greatest(coalesce(sc.C,0), coalesce(sc.I,0), coalesce(sc.A,0)) >= 2 then 'orange'
+    else 'yellow'
+  end as severity_color
+from tbl t
+left join topcat tc on t.table_name = tc.table_name and tc.rn = 1
+left join identifier($dbname)||'.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES' sc
+  on upper(sc.CATEGORY) = upper(tc.category);
+
+create or replace view identifier($dbname)||'.'||identifier($sch)||'.VW_SENSITIVE_COLUMN_DETAILS' as
+select 
+  a.table_name,
+  a.column_name,
+  upper(coalesce(a.category,'UNKNOWN')) as category,
+  try_to_double(a.confidence) as confidence,
+  sc.C as CIA_C,
+  sc.I as CIA_I,
+  sc.A as CIA_A,
+  a.details,
+  a.scanned_at,
+  case 
+    when try_to_double(a.confidence) >= 0.9 then 'Very High'
+    when try_to_double(a.confidence) >= 0.75 then 'High'
+    when try_to_double(a.confidence) >= 0.6 then 'Medium'
+    else 'Low'
+  end as confidence_bucket
+from identifier($dbname)||'.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_AUDIT' a
+left join identifier($dbname)||'.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES' sc
+  on upper(sc.CATEGORY) = upper(a.category);

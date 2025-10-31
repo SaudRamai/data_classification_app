@@ -50,7 +50,7 @@ except Exception:  # type: ignore
     audit_service = None  # type: ignore
 
 
-GOV_SCHEMA = "DATA_GOVERNANCE"
+GOV_SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 REQ_TABLE = "RECLASSIFICATION_REQUESTS"
 LOG_TABLE = "RECLASSIFICATION_WORKFLOW_LOG"
 
@@ -165,7 +165,7 @@ class SnowflakeOps:
         """Insert request to Snowflake or no-op fallback.
 
         SQL INSERT point:
-        INSERT INTO <DB>.DATA_GOVERNANCE.RECLASSIFICATION_REQUESTS (...columns...)
+        INSERT INTO <DB>.DATA_CLASSIFICATION_GOVERNANCE.RECLASSIFICATION_REQUESTS (...columns...)
         VALUES (...)
         """
         if reclassification_service:
@@ -240,7 +240,7 @@ class SnowflakeOps:
         """Insert a workflow log entry.
 
         SQL INSERT point:
-        INSERT INTO <DB>.DATA_GOVERNANCE.RECLASSIFICATION_WORKFLOW_LOG (...)
+        INSERT INTO <DB>.DATA_CLASSIFICATION_GOVERNANCE.RECLASSIFICATION_WORKFLOW_LOG (...)
         VALUES (...)
         """
         if not self.sf:
@@ -276,7 +276,7 @@ class SnowflakeOps:
         """Return requests with optional filters.
 
         SQL SELECT point:
-        SELECT * FROM <DB>.DATA_GOVERNANCE.RECLASSIFICATION_REQUESTS WHERE ... ORDER BY CREATED_AT DESC LIMIT <N>
+        SELECT * FROM <DB>.DATA_CLASSIFICATION_GOVERNANCE.RECLASSIFICATION_REQUESTS WHERE ... ORDER BY CREATED_AT DESC LIMIT <N>
         """
         # Service path preferred (maps to same table and ensures compatibility)
         try:
@@ -329,7 +329,7 @@ class SnowflakeOps:
         """Update request status and log the transition.
 
         SQL UPDATE point:
-        UPDATE <DB>.DATA_GOVERNANCE.RECLASSIFICATION_REQUESTS SET STATUS = <>, UPDATED_AT = CURRENT_TIMESTAMP WHERE ID = <>
+        UPDATE <DB>.DATA_CLASSIFICATION_GOVERNANCE.RECLASSIFICATION_REQUESTS SET STATUS = <>, UPDATED_AT = CURRENT_TIMESTAMP WHERE ID = <>
         """
         old_status = None
         if not self.sf and not reclassification_service:

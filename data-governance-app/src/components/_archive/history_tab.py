@@ -37,6 +37,7 @@ import streamlit as st
 # Local project imports
 from src.connectors.snowflake_connector import snowflake_connector
 from src.services.governance_db_resolver import resolve_governance_db
+from src.config import settings
 
 
 # ----------------------------- Snowflake helpers -----------------------------
@@ -118,8 +119,9 @@ def sf_fetch_classification_audit(
 
     where_sql = " AND ".join(where_clauses)
 
-    # IMPORTANT: Replace schema/object below to your environment.
-    # If your audit table lives elsewhere, change DATA_GOVERNANCE.CLASSIFICATION_AUDIT accordingly.
+    # Get the schema name from settings or use default
+    schema = getattr(settings, 'SNOWFLAKE_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
+    
     sql = f"""
         SELECT
           DATASET_FULL_NAME,
@@ -131,7 +133,7 @@ def sf_fetch_classification_audit(
           APPROVED_AT,
           OWNER,
           CLASSIFICATION_LEVEL
-        FROM {db}.DATA_GOVERNANCE.CLASSIFICATION_AUDIT
+        FROM {db}.{schema}.CLASSIFICATION_AUDIT
         WHERE {where_sql}
         ORDER BY COALESCE(APPROVED_AT, SUBMITTED_AT) DESC
         LIMIT %(lim)s

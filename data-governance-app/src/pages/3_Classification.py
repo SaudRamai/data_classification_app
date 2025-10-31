@@ -11,14 +11,273 @@ if _project_root not in sys.path:
 
 import streamlit as st
 import pandas as pd
+import re
 from datetime import date, datetime, timedelta
-from typing import Optional, List, Dict, Tuple, Set, Union, Any
+from typing import Optional, List, Dict, Tuple, Set, Union, Any, AnyStr
 from src.ui.theme import apply_global_theme
 from src.components.filters import render_data_filters
 from src.connectors.snowflake_connector import snowflake_connector
 from src.services.authorization_service import authz
-from src.services.tagging_service import tagging_service, ALLOWED_CLASSIFICATIONS
+try:
+    from src.services.tagging_service import tagging_service, TAG_DEFINITIONS
+except Exception:
+    tagging_service = None  # type: ignore
+    TAG_DEFINITIONS = {  # minimal fallback to keep page loading
+        "DATA_CLASSIFICATION": ["Public", "Internal", "Restricted", "Confidential"],
+    }
+
+# Get allowed classifications from tagging service
+ALLOWED_CLASSIFICATIONS = TAG_DEFINITIONS.get("DATA_CLASSIFICATION") or ["Public", "Internal", "Restricted", "Confidential"]
 from src.services.reclassification_service import reclassification_service
+from src.services.ai_sensitive_detection_service import ai_sensitive_detection_service
+
+
+def _detect_sensitive_tables(database: str, schema: Optional[str] = None, sample_size: int = 1000) -> List[Dict[str, Any]]:
+    """Detect sensitive tables in the specified database using metadata, patterns, and AI.
+    
+    Args:
+        database: Database name to analyze
+        schema: Optional schema to filter by
+        sample_size: Number of rows to sample per table for pattern matching
+        
+    Returns:
+        List of dicts with table metadata and sensitivity information
+    """
+    try:
+        # 1. Fetch all tables and columns from INFORMATION_SCHEMA
+        query = f"""
+        SELECT 
+            TABLE_SCHEMA, 
+            TABLE_NAME, 
+            COLUMN_NAME, 
+            DATA_TYPE
+        FROM {database}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'PUBLIC')
+        """
+        
+        # Add schema filter if provided
+        if schema:
+            query += f" AND TABLE_SCHEMA = '{schema}'"
+        
+        # Add final ordering
+        query += " ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+        
+        columns_df = pd.DataFrame(snowflake_connector.execute_query(query) or [])
+        if columns_df.empty:
+            return []
+        
+        # 2. Get sensitivity keywords and patterns (governance schema or AI config fallback)
+        sensitivity_rules = pd.DataFrame()
+        try:
+            gov_db = resolve_governance_db()
+            gov_schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE" if gov_db else None
+            if gov_schema_fqn:
+                query = f"""
+                SELECT 
+                    KEYWORD as token, 
+                    CATEGORY as category, 
+                    'KEYWORD' as match_type,
+                    SENSITIVITY_WEIGHT as weight
+                FROM {gov_schema_fqn}.SENSITIVE_KEYWORDS 
+                WHERE IS_ACTIVE = TRUE
+                UNION ALL
+                SELECT 
+                    PATTERN_NAME as token, 
+                    CATEGORY as category,
+                    'PATTERN' as match_type,
+                    SENSITIVITY_WEIGHT as weight
+                FROM {gov_schema_fqn}.SENSITIVE_PATTERNS 
+                WHERE IS_ACTIVE = TRUE
+                """
+                sensitivity_rules = pd.DataFrame(snowflake_connector.execute_query(query) or [])
+        except Exception:
+            sensitivity_rules = pd.DataFrame()
+        # Fallback to AI classification service in-memory configuration
+        if sensitivity_rules.empty:
+            try:
+                cfg = getattr(ai_classification_service, '_sensitivity_config', {}) or {}
+                keywords = (cfg.get('keywords') or {})
+                patterns = (cfg.get('patterns') or {})
+                rows = []
+                for token, meta in keywords.items():
+                    rows.append({
+                        'token': token,
+                        'category': (meta or {}).get('category') or (meta or {}).get('categories') or 'GENERAL',
+                        'match_type': 'KEYWORD',
+                        'weight': float((meta or {}).get('weight') or (meta or {}).get('sensitivity_weight') or 0.6),
+                    })
+                for token, meta in patterns.items():
+                    rows.append({
+                        'token': token,
+                        'category': (meta or {}).get('category') or (meta or {}).get('categories') or 'GENERAL',
+                        'match_type': 'PATTERN',
+                        'weight': float((meta or {}).get('weight') or (meta or {}).get('sensitivity_weight') or 0.8),
+                    })
+                sensitivity_rules = pd.DataFrame(rows)
+            except Exception:
+                sensitivity_rules = pd.DataFrame()
+        # Normalize and validate columns to avoid KeyErrors downstream
+        try:
+            required_cols = ['token', 'category', 'match_type', 'weight']
+            for c in required_cols:
+                if c not in sensitivity_rules.columns:
+                    sensitivity_rules[c] = pd.Series(dtype=object)
+            # Drop rows without token
+            sensitivity_rules = sensitivity_rules.dropna(subset=['token'])
+            # Coerce types
+            sensitivity_rules['token'] = sensitivity_rules['token'].astype(str)
+            sensitivity_rules['category'] = sensitivity_rules['category'].astype(str).fillna('GENERAL')
+            sensitivity_rules['match_type'] = sensitivity_rules['match_type'].astype(str).str.upper()
+            # Coerce weight to float with default
+            def _to_float(x):
+                try:
+                    return float(x)
+                except Exception:
+                    return 0.5
+            sensitivity_rules['weight'] = sensitivity_rules['weight'].apply(_to_float)
+        except Exception:
+            # If anything goes wrong, ensure empty but correctly shaped DataFrame
+            sensitivity_rules = pd.DataFrame(columns=['token','category','match_type','weight'])
+        
+        # 3. Process tables and detect sensitivity
+        results = []
+        tables = columns_df[['TABLE_SCHEMA', 'TABLE_NAME']].drop_duplicates()
+        
+        for _, table_row in tables.iterrows():
+            schema = table_row['TABLE_SCHEMA']
+            table = table_row['TABLE_NAME']
+            table_fqn = f"{database}.{schema}.{table}"
+            
+            # Get columns for this table
+            table_cols = columns_df[
+                (columns_df['TABLE_SCHEMA'] == schema) & 
+                (columns_df['TABLE_NAME'] == table)
+            ]
+            
+            # Initialize table metrics
+            high_sensitivity_cols = 0
+            medium_sensitivity_cols = 0
+            column_scores = []
+            
+            # Analyze each column
+            for _, col in table_cols.iterrows():
+                col_name = col['COLUMN_NAME']
+                col_type = col['DATA_TYPE']
+                
+                # Initialize column score
+                col_score = 0.0
+                detection_methods = []
+                
+                # 1. Check for keyword matches in column name
+                col_upper = col_name.upper()
+                keyword_df = sensitivity_rules[sensitivity_rules['match_type'] == 'KEYWORD']
+                keyword_matches = keyword_df[keyword_df['token'].astype(str).str.upper().apply(lambda t: t in col_upper)]
+                
+                if not keyword_matches.empty:
+                    max_keyword_score = keyword_matches['weight'].max()
+                    col_score = max(col_score, float(max_keyword_score))
+                    detection_methods.extend(keyword_matches['category'].unique())
+                
+                # 2. Sample data and check for pattern matches
+                try:
+                    sample_query = f"""
+                    SELECT {col_name} as value
+                    FROM {database}.{schema}.{table}
+                    WHERE {col_name} IS NOT NULL
+                    LIMIT {sample_size}
+                    """
+                    sample_data = pd.DataFrame(snowflake_connector.execute_query(sample_query) or [])
+                    
+                    if not sample_data.empty:
+                        # Check for pattern matches in sample data
+                        patt_df = sensitivity_rules[sensitivity_rules['match_type'] == 'PATTERN']
+                        for _, pattern in patt_df.iterrows():
+                            try:
+                                tok = str(pattern.get('token') or '')
+                                if not tok:
+                                    continue
+                                pattern_regex = re.compile(tok, re.IGNORECASE)
+                                matches = sample_data['value'].astype(str).str.contains(pattern_regex, na=False)
+                                match_ratio = matches.mean()
+                                
+                                if match_ratio > 0.1:  # At least 10% of sampled rows match
+                                    col_score = max(col_score, float(pattern['weight']) * min(1.0, match_ratio * 2))
+                                    detection_methods.append(f"PATTERN:{pattern['category']}")
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                
+                # 3. AI-based classification (if available)
+                ai_confidence = 0.0
+                try:
+                    if ai_classification_service and hasattr(ai_classification_service, 'classify_column'):
+                        ai_result = ai_classification_service.classify_column(
+                            database=database,
+                            schema=schema,
+                            table=table,
+                            column=col_name,
+                            data_type=col_type,
+                            sample_size=min(100, sample_size)
+                        )
+                        if ai_result and 'confidence' in ai_result:
+                            ai_confidence = float(ai_result['confidence'])
+                            col_score = max(col_score, ai_confidence)
+                            if ai_confidence > 0.7:  # Only consider strong AI signals
+                                detection_methods.append(f"AI:{ai_result.get('category', 'SENSITIVE')}")
+                except Exception:
+                    pass
+                
+                # Determine sensitivity level
+                sensitivity_level = "LOW"
+                if col_score >= 0.8:
+                    sensitivity_level = "HIGH"
+                    high_sensitivity_cols += 1
+                elif col_score >= 0.6:
+                    sensitivity_level = "MEDIUM"
+                    medium_sensitivity_cols += 1
+                
+                column_scores.append({
+                    'column': col_name,
+                    'data_type': col_type,
+                    'sensitivity_score': round(col_score, 2),
+                    'sensitivity_level': sensitivity_level,
+                    'detection_methods': list(set(detection_methods))
+                })
+            
+            # Calculate table-level sensitivity
+            total_cols = len(table_cols)
+            high_ratio = high_sensitivity_cols / max(1, total_cols)
+            avg_score = sum(c['sensitivity_score'] for c in column_scores) / max(1, total_cols)
+            
+            if high_sensitivity_cols >= 2 or high_ratio >= 0.3 or avg_score >= 0.7:
+                table_sensitivity = "HIGH"
+            elif high_sensitivity_cols >= 1 or medium_sensitivity_cols >= 2 or avg_score >= 0.5:
+                table_sensitivity = "MEDIUM"
+            else:
+                table_sensitivity = "LOW"
+            
+            results.append({
+                'database': database,
+                'schema': schema,
+                'table': table,
+                'full_name': table_fqn,
+                'sensitivity_level': table_sensitivity,
+                'confidence_score': round(avg_score, 2),
+                'high_sensitivity_cols': high_sensitivity_cols,
+                'medium_sensitivity_cols': medium_sensitivity_cols,
+                'total_columns': total_cols,
+                'columns': column_scores
+            })
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"Error detecting sensitive tables: {str(e)}")
+        if st.session_state.get('show_debug', False):
+            st.exception(e)
+        return []
+
 from src.services.decision_matrix_service import validate as dm_validate
 from src.services.audit_service import audit_service
 from src.services.ai_classification_service import ai_classification_service
@@ -102,7 +361,6 @@ try:
                 "keywords": {},
                 "categories": {},
                 "bundles": {},
-                "internal_patterns": {},
                 "compliance_mapping": {},
                 "model_metadata": {},
                 "name_tokens": {}
@@ -123,7 +381,6 @@ except Exception as e:
             "keywords": {},
             "categories": {},
             "bundles": {},
-            "internal_patterns": {},
             "compliance_mapping": {},
             "model_metadata": {},
             "name_tokens": {}
@@ -705,7 +962,7 @@ def render_live_feed():
     @st.cache_data(ttl=5)
     def _fetch_live(_db: str, _source: str, _limit: int):
         try:
-            gv = st.session_state.get("governance_schema") or "DATA_GOVERNANCE"
+            gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
             gf = st.session_state.get("global_filters") or {}
             if _source == "Asset Inventory":
                 where, params = _where_from_filters_for_fqn("FULL_NAME", gf)
@@ -805,7 +1062,7 @@ with tab_qa:
             try:
                 # Prefer canonical ASSETS table if present
                 if db:
-                    gv = st.session_state.get("governance_schema") or "DATA_GOVERNANCE"
+                    gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
                     sql = f"""
                         select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME,
                                coalesce(CLASSIFICATION_TAG, CURRENT_CLASSIFICATION, '') as CLASSIFICATION,
@@ -976,7 +1233,7 @@ with tab_qa:
         past_due_count = None
         try:
             if db:
-                gv = st.session_state.get("governance_schema") or "DATA_GOVERNANCE"
+                gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
                 sql_pd = f"""
                     select
                       count(*) as total,
@@ -1017,7 +1274,7 @@ with tab_qa:
         pii_cnt = fin_cnt = reg_cnt = None
         try:
             if db:
-                gv = st.session_state.get("governance_schema") or "DATA_GOVERNANCE"
+                gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
                 sql_cat = f"""
                     select
                       sum(CASE WHEN COALESCE(PII_DETECTED, false) THEN 1 ELSE 0 END) as pii,
@@ -1079,6 +1336,248 @@ with tab_qa:
 with tab_new:
     st.subheader("New Classification")
     sub_guided, sub_bulk, sub_ai = st.tabs(["Guided Workflow", "Bulk Upload", "AI Assistant"])
+    
+    # AI Assistant tab
+    with sub_ai:
+        st.caption("AI Assistant: Filter by database/schema to view sensitive tables, then drill down into editable sensitive columns.")
+
+        # Service handle
+        try:
+            from src.services.ai_classification_service import ai_classification_service as _svc
+        except Exception:
+            _svc = None
+
+        # Use existing global filters from the sidebar (no new filters here)
+        # Active DB from helper; schema from session/global filters if available
+        try:
+            sel_db = _active_db_from_filter()
+        except Exception:
+            sel_db = None
+        try:
+            gf = st.session_state.get("global_filters", {}) if hasattr(st, "session_state") else {}
+            sel_schema = (
+                st.session_state.get("schema_filter")
+                or (gf.get("schema") if isinstance(gf, dict) else None)
+            )
+        except Exception:
+            sel_schema = None
+        st.caption("Scope is controlled by the sidebar global filter (Database/Schema).")
+
+        # Level 1 — Sensitive Tables Overview
+        st.markdown("#### Level 1 — Sensitive Tables Overview")
+        import pandas as _pd
+        level1_rows: list[dict] = []
+        try:
+            _active_db = sel_db or _active_db_from_filter()
+            _gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
+            fqn_candidates = [
+                f"{_active_db}.{_gv}.AI_ASSISTANT_SENSITIVE_ASSETS" if _active_db else None,
+                "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.AI_ASSISTANT_SENSITIVE_ASSETS",
+            ]
+            fqn_candidates = [x for x in fqn_candidates if x]
+            rows = []
+            for _fqn in fqn_candidates:
+                where = []
+                params = {}
+                if sel_db:
+                    where.append("DATABASE_NAME = %(db)s"); params["db"] = sel_db
+                if sel_schema:
+                    where.append("SCHEMA_NAME = %(sc)s"); params["sc"] = sel_schema
+                sql = f"""
+                    SELECT DATABASE_NAME, SCHEMA_NAME, TABLE_NAME,
+                           ANY_VALUE(DETECTED_TYPE) AS DETECTED_TYPE,
+                           MAX(COMBINED_CONFIDENCE) AS MAX_CONF
+                    FROM {_fqn}
+                    {('WHERE ' + ' AND '.join(where)) if where else ''}
+                    GROUP BY 1,2,3
+                    ORDER BY MAX_CONF DESC, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME
+                    LIMIT 1000
+                """
+                try:
+                    rows = snowflake_connector.execute_query(sql, params) or []
+                    if rows:
+                        break
+                except Exception:
+                    continue
+            for r in rows:
+                db = r.get("DATABASE_NAME"); sc = r.get("SCHEMA_NAME"); tbl = r.get("TABLE_NAME")
+                fqn = f"{db}.{sc}.{tbl}"
+                level1_rows.append({
+                    "Table Name": f"{sc}.{tbl}",
+                    "Sensitive Data Type": r.get("DETECTED_TYPE") or "",
+                    "Confidence Score": f"{float(r.get('MAX_CONF') or 0.0)*100:.0f}%" if r.get('MAX_CONF') is not None else "",
+                    "Recommended Policies": "",  # filled in drill-down
+                    "OK Policies": "",
+                    "Need Review": False,  # compute via thresholds if needed
+                    "_FQN": fqn,
+                })
+        except Exception:
+            level1_rows = []
+
+        df_level1 = _pd.DataFrame(level1_rows)
+        if df_level1.empty:
+            st.info("No sensitive tables found for the selected scope.")
+            if st.button("Scan now", key="ai_scan_now"):
+                _db_to_scan = sel_db or _active_db_from_filter()
+                if _db_to_scan:
+                    with st.spinner("Scanning sensitive data for selected scope..."):
+                        try:
+                            summary = ai_sensitive_detection_service.run_scan_and_persist(
+                                _db_to_scan,
+                                schema_name=(sel_schema or None)
+                            )
+                            st.success(f"Scan complete. Columns detected: {summary.get('columns_detected', 0)}")
+                        except Exception as e:
+                            st.error(f"Scan failed: {e}")
+                        st.rerun()
+                else:
+                    st.warning("Please select a Database in the global filter to run a scan.")
+            selected_full_name = ""
+        else:
+            st.dataframe(df_level1[[
+                "Table Name",
+                "Sensitive Data Type",
+                "Confidence Score",
+                "Recommended Policies",
+                "OK Policies",
+                "Need Review",
+            ]], use_container_width=True, hide_index=True)
+
+            # Select table to drill down
+            selected_label = st.selectbox(
+                "Select a table to drill down",
+                options=[""] + [f for f in df_level1["_FQN"].tolist()],
+                index=0,
+                key="ai_gov_selected_table",
+            )
+            selected_full_name = selected_label
+
+        # Level 2 — Drill-Down: Sensitive Columns View (editable)
+        if selected_full_name:
+            st.markdown("#### Level 2 — Sensitive Columns Drill-down")
+            cols_detect = []
+            try:
+                db, sc, tbl = selected_full_name.split('.')
+                _active_db = sel_db or _active_db_from_filter() or db
+                _gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
+                fqn_candidates = [
+                    f"{_active_db}.{_gv}.AI_ASSISTANT_SENSITIVE_ASSETS" if _active_db else None,
+                    "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.AI_ASSISTANT_SENSITIVE_ASSETS",
+                ]
+                fqn_candidates = [x for x in fqn_candidates if x]
+                for _fqn in fqn_candidates:
+                    sql = f"""
+                        SELECT COLUMN_NAME, DETECTED_TYPE, COMBINED_CONFIDENCE, METHODS_USED, COMPLIANCE_TAGS
+                        FROM {_fqn}
+                        WHERE DATABASE_NAME = %(db)s AND SCHEMA_NAME = %(sc)s AND TABLE_NAME = %(tb)s
+                        ORDER BY COLUMN_NAME
+                    """
+                    try:
+                        rows = snowflake_connector.execute_query(sql, {"db": db, "sc": sc, "tb": tbl}) or []
+                        if rows:
+                            cols_detect = rows
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                cols_detect = []
+
+            # Build editable grid
+            editor_rows = []
+            for c in (cols_detect or []):
+                editor_rows.append({
+                    "Column Name": c.get("COLUMN_NAME") or c.get("column"),
+                    "Sensitivity Type": c.get("DETECTED_TYPE") or c.get("sensitivity_level") or c.get("category") or "",
+                    "C": 0,
+                    "A": 0,
+                    "I": 0,
+                    "Recommended Policies": ", ".join((c.get("METHODS_USED") or []) if isinstance(c.get("METHODS_USED"), list) else []),
+                    "Bundle": "",
+                    "Need Review": False,
+                    "Reason / Justification": "",
+                    "Keywords": "",
+                })
+            df_edit = _pd.DataFrame(editor_rows)
+            _orig_key = f"orig_edit_{selected_full_name}"
+            if not df_edit.empty:
+                st.session_state[_orig_key] = df_edit.copy()
+            edited = st.data_editor(
+                df_edit,
+                use_container_width=True,
+                num_rows="fixed",
+                hide_index=True,
+            ) if not df_edit.empty else None
+
+            if edited is not None and st.button("Save Changes", key=f"save_edits_{selected_full_name}"):
+                try:
+                    orig = st.session_state.get(_orig_key, _pd.DataFrame())
+                    user = None
+                    try:
+                        ident = authz.get_current_identity()
+                        user = getattr(ident, "user", None)
+                    except Exception:
+                        user = None
+                    actor = str(user or st.session_state.get("user") or "user")
+                    ts = __import__('datetime').datetime.utcnow().isoformat() + 'Z'
+                    for idx in range(len(edited)):
+                        row_new = edited.iloc[idx].to_dict()
+                        row_old = orig.iloc[idx].to_dict() if idx < len(orig) else {k: None for k in row_new}
+                        col_name = row_new.get("Column Name")
+                        path = {"table": selected_full_name, "column": col_name}
+                        for field in [
+                            "Sensitivity Type","C","A","I","Recommended Policies","Bundle","Need Review","Reason / Justification","Keywords"
+                        ]:
+                            if str(row_new.get(field)) != str(row_old.get(field)):
+                                change_payload = {
+                                    "username": actor,
+                                    "timestamp": ts,
+                                    "action_type": "edit",
+                                    "field": field,
+                                    "old_value": row_old.get(field),
+                                    "new_value": row_new.get(field),
+                                    "object_path": path,
+                                    "comment": row_new.get("Reason / Justification"),
+                                }
+                                try:
+                                    if _svc and hasattr(_svc, 'audit_change'):
+                                        _svc.audit_change(selected_full_name, str(col_name or ""), "EDIT", change_payload)
+                                except Exception:
+                                    pass
+                        # Persist override aggregate for column
+                        try:
+                            ov = {
+                                "sensitivity_type": row_new.get("Sensitivity Type"),
+                                "C": row_new.get("C"),
+                                "A": row_new.get("A"),
+                                "I": row_new.get("I"),
+                                "policies": [s.strip() for s in str(row_new.get("Recommended Policies") or "").split(',') if s.strip()],
+                                "bundle": row_new.get("Bundle"),
+                                "need_review": bool(row_new.get("Need Review")),
+                                "reason": row_new.get("Reason / Justification"),
+                                "keywords": [s.strip() for s in str(row_new.get("Keywords") or "").split(',') if s.strip()],
+                            }
+                            if _svc and hasattr(_svc, 'persist_column_overrides'):
+                                _svc.persist_column_overrides(selected_full_name, str(col_name or ""), ov)
+                        except Exception:
+                            pass
+                    st.success("Changes saved and audited.")
+                except Exception as e:
+                    st.error(f"Failed to save changes: {e}")
+
+        # Minimal debug expander
+        show_debug = st.checkbox("Show Debug Info", value=False)
+        if show_debug:
+            with st.expander("🔍 Debug Information", expanded=False):
+                try:
+                    cfg = getattr(ai_classification_service, '_sensitivity_config', {})
+                    st.json({
+                        "config_keys": list(cfg.keys()) if isinstance(cfg, dict) else [],
+                        "use_snowflake": bool(getattr(ai_classification_service, 'use_snowflake', False)),
+                    })
+                except Exception as e:
+                    st.error(f"Error getting debug info: {str(e)}")
+
+   
 
     # Guided Workflow
     with sub_guided:
@@ -1239,7 +1738,7 @@ with tab_new:
                 pii_flag = False; fin_flag = False
                 try:
                     db = _active_db_from_filter()
-                    gv = st.session_state.get("governance_schema") or "DATA_GOVERNANCE"
+                    gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
                     rowi = snowflake_connector.execute_query(
                         f"""
                         select PII_DETECTED, FINANCIAL_DATA_DETECTED
@@ -1310,9 +1809,122 @@ with tab_new:
             if run_scan:
                 try:
                     from src.services.ai_classification_service import ai_classification_service as _svc
+                    from src.services.sensitive_detection import classify_table_sensitivity
+                    
+                    # Set the mode (virtual or real)
                     try:
                         _svc.set_mode(False if use_virtual else True)
-                    except Exception:
+                        
+                        # Ensure we have the latest config
+                        _db = _active_db_from_filter()
+                        if _db:
+                            _sc_fqn = f"{_db}.DATA_CLASSIFICATION_GOVERNANCE"
+                            _svc.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn)
+                    except Exception as e:
+                        st.warning(f"Could not update service mode: {str(e)}")
+                    
+                    # Show loading state
+                    with st.spinner("Analyzing tables for sensitive data..."):
+                        results = []
+                        for tbl in selected_tables:
+                            try:
+                                # Get sample data
+                                df_sample = _svc.get_table_sample(tbl, sample_size=min(1000, int(sample_n)))
+                                
+                                # Check if we got valid data
+                                if df_sample is None or df_sample.empty:
+                                    st.warning(f"No data returned for table: {tbl}")
+                                    continue
+                                    
+                                # Perform sensitivity analysis
+                                sensitivity_result = classify_table_sensitivity(
+                                    table_name=tbl,
+                                    df=df_sample,
+                                    column_meta=None,
+                                    probability_threshold=0.5
+                                )
+                                
+                                # Process results
+                                if sensitivity_result and 'columns' in sensitivity_result:
+                                    sensitive_cols = [
+                                        col for col in sensitivity_result['columns'] 
+                                        if col.get('sensitive', False)
+                                    ]
+                                    
+                                    results.append({
+                                        "Table": tbl,
+                                        "Sensitive Columns": len(sensitive_cols),
+                                        "Total Columns": len(sensitivity_result['columns']),
+                                        "Score": sensitivity_result.get('score', 0),
+                                        "Sensitive": len(sensitive_cols) > 0
+                                    })
+                                    
+                                    # Store detailed results for drill-down
+                                    st.session_state.setdefault("sensitivity_results", {})[tbl] = {
+                                        "result": sensitivity_result,
+                                        "sample_data": df_sample.head(10).to_dict('records'),
+                                        "timestamp": datetime.now().isoformat()
+                                    }
+                                    
+                            except Exception as e:
+                                st.error(f"Error analyzing table {tbl}: {str(e)}")
+                                if show_debug:
+                                    import traceback
+                                    st.code(traceback.format_exc())
+                    
+                    # Display results
+                    if results:
+                        import pandas as pd
+                        results_df = pd.DataFrame(results).sort_values(
+                            by=["Sensitive", "Score"], 
+                            ascending=[False, False]
+                        )
+                        st.dataframe(results_df, use_container_width=True)
+                        
+                        # Show detailed view for selected table
+                        selected_table = st.selectbox(
+                            "Select a table to view details:",
+                            [r["Table"] for r in results if r["Sensitive"]],
+                            index=0 if any(r["Sensitive"] for r in results) else None
+                        )
+                        
+                        if selected_table and selected_table in st.session_state.get("sensitivity_results", {}):
+                            result = st.session_state["sensitivity_results"][selected_table]["result"]
+                            sample_data = st.session_state["sensitivity_results"][selected_table]["sample_data"]
+                            
+                            st.subheader(f"Details for {selected_table}")
+                            
+                            # Show sensitive columns
+                            sensitive_cols = [
+                                col for col in result.get('columns', []) 
+                                if col.get('sensitive', False)
+                            ]
+                            
+                            if sensitive_cols:
+                                st.markdown("### Sensitive Columns Detected")
+                                for col in sensitive_cols:
+                                    with st.expander(f"🔴 {col.get('column')} - {col.get('type', 'Unknown')}"):
+                                        st.json(col)
+                            else:
+                                st.info("No sensitive columns detected in this table.")
+                            
+                            # Show sample data
+                            st.markdown("### Sample Data")
+                            st.dataframe(pd.DataFrame(sample_data), use_container_width=True)
+                            
+                            # Show raw result in debug mode
+                            if show_debug:
+                                st.markdown("### Raw Analysis Result")
+                                st.json(result)
+                    
+                    else:
+                        st.warning("No tables were analyzed. Please check your selection and try again.")
+                    
+                except Exception as e:
+                    st.error(f"Error during analysis: {str(e)}")
+                    if show_debug:
+                        import traceback
+                        st.code(traceback.format_exc())
                         pass
                     # Apply context from filters/inputs
                     try:
@@ -1431,6 +2043,12 @@ with tab_new:
                                         pass
                                 except Exception:
                                     pass
+                            
+                                # Ensure detector summary object exists to avoid NameError
+                                try:
+                                    det  # noqa: F821 - check existence only
+                                except NameError:
+                                    det = {"table": {}, "columns": cols or []}
                             
                                 # Actions area for table
                                 st.markdown("###### Actions")
@@ -1735,75 +2353,21 @@ with tab_new:
                 except Exception as e:
                     pass
 
-    # AI Assistant
-    with sub_ai:
-        st.caption("AI Assistant: Global scan and per-table column detection")
-        # --- Controls & dynamic configuration ---
-        try:
-            st.session_state.setdefault("ai_overrides", {"tables": {}, "columns": {}})
-        except Exception:
-            pass
-        c_cfg1, c_cfg2, c_cfg3 = st.columns([1,1,1])
-        with c_cfg1:
-            try:
-                _def_sample = int(st.session_state.get("ai_table_sample_size") or 200)
-            except Exception:
-                _def_sample = 200
-            sample_sz = st.number_input(
-                "AI sample size (rows)", min_value=50, max_value=2000, value=int(_def_sample), step=50, key="ai_cfg_sample_rows"
-            )
-            try:
-                st.session_state["ai_table_sample_size"] = int(sample_sz)
-            except Exception:
-                pass
-        with c_cfg2:
-            legacy = st.toggle("Enable legacy regex profiling", value=bool(st.session_state.get("ai_enable_legacy_regex", False)), key="ai_cfg_legacy")
-            try:
-                st.session_state["ai_enable_legacy_regex"] = bool(legacy)
-            except Exception:
-                pass
-        with c_cfg3:
-            full_scan_priority = st.toggle("Allow full-table scan (small tables)", value=False, help="May increase accuracy and cost", key="ai_cfg_fullscan")
-        def _get_all_tables_for_ai_assist() -> List[str]:
-            """Return a list of fully-qualified table names for AI Assist selection.
-            Governance-first: read from DATA_CLASSIFICATION_GOVERNANCE.ASSETS only.
-            """
-            try:
-                gv_db = resolve_governance_db() or _active_db_from_filter()
-                # Optional default DB override from settings
+            @st.cache_data(ttl=30)
+            def _inv_tables_for_db(db: str, gv_schema: str, sel_db: str) -> List[str]:
                 try:
-                    if (gv_db is None) and (settings is not None):
-                        gv_db = settings.get("DEFAULT_DATABASE") or settings.get("CATALOG_DATABASE")
+                    rows = snowflake_connector.execute_query(
+                        f"""
+                        SELECT FULL_NAME
+                        FROM {db}.{gv_schema}.ASSET_INVENTORY
+                        WHERE SPLIT_PART(FULL_NAME, '.', 1) = %(sdb)s
+                        ORDER BY FULL_NAME
+                        """,
+                        {"sdb": sel_db},
+                    ) or []
+                    return [r.get("FULL_NAME") for r in rows]
                 except Exception:
-                    pass
-                rows = snowflake_connector.execute_query(
-                    f"""
-                    select DATABASE_NAME||'.'||SCHEMA_NAME||'.'||TABLE_NAME as FULL_NAME
-                    from {gv_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                    where coalesce(IS_ACTIVE, true)
-                    order by coalesce(RISK_SCORE,0) desc, coalesce(ROW_COUNT,0) desc, coalesce(LAST_MODIFIED_DATE, to_timestamp_ntz('1970-01-01')) desc, 1
-                    limit 5000
-                    """
-                ) or []
-                return [str(r.get("FULL_NAME")) for r in rows if r.get("FULL_NAME")]
-            except Exception:
-                return []
-
-        @st.cache_data(ttl=30)
-        def _inv_tables_for_db(db: str, gv_schema: str, sel_db: str) -> List[str]:
-            try:
-                rows = snowflake_connector.execute_query(
-                    f"""
-                    SELECT FULL_NAME
-                    FROM {db}.{gv_schema}.ASSET_INVENTORY
-                    WHERE SPLIT_PART(FULL_NAME, '.', 1) = %(sdb)s
-                    ORDER BY FULL_NAME
-                    """,
-                    {"sdb": sel_db},
-                ) or []
-                return [r.get("FULL_NAME") for r in rows]
-            except Exception:
-                return []
+                    return []
 
         def _sf_apply_tags(asset_full_name, tags):
             """Apply Snowflake tags via tagging_service or ALTER statements."""
@@ -2126,76 +2690,159 @@ with tab_new:
                         continue
             return rows
 
-        # Session state containers
-        st.session_state.setdefault("ai_sensitive_cols", {})
-        st.session_state.setdefault("ai_compliance_flags", {})
-        st.session_state.setdefault("ai_suggestions", {})
+        def _trigger_sensitive_scan():
+            """Trigger a sensitive table scan when filters change."""
+            selected_db = st.session_state.get("ai_sensitive_db")
+            if selected_db:  # Only trigger if we have at least a database selected
+                st.session_state["trigger_sensitive_scan"] = True
 
-        # Controls (use Global Filters)
-        _gv = st.session_state.get("governance_schema") or "DATA_GOVERNANCE"
-        gf = st.session_state.get("global_filters") or {}
-        # Support existing local var if present
+
+
+# Session state initialization
+st.session_state.setdefault("ai_sensitive_cols", {})
+st.session_state.setdefault("ai_compliance_flags", {})
+st.session_state.setdefault("ai_suggestions", {})
+
+# Get global filters
+_gv = st.session_state.get("governance_schema") or "DATA_GOVERNANCE"
+gf = st.session_state.get("global_filters") or {}
+
+# Disable standalone Sensitive Tables tab; content is under AI Assistant above
+_DISABLE_STANDALONE_SENSITIVE_TAB = True
+
+# Sensitive Tables Tab
+def _trigger_sensitive_scan():
+    """Trigger a sensitive table scan when filters change."""
+    if st.session_state.get("ai_sensitive_db"):
+        st.session_state["trigger_sensitive_scan"] = True
+
+if False:
+    st.markdown("### Sensitive Table Detection")
+    st.caption("Detect and classify sensitive tables based on column names and data patterns.")
+    
+    # Get current database and schema
+    current_db = _active_db_from_filter()
+    current_schema = st.session_state.get("global_filters", {}).get("schema")
+    
+    # Database and schema selection
+    col1, col2 = st.columns(2)
+    with col1:
+        db_list = [""] + snowflake_connector.execute_query("SHOW DATABASES")
+        selected_db = st.selectbox(
+            "Select Database", 
+            options=db_list, 
+            index=db_list.index(current_db) if current_db in db_list else 0,
+            key="ai_sensitive_db",
+            on_change=_trigger_sensitive_scan
+        )
+    
+    schema_list = [""]
+    if selected_db:
         try:
-            if 'global_sel' in locals() and isinstance(global_sel, dict):
-                gf = {**gf, **global_sel}
-        except Exception:
-            pass
-        db_f = str((gf.get("database") or "")).upper() or None
-        schema_f = str((gf.get("schema") or "")).upper() or None
-        table_f = str((gf.get("table") or "")).upper() or None
-        _db_active = _active_db_from_filter()
-        st.caption("Use the Global Filters (database/schema/table) to scope the sensitive tables list.")
-        if not db_f:
-            st.info("Select a Database in Global Filters to list sensitive tables from DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSET_INVENTORY.")
-            sensitive_rows = []
-        else:
-            # Compute sensitive rows using the fully qualified view; do not depend on _db_active
-            sensitive_rows = _inv_sensitive_tables(_db_active, _gv, db_f, schema_f, table_f)
-        # Build sensitive table list and auto-detected AI suggestions when DB selection changes
-        sensitive_options = [r.get("FULL_NAME") for r in (sensitive_rows or [])]
-        from collections import OrderedDict as _OD
-        sensitive_options = list(_OD((x, None) for x in (sensitive_options or [])).keys())
-        # Debug caption to surface inventory counts for current scope
-        try:
-            _fqn_try = [
-                (f"{_db_active}.{_gv}.ASSET_INVENTORY" if _db_active and _gv else None),
-                "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSET_INVENTORY",
-            ]
-            _fqn_try = [x for x in _fqn_try if x]
-            _total = _sens = None
-            for _fqn in _fqn_try:
-                qtot = f"SELECT COUNT(*) AS CNT FROM {_fqn} WHERE SPLIT_PART(FULL_NAME,'.',1)=%(db)s"
-                if schema_f:
-                    qtot += " AND SPLIT_PART(FULL_NAME,'.',2)=%(sc)s"
-                if table_f:
-                    qtot += " AND SPLIT_PART(FULL_NAME,'.',3)=%(tb)s"
-                rs = snowflake_connector.execute_query(qtot, {k: v for k, v in {"db": db_f, "sc": schema_f, "tb": table_f}.items() if v}) or []
-                _total = int((rs[0] or {}).get("CNT", 0)) if rs else 0
-                qsens = qtot + " AND (COALESCE(PII_DETECTED,FALSE) OR COALESCE(FINANCIAL_DATA_DETECTED,FALSE) OR COALESCE(IP_DATA_DETECTED,FALSE) OR COALESCE(SOC_RELEVANT,FALSE) OR COALESCE(SOX_RELEVANT,FALSE))"
-                rs2 = snowflake_connector.execute_query(qsens, {k: v for k, v in {"db": db_f, "sc": schema_f, "tb": table_f}.items() if v}) or []
-                _sens = int((rs2[0] or {}).get("CNT", 0)) if rs2 else 0
-                break
-            if _total is not None and _sens is not None:
-                st.caption(f"Inventory scope: total={_total}, sensitive={_sens}")
-        except Exception:
-            pass
-        # Persist sensitive tables and trigger auto computation on db change
-        last_db_key = "ai_last_db"
-        if st.session_state.get(last_db_key) != (db_f or ""):
-            # Reset caches on DB change
-            st.session_state["ai_sensitive_tables"] = sensitive_options
-            st.session_state["ai_table_summary"] = {}
-            st.session_state["ai_sensitive_cols"] = {}
-            st.session_state["ai_compliance_flags"] = {}
-            st.session_state["ai_suggestions"] = {}
-            st.session_state[last_db_key] = (db_f or "")
-            # Refresh AI sensitivity configuration so patterns/keywords/weights reflect the active DB
+            schema_list.extend([s[0] for s in snowflake_connector.execute_query(
+                f"SHOW SCHEMAS IN DATABASE {selected_db}")])
+        except Exception as e:
+            st.warning(f"Could not load schemas: {str(e)}")
+    
+    with col2:
+        selected_schema = st.selectbox(
+            "Filter by Schema", 
+            options=schema_list, 
+            index=schema_list.index(current_schema) if current_schema in schema_list else 0,
+            key="ai_sensitive_schema",
+            on_change=_trigger_sensitive_scan
+        )
+    
+    # Trigger scan on filter change or button press
+    if st.session_state.get("trigger_sensitive_scan", False) and selected_db:
+        st.session_state["trigger_sensitive_scan"] = False
+        with st.spinner("Scanning for sensitive tables..."):
             try:
-                _sel_db = (db_f or st.session_state.get("db_filter") or st.session_state.get("global_db_filter"))
-                _sc_fqn = (f"{_sel_db}.DATA_CLASSIFICATION_GOVERNANCE" if _sel_db else None)
-                ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn)
-            except Exception:
-                pass
+                results = _detect_sensitive_tables(
+                    database=selected_db,
+                    schema=selected_schema if selected_schema else None,
+                    sample_size=1000
+                )
+                st.session_state["sensitive_tables"] = results
+            except Exception as e:
+                st.error(f"Error during sensitive table detection: {str(e)}")
+    
+    # Manual scan button
+    if st.button("🔍 Scan for Sensitive Tables"):
+        st.session_state["trigger_sensitive_scan"] = True
+        st.experimental_rerun()
+    
+    # Display results if available
+    if "sensitive_tables" in st.session_state and st.session_state["sensitive_tables"]:
+        results = st.session_state["sensitive_tables"]
+        
+        # Filter by sensitivity level
+        sensitivity_filter = st.multiselect(
+            "Filter by Sensitivity",
+            options=["HIGH", "MEDIUM"],
+            default=["HIGH"],
+            key="sensitivity_filter"
+        )
+        
+        # Apply filters
+        filtered_results = [
+            t for t in results 
+            if t['sensitivity_level'] in sensitivity_filter
+        ]
+        
+        if not filtered_results:
+            st.info("No tables match the selected filters.")
+        else:
+            # Display summary table
+            summary_data = []
+            for table in filtered_results:
+                summary_data.append({
+                    "Schema": table['schema'],
+                    "Table": table['table'],
+                    "Sensitivity": table['sensitivity_level'],
+                    "Confidence": f"{table['confidence_score']:.0%}",
+                    "Sensitive Columns": table['high_sensitivity_cols'] + table['medium_sensitivity_cols']
+                })
+            
+            st.dataframe(
+                pd.DataFrame(summary_data),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Show details for each table
+            for table in filtered_results:
+                with st.expander(f"{table['schema']}.{table['table']} - {table['sensitivity_level']}"):
+                    st.markdown("#### Column Analysis")
+                    col_details = []
+                    for col in table['columns']:
+                        if col['sensitivity_level'] != 'LOW':
+                            col_details.append({
+                                "Column": col['column'],
+                                "Type": col['data_type'],
+                                "Sensitivity": col['sensitivity_level'],
+                                "Score": f"{col['sensitivity_score']:.0%}"
+                            })
+                    
+                    if col_details:
+                        st.dataframe(
+                            pd.DataFrame(col_details),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                    else:
+                        st.info("No sensitive columns detected in this table.")
+                    
+                    # Add action buttons
+                    if st.button("View Sample Data", key=f"view_sample_{table['schema']}_{table['table']}"):
+                        try:
+                            sample_query = f"SELECT * FROM {table['database']}.{table['schema']}.{table['table']} LIMIT 10"
+                            sample_data = snowflake_connector.execute_query(sample_query)
+                            st.dataframe(pd.DataFrame(sample_data or []))
+                        except Exception as e:
+                            st.error(f"Error fetching sample data: {str(e)}")
+        
+            # Removed 'AI Analysis' tab and its content
         # Helper: compute table-level suggestions and compliance
         def _compute_table_ai(fqn: str) -> dict:
             try:
@@ -3085,43 +3732,45 @@ with tab_tasks:
                         snowflake_connector.execute_non_query(
                             f"""
                             create table if not exists {db}.{gv}.CLASSIFICATION_REVIEW (
-                              REVIEW_ID string,
-                              ASSET_FULL_NAME string,
-                              PROPOSED_CLASSIFICATION string,
-                              PROPOSED_C number,
-                              PROPOSED_I number,
-                              PROPOSED_A number,
-                              REVIEWER string,
-                              STATUS string,
-                              CREATED_BY string,
-                              CREATED_AT timestamp_tz default current_timestamp(),
-                              UPDATED_AT timestamp_tz,
-                              REVIEW_DUE_DATE timestamp_tz,
-                              LAST_COMMENT string,
-                              RISK_SCORE number(38,2)
+                                REVIEW_ID string default uuid_string(),
+                                ASSET_FULL_NAME string,
+                                PROPOSED_CLASSIFICATION string,
+                                PROPOSED_C number,
+                                PROPOSED_I number,
+                                PROPOSED_A number,
+                                REVIEWER string,
+                                STATUS string,
+                                CREATED_BY string,
+                                CREATED_AT timestamp_tz default current_timestamp(),
+                                UPDATED_AT timestamp_tz,
+                                REVIEW_DUE_DATE timestamp_tz,
+                                LAST_COMMENT string,
+                                RISK_SCORE number(38,2),
+                                primary key (REVIEW_ID)
                             )
                             """
                         )
-                        # Ensure critical columns/defaults exist (id, timestamps)
-                        try:
-                            snowflake_connector.execute_non_query(
-                                f"alter table if exists {db}.{gv}.CLASSIFICATION_REVIEW add column if not exists REVIEW_ID string default uuid_string()"
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            snowflake_connector.execute_non_query(
-                                f"alter table if exists {db}.{gv}.CLASSIFICATION_REVIEW modify column CREATED_AT set default current_timestamp()"
-                            )
-                        except Exception:
-                            pass
                     except Exception:
                         pass
                     q_mid = f"""
-                        SELECT *
-                        FROM {db}.{gv}.CLASSIFICATION_REVIEW
+                        SELECT 
+                            CR.REVIEW_ID,
+                            CR.ASSET_FULL_NAME,
+                            CR.PROPOSED_CLASSIFICATION,
+                            CR.PROPOSED_C,
+                            CR.PROPOSED_I,
+                            CR.PROPOSED_A,
+                            CR.REVIEWER,
+                            CR.STATUS,
+                            CR.CREATED_BY,
+                            CR.CREATED_AT,
+                            CR.UPDATED_AT,
+                            CR.REVIEW_DUE_DATE,
+                            CR.LAST_COMMENT,
+                            CR.RISK_SCORE
+                        FROM {db}.{gv}.CLASSIFICATION_REVIEW CR
                         {('WHERE ' + ' AND '.join(where)) if where else ''}
-                        ORDER BY COALESCE(REVIEW_DUE_DATE, CREATED_AT, CURRENT_TIMESTAMP()) ASC
+                        ORDER BY COALESCE(CR.REVIEW_DUE_DATE, CR.CREATED_AT, CURRENT_TIMESTAMP()) ASC
                         LIMIT 500
                     """
                     rows_mid = snowflake_connector.execute_query(q_mid, params) or []
@@ -3144,10 +3793,24 @@ with tab_tasks:
                     if lookback:
                         where.append("COALESCE(DATEDIFF(day, CREATED_AT, CURRENT_TIMESTAMP), 0) <= %(lb)s"); params["lb"] = int(lookback)
                     q2 = f"""
-                        SELECT *
+                        SELECT 
+                            ID as REVIEW_ID,
+                            ASSET_FULL_NAME,
+                            REQUESTED_LABEL as PROPOSED_CLASSIFICATION,
+                            NULL as PROPOSED_C,
+                            NULL as PROPOSED_I,
+                            NULL as PROPOSED_A,
+                            NULL as REVIEWER,
+                            STATUS,
+                            REQUESTED_BY as CREATED_BY,
+                            CREATED_AT,
+                            UPDATED_AT,
+                            NULL as REVIEW_DUE_DATE,
+                            NULL as LAST_COMMENT,
+                            NULL as RISK_SCORE
                         FROM {db}.{gv}.RECLASSIFICATION_REQUESTS
                         {('WHERE ' + ' AND '.join(where)) if where else ''}
-                        ORDER BY COALESCE(CREATED_AT, CURRENT_TIMESTAMP()) DESC
+                        ORDER BY COALESCE(CREATED_AT, CURRENT_TIMESTAMP()) ASC
                         LIMIT 500
                     """
                     rows2 = snowflake_connector.execute_query(q2, params) or []

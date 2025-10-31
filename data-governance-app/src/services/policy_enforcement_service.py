@@ -87,7 +87,7 @@ class PolicyEnforcementService:
         detections: list from ai_classification_service.detect_sensitive_columns
         """
         policy_db = policy_db or settings.SNOWFLAKE_DATABASE
-        policy_schema = policy_schema or 'DATA_GOVERNANCE'
+        policy_schema = policy_schema or 'DATA_CLASSIFICATION_GOVERNANCE'
         created: list[str] = []
         applied: list[dict] = []
 

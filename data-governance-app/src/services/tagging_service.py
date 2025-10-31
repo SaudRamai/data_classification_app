@@ -19,38 +19,66 @@ from src.config.settings import settings
 logger = logging.getLogger(__name__)
 
 
-ALLOWED_CLASSIFICATIONS = ["Public", "Internal", "Restricted", "Confidential"]
-ALLOWED_CIA = ["0", "1", "2", "3"]  # store as strings in tags
-ALLOWED_SPECIAL_CATEGORIES = [
-    "PII", "PHI", "PCI", "SOX", "Financial", "Auth", "Confidential", "Other"
-]
-ALLOWED_COMPLIANCE_CATEGORIES = [
-    "GDPR", "CCPA", "HIPAA", "SOX", "PCI DSS", "SOC", "Internal/Other"
-]
-ALLOWED_REVIEW_STATUS = [
-    "Pending Reclassification", "Due Soon", "Overdue", "Reviewed"
-]
+def _load_allowed_values(connector, value_type: str) -> List[str]:
+    """Load allowed values for a specific tag type from the database"""
+    try:
+        rows = connector.execute_query(
+            """
+            SELECT VALUE 
+            FROM DATA_CLASSIFICATION_GOVERNANCE.TAG_ALLOWED_VALUES
+            WHERE TAG_TYPE = %(type)s
+            ORDER BY DISPLAY_ORDER, VALUE
+            """,
+            {"type": value_type}
+        ) or []
+        return [str(r["VALUE"]) for r in rows]
+    except Exception as e:
+        print(f"Warning: Could not load allowed values for {value_type}: {str(e)}")
+        # Default fallback values if database is not available
+        defaults = {
+            "CLASSIFICATION": ["Public", "Internal", "Restricted", "Confidential"],
+            "CIA_LEVEL": ["0", "1", "2", "3"],
+            "SPECIAL_CATEGORY": ["PII", "PHI", "PCI", "SOX", "Financial", "Auth", "Confidential", "Other"],
+            "COMPLIANCE_CATEGORY": ["GDPR", "CCPA", "HIPAA", "SOX", "PCI DSS", "SOC", "Internal/Other"],
+            "REVIEW_STATUS": ["Pending Reclassification", "Due Soon", "Overdue", "Reviewed"]
+        }
+        return defaults.get(value_type, [])
 
 TAG_DB = settings.SNOWFLAKE_DATABASE
 TAG_SCHEMA = "DATA_GOVERNANCE"
 
-TAG_DEFINITIONS = {
-    "DATA_CLASSIFICATION": ALLOWED_CLASSIFICATIONS,
-    "CONFIDENTIALITY_LEVEL": ALLOWED_CIA,
-    "INTEGRITY_LEVEL": ALLOWED_CIA,
-    "AVAILABILITY_LEVEL": ALLOWED_CIA,
-    # New tags to capture detected sensitive category and mapped compliance frameworks
-    "SPECIAL_CATEGORY": ALLOWED_SPECIAL_CATEGORIES,
-    # COMPLIANCE_CATEGORY supports multi-valued CSV (e.g., "GDPR,CCPA"). Validation ensures each value is allowed.
-    "COMPLIANCE_CATEGORY": ALLOWED_COMPLIANCE_CATEGORIES,
-    # Lifecycle & Review tags
-    # Dates must be YYYY-MM-DD; REVIEW_STATUS from ALLOWED_REVIEW_STATUS
-    "LAST_CLASSIFIED_DATE": "__DATE__",
-    "LAST_REVIEW_DATE": "__DATE__",
-    "REVIEW_STATUS": ALLOWED_REVIEW_STATUS,
-    # Explicit enforcement override for masking (TRUE/FALSE)
-    "MASKING_EXEMPT": ["TRUE", "FALSE"],
-}
+def get_tag_definitions() -> Dict[str, Any]:
+    """Load all tag definitions from the database with fallback to defaults."""
+    return {
+        # Classification and CIA levels
+        "DATA_CLASSIFICATION": _load_allowed_values(snowflake_connector, "CLASSIFICATION"),
+        "CONFIDENTIALITY_LEVEL": _load_allowed_values(snowflake_connector, "CIA_LEVEL"),
+        "INTEGRITY_LEVEL": _load_allowed_values(snowflake_connector, "CIA_LEVEL"),
+        "AVAILABILITY_LEVEL": _load_allowed_values(snowflake_connector, "CIA_LEVEL"),
+        
+        # Data categories and compliance
+        "SPECIAL_CATEGORY": _load_allowed_values(snowflake_connector, "SPECIAL_CATEGORY"),
+        "COMPLIANCE_CATEGORY": _load_allowed_values(snowflake_connector, "COMPLIANCE_CATEGORY"),
+        
+        # Lifecycle & Review tags
+        "LAST_CLASSIFIED_DATE": "__DATE__",
+        "LAST_REVIEW_DATE": "__DATE__",
+        "REVIEW_STATUS": _load_allowed_values(snowflake_connector, "REVIEW_STATUS"),
+        
+        # Explicit enforcement override for masking (TRUE/FALSE)
+        "MASKING_OVERRIDE": ["TRUE", "FALSE"],
+        
+        # Additional metadata tags
+        "DATA_OWNER": "__TEXT__",
+        "DATA_STEWARD": "__TEXT__",
+        "RETENTION_DAYS": "__NUMBER__",
+    }
+
+# Initialize tag definitions
+TAG_DEFINITIONS = get_tag_definitions()
+TAG_DEFINITIONS.update({
+    "MASKING_EXEMPT": ["TRUE", "FALSE"]
+})
 
 
 class TaggingService:
@@ -91,6 +119,90 @@ class TaggingService:
         ident = str(ident)
         return '"' + ident.replace('"', '""') + '"'
 
+    def _load_sensitivity_patterns(self) -> Dict[str, Dict]:
+        """Load sensitivity patterns and categories from database"""
+        try:
+            # Load patterns from database
+            patterns = {}
+            
+            # Load sensitive patterns
+            rows = self.connector.execute_query("""
+                SELECT 
+                    CATEGORY,
+                    PATTERN,
+                    SENSITIVITY_LEVEL,
+                    IS_STRICT
+                FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS
+                WHERE IS_ACTIVE = TRUE
+                ORDER BY PRIORITY DESC
+            """) or []
+            
+            # Group patterns by category
+            for row in rows:
+                category = str(row['CATEGORY'])
+                if category not in patterns:
+                    patterns[category] = {
+                        'sensitivity_level': int(row['SENSITIVITY_LEVEL']),
+                        'is_strict': bool(row['IS_STRICT']),
+                        'keywords': []
+                    }
+                patterns[category]['keywords'].append(str(row['PATTERN']).upper())
+            
+            # Load sensitivity levels
+            levels = {}
+            rows = self.connector.execute_query("""
+                SELECT 
+                    LEVEL_NAME,
+                    LEVEL_VALUE,
+                    DISPLAY_NAME
+                FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_LEVELS
+                ORDER BY LEVEL_VALUE
+            """) or []
+            
+            for row in rows:
+                levels[int(row['LEVEL_VALUE'])] = {
+                    'name': str(row['LEVEL_NAME']),
+                    'display': str(row['DISPLAY_NAME'])
+                }
+            
+            return {
+                'patterns': patterns,
+                'levels': levels
+            }
+            
+        except Exception as e:
+            print(f"Warning: Failed to load sensitivity patterns: {str(e)}")
+            # Fallback to default patterns
+            return {
+                'patterns': {
+                    'PII_STRICT': {
+                        'sensitivity_level': 3,
+                        'is_strict': True,
+                        'keywords': ["SSN", "NATIONAL_ID", "PASSPORT", "PAN", "AADHAAR"]
+                    },
+                    'PII': {
+                        'sensitivity_level': 2,
+                        'is_strict': False,
+                        'keywords': ["SSN", "EMAIL", "PHONE", "ADDRESS", "DOB", "PII", "PERSON", "EMPLOYEE", "CUSTOMER"]
+                    },
+                    'FINANCIAL': {
+                        'sensitivity_level': 2,
+                        'is_strict': False,
+                        'keywords': ["GL", "LEDGER", "REVENUE", "EXPENSE", "PAYROLL"]
+                    },
+                    'SOX': {
+                        'sensitivity_level': 3,
+                        'is_strict': True,
+                        'keywords': ["SOX", "FINANCIAL_REPORT", "AUDIT", "IFRS", "GAAP"]
+                    }
+                },
+                'levels': {
+                    1: {'name': 'INTERNAL', 'display': 'Internal'},
+                    2: {'name': 'RESTRICTED', 'display': 'Restricted'},
+                    3: {'name': 'CONFIDENTIAL', 'display': 'Confidential'}
+                }
+            }
+    
     # --- Policy 5.5 enforcement helper ---
     def _required_minimums(self, asset_full_name: str) -> Tuple[int, str]:
         """Return (min_confidentiality_level, min_label) based on asset name heuristics.
@@ -99,21 +211,26 @@ class TaggingService:
         up = (asset_full_name or "").upper()
         min_c = 1
         min_label = "Internal"
-        # Sensitive PII keys => C3 Confidential
-        if any(k in up for k in ["SSN","NATIONAL_ID","PASSPORT","PAN","AADHAAR"]):
-            min_c = max(min_c, 3)
-            min_label = "Confidential"
-        # PII baseline => C2 Restricted
-        if any(k in up for k in ["SSN","EMAIL","PHONE","ADDRESS","DOB","PII","PERSON","EMPLOYEE","CUSTOMER"]):
-            min_c = max(min_c, 2)
-            if min_c < 3:
-                min_label = "Restricted"
-        # Financial/SOX cues => at least C2 Restricted (elevate to C3 for strong cues)
-        if any(k in up for k in ["SOX","FINANCIAL_REPORT","GL","LEDGER","REVENUE","EXPENSE","PAYROLL","AUDIT","IFRS","GAAP"]):
-            min_c = max(min_c, 2)
-            if "SOX" in up or "FINANCIAL_REPORT" in up or "AUDIT" in up or "IFRS" in up or "GAAP" in up:
-                min_c = max(min_c, 3)
-            min_label = "Confidential" if min_c >= 3 else "Restricted"
+        
+        # Load patterns from database
+        patterns = self._load_sensitivity_patterns()
+        
+        # Check each pattern category
+        for category, config in patterns['patterns'].items():
+            keywords = config.get('keywords', [])
+            level = config.get('sensitivity_level', 1)
+            is_strict = config.get('is_strict', False)
+            
+            # Check if any keyword matches
+            if any(k in up for k in keywords):
+                min_c = max(min_c, level)
+                if is_strict:
+                    min_c = max(min_c, 3)  # Strict patterns always get highest level
+                
+                # Update label if needed
+                if min_c > 1:
+                    min_label = patterns['levels'].get(min_c, {}).get('display', 'Restricted')
+        
         return min_c, min_label
 
     def _enforce_policy_minimums(self, asset_full_name: str, tags: Dict[str, str]) -> None:

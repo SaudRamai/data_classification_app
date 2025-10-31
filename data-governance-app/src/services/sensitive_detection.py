@@ -21,6 +21,7 @@ Notes:
 """
 from __future__ import annotations
 
+import logging
 import math
 import re
 import statistics
@@ -42,6 +43,9 @@ try:
 except Exception:
     snowflake_connector = None  # type: ignore
     settings = None  # type: ignore
+
+# Module logger
+logger = logging.getLogger(__name__)
 
 # Optional embeddings model for semantic similarity
 _EMB_MODEL = None
@@ -77,18 +81,185 @@ except Exception:
 
 
 # ---------------------- Regex Catalog ----------------------
-# All regex patterns must be provided by governance config tables (SENSITIVE_PATTERNS).
-# Keep an empty default to ensure we never rely on hard-coded expressions.
+# All regex patterns are loaded from the database (SENSITIVE_PATTERNS table).
+# These will be populated on first use via _load_patterns_from_db()
 _REGEX_PATTERNS: Dict[str, List[str]] = {}
-
-# Name tokens mapping to sensitive categories (for hints)
 _NAME_TOKENS: Dict[str, List[str]] = {}
+_CATEGORY_WEIGHTS: Dict[str, float] = {}
+_PATTERNS_LOADED = False
 
-_CATEGORY_WEIGHTS: Dict[str, float] = {
-    "PII": 1.0,
-    "PHI": 0.95,
-    "Financial": 0.9,
-}
+def _load_patterns_from_db() -> None:
+    """Load patterns and configurations from the database with proper schema qualification."""
+    global _REGEX_PATTERNS, _NAME_TOKENS, _CATEGORY_WEIGHTS, _PATTERNS_LOADED
+    
+    if _PATTERNS_LOADED or snowflake_connector is None:
+        return
+        
+    try:
+        # Check if tables exist first
+        tables = snowflake_connector.execute_query(
+            "SHOW TABLES LIKE 'SENSITIVE_%' IN SCHEMA DATA_CLASSIFICATION_GOVERNANCE"
+        )
+        
+        if not tables:
+            logger.warning("Sensitivity tables not found in DATA_CLASSIFICATION_GOVERNANCE schema")
+            return
+            
+        # Load patterns from SENSITIVE_PATTERNS
+        patterns = snowflake_connector.execute_query(
+            """
+            SELECT 
+                p.PATTERN_NAME as name,
+                p.PATTERN_STRING as pattern,
+                c.CATEGORY_NAME as category,
+                p.SENSITIVITY_WEIGHT as weight
+            FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS p
+            JOIN DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES c 
+                ON p.CATEGORY_ID = c.CATEGORY_ID
+            WHERE p.IS_ACTIVE = TRUE
+            AND c.IS_ACTIVE = TRUE
+            """
+        ) or []
+        
+        # Load keywords from SENSITIVE_KEYWORDS
+        keywords = snowflake_connector.execute_query(
+            """
+            SELECT 
+                k.KEYWORD_STRING as keyword,
+                c.CATEGORY_NAME as category,
+                k.SENSITIVITY_WEIGHT as weight,
+                k.MATCH_TYPE as match_type
+            FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS k
+            JOIN DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES c 
+                ON k.CATEGORY_ID = c.CATEGORY_ID
+            WHERE k.IS_ACTIVE = TRUE
+            AND c.IS_ACTIVE = TRUE
+            """
+        ) or []
+        
+        # Load categories and weights
+        categories = snowflake_connector.execute_query(
+            """
+            SELECT 
+                CATEGORY_NAME as name,
+                CONFIDENTIALITY_LEVEL as c_level,
+                INTEGRITY_LEVEL as i_level,
+                AVAILABILITY_LEVEL as a_level,
+                DETECTION_THRESHOLD as threshold
+            FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES
+            WHERE IS_ACTIVE = TRUE
+            """
+        ) or []
+        
+        # Process patterns
+        _REGEX_PATTERNS = {}
+        for p in patterns:
+            cat = p['category']
+            if cat not in _REGEX_PATTERNS:
+                _REGEX_PATTERNS[cat] = []
+            try:
+                re.compile(p['pattern'])  # Validate pattern
+                _REGEX_PATTERNS[cat].append({
+                    'pattern': p['pattern'],
+                    'weight': float(p['weight']) if p['weight'] is not None else 1.0,
+                    'name': p['name']
+                })
+            except re.error as e:
+                logger.warning(f"Invalid regex pattern {p['pattern']}: {str(e)}")
+        
+        # Process keywords
+        _NAME_TOKENS = {}
+        for k in keywords:
+            cat = k['category']
+            if cat not in _NAME_TOKENS:
+                _NAME_TOKENS[cat] = []
+            _NAME_TOKENS[cat].append({
+                'token': k['keyword'],
+                'weight': float(k['weight']) if k['weight'] is not None else 1.0,
+                'match_type': k['match_type'] or 'EXACT'
+            })
+        
+        # Process categories and weights
+        _CATEGORY_WEIGHTS = {}
+        for c in categories:
+            category_name = c['name'].upper()
+            _CATEGORY_WEIGHTS[category_name] = {
+                'c_level': int(c['c_level']) if c['c_level'] is not None else 1,
+                'i_level': int(c['i_level']) if c['i_level'] is not None else 1,
+                'a_level': int(c['a_level']) if c['a_level'] is not None else 1,
+                'threshold': float(c['threshold']) if c['threshold'] is not None else 0.5
+            }
+        
+        # Load sensitivity weights if available
+        try:
+            weight_rows = snowflake_connector.execute_query("""
+                SELECT 
+                    w.CATEGORY, 
+                    w.WEIGHT 
+                FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_WEIGHTS w
+                WHERE w.IS_ACTIVE = TRUE
+            """) or []
+            
+            for row in weight_rows:
+                if not row:
+                    continue
+                category = str(row.get('CATEGORY', '')).strip().upper()
+                weight = float(row.get('WEIGHT', 1.0))
+                if category in _CATEGORY_WEIGHTS:
+                    _CATEGORY_WEIGHTS[category]['weight'] = weight
+                    
+        except Exception as e:
+            logger.warning(f"Could not load category weights: {str(e)}")
+            # Use default weights if we couldn't load them
+            for category in _CATEGORY_WEIGHTS:
+                _CATEGORY_WEIGHTS[category]['weight'] = 1.0
+        
+        _PATTERNS_LOADED = True
+        
+    except Exception as e:
+        import traceback
+        import sys
+        error_msg = f"Error in _load_patterns_from_db: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg, file=sys.stderr)
+        
+        # Log to audit if available
+        try:
+            snowflake_connector.execute_query(
+                """
+                INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.AUDIT_LOG (
+                    AUDIT_ID,
+                    TIMESTAMP, 
+                    USER_ID, 
+                    ACTION, 
+                    RESOURCE_TYPE, 
+                    RESOURCE_ID, 
+                    DETAILS
+                ) VALUES (
+                    UUID_STRING(),
+                    CURRENT_TIMESTAMP(),
+                    CURRENT_USER(),
+                    'ERROR',
+                    'PATTERN_LOAD',
+                    'SENSITIVE_DETECTION',
+                    PARSE_JSON(OBJECT_CONSTRUCT(
+                        'error', %s,
+                        'traceback', %s,
+                        'module', 'sensitive_detection',
+                        'function', '_load_patterns_from_db'
+                    ))
+                )
+                """, 
+                (str(e), traceback.format_exc())
+            )
+        except Exception as audit_err:
+            print(f"Failed to log error to audit: {str(audit_err)}", file=sys.stderr)
+        
+        if st is not None:
+            st.warning(f"Could not load patterns from database: {str(e)}")
+        
+        # Fall back to default patterns if database load fails
+        _load_default_configs()
+        _PATTERNS_LOADED = True  # Mark as loaded to prevent repeated attempts
 
 
 # ---------------------- Utilities ----------------------
@@ -158,10 +329,79 @@ def _series_basic_stats(series: pd.Series) -> Dict[str, float]:
     }
 
 
+def _load_default_configs() -> Dict[str, Any]:
+    """Load default configurations using the dynamic config service."""
+    defaults = {
+        "numeric_stats": {
+            "num_min": 0.0, 
+            "num_max": 0.0, 
+            "num_mean": 0.0, 
+            "num_std": 0.0, 
+            "num_skew": 0.0, 
+            "num_kurt": 0.0
+        },
+        "char_ratios": {
+            "digit_ratio": 0.0, 
+            "alpha_ratio": 0.0, 
+            "space_ratio": 0.0, 
+            "punct_ratio": 0.0
+        },
+        "fuzzy_threshold": 0.8,
+        "exact_match_weight": 1.0,
+        "fuzzy_match_weight": 0.8
+    }
+    
+    if not _load_dynamic_config:
+        logger.debug("Dynamic config service not available, using defaults")
+        return defaults
+    
+    try:
+        # Load all configurations using the dynamic config service
+        config = _load_dynamic_config(force_refresh=False)
+        
+        # Extract thresholds from CIA rules (if available)
+        if config.get('cia_rules'):
+            for category, rules in config['cia_rules'].items():
+                if 'MIN_THRESHOLD' in rules and 'fuzzy_threshold' not in defaults:
+                    defaults['fuzzy_threshold'] = float(rules['MIN_THRESHOLD'])
+        
+        # Extract weights from patterns and keywords
+        if config.get('patterns'):
+            for category, patterns in config['patterns'].items():
+                for pattern in patterns:
+                    if 'weight' in pattern and pattern.get('active', True):
+                        weight = float(pattern['weight'])
+                        if 'exact' in str(pattern.get('match_type', '')).lower():
+                            defaults['exact_match_weight'] = max(defaults['exact_match_weight'], weight)
+                        else:
+                            defaults['fuzzy_match_weight'] = max(defaults['fuzzy_match_weight'], weight)
+        
+        # Update from model config if available in the config service
+        if 'model_config' in config:
+            model_config = config['model_config']
+            if 'fuzzy_threshold' in model_config:
+                defaults['fuzzy_threshold'] = float(model_config['fuzzy_threshold'])
+            if 'exact_match_weight' in model_config:
+                defaults['exact_match_weight'] = float(model_config['exact_match_weight'])
+            if 'fuzzy_match_weight' in model_config:
+                defaults['fuzzy_match_weight'] = float(model_config['fuzzy_match_weight'])
+        
+        print(f"[DEBUG] Loaded dynamic config with thresholds: {defaults}")
+        
+    except Exception as e:
+        print(f"[WARNING] Failed to load configurations from dynamic config service: {str(e)}")
+    
+    return defaults
+
+# Load default configs at module level
+_DEFAULT_CONFIGS = _load_default_configs()
+
 def _series_numeric_stats(series: pd.Series) -> Dict[str, float]:
+    """Compute numeric statistics for a series, using database-configured defaults for empty series."""
     s = pd.to_numeric(series, errors="coerce").dropna()
     if s.empty:
-        return {"num_min": 0.0, "num_max": 0.0, "num_mean": 0.0, "num_std": 0.0, "num_skew": 0.0, "num_kurt": 0.0}
+        return _DEFAULT_CONFIGS["numeric_stats"].copy()
+    
     return {
         "num_min": float(s.min()),
         "num_max": float(s.max()),
@@ -173,14 +413,17 @@ def _series_numeric_stats(series: pd.Series) -> Dict[str, float]:
 
 
 def _series_charclass_ratios(series: pd.Series) -> Dict[str, float]:
+    """Compute character class ratios for a series, using database-configured defaults for empty series."""
     s = series.dropna().astype(str)
     if s.empty:
-        return {"digit_ratio": 0.0, "alpha_ratio": 0.0, "space_ratio": 0.0, "punct_ratio": 0.0}
+        return _DEFAULT_CONFIGS["char_ratios"].copy()
+        
     total = max(1, s.map(len).sum())
     digits = sum(ch.isdigit() for v in s for ch in v)
     alpha = sum(ch.isalpha() for v in s for ch in v)
     spaces = sum(ch.isspace() for v in s for ch in v)
     punct = sum((not ch.isalnum()) and (not ch.isspace()) for v in s for ch in v)
+    
     return {
         "digit_ratio": digits / total,
         "alpha_ratio": alpha / total,
@@ -257,27 +500,37 @@ def _flatten_keywords(cfg: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "match_type": str(it.get("match_type") or "fuzzy").lower(),
                     "weight": float(it.get("weight", 1.0 if (str(it.get("match_type") or "").lower()=="exact") else 0.8)),
                 })
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error processing keyword item: {str(e)}")
                 continue
     return flat
 
 
-def _name_tokens_for(colname: str, cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def _name_hint_categories(col_name: str, cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
-    Map a column name to sensitivity categories using dynamic keywords.
-    Returns: list of {"category","token","weight", "match_type"}
-    Matching:
-      - Exact: normalized equality with tokens or whole-piece match => weight as provided (default 1.0)
-      - Fuzzy: substring/similarity using difflib ratio => weight scaled (default 0.8 * ratio)
+    Extract category hints from column name using dynamic keywords.
+    
+    Keywords are loaded from the SENSITIVE_PATTERNS database table with IS_STRICT=TRUE.
     """
-    try:
-        if cfg is None and st is not None and hasattr(st, "session_state"):
-            cfg = st.session_state.get("sensitivity_config")
-    except Exception:
-        pass
-
-    name_tokens = _split_camel_and_delims(colname)
-    name_norm = _normalize_name(colname)
+    # Ensure patterns are loaded from the database
+    _load_patterns_from_db()
+    
+    if not col_name or not isinstance(col_name, str):
+        return []
+        
+    if not cfg:
+        cfg = _NAME_TOKENS
+        if not cfg:
+            logger.debug("No name tokens available for hinting")
+            return []
+    
+    # Get thresholds and weights from config
+    fuzzy_threshold = _DEFAULT_CONFIGS.get("fuzzy_threshold", 0.8)
+    exact_match_weight = _DEFAULT_CONFIGS.get("exact_match_weight", 1.0)
+    fuzzy_match_weight = _DEFAULT_CONFIGS.get("fuzzy_match_weight", 0.8)
+        
+    name_tokens = _split_camel_and_delims(col_name)
+    name_norm = _normalize_name(col_name)
     if not name_norm:
         return []
 
@@ -286,7 +539,8 @@ def _name_tokens_for(colname: str, cfg: Optional[Dict[str, Any]] = None) -> List
     for it in flat:
         try:
             it["token_norm"] = _normalize_name(it.get("token") or "")
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error normalizing token: {str(e)}")
             it["token_norm"] = ""
 
     hits: List[Dict[str, Any]] = []
@@ -297,16 +551,18 @@ def _name_tokens_for(colname: str, cfg: Optional[Dict[str, Any]] = None) -> List
         tok_norm = it.get("token_norm") or ""
         if not tok_norm:
             continue
+            
         mt = str(it.get("match_type") or "fuzzy").lower()
-        base_w = float(it.get("weight", 0.8 if mt != "exact" else 1.0))
+        base_w = float(it.get("weight", fuzzy_match_weight if mt != "exact" else exact_match_weight))
 
         matched = False
         weight = 0.0
+        
         # Exact: whole normalized string equal or any token-piece equals original keyword (case-insensitive)
         if mt == "exact":
             if name_norm == tok_norm or tok.lower() in [t.lower() for t in name_tokens]:
                 matched = True
-                weight = 1.0 if base_w is None else float(base_w)
+                weight = exact_match_weight if base_w is None else float(base_w)
         else:
             # Fuzzy: substring or similarity against full normalized name and each piece
             if tok_norm in name_norm:
@@ -314,21 +570,25 @@ def _name_tokens_for(colname: str, cfg: Optional[Dict[str, Any]] = None) -> List
                 weight = float(base_w)
             else:
                 # Try best ratio against pieces and full
-                cand_strs = [name_norm] + [ _normalize_name(p) for p in name_tokens ]
+                cand_strs = [name_norm] + [_normalize_name(p) for p in name_tokens]
                 best_ratio = 0.0
                 for s in cand_strs:
                     try:
                         r = SequenceMatcher(None, tok_norm, s).ratio()
                         if r > best_ratio:
                             best_ratio = r
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Error computing similarity ratio: {str(e)}")
                         continue
-                thr = 0.8
+                        
+                # Get threshold from config or use default
+                thr = fuzzy_threshold
                 try:
                     if isinstance(cfg, dict) and isinstance(cfg.get("model_metadata"), dict):
                         thr = float((cfg["model_metadata"].get("thresholds") or {}).get("token_fuzzy_threshold", thr))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error loading threshold: {str(e)}")
+                    
                 if best_ratio >= thr:
                     matched = True
                     weight = float(base_w) * float(best_ratio)
@@ -344,481 +604,20 @@ def _name_tokens_for(colname: str, cfg: Optional[Dict[str, Any]] = None) -> List
     return hits
 
 
-def _compile_dynamic_patterns(cfg: Optional[Dict[str, Any]]) -> Dict[str, List[Tuple[str, Any, float]]]:
-    """
-    Build dynamic pattern catalog from configuration.
-    Returns: {category: [(name, compiled_regex, weight), ...]}
-    """
-    out: Dict[str, List[Tuple[str, Any, float]]] = {}
-    if not cfg:
-        return out
-    try:
-        pats = cfg.get("patterns") or {}
-        if isinstance(pats, dict):
-            for cat, items in (pats or {}).items():
-                for it in (items or []):
-                    try:
-                        rx = str(it.get("regex") or it.get("pattern") or "").strip()
-                        if not rx:
-                            continue
-                        wt = float(it.get("weight", 0.5))
-                        cre = re.compile(rx)
-                        out.setdefault(str(cat), []).append((rx, cre, wt))
-                    except Exception:
-                        continue
-        elif isinstance(pats, list):
-            for it in (pats or []):
-                try:
-                    cat = str(it.get("category") or "").strip()
-                    rx = str(it.get("regex") or it.get("pattern") or "").strip()
-                    if not cat or not rx:
-                        continue
-                    wt = float(it.get("weight", 0.5))
-                    cre = re.compile(rx)
-                    out.setdefault(cat, []).append((rx, cre, wt))
-                except Exception:
-                    continue
-    except Exception:
-        return out
-
-
-def classify_sensitive_columns(features_df: pd.DataFrame, table_name: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Classify sensitive columns using regex, keyword, ML, and semantic hints.
-
-    Args:
-      features_df: DataFrame where each row represents a column and includes fields like
-        - column (str)
-        - regex_hits (list[str]) [optional]
-        - token_hits (list[str]) [optional]
-        - numeric/statistical features (e.g., uniqueness, entropy, ratios)
-      table_name: Optional full table name for persistence.
-
-    Returns: list of dict rows with keys:
-      column, dominant_category, confidence, suggested_cia, related_columns, bundle_boost, regex_hits, token_hits
-    """
-    if features_df is None or features_df.empty:
-        return []
-
-    # Load dynamic config from session if available
-    cfg: Optional[Dict[str, Any]] = None
-    try:
-        if st is not None and hasattr(st, "session_state"):
-            cfg = st.session_state.get("sensitivity_config")
-    except Exception:
-        cfg = None
-
-    # Helper to get CIA mapping from config categories
-    def _cia_for(cat: Optional[str]) -> Dict[str, int]:
-        try:
-            # Governance-driven category priority (fallback to natural order if unavailable)
-            try:
-                cfg = _load_dynamic_config() if _load_dynamic_config is not None else None
-                _prio_seq = []
-                if cfg and isinstance(cfg.get("model_metadata"), dict):
-                    _prio_seq = list(cfg["model_metadata"].get("category_priority") or [])
-                PRIORITY = {c: i for i, c in enumerate(_prio_seq)} if _prio_seq else {}
-            except Exception:
-                PRIORITY = {}
-            if cfg and cfg.get("categories") and cfg["categories"].get(cat):
-                return {"C": int(cfg["categories"][cat].get("C", 0)),
-                        "I": int(cfg["categories"][cat].get("I", 0)),
-                        "A": int(cfg["categories"][cat].get("A", 0))}
-        except Exception:
-            pass
-        # Fallback
-        return assign_cia(cat or "Public", 1.0)
-
-    # Normalize features_df columns
-    df = features_df.copy()
-    if "column" not in df.columns:
-        df["column"] = df.index.astype(str)
-
-    # Helper for token-score normalization: per-piece best weights
-    def _token_score_for(col_name: str, hits: List[Dict[str, Any]]) -> float:
-        pieces = _split_camel_and_delims(col_name)
-        if not pieces:
-            return 0.0
-        best_per_piece: List[float] = []
-        for p in pieces:
-            p_norm = _normalize_name(p)
-            best = 0.0
-            for h in hits:
-                tok = str(h.get("token") or "")
-                tnorm = _normalize_name(tok)
-                if not tnorm:
-                    continue
-                if tnorm == p_norm or tnorm in p_norm or p_norm in tnorm:
-                    best = max(best, float(h.get("weight", 0.0)))
-            best_per_piece.append(best)
-        score = sum(best_per_piece) / float(len(pieces))
-        return float(max(0.0, min(1.0, score)))
-
-    # Category embeddings built from dynamic keywords
-    def _build_category_embeddings(cfg_in: Optional[Dict[str, Any]]):
-        model, _np = _get_embedding_model()
-        if model is None or _np is None or not cfg_in:
-            return {}
-        cats: Dict[str, List[str]] = {}
-        # Prefer flattened list if provided
-        kw_items = cfg_in.get("keywords_flat") or cfg_in.get("keywords") or []
-        # If keywords is a dict of category->items, convert to flat items
-        if isinstance(kw_items, dict):
-            flat: List[Dict[str, Any]] = []
-            try:
-                for _cat, _lst in kw_items.items():
-                    for _it in (_lst or []):
-                        flat.append({
-                            "category": _cat,
-                            "token": _it.get("token") or _it.get("keyword"),
-                        })
-            except Exception:
-                flat = []
-            kw_items = flat
-        for item in (kw_items or []):
-            try:
-                cat = str(item.get("category") or "").strip()
-                tok = str(item.get("token") or "").strip()
-                if cat and tok:
-                    cats.setdefault(cat, []).append(tok)
-            except Exception:
-                continue
-        embeds: Dict[str, Any] = {}
-        for cat, toks in cats.items():
-            try:
-                vecs = model.encode(toks, normalize_embeddings=True)
-                vecs = _np.array(vecs)
-                if vecs.size == 0:
-                    continue
-                embeds[cat] = vecs.mean(axis=0)
-            except Exception:
-                continue
-        return embeds
-
-    def _semantic_similarity(col_name: str, samples: List[str], cat_embeds: Dict[str, Any]) -> Tuple[Optional[str], float]:
-        model, _np = _get_embedding_model()
-        if model is None or _np is None or not cat_embeds:
-            return None, 0.0
-        try:
-            text = (re.sub(r"[_\-]+", " ", col_name or "").strip() + " " + " ".join([str(s) for s in (samples or [])][:10])).strip()
-            if not text:
-                return None, 0.0
-            col_vec = model.encode([text], normalize_embeddings=True)
-            col_vec = _np.array(col_vec)[0]
-            sims: Dict[str, float] = {}
-            for cat, ref in cat_embeds.items():
-                try:
-                    sims[cat] = float(_np.dot(col_vec, ref))
-                except Exception:
-                    continue
-            if not sims:
-                return None, 0.0
-            cat, sc = max(sims.items(), key=lambda kv: kv[1])
-            return cat, float(max(0.0, min(1.0, sc)))
-        except Exception:
-            return None, 0.0
-
-    out: List[Dict[str, Any]] = []
-    cols = list(df["column"].astype(str))
-    cols_upper = [c.upper() for c in cols]
-    # Build a quick lookup for bundles to find related columns
-    bundles = cfg.get("bundles") if cfg else []
-    cat_embeds = _build_category_embeddings(cfg)
-
-    for idx, row in df.iterrows():
-        colname = str(row.get("column"))
-        up = colname.upper()
-        # Collect regex and token hits if provided, else approximate from features
-        regex_hits = list(row.get("regex_hits") or [])
-        token_hits = list(row.get("token_hits") or [])
-        if not regex_hits:
-            # derive from rx_* columns with non-zero values
-            try:
-                rx_thr = 0.15
-                if cfg and isinstance(cfg.get("model_metadata"), dict):
-                    rx_thr = float((cfg["model_metadata"].get("thresholds", {}) or {}).get("rx_feature_hit_threshold", rx_thr))
-                regex_hits = [k.replace("rx_", "") for k, v in row.items() if isinstance(k, str) and k.startswith("rx_") and float(v or 0.0) > float(rx_thr)]
-            except Exception:
-                regex_hits = [k.replace("rx_", "") for k, v in row.items() if isinstance(k, str) and k.startswith("rx_") and float(v or 0.0) > 0.15]
-        if not token_hits:
-            token_hits = _name_tokens_for(colname, cfg)
-
-        # Scores per spec (normalize by total configured items where meaningful)
-        try:
-            total_patterns = max(1, len(regex_hits) + 3)  # guard; if not explicit list, treat hits magnitude as proxy
-            regex_score = min(1.0, float(len(regex_hits)) / float(total_patterns))
-        except Exception:
-            regex_score = 0.0
-        try:
-            token_score = _token_score_for(colname, token_hits)
-        except Exception:
-            token_score = 0.0
-
-        # ML probability (use an existing heuristic model on engineered features if present)
-        ml_conf = 0.0
-        try:
-            # Heuristic from provided features: uniqueness, entropy, digit ratio
-            uniq = float(row.get("unique_ratio") or row.get("uniqueness") or 0.0)
-            entr = float(row.get("avg_entropy") or 0.0)
-            dig = float(row.get("digit_ratio") or 0.0)
-            base = 0.0
-            if uniq >= 0.8 and entr >= 2.0:
-                base += 0.5
-            elif uniq >= 0.6 and entr >= 1.5:
-                base += 0.3
-            if dig >= 0.5:
-                base += 0.2
-            ml_conf = max(0.0, min(1.0, base))
-        except Exception:
-            ml_conf = 0.0
-
-        # Semantic similarity
-        samples = list(row.get("sample_values") or [])
-        sem_cat, sem_sim = _semantic_similarity(colname, samples, cat_embeds)
-        semantic_conf = float(max(0.0, min(1.0, sem_sim)))
-        semantic_category = sem_cat
-
-        # Ensemble per spec (with semantic) — allow dynamic weights
-        try:
-            w = {"regex": 0.4, "token": 0.2, "ml": 0.25, "semantic": 0.15}
-            if cfg and isinstance(cfg.get("model_metadata"), dict):
-                ew = (cfg["model_metadata"].get("ensemble_weights") or {})
-                w.update({
-                    "regex": float(ew.get("regex", w["regex"])),
-                    "token": float(ew.get("token", w["token"])),
-                    "ml": float(ew.get("ml", w["ml"])),
-                    "semantic": float(ew.get("semantic", w["semantic"]))
-                })
-            s = w["regex"] * float(regex_score) + w["token"] * float(token_score) + w["ml"] * float(ml_conf) + w["semantic"] * float(semantic_conf)
-            final_conf = float(max(0.0, min(1.0, s)))
-        except Exception:
-            final_conf = 0.4 * regex_score + 0.2 * token_score + 0.25 * ml_conf + 0.15 * semantic_conf
-
-        # Bundle detection to derive related columns and boost
-        related: List[str] = []
-        bundle_boost = False
-        try:
-            if bundles:
-                for b in bundles:
-                    toks = [str(x).upper() for x in (b.get("columns") or [])]
-                    if not toks:
-                        continue
-                    # if this column matches any bundle token
-                    if any(t in up for t in toks):
-                        present = [c for c in cols_upper if any(t in c for t in toks)]
-                        related = [rc for rc in present if rc != up]
-                        if related:
-                            bundle_boost = True
-                            try:
-                                final_conf = min(1.0, final_conf + float(b.get("boost", 0.05)))
-                            except Exception:
-                                final_conf = min(1.0, final_conf + 0.05)
-                            break
-        except Exception:
-            pass
-
-        # Determine dominant category by summing per-category evidence
-        def _dominant_from(regex_hits: List[str], token_hits_list: List[Dict[str, Any]], sem_cat: Optional[str], regex_sc: float, token_sc: float, sem_sc: float) -> Optional[str]:
-            from collections import defaultdict
-            scores = defaultdict(float)
-            # Token evidence: sum raw weights per category; optional bonus for exact matches on small-signal columns
-            for h in (token_hits_list or []):
-                c = str(h.get("category") or "").strip()
-                w = float(h.get("weight", 0.0))
-                if not c:
-                    continue
-                if str(h.get("match_type") or "") == "exact":
-                    w = min(1.0, w + 0.1)
-                scores[c] += w
-            # Normalize token contribution to token_sc
-            total_token_raw = sum(max(0.0, float(h.get("weight", 0.0))) for h in (token_hits_list or [])) or 1.0
-            if scores and total_token_raw > 0:
-                scale = float(token_sc) / float(total_token_raw)
-                for k in list(scores.keys()):
-                    scores[k] *= scale
-            # Regex evidence: add regex_sc to each category present in regex_hits
-            for c in (regex_hits or []):
-                try:
-                    scores[str(c)] += float(regex_sc)
-                except Exception:
-                    continue
-            # Semantic evidence
-            if sem_cat:
-                scores[str(sem_cat)] += float(sem_sc)
-            if not scores:
-                return None
-            # Apply governance priority if present to break ties
-            prio = []
-            try:
-                if cfg and isinstance(cfg.get("model_metadata"), dict):
-                    prio = list(cfg["model_metadata"].get("category_priority") or [])
-            except Exception:
-                prio = []
-            best_cat, best_val = None, -1.0
-            for cat, val in scores.items():
-                if val > best_val:
-                    best_cat, best_val = cat, val
-                elif abs(val - best_val) < 1e-9 and prio:
-                    # tie-break by priority order
-                    try:
-                        if prio.index(cat) < prio.index(best_cat):
-                            best_cat = cat
-                            best_val = val
-                    except Exception:
-                        pass
-            return best_cat
-
-        dominant = _dominant_from(regex_hits, token_hits, semantic_category, regex_score, token_score, semantic_conf)
-        # If semantic strong and disagrees, prefer semantic
-        if semantic_category and semantic_conf >= 0.80 and semantic_category != dominant:
-            dominant = semantic_category
-        cia = _cia_for(dominant)
-
-        row_out = {
-            "column": colname,
-            "dominant_category": dominant,
-            "confidence": int(round(max(0.0, min(1.0, final_conf)) * 100)),
-            "suggested_cia": cia,
-            "related_columns": related,
-            "bundle_boost": bool(bundle_boost),
-            "regex_hits": regex_hits,
-            "token_hits": token_hits,
-            "semantic_category": semantic_category,
-            "semantic_confidence": int(round(semantic_conf * 100)),
-        }
-
-        # Optional persistence into SENSITIVE_AUDIT and CLASSIFICATION_AI_RESULTS
-        try:
-            if table_name and snowflake_connector is not None:
-                schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
-                if settings is not None:
-                    db = getattr(settings, "SCAN_CATALOG_DB", None) or getattr(settings, "SNOWFLAKE_DATABASE", None)
-                    if db:
-                        schema_fqn = f"{db}.DATA_CLASSIFICATION_GOVERNANCE"
-                snowflake_connector.execute_non_query(
-                    f"""
-                    create table if not exists {schema_fqn}.SENSITIVE_AUDIT (
-                      audit_id number autoincrement,
-                      table_name string,
-                      column_name string,
-                      category string,
-                      confidence number,
-                      cia string,
-                      bundle_detected boolean,
-                      scanned_at timestamp_ntz default current_timestamp(),
-                      primary key (audit_id)
-                    )
-                    """
-                )
-                snowflake_connector.execute_non_query(
-                    f"""
-                    insert into {schema_fqn}.SENSITIVE_AUDIT (table_name, column_name, category, confidence, cia, bundle_detected)
-                    values (%(t)s, %(c)s, %(cat)s, %(conf)s, %(cia)s, %(bb)s)
-                    """,
-                    {
-                        "t": str(table_name),
-                        "c": colname,
-                        "cat": str(dominant or ""),
-                        "conf": int(row_out["confidence"]),
-                        "cia": f"{cia.get('C',0)}/{cia.get('I',0)}/{cia.get('A',0)}",
-                        "bb": bool(bundle_boost),
-                    },
-                )
-                # Persist raw AI outputs for analysis
-                snowflake_connector.execute_non_query(
-                    f"""
-                    create table if not exists {schema_fqn}.CLASSIFICATION_AI_RESULTS (
-                      result_id number autoincrement,
-                      table_name string,
-                      column_name string,
-                      ai_category string,
-                      regex_confidence float,
-                      keyword_confidence float,
-                      ml_confidence float,
-                      semantic_confidence float,
-                      final_confidence float,
-                      semantic_category string,
-                      model_version string,
-                      details variant,
-                      created_at timestamp_ntz default current_timestamp(),
-                      primary key (result_id)
-                    )
-                    """
-                )
-                details = {
-                    "regex_hits": regex_hits,
-                    "token_hits": token_hits,
-                }
-                snowflake_connector.execute_non_query(
-                    f"""
-                    insert into {schema_fqn}.CLASSIFICATION_AI_RESULTS (
-                      table_name, column_name, ai_category, regex_confidence, keyword_confidence, ml_confidence, semantic_confidence, final_confidence, semantic_category, model_version, details
-                    ) values (%(t)s, %(c)s, %(ai)s, %(r)s, %(k)s, %(m)s, %(s)s, %(f)s, %(scat)s, %(ver)s, PARSE_JSON(%(det)s))
-                    """,
-                    {
-                        "t": str(table_name),
-                        "c": colname,
-                        "ai": str(dominant or ""),
-                        "r": float(regex_score * 100.0),
-                        "k": float(token_score * 100.0),
-                        "m": float(ml_conf * 100.0),
-                        "s": float(semantic_conf * 100.0),
-                        "f": float(max(0.0, min(1.0, final_conf)) * 100.0),
-                        "scat": str(semantic_category or ""),
-                        "ver": "v1.0",
-                        "det": json.dumps(details).replace("'", "''"),
-                    },
-                )
-        except Exception:
-            pass
-
-        out.append(row_out)
-
-    return out
-
-
-def _dynamic_keywords_lookup(cfg: Optional[Dict[str, Any]]) -> Dict[str, List[Tuple[str, str, float]]]:
-    """
-    Returns: {category: [(keyword, match_type, weight), ...]}
-    """
-    out: Dict[str, List[Tuple[str, str, float]]] = {}
-    if not cfg:
-        return out
-    kws = cfg.get("keywords") or {}
-    if isinstance(kws, dict):
-        for cat, items in (kws or {}).items():
-            for it in items or []:
-                try:
-                    if not it.get("active", True):
-                        continue
-                    kw = str(it.get("keyword") or it.get("token") or "").strip()
-                    if not kw:
-                        continue
-                    mt = str(it.get("match_type") or "fuzzy").lower()
-                    wt = float(it.get("weight", 0.5))
-                    out.setdefault(cat, []).append((kw, mt, wt))
-                except Exception:
-                    continue
-    elif isinstance(kws, list):
-        for it in kws:
-            try:
-                cat = str(it.get("category") or "").strip()
-                kw = str(it.get("keyword") or it.get("token") or "").strip()
-                if not cat or not kw:
-                    continue
-                mt = str(it.get("match_type") or "fuzzy").lower()
-                wt = float(it.get("weight", 0.5))
-                out.setdefault(cat, []).append((kw, mt, wt))
-            except Exception:
-                continue
-    return out
-
-
 def regex_screen(series: pd.Series, max_rows: int = 200, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
     """
     Compute regex match probabilities for the given series.
-
+    
+    Patterns are loaded from the SENSITIVE_PATTERNS database table.
     Returns a dict of pattern -> probability (0..1), adjusted by consistency.
     """
+    # Ensure patterns are loaded from the database
+    _load_patterns_from_db()
+    
+    if not _REGEX_PATTERNS:
+        logger.warning("No regex patterns loaded from database. Regex screening will be skipped.")
+        return {}
+        
     if series is None or series.empty:
         return {}
 
@@ -1166,138 +965,208 @@ def aggregate_table_sensitivity(table_name: str, col_probs: Dict[str, float]) ->
     }
 
 
-def classify_table_sensitivity(table_name: str, df: pd.DataFrame,
-                               column_meta: Optional[List[Dict[str, Any]]] = None,
-                               probability_threshold: float = 0.5) -> Dict[str, Any]:
+def _analyze_composites(df_in: pd.DataFrame, feats: Dict[str, Dict[str, Any]], hints: Dict[str, List[str]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Analyze columns for composite/multi-column patterns.
+    
+    Args:
+        df_in: Input DataFrame
+        feats: Features dictionary from analyze_metadata
+        hints: Name hints for columns
+        cfg: Configuration dictionary
+        
+    Returns:
+        List of composite detections, each with type, columns, and risk
     """
-    Full pipeline per table.
-
-    Output structure:
-    {
-      "table": str,
-      "schema": Optional[str],
-      "sensitive": bool,
-      "score": float,
-      "columns": [
-        {
-          "column": str,
-          "sensitive": bool,
-          "probability": float,
-          "suggested_cia": {"C": int, "I": int, "A": int},
-          "dominant_type": Optional[str],
-          "justification": str
-        }
-      ]
-    }
-    """
-    if df is None or df.empty:
-        return {"table": table_name, "schema": None, "sensitive": False, "score": 0.0, "columns": []}
-
-    # Load dynamic configuration once per call
-    cfg: Optional[Dict[str, Any]] = None
-    try:
-        if _load_dynamic_config is not None:
-            cfg = _load_dynamic_config()
-    except Exception:
-        cfg = None
-
-    features = analyze_metadata(table_name, df, column_meta, cfg=cfg)
-    # Name hints used for both ML and dominant type
-    name_hints: Dict[str, List[str]] = {c: list(_cached_name_hints(table_name, c)) for c in df.columns}
-    # Merge in dynamic keyword categories (if any)
-    try:
-        if cfg:
-            for c in df.columns:
-                dyn_h = _name_hint_categories(c, cfg=cfg)
-                if dyn_h:
-                    base = set(name_hints.get(c, []))
-                    name_hints[c] = list(sorted(base.union(set(dyn_h))))
-    except Exception:
-        pass
-
-    probs = ml_predict(features, name_hints)
-
-    # --- Composite multi-column analysis ---
-    def _analyze_composites(df_in: pd.DataFrame, feats: Dict[str, Dict[str, Any]], hints: Dict[str, List[str]]):
-        comps: List[Dict[str, Any]] = []
-        cols = list(df_in.columns)
-        up_cols = {c: c.upper() for c in cols}
-        # Dynamic bundles from config (each bundle lists column tokens to co-occur)
-        try:
-            if cfg and cfg.get("bundles"):
-                for b in cfg["bundles"] or []:
-                    if not b.get("active", True):
-                        continue
-                    toks = [str(t).upper() for t in (b.get("columns") or [])]
-                    if not toks:
-                        continue
-                    present = []
-                    for t in toks:
-                        hits = [c for c in cols if t in up_cols[c]]
-                        if hits:
-                            present.extend(hits[:1])
-                        else:
-                            present = []
-                            break
-                    if present:
-                        boost = float(b.get("boost", 0.1))
-                        comps.append({
-                            "type": str(b.get("name") or "bundle"),
-                            "columns": sorted(list(set(present))),
-                            "risk": float(min(1.0, max(0.0, boost))),
-                        })
-        except Exception:
-            pass
+    comps: List[Dict[str, Any]] = []
+    if df_in is None or df_in.empty:
         return comps
+        
+    cols = list(df_in.columns)
+    up_cols = {c: c.upper() for c in cols}
+    
+    # Dynamic bundles from config (each bundle lists column tokens to co-occur)
+    try:
+        if cfg and cfg.get("bundles"):
+            for b in cfg["bundles"] or []:
+                if not b.get("active", True):
+                    continue
+                    
+                toks = [str(t).upper() for t in (b.get("columns") or [])]
+                if not toks:
+                    continue
+                    
+                present = []
+                for t in toks:
+                    hits = [c for c in cols if t in up_cols[c]]
+                    if hits:
+                        present.extend(hits[:1])
+                        
+                if present:
+                    boost = float(b.get("boost", 0.1))
+                    comps.append({
+                        "type": str(b.get("name") or "bundle"),
+                        "columns": sorted(list(set(present))),
+                        "risk": float(min(1.0, max(0.0, boost))),
+                    })
+    except Exception as e:
+        print(f"[WARN] Error in composite analysis: {str(e)}")
+        
+    return comps
 
-    composites = _analyze_composites(df, features, name_hints)
 
-    # Build column outputs
-    columns_out: List[Dict[str, Any]] = []
-    for c in df.columns:
-        f = features.get(c, {})
-        rx_probs = {k.replace("rx_", ""): float(v) for k, v in f.items() if k.startswith("rx_")}
-        dom = _dominant_type(name_hints.get(c) or [], rx_probs)
-        # Ensemble: combine regex and ML using weighted average, retain recall by upper-bounding with max
-        rx_max = max(rx_probs.values()) if rx_probs else 0.0
-        p_ml = float(probs.get(c, 0.0))
-        p = float(min(1.0, 0.4 * rx_max + 0.6 * p_ml))
-        p = float(max(p, rx_max, p_ml))
-        # Composite boost: if column participates in a high-risk composite, lift probability
-        comp_hits = [comp for comp in composites if c in comp.get("columns", [])]
-        if comp_hits:
-            boost = max((ch.get("risk", 0.0) for ch in comp_hits), default=0.0)
-            p = float(min(1.0, max(p, 0.6*boost + 0.4*p)))
-        cia = assign_cia(dom or ("PII" if p >= 0.5 else "Public"), p, cfg=cfg)
-        justification_parts: List[str] = []
-        if name_hints.get(c):
-            justification_parts.append(f"name_hints={name_hints[c]}")
-        top_rx = sorted(rx_probs.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        if top_rx:
-            justification_parts.append(f"regex_top={[(k, round(v,3)) for k,v in top_rx]}")
-        justification_parts.append(f"stats={{'uniq_ratio': {round(f.get('unique_ratio', 0.0),3)}, 'avg_len': {round(f.get('avg_len', 0.0),2)}}}")
-        if comp_hits:
-            justification_parts.append(f"composites={[ch.get('type') for ch in comp_hits]}")
-        columns_out.append({
-            "column": c,
-            "sensitive": bool(p >= probability_threshold),
-            "probability": round(p, 3),
-            "suggested_cia": cia,
-            "dominant_type": dom,
-            "justification": "; ".join(justification_parts),
-            "composite_hits": [ch.get("type") for ch in comp_hits],
-            "related_columns": [],
-        })
+def classify_table_sensitivity(table_name: str, df: pd.DataFrame,
+                             column_meta: Optional[List[Dict[str, Any]]] = None,
+                             probability_threshold: float = 0.5) -> Dict[str, Any]:
+    """
+    Full pipeline for table sensitivity classification.
+    
+    Args:
+        table_name: Name of the table being analyzed
+        df: DataFrame containing sample data from the table
+        column_meta: Optional list of column metadata dictionaries
+        probability_threshold: Threshold for considering a column sensitive (0-1)
+        
+    Returns:
+        Dict containing analysis results with structure:
+        {
+            "table": str,
+            "schema": Optional[str],
+            "sensitive": bool,
+            "score": float,
+            "columns": [
+                {
+                    "column": str,
+                    "sensitive": bool,
+                    "probability": float,
+                    "suggested_cia": {"C": int, "I": int, "A": int},
+                    "dominant_type": Optional[str],
+                    "justification": str,
+                    "related_columns": List[str],
+                    "composite_hits": List[str]
+                },
+                ...
+            ],
+            "composites": List[Dict[str, Any]],
+            "config_version": Optional[str]
+        }
+    """
+    # Initialize empty result structure
+    result: Dict[str, Any] = {
+        "table": table_name,
+        "sensitive": False,
+        "score": 0.0,
+        "columns": [],
+        "composites": [],
+        "config_version": None
+    }
+    
+    try:
+        if df is None or df.empty:
+            print(f"[WARN] Empty or no data provided for table: {table_name}")
+            result["error"] = "No data provided"
+            return result
+            
+        print(f"[INFO] Analyzing table: {table_name}, shape: {df.shape}")
+        
+        # Load dynamic configuration once per call
+        current_cfg = {}
+        try:
+            if _load_dynamic_config is not None:
+                dynamic_cfg = _load_dynamic_config()
+                if dynamic_cfg:
+                    current_cfg.update(dynamic_cfg)
+                    result["config_version"] = current_cfg.get("version")
+        except Exception as e:
+            print(f"[WARN] Could not load dynamic config: {str(e)}")
 
-    # Optional: embeddings-based related column grouping and boost
+        # Analyze metadata and get name hints
+        features = analyze_metadata(table_name, df, column_meta, cfg=current_cfg)
+        
+        # Get name hints for columns
+        name_hints: Dict[str, List[str]] = {}
+        for c in df.columns:
+            name_hints[c] = list(_cached_name_hints(table_name, c))
+        
+        # Merge in dynamic keyword categories (if any)
+        try:
+            if current_cfg:
+                for c in df.columns:
+                    dyn_h = _name_hint_categories(c, cfg=current_cfg)
+                    if dyn_h:
+                        base = set(name_hints.get(c, []))
+                        name_hints[c] = list(sorted(base.union(set(dyn_h))))
+        except Exception as e:
+            print(f"[WARN] Error processing name hints: {str(e)}")
+            
+        # Get ML predictions
+        probs = ml_predict(features, name_hints)
+
+        # Run composite analysis
+        composites = _analyze_composites(df, features, name_hints, current_cfg)
+        result["composites"] = composites
+
+        # Build column outputs
+        columns_out: List[Dict[str, Any]] = []
+        sensitive_columns = 0
+        total_confidence = 0.0
+        
+        for c in df.columns:
+            f = features.get(c, {})
+            rx_probs = {k.replace("rx_", ""): float(v) for k, v in f.items() if k.startswith("rx_")}
+            dom = _dominant_type(name_hints.get(c) or [], rx_probs)
+            # Ensemble: combine regex and ML using weighted average, retain recall by upper-bounding with max
+            rx_max = max(rx_probs.values()) if rx_probs else 0.0
+            p_ml = float(probs.get(c, 0.0))
+            
+            # Calculate combined probability with weighted average
+            w_rx = 0.7  # Higher weight for regex patterns
+            w_ml = 0.3  # Lower weight for ML
+            p_combined = (w_rx * rx_max + w_ml * p_ml) / (w_rx + w_ml)
+            p_combined = max(p_combined, rx_max, p_ml)  # Upper-bound by max of all
+            
+            # Check if column is sensitive
+            is_sensitive = p_combined >= probability_threshold
+            if is_sensitive:
+                sensitive_columns += 1
+                total_confidence += p_combined
+                
+            # Get CIA classification
+            cia = assign_cia(dom, p_combined, current_cfg) if dom else {"C": 0, "I": 0, "A": 0}
+            
+            # Add column to results
+            columns_out.append({
+                "column": c,
+                "sensitive": is_sensitive,
+                "probability": round(p_combined, 4),
+                "suggested_cia": cia,
+                "dominant_type": dom,
+                "justification": f"Detected as {dom} with {p_combined*100:.1f}% confidence" if dom else "No specific type detected",
+                "related_columns": [],
+                "composite_hits": [
+                    c for comp in composites 
+                    if c in comp.get("columns", []) and comp.get("type") == dom
+                ]
+            })
+            
+        # Update result with column analysis
+        result["columns"] = columns_out
+        result["sensitive"] = sensitive_columns > 0
+        result["score"] = round(total_confidence / max(1, sensitive_columns), 4) if sensitive_columns > 0 else 0.0
+        
+    except Exception as e:
+        print(f"[ERROR] Error in sensitivity classification for {table_name}: {str(e)}")
+        result["error"] = f"Classification error: {str(e)}"
+        
+    # Apply embeddings-based related column grouping and boost if available
     try:
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
             import numpy as _np  # type: ignore
             _emb_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-        except Exception:
+        except Exception as e:
             _emb_model = None
             _np = None
+            
         if _emb_model is not None and _np is not None and columns_out:
             names = [r["column"] for r in columns_out]
             texts = [re.sub(r"[_\-]+", " ", n).strip() for n in names]
@@ -1306,6 +1175,8 @@ def classify_table_sensitivity(table_name: str, df: pd.DataFrame,
             n = len(names)
             groups: List[List[int]] = []
             used = set()
+            
+            # Group similar column names using embeddings
             for i in range(n):
                 if i in used:
                     continue
@@ -1315,38 +1186,48 @@ def classify_table_sensitivity(table_name: str, df: pd.DataFrame,
                     if j in used:
                         continue
                     sim = float(_np.dot(vecs[i], vecs[j]))
-                    if sim >= 0.80:
+                    if sim >= 0.80:  # Similarity threshold
                         grp.append(j)
                         used.add(j)
                 if len(grp) >= 2:
                     groups.append(grp)
-            # Apply boost and set related columns list
+            
+            # Apply boost and set related columns for each group
             for grp in groups:
                 rel_names = [names[k] for k in grp]
                 for idx in grp:
                     row = columns_out[idx]
                     row["related_columns"] = [n for n in rel_names if n != row["column"]]
-                    # boost probability slightly for grouped sensitive columns
+                    
+                    # Boost probability for grouped columns
                     base_p = float(row.get("probability", 0.0))
-                    if base_p < 0.85:
+                    if base_p < 0.85:  # Only boost if not already high confidence
                         row["probability"] = round(float(min(1.0, 0.15 + 0.85 * base_p)), 3)
-                    # refresh sensitive flag and CIA if needed
+                    
+                    # Update sensitive flag and CIA based on new probability
                     row["sensitive"] = bool(row["probability"] >= probability_threshold)
-                    row["suggested_cia"] = assign_cia(row.get("dominant_type") or ("PII" if row["sensitive"] else "Public"), row["probability"])  # type: ignore
-    except Exception:
-        pass
-
-    table_agg = aggregate_table_sensitivity(table_name, {r["column"]: r["probability"] for r in columns_out})
-    out = {
-        "table": table_name,
+                    row["suggested_cia"] = assign_cia(
+                        row.get("dominant_type") or ("PII" if row["sensitive"] else "Public"),
+                        row["probability"]
+                    )
+    except Exception as e:
+        print(f"[WARN] Error in embeddings-based analysis: {str(e)}")
+    
+    # Aggregate results at table level
+    table_agg = aggregate_table_sensitivity(
+        table_name, 
+        {r["column"]: r["probability"] for r in columns_out}
+    )
+    
+    # Prepare final result
+    result.update({
         "schema": None,
         "sensitive": bool(table_agg["sensitive"]),
         "score": float(table_agg["score"]),
-        "columns": columns_out,
-        "composites": composites,
-        "config_version": (cfg.get("version") if cfg else None),
-    }
-    return out
+        "config_version": (current_cfg.get("version") if current_cfg else None),
+    })
+    
+    return result
 
 
 # ---------------------- Sample Usage ----------------------
@@ -1369,12 +1250,489 @@ import numpy as np
 from collections import defaultdict
 
 class SensitiveDataDetector:
-    """Core sensitive data detection engine"""
+    """
+    Core sensitive data detection engine with multi-layered detection:
+    1. Metadata pattern matching (table/column names)
+    2. Regex-based data sampling
+    3. AI-assisted classification
+    4. Configurable category sensitivity weights
+    """
     
-    def __init__(self):
+    def __init__(self, governance_db: Optional[str] = None, governance_schema: str = 'DATA_CLASSIFICATION_GOVERNANCE'):
+        """Initialize the detector with configuration.
+        
+        Args:
+            governance_db: Name of the governance database
+            governance_schema: Schema containing the governance tables
+        """
+        self.governance_db = governance_db
+        self.governance_schema = governance_schema
+        self.sample_size = 100
+        self.min_confidence = 0.6
+        self.use_ai = True
+        
+        # Initialize configuration
+        self._config = {
+            'categories': None,
+            'keywords': None,
+            'patterns': None,
+            'thresholds': None,
+            'last_loaded': None
+        }
+        
+        # Legacy attributes for backward compatibility
         self.patterns = {}
         self.keywords = {}
         self.weights = {}
+        
+        # Load configuration
+        try:
+            self._load_configuration()
+        except Exception as e:
+            logger.warning(f"Failed to load detection configuration: {e}")
+    
+    def _load_configuration(self) -> None:
+        """Load configuration from governance database."""
+        if not self.governance_db or not snowflake_connector:
+            logger.warning("Governance database or connector not available")
+            return
+            
+        try:
+            # Load categories
+            categories = self._load_categories()
+            
+            # Load keywords with category info
+            keywords = self._load_keywords()
+            
+            # Load patterns with compiled regex
+            patterns = self._load_patterns()
+            
+            # Load thresholds
+            thresholds = self._load_thresholds()
+            
+            # Update config
+            self._config.update({
+                'categories': categories,
+                'keywords': keywords,
+                'patterns': patterns,
+                'thresholds': thresholds,
+                'last_loaded': datetime.utcnow()
+            })
+            
+            logger.info("Successfully loaded detection configuration")
+            
+        except Exception as e:
+            logger.error(f"Failed to load configuration: {e}")
+            raise
+    
+    def _load_categories(self) -> Dict[str, Dict]:
+        """Load sensitivity categories from the database."""
+        query = f"""
+            SELECT 
+                CATEGORY_ID,
+                CATEGORY_NAME,
+                DESCRIPTION,
+                CONFIDENTIALITY_LEVEL,
+                DETECTION_THRESHOLD,
+                IS_ACTIVE
+            FROM {self.governance_db}.{self.governance_schema}.SENSITIVITY_CATEGORIES
+            WHERE IS_ACTIVE = TRUE
+        """
+        
+        rows = snowflake_connector.execute_query(query) or []
+        return {row['CATEGORY_ID']: dict(row) for row in rows}
+    
+    def _load_keywords(self) -> List[Dict]:
+        """Load sensitive keywords from the database."""
+        query = f"""
+            SELECT 
+                k.KEYWORD_ID,
+                k.CATEGORY_ID,
+                k.KEYWORD_STRING,
+                k.MATCH_TYPE,
+                k.SENSITIVITY_WEIGHT,
+                c.CATEGORY_NAME,
+                k.IS_ACTIVE
+            FROM {self.governance_db}.{self.governance_schema}.SENSITIVE_KEYWORDS k
+            JOIN {self.governance_db}.{self.governance_schema}.SENSITIVITY_CATEGORIES c
+                ON k.CATEGORY_ID = c.CATEGORY_ID
+            WHERE k.IS_ACTIVE = TRUE
+            ORDER BY k.SENSITIVITY_WEIGHT DESC
+        """
+        
+        return snowflake_connector.execute_query(query) or []
+    
+    def _load_patterns(self) -> List[Dict]:
+        """Load detection patterns from the database."""
+        query = f"""
+            SELECT 
+                p.PATTERN_ID,
+                p.CATEGORY_ID,
+                p.PATTERN_STRING,
+                p.PATTERN_TYPE,
+                p.SENSITIVITY_WEIGHT,
+                c.CATEGORY_NAME,
+                p.IS_ACTIVE
+            FROM {self.governance_db}.{self.governance_schema}.SENSITIVE_PATTERNS p
+            JOIN {self.governance_db}.{self.governance_schema}.SENSITIVITY_CATEGORIES c
+                ON p.CATEGORY_ID = c.CATEGORY_ID
+            WHERE p.IS_ACTIVE = TRUE
+            ORDER BY p.SENSITIVITY_WEIGHT DESC
+        """
+        
+        patterns = snowflake_connector.execute_query(query) or []
+        
+        # Pre-compile regex patterns for better performance
+        for pattern in patterns:
+            try:
+                pattern['compiled_pattern'] = re.compile(
+                    pattern['PATTERN_STRING'], 
+                    re.IGNORECASE | re.MULTILINE
+                )
+            except re.error as e:
+                logger.warning(f"Invalid regex pattern {pattern['PATTERN_STRING']}: {e}")
+                pattern['compiled_pattern'] = None
+        
+        return patterns
+    
+    def _load_thresholds(self) -> List[Dict]:
+        """Load sensitivity thresholds from the database."""
+        query = f"""
+            SELECT 
+                THRESHOLD_NAME,
+                CONFIDENCE_LEVEL,
+                SENSITIVITY_LEVEL,
+                DESCRIPTION,
+                IS_ACTIVE
+            FROM {self.governance_db}.{self.governance_schema}.SENSITIVITY_THRESHOLDS
+            WHERE IS_ACTIVE = TRUE
+            ORDER BY CONFIDENCE_LEVEL DESC
+        """
+        
+        return snowflake_connector.execute_query(query) or []
+    
+    def _determine_sensitivity_level(self, confidence: float) -> str:
+        """Determine the sensitivity level based on confidence score."""
+        if not self._config['thresholds']:
+            # Default thresholds if not configured
+            if confidence >= 0.8:
+                return "HIGH"
+            elif confidence >= 0.5:
+                return "MEDIUM"
+            elif confidence >= 0.3:
+                return "LOW"
+            return "NONE"
+        
+        # Use configured thresholds
+        for threshold in self._config['thresholds']:
+            if confidence >= threshold['CONFIDENCE_LEVEL']:
+                return threshold['SENSITIVITY_LEVEL']
+        
+        return "NONE"
+    
+    def _check_keyword_matches(self, text: str) -> List[Dict]:
+        """Check if text contains any sensitive keywords."""
+        if not text or not self._config['keywords']:
+            return []
+            
+        matches = []
+        text_upper = text.upper()
+        
+        for keyword in self._config['keywords']:
+            keyword_str = keyword['KEYWORD_STRING'].upper()
+            match_type = keyword.get('MATCH_TYPE', '').upper()
+            
+            if match_type == 'EXACT' and keyword_str == text_upper:
+                matches.append({
+                    'keyword_id': keyword['KEYWORD_ID'],
+                    'keyword': keyword_str,
+                    'category_id': keyword['CATEGORY_ID'],
+                    'category_name': keyword['CATEGORY_NAME'],
+                    'match_type': 'exact',
+                    'weight': float(keyword['SENSITIVITY_WEIGHT'] or 0)
+                })
+            elif match_type == 'CONTAINS' and keyword_str in text_upper:
+                matches.append({
+                    'keyword_id': keyword['KEYWORD_ID'],
+                    'keyword': keyword_str,
+                    'category_id': keyword['CATEGORY_ID'],
+                    'category_name': keyword['CATEGORY_NAME'],
+                    'match_type': 'contains',
+                    'weight': float(keyword['SENSITIVITY_WEIGHT'] or 0)
+                })
+            elif match_type == 'REGEX':
+                try:
+                    if re.search(keyword_str, text_upper, re.IGNORECASE):
+                        matches.append({
+                            'keyword_id': keyword['KEYWORD_ID'],
+                            'keyword': keyword_str,
+                            'category_id': keyword['CATEGORY_ID'],
+                            'category_name': keyword['CATEGORY_NAME'],
+                            'match_type': 'regex',
+                            'weight': float(keyword['SENSITIVITY_WEIGHT'] or 0)
+                        })
+                except re.error:
+                    logger.warning(f"Invalid regex pattern in keyword: {keyword_str}")
+        
+        return matches
+    
+    def _check_pattern_matches(self, text: str) -> List[Dict]:
+        """Check if text matches any sensitive patterns."""
+        if not text or not isinstance(text, str) or not self._config['patterns']:
+            return []
+            
+        matches = []
+        
+        for pattern in self._config['patterns']:
+            if not pattern.get('compiled_pattern'):
+                continue
+                
+            if pattern['compiled_pattern'].search(text):
+                matches.append({
+                    'pattern_id': pattern['PATTERN_ID'],
+                    'pattern': pattern['PATTERN_STRING'],
+                    'category_id': pattern['CATEGORY_ID'],
+                    'category_name': pattern['CATEGORY_NAME'],
+                    'weight': float(pattern['SENSITIVITY_WEIGHT'] or 0)
+                })
+        
+        return matches
+    
+    def _sample_column_data(self, database: str, schema: str, table: str, column: str) -> List[Any]:
+        """Sample data from a table column for pattern matching."""
+        if self.sample_size <= 0 or not snowflake_connector:
+            return []
+            
+        query = f"""
+            SELECT "{column}" as sample_value
+            FROM "{database}"."{schema}"."{table}"
+            WHERE "{column}" IS NOT NULL
+            SAMPLE ({self.sample_size} ROWS)
+        """
+        
+        try:
+            results = snowflake_connector.execute_query(query) or []
+            return [row['SAMPLE_VALUE'] for row in results if row['SAMPLE_VALUE'] is not None]
+        except Exception as e:
+            logger.warning(f"Error sampling data from {database}.{schema}.{table}.{column}: {e}")
+            return []
+    
+    def _calculate_confidence(self, matches: List[Dict]) -> float:
+        """Calculate confidence score based on matches and weights."""
+        if not matches:
+            return 0.0
+            
+        # Use the highest weight match
+        max_weight = max(float(match.get('weight', 0)) for match in matches)
+        
+        # Normalize to 0-1 range
+        return min(max_weight / 100.0, 1.0)
+    
+    def detect_sensitive_columns(
+        self,
+        database: str,
+        schema_name: Optional[str] = None,
+        table_name: Optional[str] = None,
+        column_name: Optional[str] = None
+    ) -> List[Dict]:
+        """Detect sensitive data in database columns.
+        
+        Args:
+            database: Database name
+            schema_name: Optional schema name filter
+            table_name: Optional table name filter
+            column_name: Optional column name filter
+            
+        Returns:
+            List of detection results for each column analyzed
+        """
+        if not snowflake_connector:
+            logger.error("Snowflake connector not available")
+            return []
+            
+        # Build query to get column metadata
+        query = f"""
+            SELECT 
+                TABLE_SCHEMA,
+                TABLE_NAME, 
+                COLUMN_NAME,
+                DATA_TYPE
+            FROM "{database}".INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
+        """
+        
+        params = {}
+        
+        if schema_name:
+            query += " AND TABLE_SCHEMA = %(schema_name)s"
+            params['schema_name'] = schema_name
+            
+        if table_name:
+            query += " AND TABLE_NAME = %(table_name)s"
+            params['table_name'] = table_name
+            
+        if column_name:
+            query += " AND COLUMN_NAME = %(column_name)s"
+            params['column_name'] = column_name
+            
+        query += " ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+        
+        # Get all columns to analyze
+        columns = snowflake_connector.execute_query(query, params) or []
+        
+        if not columns:
+            logger.warning(f"No columns found matching criteria in database: {database}")
+            return []
+        
+        results = []
+        
+        # Process each column
+        for col in columns:
+            try:
+                schema = col['TABLE_SCHEMA']
+                table = col['TABLE_NAME']
+                column = col['COLUMN_NAME']
+                data_type = col['DATA_TYPE']
+                
+                logger.debug(f"Analyzing column: {schema}.{table}.{column}")
+                
+                # 1. Check column name against keywords
+                column_matches = self._check_keyword_matches(column)
+                table_matches = self._check_keyword_matches(table)
+                schema_matches = self._check_keyword_matches(schema)
+                
+                # 2. Sample data and check for pattern matches
+                sample_values = []
+                data_matches = []
+                
+                if self.sample_size > 0 and snowflake_connector:
+                    sample_values = self._sample_column_data(database, schema, table, column)
+                    
+                    # Check each sample value against patterns
+                    for value in sample_values:
+                        if value is None:
+                            continue
+                        data_matches.extend(self._check_pattern_matches(str(value)))
+                
+                # 3. Combine all matches
+                all_matches = column_matches + table_matches + schema_matches + data_matches
+                
+                # Calculate confidence and sensitivity
+                confidence = self._calculate_confidence(all_matches)
+                sensitivity_level = self._determine_sensitivity_level(confidence)
+                
+                # Get unique categories
+                detected_categories = set()
+                for match in all_matches:
+                    if 'category_id' in match and match['category_id'] not in detected_categories:
+                        detected_categories.add(match['category_id'])
+                
+                # Create result dictionary
+                result = {
+                    'database': database,
+                    'schema': schema,
+                    'table': table,
+                    'column': column,
+                    'data_type': data_type,
+                    'confidence': confidence,
+                    'sensitivity_score': confidence * 100,  # Convert to 0-100 scale
+                    'sensitivity_level': sensitivity_level,
+                    'detected_categories': list(detected_categories),
+                    'sample_values': sample_values[:5],  # Keep first 5 samples
+                    'match_details': {
+                        'column_matches': column_matches,
+                        'table_matches': table_matches,
+                        'schema_matches': schema_matches,
+                        'data_matches': data_matches
+                    }
+                }
+                
+                # Add to results if sensitive or above threshold
+                if confidence >= self.min_confidence or sensitivity_level != "NONE":
+                    results.append(result)
+                
+            except Exception as e:
+                logger.error(
+                    f"Error processing column {col.get('TABLE_SCHEMA', '?')}."
+                    f"{col.get('TABLE_NAME', '?')}.{col.get('COLUMN_NAME', '?')}: {e}"
+                )
+        
+        return results
+    
+    def detect_sensitive_tables(
+        self,
+        database: str,
+        schema_name: Optional[str] = None,
+        table_name: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Detect sensitive tables based on column analysis.
+        
+        Args:
+            database: Database name
+            schema_name: Optional schema name filter
+            table_name: Optional table name filter
+            
+        Returns:
+            List of dictionaries with table-level sensitivity information
+        """
+        # First, detect sensitive columns
+        column_results = self.detect_sensitive_columns(
+            database=database,
+            schema_name=schema_name,
+            table_name=table_name
+        )
+        
+        # Group by table
+        table_results = {}
+        
+        for col_result in column_results:
+            table_key = f"{col_result['schema']}.{col_result['table']}"
+            
+            if table_key not in table_results:
+                table_results[table_key] = {
+                    'database': database,
+                    'schema': col_result['schema'],
+                    'table': col_result['table'],
+                    'sensitive_columns': [],
+                    'sensitivity_score': 0,
+                    'sensitivity_level': 'NONE',
+                    'categories': set(),
+                    'last_scanned': datetime.utcnow().isoformat()
+                }
+            
+            # Add column info
+            table_results[table_key]['sensitive_columns'].append({
+                'column_name': col_result['column'],
+                'data_type': col_result['data_type'],
+                'sensitivity_score': col_result['sensitivity_score'],
+                'sensitivity_level': col_result['sensitivity_level'],
+                'confidence': col_result['confidence'],
+                'detected_categories': col_result['detected_categories']
+            })
+            
+            # Track highest sensitivity level
+            current_level = table_results[table_key]['sensitivity_level']
+            if col_result['sensitivity_level'] == 'HIGH' or \
+               (current_level == 'MEDIUM' and col_result['sensitivity_level'] == 'LOW') or \
+               (current_level == 'NONE' and col_result['sensitivity_level'] in ['LOW', 'MEDIUM']):
+                table_results[table_key]['sensitivity_level'] = col_result['sensitivity_level']
+            
+            # Track categories
+            table_results[table_key]['categories'].update(col_result['detected_categories'])
+            
+            # Update max score
+            table_results[table_key]['sensitivity_score'] = max(
+                table_results[table_key]['sensitivity_score'],
+                col_result['sensitivity_score']
+            )
+        
+        # Convert to list and format categories
+        results = []
+        for table_info in table_results.values():
+            table_info['categories'] = list(table_info['categories'])
+            results.append(table_info)
+        
+        return results
         
     def configure(self, patterns: Dict, keywords: Dict, weights: Dict):
         """Configure detection rules and weights"""

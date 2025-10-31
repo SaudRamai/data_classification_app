@@ -73,21 +73,177 @@ class AIClassificationService:
         self._zsc = None
         # Feedback store (persisted to JSON)
         self._feedback: Dict[str, Any] = {}
+        
+        # Initialize sensitivity configuration with comprehensive defaults
+        self._sensitivity_config = {
+            # Pattern definitions for structured data detection
+            "patterns": [
+                {
+                    "name": "EMAIL",
+                    "regex": r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+                    "category": "PII",
+                    "weight": 0.9,
+                    "description": "Email address pattern"
+                },
+                {
+                    "name": "CREDIT_CARD",
+                    "regex": r'\b(?:\d[ -]*?){13,16}\b',
+                    "category": "FINANCIAL",
+                    "weight": 1.0,
+                    "description": "Credit card number pattern"
+                },
+                {
+                    "name": "SSN",
+                    "regex": r'\b\d{3}[-.]?\d{2}[-.]?\d{4}\b',
+                    "category": "PII",
+                    "weight": 1.0,
+                    "description": "Social Security Number pattern"
+                },
+                {
+                    "name": "PHONE",
+                    "regex": r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
+                    "category": "PII",
+                    "weight": 0.8,
+                    "description": "Phone number pattern"
+                },
+                {
+                    "name": "IP_ADDRESS",
+                    "regex": r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
+                    "category": "NETWORK",
+                    "weight": 0.7,
+                    "description": "IPv4 address pattern"
+                }
+            ],
+            
+            # Keywords for semantic matching
+            "keywords": [
+                {"token": "ssn", "category": "PII", "weight": 1.0, "match_type": "exact"},
+                {"token": "social security", "category": "PII", "weight": 0.9, "match_type": "contains"},
+                {"token": "credit card", "category": "FINANCIAL", "weight": 0.9, "match_type": "contains"},
+                {"token": "dob", "category": "PII", "weight": 0.8, "match_type": "exact"},
+                {"token": "date of birth", "category": "PII", "weight": 0.9, "match_type": "contains"},
+                {"token": "salary", "category": "FINANCIAL", "weight": 0.9, "match_type": "contains"},
+                {"token": "income", "category": "FINANCIAL", "weight": 0.8, "match_type": "contains"},
+                {"token": "medical", "category": "HEALTH", "weight": 0.9, "match_type": "contains"},
+                {"token": "diagnosis", "category": "HEALTH", "weight": 0.9, "match_type": "contains"},
+                {"token": "treatment", "category": "HEALTH", "weight": 0.8, "match_type": "contains"}
+            ],
+            
+            # Sensitivity categories with severity levels
+            "categories": {
+                "PII": {
+                    "description": "Personally Identifiable Information",
+                    "severity": "high",
+                    "cia": {"C": 3, "I": 3, "A": 2},
+                    "compliance": ["GDPR", "CCPA", "PIPEDA"]
+                },
+                "FINANCIAL": {
+                    "description": "Financial Information",
+                    "severity": "high",
+                    "cia": {"C": 3, "I": 3, "A": 2},
+                    "compliance": ["PCI-DSS", "SOX", "GLBA"]
+                },
+                "HEALTH": {
+                    "description": "Protected Health Information",
+                    "severity": "high",
+                    "cia": {"C": 3, "I": 3, "A": 2},
+                    "compliance": ["HIPAA", "HITECH", "GDPR"]
+                },
+                "CONTACT": {
+                    "description": "Contact Information",
+                    "severity": "medium",
+                    "cia": {"C": 2, "I": 2, "A": 1},
+                    "compliance": ["GDPR", "CCPA"]
+                },
+                "LOCATION": {
+                    "description": "Geolocation Data",
+                    "severity": "medium",
+                    "cia": {"C": 2, "I": 2, "A": 1},
+                    "compliance": ["GDPR"]
+                },
+                "DEMOGRAPHIC": {
+                    "description": "Demographic Information",
+                    "severity": "low",
+                    "cia": {"C": 1, "I": 1, "A": 1},
+                    "compliance": []
+                }
+            },
+            
+            # Predefined bundles of columns that together indicate sensitivity
+            "bundles": [
+                {
+                    "name": "PERSON_IDENTIFIERS",
+                    "description": "Combination of fields that can identify a person",
+                    "columns": ["first_name", "last_name", "date_of_birth"],
+                    "severity": "high",
+                    "category": "PII"
+                },
+                {
+                    "name": "FINANCIAL_RECORD",
+                    "description": "Combination of fields that indicate financial records",
+                    "columns": ["account_number", "routing_number", "account_holder_name"],
+                    "severity": "high",
+                    "category": "FINANCIAL"
+                }
+            ],
+            
+            # Compliance framework mappings
+            "compliance_mapping": {
+                "GDPR": {"PII": "high", "CONTACT": "medium"},
+                "HIPAA": {"HEALTH": "high", "PII": "high"},
+                "PCI-DSS": {"FINANCIAL": "high"},
+                "CCPA": {"PII": "high", "CONTACT": "medium"}
+            },
+            
+            # Model configuration
+            "model_metadata": {
+                "thresholds": {
+                    "high_confidence": 0.8,
+                    "medium_confidence": 0.6,
+                    "low_confidence": 0.4
+                },
+                "min_samples_for_training": 100,
+                "max_training_iterations": 1000,
+                "feature_importance_threshold": 0.01
+            },
+            
+            # Token weights for name-based detection
+            "name_tokens": {
+                "id": 0.8,
+                "name": 0.7,
+                "addr": 0.7,
+                "phone": 0.8,
+                "email": 0.9,
+                "ssn": 0.95,
+                "dob": 0.85,
+                "credit": 0.9,
+                "salary": 0.85,
+                "medical": 0.9
+            },
+            
+            # System metadata
+            "version": "1.0.0",
+            "last_updated": "2025-10-30T00:00:00Z",
+            "is_active": True
+        }
+        
+        # Try to load feedback and config
         try:
             self._load_feedback()
-        except Exception:
+        except Exception as e:
+            print(f"Warning: Could not load feedback: {str(e)}")
             self._feedback = {}
+            
         try:
             if self.use_snowflake:
                 self.load_feedback_from_snowflake()
-        except Exception:
-            pass
-        # Force refresh dynamic sensitivity configuration at startup so updates are immediately effective
-        try:
-            if self.use_snowflake:
-                self.load_sensitivity_config(force_refresh=True)
-        except Exception:
-            pass
+                # Try to load sensitivity config
+                try:
+                    self.load_sensitivity_config(force_refresh=True)
+                except Exception as e:
+                    print(f"Warning: Could not load initial sensitivity config: {str(e)}")
+        except Exception as e:
+            print(f"Warning: Could not initialize Snowflake components: {str(e)}")
 
     def _persist_audit(self, records: List[Dict[str, Any]]) -> None:
         """Persist table-level audit records into Snowflake SENSITIVE_AUDIT, with local JSONL fallback.
@@ -849,27 +1005,21 @@ class AIClassificationService:
 
     def load_sensitivity_config(self, force_refresh: bool = False) -> Dict[str, Any]:
         """Load dynamic sensitivity configuration from Snowflake and cache it.
-
+        
         Sources (DATA_CLASSIFICATION_GOVERNANCE schema):
-        - SENSITIVE_PATTERNS(category, pattern, priority, is_active, updated_at)
-        - SENSITIVE_KEYWORDS(category, keyword, priority, is_active, updated_at)
-        - SENSITIVE_FLAGS(category, flag_name, is_active, updated_at)
-        - SENSITIVITY_CATEGORIES(category, cia_c, cia_i, cia_a, is_active, updated_at)
-        - SENSITIVE_BUNDLES(bundle_name, category, column_name, boost, is_active, updated_at)
+        - SENSITIVE_PATTERNS - Pattern-based detection rules
+        - SENSITIVE_KEYWORDS - Keyword-based detection
+        - SENSITIVITY_CATEGORIES - Category definitions and CIA ratings
+        - SENSITIVE_BUNDLES - Multi-column pattern bundles
+        - SENSITIVITY_WEIGHTS - Weights for different sensitivity factors
+        - SENSITIVITY_THRESHOLDS - Confidence thresholds for classification
+        - SENSITIVITY_MODEL_CONFIG - Model configuration parameters
+        - COMPLIANCE_MAPPING - Compliance framework mappings
 
-        Cache layout in Streamlit session_state:
-        st.session_state["sensitivity_config"] = {
-            "patterns": [ {"category": str, "regex": str, "compiled": Pattern} ],
-            "keywords": [ {"category": str, "token": str} ],  # tokens lowercased
-            "categories": { category: {"C": int, "I": int, "A": int} },
-            "bundles": [ {"bundle_name": str, "category": str, "columns": [str,...], "boost": float} ],
-        }
-
-        Use force_refresh=True to bypass the cache.
+        Returns:
+            Dict containing all sensitivity configuration parameters
         """
-        cfg_default: Dict[str, Any] = {"patterns": [], "keywords": [], "categories": {}, "bundles": [], "column_bundles": [], "thresholds_category": {}, "weights_table": {}, "flags": []}
-
-        # Return cached unless forced
+        # Check for cached configuration in session state if not forcing refresh
         try:
             if not force_refresh and st is not None and hasattr(st, "session_state"):
                 sc = st.session_state.get("sensitivity_config")
@@ -877,8 +1027,306 @@ class AIClassificationService:
                     return sc
         except Exception:
             pass
+            
+        # If we have a cached config and not forcing refresh, return it
+        if not force_refresh and self._sensitivity_config:
+            return self._sensitivity_config
+            
+        # Default configuration if database is not available
+        default_config = {
+            "patterns": [],
+            "keywords": [],
+            "categories": {
+                "PII": {"description": "Personally Identifiable Information", "severity": "high"},
+                "FINANCIAL": {"description": "Financial Information", "severity": "high"},
+                "HEALTH": {"description": "Health Information", "severity": "high"}
+            },
+            "bundles": [],
+            "compliance_mapping": {},
+            "model_metadata": {
+                "thresholds": {
+                    "high_confidence": 0.8,
+                    "medium_confidence": 0.5
+                }
+            },
+            "name_tokens": {}
+        }
 
-        cfg: Dict[str, Any] = dict(cfg_default)
+        # Set default config in case of errors
+        self._sensitivity_config = default_config
+        
+        # If Snowflake is not available, return default config
+        if not (self.use_snowflake and snowflake_connector is not None):
+            return self._sensitivity_config
+            
+        try:
+            # Try to load from database
+            cfg = self._load_config_from_database(force_refresh)
+            if cfg:
+                self._sensitivity_config = cfg
+                # Update session state if available
+                try:
+                    if st is not None and hasattr(st, "session_state"):
+                        st.session_state["sensitivity_config"] = cfg
+                except Exception:
+                    pass
+                return cfg
+                
+        except Exception as e:
+            print(f"Warning: Could not load sensitivity configuration: {str(e)}. Using default configuration.")
+            
+        return self._sensitivity_config
+
+        # Load patterns
+        patterns = []
+        try:
+            rows = snowflake_connector.execute_query(
+                f"""
+                SELECT 
+                    category, 
+                    pattern, 
+                    COALESCE(priority, 0) as priority,
+                    COALESCE(is_negative, false) as is_negative
+                FROM {schema_fqn}.SENSITIVE_PATTERNS
+                WHERE COALESCE(is_active, true)
+                ORDER BY is_negative, priority DESC
+                """
+            ) or []
+
+            # Process patterns
+            try:
+                for row in rows:
+                    try:
+                        pattern = {
+                            "category": str(row["CATEGORY"]),
+                            "pattern": str(row["PATTERN"]),
+                            "priority": int(row["PRIORITY"]),
+                            "is_negative": bool(row["IS_NEGATIVE"])
+                        }
+                        patterns.append(pattern)
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Warning: Could not process SENSITIVE_PATTERNS: {str(e)}")
+            
+            # Load keywords
+            keywords = []
+            try:
+                rows = snowflake_connector.execute_query(
+                    f"""
+                    SELECT 
+                        category, 
+                        keyword, 
+                        COALESCE(priority, 0) as priority
+                    FROM {schema_fqn}.SENSITIVE_KEYWORDS
+                    WHERE COALESCE(is_active, true)
+                    ORDER BY priority DESC
+                    """
+                ) or []
+                
+                for row in rows:
+                    try:
+                        keyword = {
+                            "category": str(row["CATEGORY"]),
+                            "keyword": str(row["KEYWORD"]).lower(),
+                            "priority": int(row["PRIORITY"])
+                        }
+                        keywords.append(keyword)
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Warning: Could not load SENSITIVE_KEYWORDS: {str(e)}")
+            
+            # Load categories
+            categories = {}
+            try:
+                rows = snowflake_connector.execute_query(
+                    f"""
+                    SELECT 
+                        category_name as category,
+                        COALESCE(confidentiality_level, 1) as c,
+                        COALESCE(integrity_level, 1) as i,
+                        COALESCE(availability_level, 1) as a
+                    FROM {schema_fqn}.SENSITIVITY_CATEGORIES
+                    WHERE COALESCE(is_active, true)
+                    """
+                ) or []
+                
+                for row in rows:
+                    try:
+                        category = str(row["CATEGORY"])
+                        categories[category] = {
+                            "C": int(row["C"]),
+                            "I": int(row["I"]),
+                            "A": int(row["A"])
+                        }
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Warning: Could not load SENSITIVITY_CATEGORIES: {str(e)}")
+            
+            # Load bundles
+            bundles = []
+            try:
+                rows = snowflake_connector.execute_query(
+                    f"""
+                    SELECT 
+                        bundle_name,
+                        category,
+                        column_name,
+                        COALESCE(boost, 0.1) as boost
+                    FROM {schema_fqn}.SENSITIVE_BUNDLES
+                    WHERE COALESCE(is_active, true)
+                    ORDER BY COALESCE(priority, 100) DESC
+                    """
+                ) or []
+                
+                for row in rows:
+                    try:
+                        bundle = {
+                            "bundle_name": str(row["BUNDLE_NAME"]),
+                            "category": str(row["CATEGORY"]),
+                            "column_name": str(row["COLUMN_NAME"]),
+                            "boost": float(row["BOOST"])
+                        }
+                        bundles.append(bundle)
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Warning: Could not load SENSITIVE_BUNDLES: {str(e)}")
+            
+            # Load thresholds
+            thresholds = {}
+            try:
+                rows = snowflake_connector.execute_query(
+                    f"""
+                    SELECT 
+                        threshold_name as name,
+                        confidence_level as threshold,
+                        sensitivity_level as level
+                    FROM {schema_fqn}.SENSITIVITY_THRESHOLDS
+                    WHERE COALESCE(is_active, true)
+                    """
+                ) or []
+                
+                for row in rows:
+                    try:
+                        name = str(row["NAME"])
+                        thresholds[name] = {
+                            "threshold": float(row["THRESHOLD"]),
+                            "level": str(row["LEVEL"])
+                        }
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Warning: Could not load SENSITIVITY_THRESHOLDS: {str(e)}")
+            
+            # Load weights
+            weights = {}
+            try:
+                rows = snowflake_connector.execute_query(
+                    f"""
+                    SELECT 
+                        sensitivity_type as type,
+                        weight
+                    FROM {schema_fqn}.SENSITIVITY_WEIGHTS
+                    WHERE COALESCE(is_active, true)
+                    """
+                ) or []
+                
+                for row in rows:
+                    try:
+                        weights[str(row["TYPE"])] = float(row["WEIGHT"])
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Warning: Could not load SENSITIVITY_WEIGHTS: {str(e)}")
+            
+            # Load model config
+            model_config = {}
+            try:
+                rows = snowflake_connector.execute_query(
+                    f"""
+                    SELECT 
+                        model_name as name,
+                        model_version as version,
+                        model_type as type,
+                        configuration
+                    FROM {schema_fqn}.SENSITIVITY_MODEL_CONFIG
+                    WHERE COALESCE(is_active, true)
+                    """
+                ) or []
+                
+                for row in rows:
+                    try:
+                        config = row["CONFIGURATION"]
+                        if isinstance(config, str):
+                            config = json.loads(config)
+                        model_config[str(row["NAME"])] = {
+                            "version": str(row["VERSION"]),
+                            "type": str(row["TYPE"]),
+                            "config": config
+                        }
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Warning: Could not load SENSITIVITY_MODEL_CONFIG: {str(e)}")
+            
+            # Load compliance mapping
+            compliance_mapping = {}
+            try:
+                rows = snowflake_connector.execute_query(
+                    f"""
+                    SELECT 
+                        detected_category as category,
+                        framework,
+                        rule,
+                        COALESCE(priority, 100) as priority
+                    FROM {schema_fqn}.COMPLIANCE_MAPPING
+                    WHERE COALESCE(is_active, true)
+                    ORDER BY priority DESC
+                    """
+                ) or []
+                
+                for row in rows:
+                    try:
+                        category = str(row["CATEGORY"])
+                        if category not in compliance_mapping:
+                            compliance_mapping[category] = []
+                        compliance_mapping[category].append({
+                            "framework": str(row["FRAMEWORK"]),
+                            "rule": str(row["RULE"]) if row["RULE"] else None,
+                            "priority": int(row["PRIORITY"])
+                        })
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Warning: Could not load COMPLIANCE_MAPPING: {str(e)}")
+            
+            # Internal patterns functionality has been removed
+            # Update configuration with loaded data
+            cfg.update({
+                "patterns": patterns,
+                "keywords": keywords,
+                "categories": categories,
+                "bundles": bundles,
+                "thresholds": thresholds,
+                "weights": weights,
+                "model_config": model_config,
+                "compliance_mapping": compliance_mapping
+            })
+            
+            # Update cache
+            try:
+                if st is not None and hasattr(st, "session_state"):
+                    st.session_state["sensitivity_config"] = cfg
+            except Exception:
+                pass
+                
+        except Exception as e:
+            print(f"Error loading sensitivity configuration: {str(e)}")
+        
+        return cfg
         try:
             if not (self.use_snowflake and snowflake_connector is not None):
                 raise RuntimeError("Snowflake connector unavailable")
@@ -890,7 +1338,30 @@ class AIClassificationService:
                     db = getattr(settings, "SCAN_CATALOG_DB", None) or getattr(settings, "SNOWFLAKE_DATABASE", None)
             except Exception:
                 db = None
-            schema_fqn = f"{db}.DATA_CLASSIFICATION_GOVERNANCE" if db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE"
+            
+            # Default to DATA_CLASSIFICATION_DB if no database is configured
+            db = db or "DATA_CLASSIFICATION_DB"
+            schema_fqn = f"{db}.DATA_CLASSIFICATION_GOVERNANCE"
+            
+            # Ensure database and schema exist
+            try:
+                if snowflake_connector:
+                    # Check if database exists
+                    db_check = snowflake_connector.execute_query(
+                        f"SELECT 1 FROM INFORMATION_SCHEMA.DATABASES WHERE DATABASE_NAME = '{db}'"
+                    )
+                    if not db_check:
+                        raise ValueError(f"Database '{db}' does not exist or is not accessible")
+                        
+                    # Check if schema exists
+                    schema_check = snowflake_connector.execute_query(
+                        f"SELECT 1 FROM {db}.INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'DATA_CLASSIFICATION_GOVERNANCE'"
+                    )
+                    if not schema_check:
+                        raise ValueError(f"Schema 'DATA_CLASSIFICATION_GOVERNANCE' does not exist in database '{db}'")
+            except Exception as e:
+                logger.error(f"Error verifying database/schema: {str(e)}")
+                raise
 
             # Ensure schema and tables exist (best-effort)
             try:
@@ -901,8 +1372,11 @@ class AIClassificationService:
                       pattern string,
                       priority number default 0,
                       is_active boolean default true,
+                      is_negative boolean default false,
                       updated_at timestamp_ntz default current_timestamp()
                     );
+                    comment on column {schema_fqn}.SENSITIVE_PATTERNS.is_negative is 
+                    'When TRUE, this pattern is used to reduce false positives by matching non-sensitive data';
                     create table if not exists {schema_fqn}.SENSITIVE_KEYWORDS (
                       category string,
                       keyword string,
@@ -968,12 +1442,51 @@ class AIClassificationService:
             # Only active rows; order by priority desc and updated_at desc when available
             rows_patterns = snowflake_connector.execute_query(
                 f"""
-                select category, pattern, coalesce(priority, 0) as priority
+                select 
+                    category, 
+                    pattern, 
+                    coalesce(priority, 0) as priority,
+                    coalesce(is_negative, false) as is_negative
                 from {schema_fqn}.SENSITIVE_PATTERNS
                 where coalesce(is_active, true)
+                order by is_negative, priority desc
+                """
+            ) or []
+            
+            # Load negative patterns
+            rows_negative = snowflake_connector.execute_query(
+                f"""
+                select 
+                    category, 
+                    pattern,
+                    'NEG_' || row_number() over (order by priority desc) as pattern_name,
+                    coalesce(priority, 0) as priority
+                from {schema_fqn}.SENSITIVE_PATTERNS
+                where coalesce(is_negative, false) and coalesce(is_active, true)
                 order by priority desc
                 """
             ) or []
+            
+            # Group negative patterns by category
+            negative_patterns = {}
+            for row in rows_negative:
+                cat = row.get('CATEGORY')
+                if not cat:
+                    continue
+                if cat not in negative_patterns:
+                    negative_patterns[cat] = {'name_tokens': [], 'value_regex': []}
+                
+                pattern = row.get('PATTERN')
+                if not pattern:
+                    continue
+                    
+                # If pattern looks like a simple token (no regex special chars), add to name_tokens
+                if re.match(r'^[A-Z0-9_]+$', pattern):
+                    negative_patterns[cat]['name_tokens'].append(pattern)
+                else:
+                    negative_patterns[cat]['value_regex'].append(pattern)
+            
+            cfg["negative_patterns"] = negative_patterns
             rows_keywords = snowflake_connector.execute_query(
                 f"""
                 select category, keyword, coalesce(priority, 0) as priority
@@ -1011,20 +1524,21 @@ class AIClassificationService:
             except Exception:
                 rows_col_bundles = []
 
-            # Optional: INTERNAL_DATA_PATTERNS (negative caps)
-            rows_internal = []
+            # Load negative patterns (previously in INTERNAL_DATA_PATTERNS)
+            rows_negative = []
             try:
-                rows_internal = snowflake_connector.execute_query(
+                rows_negative = snowflake_connector.execute_query(
                     f"""
                     select pattern_type, pattern, coalesce(max_confidence,30) as max_confidence
-                    from {schema_fqn}.INTERNAL_DATA_PATTERNS
-                    where coalesce(is_active, true)
+                    from {schema_fqn}.SENSITIVE_PATTERNS
+                    where coalesce(is_active, true) and is_negative = true
                     """
                 ) or []
-            except Exception:
-                rows_internal = []
+            except Exception as e:
+                print(f"Warning: Could not load negative patterns: {str(e)}")
+                rows_negative = []
 
-            # Optional: MODEL_METADATA thresholds (latest)
+            # Negative patterns functionality has been removed
             rows_meta = []
             try:
                 rows_meta = snowflake_connector.execute_query(
@@ -1121,16 +1635,6 @@ class AIClassificationService:
                     continue
             bundles = list(bundle_map.values())
 
-            internal_patterns = []
-            for r in rows_internal:
-                try:
-                    pt = str(r.get("PATTERN_TYPE") or r.get("pattern_type") or "")
-                    rx = str(r.get("PATTERN") or r.get("pattern") or "")
-                    mc = int(r.get("MAX_CONFIDENCE") if r.get("MAX_CONFIDENCE") is not None else r.get("max_confidence", 30))
-                    if pt and rx:
-                        internal_patterns.append({"type": pt, "regex": rx, "max_confidence": mc})
-                except Exception:
-                    continue
             thresholds = {}
             try:
                 if rows_meta:
@@ -1241,7 +1745,6 @@ class AIClassificationService:
                     }
                     for r in (rows_col_bundles or [])
                 ],
-                "internal_patterns": internal_patterns,
                 "thresholds": thresholds,
                 "model_metadata": model_meta_out,
                 "thresholds_category": thresholds_cat,
@@ -1300,11 +1803,75 @@ class AIClassificationService:
         except Exception:
             return
 
-    def _load_feedback(self) -> None:
+    def _load_config_from_database(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Load sensitivity configuration from the database.
+        
+        Returns:
+            Dict containing the loaded configuration or None if loading fails
+        """
         try:
-            path = self._feedback_file_path()
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
+            # Default configuration structure
+            cfg = {
+                "patterns": [],
+                "keywords": [],
+                "categories": {},
+                "bundles": [],
+                "compliance_mapping": {},
+                "model_metadata": {
+                    "thresholds": {
+                        "high_confidence": 0.8,
+                        "medium_confidence": 0.5
+                    }
+                },
+                "name_tokens": {}
+            }
+            
+            # Load patterns
+            patterns = snowflake_connector.execute_query(
+                "SELECT * FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS WHERE IS_ACTIVE = TRUE"
+            )
+            if patterns:
+                cfg["patterns"] = patterns
+                
+            # Load keywords
+            keywords = snowflake_connector.execute_query(
+                "SELECT * FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS WHERE IS_ACTIVE = TRUE"
+            )
+            if keywords:
+                cfg["keywords"] = keywords
+                
+            # Load categories
+            categories = snowflake_connector.execute_query(
+                "SELECT * FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES"
+            )
+            if categories:
+                cfg["categories"] = {cat["CATEGORY"]: cat for cat in categories}
+                
+            # Load bundles
+            bundles = snowflake_connector.execute_query(
+                "SELECT * FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_BUNDLES WHERE IS_ACTIVE = TRUE"
+            )
+            if bundles:
+                cfg["bundles"] = bundles
+                
+            # Load model metadata
+            model_metadata = snowflake_connector.execute_query(
+                "SELECT * FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_MODEL_CONFIG"
+            )
+            if model_metadata:
+                cfg["model_metadata"].update(model_metadata[0] if model_metadata else {})
+                
+            return cfg
+            
+        except Exception as e:
+            print(f"Error loading configuration from database: {str(e)}")
+            return None
+            
+    def _load_feedback(self) -> None:
+        """Load feedback from JSON file."""
+        try:
+            if os.path.exists(self._feedback_file):
+                with open(self._feedback_file, 'r') as f:
                     self._feedback = json.load(f) or {}
             else:
                 self._feedback = {}
@@ -1328,7 +1895,7 @@ class AIClassificationService:
         - SENSITIVITY_CATEGORIES (CATEGORY, [C|CIA_C|CONFIDENTIALITY], [I|CIA_I|INTEGRITY], [A|CIA_A|AVAILABILITY], [MIN_THRESHOLD])
         - SENSITIVE_BUNDLES (BUNDLE_NAME, CATEGORY, COLUMNS(list or comma-string), [BOOST], [PRIORITY], [IS_ACTIVE], [VERSION])
 
-        Returns: {patterns, keywords, categories, bundles, internal_patterns, compliance_mapping, model_metadata, name_tokens}
+        Returns: {patterns, keywords, categories, bundles, compliance_mapping, model_metadata, name_tokens}
         Caches in Streamlit session_state and simple in-memory cache to avoid frequent queries.
         """
         # Cache check (per-governance FQN)
@@ -1462,24 +2029,20 @@ class AIClassificationService:
                 continue
         bundles = sorted(bundles, key=lambda x: (-int(x.get("priority", 100)), -float(x.get("boost", 0.1))))
 
-        # Internal patterns
-        internal_rows = _q([
-            f"SELECT PATTERN_TYPE, PATTERN, COALESCE(MAX_CONFIDENCE,30) AS MAX_CONFIDENCE, COALESCE(ACTIVE, TRUE) AS ACTIVE FROM {sc_fqn}.INTERNAL_DATA_PATTERNS",
-            f"SELECT PATTERN_TYPE, PATTERN, COALESCE(MAX_CONFIDENCE,30) AS MAX_CONFIDENCE, COALESCE(IS_ACTIVE, TRUE) AS ACTIVE FROM {sc_fqn}.INTERNAL_DATA_PATTERNS",
-        ])
-        internal_patterns: List[Dict[str, Any]] = []
-        for r in internal_rows:
-            try:
-                if not bool(r.get("ACTIVE", True)):
-                    continue
-                pt = str(r.get("PATTERN_TYPE") or "").strip()
-                rx = str(r.get("PATTERN") or "").strip()
-                mc = int(r.get("MAX_CONFIDENCE") or 30)
-                if pt and rx:
-                    internal_patterns.append({"type": pt, "regex": rx, "max_confidence": mc})
-            except Exception:
-                continue
-
+        # Initialize the config dictionary with all required keys and default values
+        cfg = {
+            "patterns": patterns or [],
+            "keywords": keywords or {},
+            "categories": categories or {},
+            "bundles": bundles or [],
+            "compliance_mapping": {},  # Will be populated below
+            "model_metadata": {},      # Will be populated below
+            "name_tokens": {},         # Will be populated below
+            "thresholds": {},          # Will be populated below
+            "cia_rules": {}            # Will be populated below
+        }
+        
+        # Negative patterns functionality has been removed
         # Compliance mapping (prefer IS_ACTIVE; fallback to TRUE)
         cmp_rows = _q([
             f"SELECT DETECTED_CATEGORY, FRAMEWORK, RULE, COALESCE(PRIORITY,100) AS PRIORITY, COALESCE(IS_ACTIVE, TRUE) AS ACTIVE FROM {sc_fqn}.COMPLIANCE_MAPPING",
@@ -1562,11 +2125,9 @@ class AIClassificationService:
             "keywords": keywords,
             "categories": categories,
             "bundles": bundles,
-            "internal_patterns": internal_patterns,
             "compliance_mapping": compliance_mapping,
             "model_metadata": model_metadata,
-            "name_tokens": name_tokens,
-            "name_tokens": name_tokens,
+            "name_tokens": name_tokens
         }
 
         # Save to caches
@@ -1591,7 +2152,7 @@ class AIClassificationService:
                   corrected_confidence,
                   payload,
                   created_at
-                from DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_FEEDBACK
+                from {schema_fqn}.SENSITIVE_FEEDBACK
                 order by created_at desc
                 limit 10000
                 """
@@ -1692,7 +2253,7 @@ class AIClassificationService:
                     payload_sql = json.dumps(pl).replace("'", "''")
                     snowflake_connector.execute_non_query(
                         f"""
-                        insert into DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_FEEDBACK
+                        insert into {schema_fqn}.SENSITIVE_FEEDBACK
                           (TABLE_NAME, COLUMN_NAME, CORRECTED_CATEGORY, CORRECTED_CONFIDENCE, PAYLOAD, CREATED_BY)
                         select %(tb_full)s, %(col)s, %(ccat)s, %(cconf)s, parse_json('{payload_sql}'), %(uname)s
                         """,
@@ -1709,7 +2270,7 @@ class AIClassificationService:
                         ai_cat = (pl or {}).get("ai_category")
                         snowflake_connector.execute_non_query(
                             """
-                            insert into DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_FEEDBACK_LOG
+                            insert into {schema_fqn}.SENSITIVE_FEEDBACK_LOG
                               (TABLE_NAME, COLUMN_NAME, AI_CATEGORY, USER_CATEGORY, CONFIDENCE, FEEDBACK_ACTION, REVIEWER)
                             select %(tb_full)s, %(col)s, %(ai)s, %(uc)s, %(conf)s, %(act)s, %(uname)s
                             """,
@@ -3068,30 +3629,10 @@ class AIClassificationService:
     def _negative_patterns(self) -> Dict[str, Any]:
         """Return negative (counter) patterns that should lower confidence when present.
 
-        These are primarily aimed at reducing false positives for operational/product
-        attributes that contain generic terms like CODE or RATE but are not PII.
+        These are loaded from the SENSITIVE_PATTERNS table where is_negative = true.
         """
-        return {
-            'PII': {
-                'name_tokens': [
-                    # Product/operational terms
-                    'PRODUCT','SKU','ITEM','MATERIAL','PART','ARTICLE','CATALOG','INVENTORY','STOCK','BATCH',
-                    'ORDER','ORDER_LINE','LINE','TXN','TRANSACTION','REF','REFERENCE','SERIAL','SERIAL_NO','BARCODE',
-                    'CURRENCY','FX','FOREX','EXCHANGE','RATE','PRICE','UNIT_PRICE','LIST_PRICE','AMOUNT_DUE','TAX_RATE',
-                    'CATEGORY','SUBCATEGORY','TYPE','FLAG','STATUS','STATE',
-                    'CODE','PRODUCT_CODE','ITEM_CODE','COLOR_CODE','ERROR_CODE'
-                ],
-                'value_regex': []
-            },
-            'Financial': {
-                'name_tokens': [
-                    # Non-sensitive financial ops terms that often appear alongside identifiers
-                    'CURRENCY','FX','EXCHANGE','RATE','SPOT','FORWARD','INDEX','PRICE_INDEX','BENCHMARK','QUANTITY',
-                    'UNIT_PRICE','DISCOUNT','MARKUP','MARGIN','TAX_RATE','VAT_RATE'
-                ],
-                'value_regex': []
-            },
-        }
+        cfg = self.load_sensitivity_config()
+        return cfg.get("negative_patterns", {})
 
     def detect_sensitive_columns(self, table_name: str, sample_size: int = 100) -> List[Dict[str, Any]]:
         """
@@ -3107,7 +3648,6 @@ class AIClassificationService:
         # Prefer COLUMN_BUNDLES; fallback to legacy bundles
         dyn_bundles = (cfg.get("column_bundles") or (cfg.get("bundles") or []))
         cia_rules = cfg.get("cia_rules") or {}
-        internal_patterns = cfg.get("internal_patterns") or []
         # Pull model metadata (weights/thresholds) from config, fallback to legacy key
         model_meta = cfg.get("model_metadata") or cfg.get("thresholds") or {}
         # Defaults for ensemble weights and knobs when not present in DB
@@ -3626,18 +4166,7 @@ class AIClassificationService:
                         conf *= require_multi_scale
             except Exception:
                 pass
-            # Apply internal negative caps from INTERNAL_DATA_PATTERNS on column name
-            try:
-                for ip in internal_patterns:
-                    rx = ip.get("regex")
-                    mc = int(ip.get("max_confidence") or 30)
-                    if not rx:
-                        continue
-                    if re.search(rx, up, flags=re.IGNORECASE):
-                        conf = min(conf, max(0.0, min(1.0, mc/100.0)))
-                        negative_caps.append(str(rx))
-            except Exception:
-                pass
+            # Negative patterns functionality has been removed
             conf = max(0.0, min(1.0, conf))
 
             # Determine dominant category via weighted voting (regex/token/semantic)
@@ -3903,61 +4432,117 @@ class AIClassificationService:
                 return []
 
         def _regex_signal(col_vals: List[str]) -> Dict[str, float]:
-            scores: Dict[str, float] = {k: 0.0 for k in ["PII","PHI","Financial","SOX","Regulatory","Operational","TradeSecret"]}
+            # Load categories from config or use default
+            categories = list((cfg.get("categories") or {}).keys())
+            if not categories:
+                categories = ["PII", "PHI", "Financial", "SOX", "Regulatory", "Operational", "TradeSecret"]
+                
+            scores: Dict[str, float] = {k: 0.0 for k in categories}
             if not col_vals:
                 return scores
+                
             total = 0
-            match_count: Dict[str, int] = {k: 0 for k in scores}
+            match_count: Dict[str, int] = {k: 0 for k in categories}
+            
+            # Get patterns from config
+            patterns_list = cfg.get("patterns") or []
+            category_patterns: Dict[str, List[str]] = {}
+            
+            # Group patterns by category
+            for p in patterns_list:
+                try:
+                    cat = str(p.get("category") or "").strip()
+                    pattern = str(p.get("pattern") or "").strip()
+                    if not cat or not pattern:
+                        continue
+                    category_patterns.setdefault(cat, []).append(pattern)
+                except Exception:
+                    continue
+            
+            # Process each value
             for v in col_vals:
                 vv = v.strip()
                 if not vv:
                     continue
+                    
                 total += 1
-                # PII sub-patterns (email, phone, ssn, aadhaar generic)
-                for rx in patterns.get('PII', {}).get('value_regex', []) or []:
-                    try:
-                        if re.search(rx, vv):
-                            match_count['PII'] += 1
-                            break
-                    except Exception:
+                
+                # Check patterns for each category
+                for cat, cat_patterns in category_patterns.items():
+                    if cat not in scores:
                         continue
-                # Financial patterns (card-like, IBAN, routing)
-                for rx in patterns.get('Financial', {}).get('value_regex', []) or []:
-                    try:
-                        if re.search(rx, vv):
-                            match_count['Financial'] += 1
-                            break
-                    except Exception:
-                        continue
-            if total == 0:
-                return scores
-            for k in scores:
-                scores[k] = min(1.0, float(match_count.get(k, 0)) / float(total))
+                    for rx in cat_patterns:
+                        try:
+                            if re.search(rx, vv, re.IGNORECASE):
+                                match_count[cat] = match_count.get(cat, 0) + 1
+                                break  # Count at most one match per category per value
+                        except Exception:
+                            continue
+            
+            # Calculate scores
+            if total > 0:
+                for cat in scores:
+                    scores[cat] = min(1.0, float(match_count.get(cat, 0)) / float(total))
+                    
             return scores
 
         def _name_hints(col_name: str) -> Dict[str, float]:
             upc = (col_name or '').upper()
-            hints = {k: 0.0 for k in ["PII","PHI","Financial","SOX","Regulatory","Operational","TradeSecret"]}
+            hints = {k: 0.0 for k in (categories or [])}
+            
+            # Load name tokens from database config
+            name_tokens = cfg.get('name_tokens', {})
+            
             # Column-level name token matches
-            for cat, spec in (patterns or {}).items():
-                toks = spec.get('name_tokens') or []
-                for t in toks:
-                    if t in upc:
-                        if cat in hints:
-                            hints[cat] = max(hints[cat], 1.0)
-            # Table-level context hints
-            if any(k in base_table for k in ["PATIENT","MED","HEALTH","ICD","RX"]):
-                hints["PHI"] = max(hints["PHI"], 0.6)
-            if any(k in base_table for k in ["GL","LEDGER","INVOICE","PAYROLL","FIN","BANK"]):
-                hints["Financial"] = max(hints["Financial"], 0.6)
-            if any(k in base_table for k in ["AUDIT","IFRS","GAAP","JOURNAL"]):
-                hints["SOX"] = max(hints["SOX"], 0.6)
-            if any(k in base_table for k in ["GDPR","CCPA","HIPAA","SEC"]):
-                hints["Regulatory"] = max(hints["Regulatory"], 0.6)
-            if any(k in base_table for k in ["PROJECT","PLAN","ORG","REPORT"]):
-                hints["Operational"] = max(hints["Operational"], 0.5)
-            if any(k in base_table for k in ["ALGORITHM","PROPRIETARY","SECRET"]):
-                hints["TradeSecret"] = max(hints["TradeSecret"], 0.5)
+            for cat, tokens in name_tokens.items():
+                if not isinstance(tokens, list):
+                    continue
+                for token in tokens:
+                    if not isinstance(token, str):
+                        continue
+                    if token.upper() in upc and cat in hints:
+                        hints[cat] = max(hints[cat], 1.0)
+            
+            # Table-level context hints from database config
+            table_patterns = cfg.get('table_patterns', {})
+            for category, patterns in table_patterns.items():
+                if not isinstance(patterns, list):
+                    continue
+                if any(k in base_table for k in patterns):
+                    hints[category] = max(hints.get(category, 0), 0.6)
+            
+            # Fallback to default patterns if no database config found
+            if not name_tokens or not table_patterns:
+                # Default column name patterns
+                default_name_patterns = {
+                    'PII': ['name', 'first', 'last', 'surname', 'email', 'phone', 'ssn', 'aadhaar', 'pan'],
+                    'PHI': ['medical', 'health', 'patient', 'diagnosis', 'treatment'],
+                    'Financial': ['account', 'bank', 'credit', 'debit', 'balance', 'amount', 'price', 'cost', 'salary'],
+                    'SOX': ['audit', 'sox', 'compliance', 'control'],
+                    'Regulatory': ['gdpr', 'ccpa', 'hipaa', 'pci', 'compliance'],
+                    'Operational': ['status', 'flag', 'code', 'type', 'category'],
+                    'TradeSecret': ['secret', 'proprietary', 'confidential']
+                }
+                
+                # Check default name patterns
+                for cat, tokens in default_name_patterns.items():
+                    if any(token.upper() in upc for token in tokens):
+                        hints[cat] = max(hints.get(cat, 0), 1.0)
+                
+                # Default table patterns
+                default_table_patterns = {
+                    'PHI': ["PATIENT", "MED", "HEALTH", "ICD", "RX"],
+                    'Financial': ["GL", "LEDGER", "INVOICE", "PAYROLL", "FIN", "BANK"],
+                    'SOX': ["AUDIT", "IFRS", "GAAP", "JOURNAL"],
+                    'Regulatory': ["GDPR", "CCPA", "HIPAA", "SEC"],
+                    'Operational': ["PROJECT", "PLAN", "ORG", "REPORT"],
+                    'TradeSecret': ["ALGORITHM", "PROPRIETARY", "SECRET"]
+                }
+                
+                for cat, patterns in default_table_patterns.items():
+                    if any(k in base_table for k in patterns):
+                        hints[cat] = max(hints.get(cat, 0), 0.6)
+            
             return hints
 
         def _embedding_boost(col_name: str, sample_vals: List[str]) -> Dict[str, float]:
@@ -4006,10 +4591,16 @@ class AIClassificationService:
             name_scores = _name_hints(cname)
             emb_boosts = _embedding_boost(cname, samples)
 
+            # Load categories from database
+            cfg = self.load_sensitivity_config()
+            categories = list((cfg.get("categories") or {}).keys())
+            if not categories:
+                categories = ["PII", "PHI", "Financial", "SOX", "Regulatory", "Operational", "TradeSecret"]
+                
             # Merge signals: simple capped additive fusion
             probs: Dict[str, float] = {}
             just: List[str] = []
-            for cat in ["PII","PHI","Financial","SOX","Regulatory","Operational","TradeSecret"]:
+            for cat in categories:
                 base = 0.0
                 r = float(regex_scores.get(cat, 0.0))
                 n = float(name_scores.get(cat, 0.0))
@@ -5912,9 +6503,10 @@ class AIClassificationService:
                         cia_str = f"{c}/{i}/{a}"
                     except Exception:
                         cia_str = None
+                    schema_fqn = self._gov_schema_fqn()
                     snowflake_connector.execute_non_query(
-                        """
-                        insert into DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_AUDIT (
+                        f"""
+                            INSERT INTO {schema_fqn}.CLASSIFICATION_DECISIONS (
                             table_name, column_name, data_type, sensitive_type, CIA,
                             created_by, created_on, updated_by, updated_on, scan_timestamp, confidence, feedback
                         ) values (
@@ -5942,6 +6534,88 @@ class AIClassificationService:
             return {"inserted": inserted, "mode": "snowflake"}
         except Exception as e:
             return {"error": str(e)}
+
+    def list_sensitive_tables(self) -> List[str]:
+        """List tables with sensitive data, either from Snowflake audit table or from local cache."""
+        if self.use_snowflake and snowflake_connector is not None:
+            try:
+                schema_fqn = self._gov_schema_fqn()
+                rows = snowflake_connector.execute_query(
+                    f"SELECT DISTINCT TABLE_NAME FROM {schema_fqn}.SENSITIVE_AUDIT"
+                )
+                return [str(r["TABLE_NAME"]) for r in rows]
+            except Exception:
+                pass
+        # Fallback to local cache
+        return [str(t) for t in self.get_sensitive_tables()]
+
+    def list_sensitive_columns_for_ui(self, table_name: str) -> List[str]:
+        """List columns with sensitive data for a given table, either from Snowflake audit table or from local cache."""
+        if self.use_snowflake and snowflake_connector is not None:
+            try:
+                schema_fqn = self._gov_schema_fqn()
+                rows = snowflake_connector.execute_query(
+                    f"SELECT DISTINCT COLUMN_NAME FROM {schema_fqn}.SENSITIVE_AUDIT WHERE TABLE_NAME = %(t)s",
+                    {"t": table_name},
+                )
+                return [str(r["COLUMN_NAME"]) for r in rows]
+            except Exception:
+                pass
+        # Fallback to local cache
+        return [str(c) for c in self.get_sensitive_columns(table_name)]
+
+    def persist_column_overrides(self, table_name: str, column_name: str, override: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist column override to Snowflake audit table if available, otherwise to local cache."""
+        if self.use_snowflake and snowflake_connector is not None:
+            try:
+                schema_fqn = self._gov_schema_fqn()
+                snowflake_connector.execute_non_query(
+                    f"""
+                        INSERT INTO {schema_fqn}.COLUMN_OVERRIDES (
+                            TABLE_NAME, COLUMN_NAME, OVERRIDE
+                        ) values (
+                            %(t)s, %(col)s, %(ov)s
+                        )
+                    """,
+                    {
+                        "t": table_name,
+                        "col": column_name,
+                        "ov": json.dumps(override),
+                    },
+                )
+                return {"success": True}
+            except Exception as e:
+                return {"error": str(e)}
+        # Fallback to local cache
+        self.set_column_override(table_name, column_name, override)
+        return {"success": True}
+
+    def audit_change(self, table_name: str, column_name: str, change_type: str, change_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Audit change to Snowflake audit table if available, otherwise to local cache."""
+        if self.use_snowflake and snowflake_connector is not None:
+            try:
+                schema_fqn = self._gov_schema_fqn()
+                snowflake_connector.execute_non_query(
+                    f"""
+                        INSERT INTO {schema_fqn}.AUDIT_LOG (
+                            TABLE_NAME, COLUMN_NAME, CHANGE_TYPE, CHANGE_DATA
+                        ) values (
+                            %(t)s, %(col)s, %(ct)s, %(cd)s
+                        )
+                    """,
+                    {
+                        "t": table_name,
+                        "col": column_name,
+                        "ct": change_type,
+                        "cd": json.dumps(change_data),
+                    },
+                )
+                return {"success": True}
+            except Exception as e:
+                return {"error": str(e)}
+        # Fallback to local cache
+        self.log_change(table_name, column_name, change_type, change_data)
+        return {"success": True}
 
 # Global instance
 ai_classification_service = AIClassificationService()

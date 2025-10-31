@@ -1,7 +1,7 @@
 """
 Audit Service
 - Provides immutable audit logging for key actions.
-- Persists logs in Snowflake table <DB>.DATA_GOVERNANCE.AUDIT_LOG (DB from settings)
+- Persists logs in Snowflake table <DB>.DATA_CLASSIFICATION_GOVERNANCE.AUDIT_LOG (DB from settings)
 """
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -14,7 +14,7 @@ from src.config.settings import settings
 logger = logging.getLogger(__name__)
 
 DB = settings.SNOWFLAKE_DATABASE
-SCHEMA = "DATA_GOVERNANCE"
+SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 TABLE = "AUDIT_LOG"
 DIGEST_TABLE = "DAILY_AUDIT_DIGESTS"
 

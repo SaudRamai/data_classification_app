@@ -259,14 +259,13 @@ def render_realtime_dashboard():
 
         # Asset Type from ASSETS (TABLE_TYPE or ASSET_TYPE)
         try:
-            # Prefer TABLE_TYPE
+            # Get distinct TABLE_TYPE values from ASSETS
             at_rows = snowflake_connector.execute_query(
                 f"""
-                with s as (
-                  select distinct TABLE_TYPE as T from {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS where TABLE_TYPE is not null
-                  union
-                  select distinct ASSET_TYPE as T from {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS where ASSET_TYPE is not null
-                ) select T from s order by 1
+                SELECT DISTINCT TABLE_TYPE as T 
+                FROM {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS 
+                WHERE TABLE_TYPE IS NOT NULL
+                ORDER BY 1
                 """
             ) if sel_db else []
             at_opts = ["All"] + [r.get("T") for r in (at_rows or []) if r.get("T")]

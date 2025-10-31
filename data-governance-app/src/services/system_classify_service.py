@@ -3,9 +3,9 @@ System Classify Service
 
 Integrates Snowflake native SYSTEM$CLASSIFY for sensitive data detection across target schemas
 (RAW, STAGING, DATA_VAULT). Persists outputs to:
-- DATA_GOVERNANCE.CLASSIFICATION_DECISIONS (final decisions summary per table)
+- DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS (final decisions summary per table)
 - CLASSIFICATION_HISTORY.CLASSIFICATION_HISTORY (detailed, historical record per column)
-- DATA_GOVERNANCE.CLASSIFICATION_QUEUE (unclassified or low-confidence items)
+- DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_QUEUE (unclassified or low-confidence items)
 Also applies Snowflake tags (DATA_CLASSIFICATION, CONFIDENTIALITY_LEVEL) using TaggingService,
 validating values against CLASSIFICATION_METADATA.ALLOWED_TAG_VALUES when present.
 """
@@ -36,7 +36,7 @@ class SystemClassifyService:
         self._ia_rules: Optional[List[Dict]] = None  # cached optional rules from DB
 
     def _load_ia_rules(self) -> List[Dict]:
-        """Load optional I/A inference rules from {DB}.DATA_GOVERNANCE.IA_RULES.
+        """Load optional I/A inference rules from {DB}.DATA_CLASSIFICATION_GOVERNANCE.IA_RULES.
         Expected columns: TYPE, PATTERN, I_LEVEL, A_LEVEL, PRIORITY (optional)
         - TYPE can correlate to detected categories (e.g., 'FINANCIAL','PII','AUTH','PHI','PCI')
         - PATTERN is applied to ASSET_FULL_NAME (case-insensitive substring match or regex if delimited by /.../)
@@ -51,7 +51,7 @@ class SystemClassifyService:
                        COALESCE(I_LEVEL, 1) AS I_LEVEL,
                        COALESCE(A_LEVEL, 1) AS A_LEVEL,
                        COALESCE(PRIORITY, 0) AS PRIORITY
-                FROM {DB}.DATA_GOVERNANCE.IA_RULES
+                FROM {DB}.DATA_CLASSIFICATION_GOVERNANCE.IA_RULES
                 LIMIT 10000
                 """
             ) or []
@@ -224,11 +224,11 @@ class SystemClassifyService:
                     )
                 except Exception as e:
                     logger.warning(f"Tagging failed for {full}: {e}")
-                # Record decision summary into DATA_GOVERNANCE.CLASSIFICATION_DECISIONS
+                # Record decision summary into DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS
                 try:
                     self.connector.execute_non_query(
                         f"""
-                        INSERT INTO {DB}.DATA_GOVERNANCE.CLASSIFICATION_DECISIONS
+                        INSERT INTO {DB}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS
                         (ID, ASSET_FULL_NAME, USER_ID, ACTION, CLASSIFICATION_LEVEL, CIA_CONF, CIA_INT, CIA_AVAIL, RATIONALE, CREATED_AT, DETAILS)
                         SELECT %(id)s, %(full)s, 'system', 'AUTO', %(lbl)s, %(c)s, %(i)s, %(a)s,
                                %(rat)s, CURRENT_TIMESTAMP,
@@ -253,7 +253,7 @@ class SystemClassifyService:
                     try:
                         self.connector.execute_non_query(
                             f"""
-                            INSERT INTO {DB}.DATA_GOVERNANCE.CLASSIFICATION_QUEUE
+                            INSERT INTO {DB}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_QUEUE
                             (ID, ASSET_FULL_NAME, COLUMN_NAME, REASON, SUGGESTED_LABEL, CONFIDENCE, SENSITIVE_CATEGORIES, CREATED_AT, DETAILS)
                             SELECT %(id)s, %(full)s, NULL, %(reason)s, %(lbl)s, %(conf)s, PARSE_JSON(%(cats)s), CURRENT_TIMESTAMP,
                                    TO_VARIANT(PARSE_JSON(%(det)s))

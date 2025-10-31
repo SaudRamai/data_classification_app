@@ -7,7 +7,7 @@ from typing import Optional
 from src.config.settings import settings
 
 
-def setup_logger(name: str = "data_governance", level: Optional[str] = None) -> logging.Logger:
+def setup_logger(name: str = "data_classification_governance", level: Optional[str] = None) -> logging.Logger:
     """
     Set up and configure logger.
     

@@ -1,10 +1,10 @@
 -- Snowflake Tasks to enforce SLA checks and enqueue notifications (no static values)
--- Requires: DATA_GOVERNANCE schema, CHECKS, CHECK_RESULTS, VIOLATIONS, APP_SETTINGS, CLASSIFICATION_QUEUE, NOTIFICATIONS_OUTBOX
--- Run as a privileged role with USAGE on target warehouse and OWNERSHIP on DATA_GOVERNANCE objects.
+-- Requires: DATA_CLASSIFICATION_GOVERNANCE schema, CHECKS, CHECK_RESULTS, VIOLATIONS, APP_SETTINGS, CLASSIFICATION_QUEUE, NOTIFICATIONS_OUTBOX
+-- Run as a privileged role with USAGE on target warehouse and OWNERSHIP on DATA_CLASSIFICATION_GOVERNANCE objects.
 
 -- Configure
 set dbname = current_database();
-set sch    = 'DATA_GOVERNANCE';
+set sch    = 'DATA_CLASSIFICATION_GOVERNANCE';
 set wh     = '{{YOUR_WAREHOUSE}}'; -- replace before running
 
 -- Ensure settings and outbox tables exist

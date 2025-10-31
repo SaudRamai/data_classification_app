@@ -3,8 +3,10 @@ import sys
 import random
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+import textwrap
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -28,8 +30,24 @@ apply_global_theme()
 st.title("Data Intelligence")
 st.caption("Unified Quality and Lineage powered by Snowflake metadata and account usage views")
 
+# Require Snowflake credentials before running any queries on this page
+_has_user = bool(st.session_state.get("sf_user") or getattr(settings, "SNOWFLAKE_USER", None))
+_has_account = bool(st.session_state.get("sf_account") or getattr(settings, "SNOWFLAKE_ACCOUNT", None))
+if not (_has_user and _has_account):
+    st.info("Please login on the Home page to establish a Snowflake session (or set SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER in environment). Then return here.")
+    st.stop()
+
 # ------------- Helpers -------------
 DEFAULT_TTL = 1800  # 30 minutes for most caches
+
+def _has_sf_creds() -> bool:
+    """Return True if minimal Snowflake credentials are present (account + user)."""
+    try:
+        _u = st.session_state.get("sf_user") or getattr(settings, "SNOWFLAKE_USER", None)
+        _a = st.session_state.get("sf_account") or getattr(settings, "SNOWFLAKE_ACCOUNT", None)
+        return bool(_u and _a)
+    except Exception:
+        return False
 
 def _run(query: str, params: Optional[Dict] = None) -> List[Dict]:
     """Execute a SQL query and return results as a list of dictionaries.
@@ -42,6 +60,10 @@ def _run(query: str, params: Optional[Dict] = None) -> List[Dict]:
         List of dictionaries where each dictionary represents a row with column names as keys
     """
     try:
+        # Defensive: do not attempt a connection if credentials are missing
+        if not _has_sf_creds():
+            st.info("Snowflake session not established. Please login first.")
+            return []
         # Get the active Snowflake connection context manager
         with snowflake_connector.get_connection() as conn:
             if not conn:
@@ -216,6 +238,9 @@ def _get_quality_metrics(database: str = None, schema: str = None, table: str = 
     }
 
     try:
+        # Skip Snowflake access if no credentials
+        if not _has_sf_creds():
+            return metrics
         # Build the main query using Snowflake's ACCOUNT_USAGE views and DMFs
         query = """
 WITH 
@@ -604,6 +629,9 @@ def _get_overall_health() -> Dict[str, Any]:
     }
     
     try:
+        # Skip Snowflake access if no credentials
+        if not _has_sf_creds():
+            return health_metrics
         query = """
         WITH 
         storage_health AS (
@@ -710,6 +738,8 @@ def _get_overall_health() -> Dict[str, Any]:
 def _warehouses() -> List[str]:
     """Return list of warehouses available to the current user."""
     try:
+        if not _has_sf_creds():
+            return []
         # Try to get from session state first
         if 'cached_warehouses' in st.session_state:
             return st.session_state.cached_warehouses
@@ -727,9 +757,9 @@ def _warehouses() -> List[str]:
         # Fallback to INFORMATION_SCHEMA if SHOW fails
         try:
             rows = _run("""
-                SELECT WAREHOUSE_NAME 
-                FROM INFORMATION_SCHEMA.WAREHOUSES 
-                WHERE WAREHOUSE_OWNER = CURRENT_ROLE()
+                SELECT DISTINCT WAREHOUSE_NAME 
+                FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSES 
+                WHERE DELETED_ON IS NULL
                 ORDER BY WAREHOUSE_NAME
                 LIMIT 100
             """)
@@ -756,6 +786,8 @@ def _warehouses() -> List[str]:
 def _current_warehouse() -> Optional[str]:
     """Return current session warehouse if set, else None (best-effort)."""
     try:
+        if not _has_sf_creds():
+            return None
         # Try to get from session state first
         if 'current_warehouse' in st.session_state:
             return st.session_state.current_warehouse
@@ -775,22 +807,18 @@ def _use_warehouse(wh: Optional[str]) -> None:
     """Resume and USE the selected warehouse, best-effort."""
     if not wh:
         return
+    if not _has_sf_creds():
+        return
     try:
         # First check if warehouse is already running
         try:
-            # Use a direct query to check warehouse state
-            wh_info = snowflake_connector.execute_query(
-                "SELECT STATE FROM TABLE(INFORMATION_SCHEMA.WAREHOUSES) WHERE WAREHOUSE_NAME = %s",
-                (wh,)
-            ) or []
-            
-            if wh_info and wh_info[0].get("STATE") == 'SUSPENDED':
-                snowflake_connector.execute_non_query(f"ALTER WAREHOUSE {wh} RESUME IF SUSPENDED")
+            # Best effort: attempt to resume without querying INFORMATION_SCHEMA
+            snowflake_connector.execute_non_query(f'ALTER WAREHOUSE "{wh}" RESUME IF SUSPENDED')
         except Exception as e:
-            st.warning(f"Could not check/resume warehouse {wh}: {e}")
+            st.warning(f"Could not resume warehouse {wh}: {e}")
             
         try:
-            snowflake_connector.execute_non_query(f"USE WAREHOUSE {wh}")
+            snowflake_connector.execute_non_query(f'USE WAREHOUSE "{wh}"')
             st.session_state['sf_warehouse'] = wh
             # Update the current warehouse in session state
             st.session_state.current_warehouse = wh
@@ -904,7 +932,7 @@ def _get_object_type(database: str, schema: str, object_name: str) -> str:
             FROM INFORMATION_SCHEMA.TABLES 
             WHERE TABLE_CATALOG = %(db)s 
               AND TABLE_SCHEMA = %(schema)s 
-              AND TABLE_NAME = %(name)
+              AND TABLE_NAME = %(name)s
               AND TABLE_TYPE = 'BASE TABLE'
             """,
             {"db": database, "schema": schema, "name": object_name}
@@ -920,7 +948,7 @@ def _get_object_type(database: str, schema: str, object_name: str) -> str:
             FROM INFORMATION_SCHEMA.VIEWS 
             WHERE TABLE_CATALOG = %(db)s 
               AND TABLE_SCHEMA = %(schema)s 
-              AND TABLE_NAME = %(name)
+              AND TABLE_NAME = %(name)s
             """,
             {"db": database, "schema": schema, "name": object_name}
         )
@@ -999,21 +1027,34 @@ def _columns(db: str, schema: str, object_name: str) -> List[str]:
 @st.cache_data(ttl=DEFAULT_TTL)
 def _estimate_size(fqn: str) -> Optional[int]:
     try:
-        # SYSTEM$ESTIMATE_TABLE_SIZE returns VARIANT; select value:bytes_total if available
-        rows = _run(f"select SYSTEM$ESTIMATE_TABLE_SIZE('{fqn}') as EST") or []
-        if not rows:
-            return None
-        est = rows[0].get("EST")
-        if isinstance(est, dict):
-            # snowflake-connector may parse VARIANT to dict
-            return int(est.get("bytes") or est.get("bytes_total") or 0) or None
-        # Fallback: try to parse JSON string
+        # Prefer ACCOUNT_USAGE metrics; SYSTEM$ESTIMATE_TABLE_SIZE may be unavailable
         try:
-            import json
-            d = json.loads(est)
-            return int(d.get("bytes") or d.get("bytes_total") or 0) or None
+            db, sch, tbl = _split_fqn(fqn)
+            rows = _run(
+                """
+                SELECT COALESCE(MAX(ACTIVE_BYTES), 0) AS BYTES
+                FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS
+                WHERE TABLE_CATALOG = %(db)s AND TABLE_SCHEMA = %(sc)s AND TABLE_NAME = %(tb)s
+                """,
+                {"db": db, "sc": sch, "tb": tbl},
+            ) or []
+            return int(rows[0].get("BYTES", 0)) if rows else None
         except Exception:
-            return None
+            # SYSTEM$ESTIMATE_TABLE_SIZE returns VARIANT; select value:bytes_total if available
+            rows = _run(f"select SYSTEM$ESTIMATE_TABLE_SIZE('{fqn}') as EST") or []
+            if not rows:
+                return None
+            est = rows[0].get("EST")
+            if isinstance(est, dict):
+                # snowflake-connector may parse VARIANT to dict
+                return int(est.get("bytes") or est.get("bytes_total") or 0) or None
+            # Fallback: try to parse JSON string
+            try:
+                import json
+                d = json.loads(est)
+                return int(d.get("bytes") or d.get("bytes_total") or 0) or None
+            except Exception:
+                return None
     except Exception:
         return None
 
@@ -1233,7 +1274,7 @@ def _run_snapshot(active_db: Optional[str], schemas: List[str], table_limit: int
             except Exception:
                 pass
             try:
-                r2 = _run(f"select try_min(\"{col}\") as MINV, try_max(\"{col}\") as MAXV, try_avg(iff(try_to_double(\"{col}\") is null, null, try_to_double(\"{col}\"))) as AVGV from {fqn}") or []
+                r2 = _run(f"select min(\"{col}\") as MINV, max(\"{col}\") as MAXV, avg(try_to_double(\"{col}\")) as AVGV from {fqn}") or []
                 if r2:
                     minv = r2[0].get('MINV'); maxv = r2[0].get('MAXV'); avgv = r2[0].get('AVGV')
                     for metric, val in [("MIN", minv), ("MAX", maxv), ("AVG", avgv)]:
@@ -1392,32 +1433,7 @@ with st.sidebar:
                     except Exception as e:
                         continue
                 
-                # Try to maintain the previously selected object if it still exists
-                prev_object = st.session_state.get('prev_object')
-                default_obj_idx = 0
-                
-                # Find the display name for the previously selected object
-                selected_display = "None"
-                if prev_object and prev_object != "None":
-                    for disp_name, obj_info in obj_map.items():
-                        if obj_info and obj_info.get('name') == prev_object:
-                            selected_display = disp_name
-                            break
-                
-                # Object selection dropdown
-                selected_display = st.selectbox(
-                    "Table/View",
-                    options=display_names,
-                    index=display_names.index(selected_display) if selected_display in display_names else 0,
-                    key="int_object_display",
-                    help="Select a table or view to analyze"
-                )
-                
-                # Get the actual object name from the map
-                sel_object = obj_map.get(selected_display, {}).get('name', "None") if selected_display != "None" else "None"
-                
-                # Update the previous object in session state
-                st.session_state.prev_object = sel_object if sel_object != "None" else None
+                # Removed duplicate 'Table/View' selectbox to avoid double filtering
             
             # Create display names that include the object type
             display_names = ["None"]
@@ -1454,7 +1470,7 @@ with st.sidebar:
                     "Object (table/view)",
                     options=display_names,
                     index=display_names.index(prev_display_name) if prev_display_name in display_names else 0,
-                    key="int_object_display",
+                    key="int_object_display_2",
                     help="Select a table or view to analyze"
                 )
                 
@@ -1672,7 +1688,7 @@ with q_tab:
                 hovermode="x unified"
             )
             
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         
         st.markdown("---")
         
@@ -1683,41 +1699,18 @@ with q_tab:
         with st.spinner('🔍 Loading quality dimension metrics...'):
             quality_metrics = _get_quality_dimensions_metrics()
         
-        # Helper function to create dimension cards
-        def dimension_card(title: str, icon: str, metrics: List[Dict], color: str = "#3498db"):
-            # Generate metric HTML
-            metrics_html = ''
-            for m in metrics:
-                help_html = f'<div style="font-size: 10px; color: #95a5a6;">{m.get("help", "")}</div>' if m.get("help") else ''
-                metrics_html += f'''
-                <div style="padding: 8px; background: #f8f9fa; border-radius: 6px;">
-                    <div style="font-size: 12px; color: #7f8c8d; margin-bottom: 4px;">{m['label']}</div>
-                    <div style="font-size: 18px; font-weight: 600; color: {m.get('color', '#2c3e50')};">
-                        {m['value']}
-                    </div>
-                    {help_html}
-                </div>
-                '''
-            
-            # Get timestamp from first metric
-            timestamp = pd.to_datetime(metrics[0].get('timestamp', datetime.utcnow().isoformat())).strftime('%Y-%m-%d %H:%M')
-            
-            # Return complete card HTML
-            return f"""
-            <div style="background: white; border-radius: 10px; padding: 15px; 
-                        box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 20px;
-                        border-left: 4px solid {color};">
-                <div style="display: flex; align-items: center; margin-bottom: 12px;">
-                    <div style="font-size: 20px; margin-right: 10px;">{icon}</div>
-                    <div style="font-weight: 600; font-size: 16px; color: #2c3e50;">{title}</div>
-                </div>
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                    {metrics_html}
-                </div>
-                <div style="font-size: 10px; color: #bdc3c7; margin-top: 10px; text-align: right;">
-                    Updated: {timestamp}
-                </div>
-            </div>"""
+        # Helper function to render a dimension card using native Streamlit components
+        def render_dimension_card(title: str, icon: str, metrics: List[Dict], color: str = "#3498db"):
+            box = st.container(border=True)
+            with box:
+                st.markdown(f"{icon} **{title}**")
+                col_a, col_b = st.columns(2)
+                cols = [col_a, col_b]
+                for idx, m in enumerate(metrics):
+                    with cols[idx % 2]:
+                        st.metric(m['label'], m['value'])
+                        if m.get('help'):
+                            st.caption(m['help'])
         
         # Create rows of cards (3 per row)
         dimensions = [
@@ -1884,13 +1877,12 @@ with q_tab:
                 if i + j < len(dimensions):
                     dim = dimensions[i + j]
                     with cols[j]:
-                        card_html = dimension_card(
+                        render_dimension_card(
                             title=dim['title'],
                             icon=dim['icon'],
                             metrics=dim['metrics'],
                             color=dim['color']
                         )
-                        st.markdown(card_html, unsafe_allow_html=True)
         
         # Initialize default metrics
         default_metrics = {
@@ -2175,7 +2167,7 @@ with q_tab:
                 height=300
             )
             
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         
         st.markdown("---")
         
@@ -2244,33 +2236,28 @@ with q_tab:
         
         st.markdown("---")
         
-        # Impact & Drill-down Section
-        st.markdown("### 🔗 Impact & Drill-down")
+        # Impact & Drill-down Section (removed)
+        # st.markdown("### 🔗 Impact & Drill-down")
         
-        # Affected Downstream Systems
-        st.markdown("#### Affected Downstream Systems")
-        if sel_object and sel_object != "None":
-            st.info(f"Selected: {sel_object}")
-            st.write("This table shows systems that depend on the selected object.")
-            # Add actual dependency analysis here
-        else:
-            st.info("Select an object from the sidebar to view impact analysis.")
+        # Impact & Drill-down removed
         
-        # Dataset-Level Detailed Views
-        st.markdown("#### Dataset-Level Details")
+        # Removed dataset-level details
         if sel_object and sel_object != "None":
             try:
                 db, schema, table = sel_object.split('.')
-                # Get table stats
-                stats = _run(f"""
+                # Get table stats (parameterized and quoted)
+                stats = _run(
+                    f"""
                     SELECT 
                         ROW_COUNT,
                         BYTES,
                         LAST_ALTERED,
                         DATEDIFF('hour', LAST_ALTERED, CURRENT_TIMESTAMP()) as hours_since_update
-                    FROM {0}.INFORMATION_SCHEMA.TABLES 
-                    WHERE TABLE_SCHEMA = '{1}' AND TABLE_NAME = '{2}'
-                """.format(db, schema, table))
+                    FROM "{db}".INFORMATION_SCHEMA.TABLES 
+                    WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
+                    """,
+                    {"s": schema, "t": table},
+                )
                 
                 if stats:
                     st.metric("Row Count", f"{int(stats[0].get('ROW_COUNT', 0)):,}")
@@ -2534,28 +2521,36 @@ with q_tab:
             # Consistency score: check duplicates on key-like columns (PRIMARY KEY or id-like)
             consistency = None
             try:
-                # Prefer PK/UNIQUE columns
-                key_rows = _run(
-                    f"""
-                    select kc.COLUMN_NAME, tc.CONSTRAINT_TYPE
-                    from {db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE kc
-                    join {db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-                      on tc.TABLE_SCHEMA=kc.TABLE_SCHEMA and tc.TABLE_NAME=kc.TABLE_NAME and tc.CONSTRAINT_NAME=kc.CONSTRAINT_NAME
-                    where kc.TABLE_SCHEMA=%(s)s and kc.TABLE_NAME=%(t)s and tc.CONSTRAINT_TYPE in ('PRIMARY KEY','UNIQUE')
-                    order by kc.POSITION
-                    """,
-                    {"s": sch, "t": name}
-                ) or []
+                # Prefer PK/UNIQUE columns (fallback to SHOW if KCU not available)
+                key_rows = []
+                try:
+                    key_rows = _run(
+                        f"""
+                        select kc.COLUMN_NAME, tc.CONSTRAINT_TYPE
+                        from {db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE kc
+                        join {db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                          on tc.TABLE_SCHEMA=kc.TABLE_SCHEMA and tc.TABLE_NAME=kc.TABLE_NAME and tc.CONSTRAINT_NAME=kc.CONSTRAINT_NAME
+                        where kc.TABLE_SCHEMA=%(s)s and kc.TABLE_NAME=%(t)s and tc.CONSTRAINT_TYPE in ('PRIMARY KEY','UNIQUE')
+                        order by kc.POSITION
+                        """,
+                        {"s": sch, "t": name}
+                    ) or []
+                except Exception:
+                    try:
+                        rows = _run(f"SHOW PRIMARY KEYS IN TABLE \"{db}\".\"{sch}\".\"{name}\"") or []
+                        key_rows = [{"COLUMN_NAME": r.get("column_name"), "CONSTRAINT_TYPE": "PRIMARY KEY"} for r in rows]
+                    except Exception:
+                        key_rows = []
                 key_col = key_rows[0].get("COLUMN_NAME") if key_rows else None
                 if not key_col:
                     # fallback id-like
                     upcols = [c.upper() for c in col_names]
                     key_col = next((c for c in upcols if c in ("ID", f"{name.upper()}_ID", "PK_ID", "ROW_ID")), None)
                 if key_col:
-                    dup = _run(f"select count(*) as TOTAL, count(\"{key_col}\") as NON_NULL, count(distinct \"{key_col}\") as DISTINCT from {fqn}") or []
+                    dup = _run(f"select count(*) as TOTAL, count(\"{key_col}\") as NON_NULL, count(distinct \"{key_col}\") as DISTINCT_COUNT from {fqn}") or []
                     t = int((dup[0].get("TOTAL") if dup else 0) or 0)
                     nn = int((dup[0].get("NON_NULL") if dup else 0) or 0)
-                    di = int((dup[0].get("DISTINCT") if dup else 0) or 0)
+                    di = int((dup[0].get("DISTINCT_COUNT") if dup else 0) or 0)
                     dup_pct = max(0.0, (1.0 - (di/nn)) * 100.0) if nn else 0.0
                     consistency = round(100.0 - dup_pct, 2)
             except Exception:
@@ -2742,10 +2737,10 @@ with q_tab:
             for _, r in df_cols.iterrows():
                 col = r.get("COLUMN_NAME")
                 try:
-                    rs = _run(f"select count(*) as TOTAL, count(\"{col}\") as NON_NULL, count(distinct \"{col}\") as DISTINCT, avg(len(to_varchar(\"{col}\"))) as AVG_LEN, min(try_to_double(\"{col}\")) as MIN_NUM, max(try_to_double(\"{col}\")) as MAX_NUM, avg(try_to_double(\"{col}\")) as AVG_NUM, stddev_samp(try_to_double(\"{col}\")) as STD_NUM, min(try_to_timestamp(\"{col}\")) as MIN_TS, max(try_to_timestamp(\"{col}\")) as MAX_TS from {drill_table}") or []
+                    rs = _run(f"select count(*) as TOTAL, count(\"{col}\") as NON_NULL, count(distinct \"{col}\") as DISTINCT_COUNT, avg(len(to_varchar(\"{col}\"))) as AVG_LEN, min(try_to_double(\"{col}\")) as MIN_NUM, max(try_to_double(\"{col}\")) as MAX_NUM, avg(try_to_double(\"{col}\")) as AVG_NUM, stddev_samp(try_to_double(\"{col}\")) as STD_NUM, min(try_to_timestamp(\"{col}\")) as MIN_TS, max(try_to_timestamp(\"{col}\")) as MAX_TS from {drill_table}") or []
                     total = int((rs[0].get("TOTAL") if rs else 0) or 0)
                     nonnull = int((rs[0].get("NON_NULL") if rs else 0) or 0)
-                    distinct = int((rs[0].get("DISTINCT") if rs else 0) or 0)
+                    distinct = int((rs[0].get("DISTINCT_COUNT") if rs else 0) or 0)
                     avg_len = float((rs[0].get("AVG_LEN") if rs else 0) or 0)
                     null_pct = round(((total - nonnull)/total)*100.0, 2) if total else 0.0
                     stats.append({
@@ -2771,7 +2766,7 @@ with q_tab:
                     continue
             if stats:
                 df_stats = pd.DataFrame(stats)
-                st.dataframe(df_stats, use_container_width=True)
+                st.dataframe(df_stats, width='stretch')
                 # Column drilldown charts
                 try:
                     col_choice = st.selectbox("Column to visualize", options=[s.get("COLUMN") for s in stats] if stats else [])
@@ -2926,7 +2921,7 @@ with q_tab:
                         {"d": db, "s": sch, "t": name}
                     ) or []
                     st.markdown("**ACCOUNT_USAGE.COLUMNS**")
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    st.dataframe(pd.DataFrame(rows), width='stretch')
                 except Exception as e:
                     st.info(f"Account usage columns unavailable: {e}")
             # Table metadata + size
@@ -2977,13 +2972,13 @@ with q_tab:
             stats_rows = []
             for c in chosen_cols:
                 try:
-                    r = _run(f"select count(*) as TOTAL, count(\"{c}\") as NON_NULL, count(distinct \"{c}\") as DISTINCT from {sel_object}") or []
+                    r = _run(f"select count(*) as TOTAL, count(\"{c}\") as NON_NULL, count(distinct \"{c}\") as DISTINCT_COUNT from {sel_object}") or []
                     total = int(r[0].get("TOTAL") or 0) if r else 0
                     nonnull = int(r[0].get("NON_NULL") or 0) if r else 0
-                    distinct = int(r[0].get("DISTINCT") or 0) if r else 0
+                    distinct = int(r[0].get("DISTINCT_COUNT") or 0) if r else 0
                     minv = maxv = avgv = None
                     try:
-                        r2 = _run(f"select try_min(\"{c}\") as MINV, try_max(\"{c}\") as MAXV, try_avg(iff(try_to_double(\"{c}\") is null, null, try_to_double(\"{c}\"))) as AVGV from {sel_object}") or []
+                        r2 = _run(f"select min(\"{c}\") as MINV, max(\"{c}\") as MAXV, avg(try_to_double(\"{c}\")) as AVGV from {sel_object}") or []
                         minv = r2[0].get("MINV") if r2 else None
                         maxv = r2[0].get("MAXV") if r2 else None
                         avgv = r2[0].get("AVGV") if r2 else None
@@ -3092,7 +3087,7 @@ with q_tab:
                     continue
             if stats_rows:
                 df_stats = pd.DataFrame(stats_rows)
-                st.dataframe(df_stats, use_container_width=True)
+                st.dataframe(df_stats, width='stretch')
 
             # Simple distributions for first selected column
             if chosen_cols:
@@ -3145,7 +3140,7 @@ with q_tab:
                 rows = []
                 st.info(f"Stale scan unavailable: {e}")
             st.markdown("**Stale Tables**")
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), width='stretch')
 
             # Empty tables
             try:
@@ -3370,7 +3365,7 @@ Provide complete implementation including:
                         {"s": sch, "t": name}
                     ) or []
                     st.caption("Masking Policies")
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    st.dataframe(pd.DataFrame(rows), width='stretch')
                 except Exception as e:
                     st.info(f"Masking policy info unavailable: {e}")
 
@@ -3406,7 +3401,7 @@ Provide complete implementation including:
                 rows_stale = []
                 st.info("Stale scan unavailable.")
             st.markdown("**Stale Tables**")
-            st.dataframe(pd.DataFrame(rows_stale), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows_stale), width='stretch')
 
             # Empty tables
             try:
@@ -3427,7 +3422,7 @@ Provide complete implementation including:
                 rows_empty = []
                 st.info("Empty table scan unavailable.")
             st.markdown("**Empty Tables**")
-            st.dataframe(pd.DataFrame(rows_empty), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows_empty), width='stretch')
 
             # Schema quality summary (nullability)
             try:
@@ -3448,7 +3443,7 @@ Provide complete implementation including:
                 rows_schema = []
                 st.info("Schema quality scan unavailable.")
             st.markdown("**Schema Quality (Nullability Summary)**")
-            st.dataframe(pd.DataFrame(rows_schema), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows_schema), width='stretch')
 
         def _detect_and_persist(dbname: Optional[str], thr_null_pct: float, thr_duplicates_pct: float) -> int:
             if not dbname:
@@ -3527,7 +3522,7 @@ Provide complete implementation including:
                 st.session_state["dq_resolutions"].append({"at": datetime.utcnow().isoformat(), "note": res_note})
         if st.session_state["dq_resolutions"]:
             st.markdown("**Notes (session)**")
-            st.dataframe(pd.DataFrame(st.session_state["dq_resolutions"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(st.session_state["dq_resolutions"]), width='stretch', hide_index=True)
         st.markdown("---")
         st.subheader("Verify Resolutions")
         st.caption("Re-run the Quality Issues scans to confirm issues are resolved")
@@ -3538,12 +3533,12 @@ Provide complete implementation including:
 # Data Lineage
 # =====================================
 with l_tab:
-    lin_viz, lin_impact, lin_map, lin_change, lin_column = st.tabs([
+    lin_viz, lin_map, lin_change, lin_column, lin_impact = st.tabs([
         "Lineage Visualization",
-        "Impact Analysis",
         "Dependency Mapping",
         "Change Propagation",
         "Column-level Info",
+        "Impact Analysis",
     ])
 
     # Base: dependencies from INFORMATION_SCHEMA
@@ -3560,6 +3555,9 @@ with l_tab:
         try:
             where = []
             params: Dict[str, Any] = {}
+            # Limit to selected database in ACCOUNT_USAGE
+            where.append("REFERENCING_OBJECT_DATABASE = %(db)s")
+            params["db"] = db
             if schema and schema != "All":
                 where.append("REFERENCING_OBJECT_SCHEMA = %(s)s")
                 params["s"] = schema
@@ -3569,10 +3567,10 @@ with l_tab:
             w = (" where " + " and ".join(where)) if where else ""
             rows1 = _run(
                 f"""
-                select REFERENCING_OBJECT_DATABASE, REFERENCING_OBJECT_SCHEMA, REFERENCING_OBJECT_NAME,
-                       REFERENCED_OBJECT_DATABASE, REFERENCED_OBJECT_SCHEMA, REFERENCED_OBJECT_NAME,
+                select REFERENCING_OBJECT_CATALOG, REFERENCING_OBJECT_SCHEMA, REFERENCING_OBJECT_NAME,
+                       REFERENCED_OBJECT_CATALOG, REFERENCED_OBJECT_SCHEMA, REFERENCED_OBJECT_NAME,
                        REFERENCED_OBJECT_DOMAIN as REFERENCED_TYPE
-                from {db}.INFORMATION_SCHEMA.OBJECT_DEPENDENCIES
+                from SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES
                 {w}
                 limit 5000
                 """,
@@ -3584,6 +3582,9 @@ with l_tab:
         try:
             whereU = []
             paramsU: Dict[str, Any] = {}
+            # Limit to selected database in ACCOUNT_USAGE
+            whereU.append("REFERENCED_OBJECT_CATALOG = %(db)s")
+            paramsU["db"] = db
             if schema and schema != "All":
                 whereU.append("REFERENCED_OBJECT_SCHEMA = %(s)s")
                 paramsU["s"] = schema
@@ -3593,10 +3594,10 @@ with l_tab:
             wU = (" where " + " and ".join(whereU)) if whereU else ""
             rows1u = _run(
                 f"""
-                select REFERENCING_OBJECT_DATABASE, REFERENCING_OBJECT_SCHEMA, REFERENCING_OBJECT_NAME,
-                       REFERENCED_OBJECT_DATABASE, REFERENCED_OBJECT_SCHEMA, REFERENCED_OBJECT_NAME,
+                select REFERENCING_OBJECT_CATALOG, REFERENCING_OBJECT_SCHEMA, REFERENCING_OBJECT_NAME,
+                       REFERENCED_OBJECT_CATALOG, REFERENCED_OBJECT_SCHEMA, REFERENCED_OBJECT_NAME,
                        REFERENCED_OBJECT_DOMAIN as REFERENCED_TYPE
-                from {db}.INFORMATION_SCHEMA.OBJECT_DEPENDENCIES
+                from SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES
                 {wU}
                 limit 5000
                 """,
@@ -3604,63 +3605,8 @@ with l_tab:
             ) or []
         except Exception:
             rows1u = []
-        # VIEW -> TABLE edges via VIEW_TABLE_USAGE (downstream: selected is a view)
-        try:
-            where2 = []
-            params2: Dict[str, Any] = {}
-            if schema and schema != "All":
-                where2.append("VIEW_SCHEMA = %(s)s")
-                params2["s"] = schema
-            if name:
-                where2.append("VIEW_NAME = %(t)s")
-                params2["t"] = name
-            w2 = (" where " + " and ".join(where2)) if where2 else ""
-            rows2 = _run(
-                f"""
-                select VIEW_CATALOG as REFERENCING_OBJECT_DATABASE,
-                       VIEW_SCHEMA as REFERENCING_OBJECT_SCHEMA,
-                       VIEW_NAME as REFERENCING_OBJECT_NAME,
-                       TABLE_CATALOG as REFERENCED_OBJECT_DATABASE,
-                       TABLE_SCHEMA as REFERENCED_OBJECT_SCHEMA,
-                       TABLE_NAME as REFERENCED_OBJECT_NAME,
-                       'TABLE' as REFERENCED_TYPE
-                from {db}.INFORMATION_SCHEMA.VIEW_TABLE_USAGE
-                {w2}
-                limit 5000
-                """,
-                params2
-            ) or []
-        except Exception:
-            rows2 = []
-        # VIEW -> TABLE edges via VIEW_TABLE_USAGE (upstream: selected is a table, find views that use it)
-        try:
-            where3 = []
-            params3: Dict[str, Any] = {}
-            if schema and schema != "All":
-                where3.append("TABLE_SCHEMA = %(s)s")
-                params3["s"] = schema
-            if name:
-                where3.append("TABLE_NAME = %(t)s")
-                params3["t"] = name
-            w3 = (" where " + " and ".join(where3)) if where3 else ""
-            rows3 = _run(
-                f"""
-                select VIEW_CATALOG as REFERENCING_OBJECT_DATABASE,
-                       VIEW_SCHEMA as REFERENCING_OBJECT_SCHEMA,
-                       VIEW_NAME as REFERENCING_OBJECT_NAME,
-                       TABLE_CATALOG as REFERENCED_OBJECT_DATABASE,
-                       TABLE_SCHEMA as REFERENCED_OBJECT_SCHEMA,
-                       TABLE_NAME as REFERENCED_OBJECT_NAME,
-                       'TABLE' as REFERENCED_TYPE
-                from {db}.INFORMATION_SCHEMA.VIEW_TABLE_USAGE
-                {w3}
-                limit 5000
-                """,
-                params3
-            ) or []
-        except Exception:
-            rows3 = []
-        df = pd.DataFrame(rows1 + rows1u + rows2 + rows3)
+        # Combine results; ACCOUNT_USAGE covers view->table via object dependencies
+        df = pd.DataFrame(rows1 + rows1u)
         return df if not df.empty else pd.DataFrame()
 
     # ---- Lineage Visualization ----
@@ -3805,7 +3751,7 @@ with l_tab:
                                          marker=dict(size=12, color=marker_colors),
                                          hovertext=hover_text, hoverinfo='text'))
                 fig.update_layout(showlegend=False, margin=dict(l=10,r=10,t=10,b=10), height=560)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
         else:
             st.info("Select an object from the sidebar to visualize lineage.")
 
@@ -3819,11 +3765,11 @@ with l_tab:
                 st.info("No downstream dependencies found.")
             else:
                 down = df[[
-                    "REFERENCING_OBJECT_DATABASE","REFERENCING_OBJECT_SCHEMA","REFERENCING_OBJECT_NAME"
+                    "REFERENCING_OBJECT_CATALOG","REFERENCING_OBJECT_SCHEMA","REFERENCING_OBJECT_NAME"
                 ]].drop_duplicates()
-                down["FULL_NAME"] = down["REFERENCING_OBJECT_DATABASE"] + "." + down["REFERENCING_OBJECT_SCHEMA"] + "." + down["REFERENCING_OBJECT_NAME"]
+                down["FULL_NAME"] = down["REFERENCING_OBJECT_CATALOG"] + "." + down["REFERENCING_OBJECT_SCHEMA"] + "." + down["REFERENCING_OBJECT_NAME"]
                 st.markdown("**Downstream Objects**")
-                st.dataframe(down[["FULL_NAME"]], use_container_width=True)
+                st.dataframe(down[["FULL_NAME"]], width='stretch')
                 # Query history: who uses downstream
                 try:
                     start_dt = datetime.utcnow() - timedelta(days=30)
@@ -3841,7 +3787,7 @@ with l_tab:
                     ) or []
                     qdf = pd.DataFrame(qh)
                     st.markdown("**Dependent Queries (30d)**")
-                    st.dataframe(qdf, use_container_width=True)
+                    st.dataframe(qdf, width='stretch')
                     # Risk score: simple heuristic
                     affected_assets = len(down)
                     distinct_users = qdf.get("USER_NAME", pd.Series(dtype=str)).nunique() if not qdf.empty else 0
@@ -3869,7 +3815,7 @@ with l_tab:
                 view = df.copy()
                 if typ:
                     view = view[view["REFERENCED_TYPE"].isin(typ)]
-                st.dataframe(view, use_container_width=True)
+                st.dataframe(view, width='stretch')
                 # PK/FK best-effort and orphan/cycle detection around selected schema
                 if db and sel_schema and sel_schema != "All":
                     try:
@@ -3885,13 +3831,13 @@ with l_tab:
                             {"s": sel_schema}
                         ) or []
                         st.markdown("**PK/UNIQUE columns (best-effort)**")
-                        st.dataframe(pd.DataFrame(keys), use_container_width=True)
+                        st.dataframe(pd.DataFrame(keys), width='stretch')
                     except Exception:
                         pass
                 # Graph-based checks
                 try:
-                    edges = list(set([(f"{r['REFERENCED_OBJECT_DATABASE']}.{r['REFERENCED_OBJECT_SCHEMA']}.{r['REFERENCED_OBJECT_NAME']}",
-                                       f"{r['REFERENCING_OBJECT_DATABASE']}.{r['REFERENCING_OBJECT_SCHEMA']}.{r['REFERENCING_OBJECT_NAME']}") for _, r in view.iterrows()]))
+                    edges = list(set([(f"{r['REFERENCED_OBJECT_CATALOG']}.{r['REFERENCED_OBJECT_SCHEMA']}.{r['REFERENCED_OBJECT_NAME']}",
+                                       f"{r['REFERENCING_OBJECT_CATALOG']}.{r['REFERENCING_OBJECT_SCHEMA']}.{r['REFERENCING_OBJECT_NAME']}") for _, r in view.iterrows()]))
                     nodes = sorted({n for e in edges for n in e})
                     out_deg = {n:0 for n in nodes}
                     in_deg = {n:0 for n in nodes}
@@ -3900,7 +3846,7 @@ with l_tab:
                     orphans = [n for n in nodes if in_deg.get(n,0)==0 and out_deg.get(n,0)==0]
                     st.markdown("**Orphan Objects**")
                     if orphans:
-                        st.dataframe(pd.DataFrame({"ORPHAN": orphans}), use_container_width=True)
+                        st.dataframe(pd.DataFrame({"ORPHAN": orphans}), width='stretch')
                     # Simple cycle detection (depth-limited)
                     from collections import defaultdict, deque
                     g = defaultdict(list)
@@ -3922,7 +3868,7 @@ with l_tab:
                                     dq.append((nb, path+[nb]))
                     if cycles:
                         st.markdown("**Detected Cycles (truncated)**")
-                        st.dataframe(pd.DataFrame({"CYCLE": [" -> ".join(c[:10]) for c in cycles[:20]]}), use_container_width=True)
+                        st.dataframe(pd.DataFrame({"CYCLE": [" -> ".join(c[:10]) for c in cycles[:20]]}), width='stretch')
                 except Exception:
                     pass
         except Exception as e:
@@ -4001,7 +3947,7 @@ with l_tab:
                         {"d": db, "s": sch, "t": name}
                     ) or []
                     st.markdown("**Column Tags**")
-                    st.dataframe(pd.DataFrame(tr), use_container_width=True)
+                    st.dataframe(pd.DataFrame(tr), width='stretch')
                 except Exception as e:
                     st.info(f"TAG_REFERENCES unavailable: {e}")
             with c2:
@@ -4045,7 +3991,7 @@ with l_tab:
                             {"s": sch, "t": name}
                         ) or []
                         if vcu:
-                            st.dataframe(pd.DataFrame(vcu), use_container_width=True)
+                            st.dataframe(pd.DataFrame(vcu), width='stretch')
                         else:
                             st.info("No column-level lineage returned.")
                     except Exception as e:

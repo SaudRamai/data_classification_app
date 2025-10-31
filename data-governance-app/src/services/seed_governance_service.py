@@ -16,7 +16,6 @@ TABLES = [
     "SENSITIVITY_THRESHOLDS",
     "SENSITIVITY_WEIGHTS",
     "SENSITIVE_BUNDLES",
-    "INTERNAL_DATA_PATTERNS",
     "COMPLIANCE_MAPPING",
     "SENSITIVITY_MODEL_CONFIG",
 ]
@@ -31,7 +30,7 @@ def _ensure_active_flags(database: str, schema: str = "DATA_CLASSIFICATION_GOVER
     for t in [
         "SENSITIVE_PATTERNS", "SENSITIVE_KEYWORDS", "SENSITIVITY_CATEGORIES",
         "SENSITIVITY_THRESHOLDS", "SENSITIVITY_WEIGHTS", "SENSITIVE_BUNDLES",
-        "INTERNAL_DATA_PATTERNS", "COMPLIANCE_MAPPING"
+        "COMPLIANCE_MAPPING"
     ]:
         try:
             snowflake_connector.execute_non_query(

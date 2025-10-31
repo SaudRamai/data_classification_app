@@ -1,7 +1,7 @@
 """
 Classification Decision Service
 - Persists classification decisions and rationale for auditability (Policy 4.2.4, 6.1.2)
-- Table: <DB>.DATA_GOVERNANCE.CLASSIFICATION_DECISIONS
+- Table: <DB>.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS
 """
 from typing import Optional, Dict, Any, Set
 import uuid
@@ -22,7 +22,7 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-SCHEMA = "DATA_GOVERNANCE"
+SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 TABLE = "CLASSIFICATION_DECISIONS"
 
 

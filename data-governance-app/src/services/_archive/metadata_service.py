@@ -12,7 +12,7 @@ from src.config.settings import settings
 logger = logging.getLogger(__name__)
 
 DB = settings.SNOWFLAKE_DATABASE
-SCHEMA = "DATA_GOVERNANCE"
+SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 
 
 class MetadataService:

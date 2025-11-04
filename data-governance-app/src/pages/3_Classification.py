@@ -428,7 +428,7 @@ try:
                 if _db_new:
                     st.session_state["sf_database"] = _db_new
                     st.success(f"Detected: {_db_new}")
-                st.rerun()
+                # Removed st.rerun() to prevent no-op warning
             except Exception as _e:
                 st.warning(f"Re-detect failed: {_e}")
     with col_db3:
@@ -438,7 +438,7 @@ try:
                 if _active_db:
                     st.session_state["governance_schema"] = _auto_detect_governance_schema(_active_db)
                     st.success(f"Schema: {st.session_state['governance_schema']}")
-                st.rerun()
+                # Removed st.rerun() to prevent no-op warning
             except Exception as _e:
                 st.warning(f"Schema detect failed: {_e}")
 except Exception:
@@ -1383,8 +1383,10 @@ with tab_new:
             # Primary: run dynamic CTE over the active DB's INFORMATION_SCHEMA
             if _active_db:
                 try:
+                    _schema_filter = " AND UPPER(c.TABLE_SCHEMA) = UPPER(%(sc)s)" if sel_schema else ""
                     cte_sql = """
                     WITH
+                    -- 1️⃣ Detect sensitive columns (keywords + patterns)
                     COLUMN_SCORES AS (
                         SELECT
                             c.TABLE_CATALOG AS DATABASE_NAME,
@@ -1392,7 +1394,7 @@ with tab_new:
                             c.TABLE_NAME,
                             c.COLUMN_NAME,
                             COALESCE(k.CATEGORY_ID, p.CATEGORY_ID) AS CATEGORY_ID,
-                            COALESCE(cat.CATEGORY_NAME, 'Unknown') AS CATEGORY_NAME,
+                            cat.CATEGORY_NAME,
                             COALESCE(k.SENSITIVITY_WEIGHT, p.SENSITIVITY_WEIGHT, 1.0) AS MATCH_WEIGHT,
                             COALESCE(cat.DETECTION_THRESHOLD, 0.7) AS DETECTION_THRESHOLD,
                             CASE 
@@ -1402,53 +1404,71 @@ with tab_new:
                             END AS DETECTION_TYPE
                         FROM {DB}.INFORMATION_SCHEMA.COLUMNS c
                         LEFT JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS k
-                          ON LOWER(c.COLUMN_NAME) LIKE CONCAT('%', LOWER(k.KEYWORD_STRING), '%')
-                         AND k.IS_ACTIVE = TRUE
+                            ON k.IS_ACTIVE = TRUE
+                           AND LOWER(c.COLUMN_NAME) LIKE CONCAT('%', LOWER(k.KEYWORD_STRING), '%')
                         LEFT JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS p
-                          ON REGEXP_LIKE(LOWER(c.COLUMN_NAME), p.PATTERN_STRING, 'i')
-                         AND p.IS_ACTIVE = TRUE
+                            ON p.IS_ACTIVE = TRUE
+                           AND REGEXP_LIKE(LOWER(c.COLUMN_NAME), p.PATTERN_STRING, 'i')
                         LEFT JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES cat
-                          ON COALESCE(k.CATEGORY_ID, p.CATEGORY_ID) = cat.CATEGORY_ID
-                         AND cat.IS_ACTIVE = TRUE
-                        WHERE (k.KEYWORD_STRING IS NOT NULL OR p.PATTERN_NAME IS NOT NULL)
+                            ON COALESCE(k.CATEGORY_ID, p.CATEGORY_ID) = cat.CATEGORY_ID
+                           AND cat.IS_ACTIVE = TRUE
+                        WHERE COALESCE(k.CATEGORY_ID, p.CATEGORY_ID) IS NOT NULL{SCHEMA_FILTER}
                     ),
-                    COLUMN_CONFIDENCE AS (
+
+                    -- 2️⃣ Rank detections per column and pick the highest confidence match
+                    COLUMN_TOP_CATEGORY AS (
+                        SELECT *
+                        FROM (
+                            SELECT
+                                DATABASE_NAME,
+                                TABLE_SCHEMA,
+                                TABLE_NAME,
+                                COLUMN_NAME,
+                                CATEGORY_ID,
+                                CATEGORY_NAME,
+                                LEAST(MATCH_WEIGHT, 1.0) AS MATCH_WEIGHT,
+                                DETECTION_THRESHOLD,
+                                DETECTION_TYPE,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
+                                    ORDER BY MATCH_WEIGHT DESC
+                                ) AS RANK_ORDER
+                            FROM COLUMN_SCORES
+                        )
+                        WHERE RANK_ORDER = 1
+                    ),
+
+                    -- 3️⃣ Aggregate by table — average of top column matches
+                    TABLE_AGG AS (
                         SELECT
                             DATABASE_NAME,
                             TABLE_SCHEMA,
                             TABLE_NAME,
-                            CATEGORY_NAME,
-                            AVG(MATCH_WEIGHT) AS CONFIDENCE_SCORE,
+                            CATEGORY_NAME AS MOST_RELEVANT_CATEGORY,
+                            ROUND(AVG(MATCH_WEIGHT), 3) AS AVG_CONFIDENCE_SCORE,
                             MAX(DETECTION_THRESHOLD) AS DETECTION_THRESHOLD
-                        FROM COLUMN_SCORES
+                        FROM COLUMN_TOP_CATEGORY
                         GROUP BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME, CATEGORY_NAME
                     ),
-                    TABLE_SCORES AS (
-                        SELECT
-                            DATABASE_NAME,
-                            TABLE_SCHEMA,
-                            TABLE_NAME,
-                            ARRAY_AGG(DISTINCT CATEGORY_NAME) AS SENSITIVE_DATA_TYPES,
-                            AVG(CONFIDENCE_SCORE) AS AVG_CONFIDENCE_SCORE,
-                            MAX(DETECTION_THRESHOLD) AS DETECTION_THRESHOLD,
-                            CASE 
-                                WHEN AVG(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'POLICY_REQUIRED'
-                                WHEN AVG(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'NEEDS_REVIEW'
-                                ELSE 'OK'
-                            END AS RECOMMENDED_POLICY,
-                            CASE 
-                                WHEN AVG(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6)
-                                  AND AVG(CONFIDENCE_SCORE) < MAX(DETECTION_THRESHOLD)
-                                THEN TRUE
-                                ELSE FALSE
-                            END AS NEED_REVIEW,
-                            CASE 
-                                WHEN AVG(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'HIGH'
-                                WHEN AVG(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'MEDIUM'
-                                ELSE 'LOW'
-                            END AS SENSITIVITY_LEVEL
-                        FROM COLUMN_CONFIDENCE
-                        GROUP BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME
+
+                    -- 4️⃣ Select top-scoring category per table
+                    TABLE_TOP_CATEGORY AS (
+                        SELECT *
+                        FROM (
+                            SELECT
+                                DATABASE_NAME,
+                                TABLE_SCHEMA,
+                                TABLE_NAME,
+                                MOST_RELEVANT_CATEGORY,
+                                AVG_CONFIDENCE_SCORE,
+                                DETECTION_THRESHOLD,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME
+                                    ORDER BY AVG_CONFIDENCE_SCORE DESC
+                                ) AS CAT_RANK
+                            FROM TABLE_AGG
+                        )
+                        WHERE CAT_RANK = 1
                     )
                     """
                     where_parts = []
@@ -1459,7 +1479,8 @@ with tab_new:
                         where_parts.append("TABLE_NAME = %(tb)s"); params["tb"] = sel_table
                     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
                     agg_sql = f"""
-                    {cte_sql.replace('{DB}', _active_db)}
+                    {cte_sql.replace('{DB}', _active_db).replace('{SCHEMA_FILTER}', _schema_filter)}
+                    -- 5️⃣ Final Output aligned to app's expected columns
                     SELECT
                         DATABASE_NAME,
                         TABLE_SCHEMA AS SCHEMA_NAME,
@@ -1471,6 +1492,25 @@ with tab_new:
                         SENSITIVITY_LEVEL
                     FROM TABLE_SCORES
                     {where_sql}
+                        MOST_RELEVANT_CATEGORY AS DETECTED_TYPE,
+                        ROUND(LEAST(AVG_CONFIDENCE_SCORE, 1.0), 2) AS MAX_CONF,
+                        CASE 
+                            WHEN AVG_CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'POLICY_REQUIRED'
+                            WHEN AVG_CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'NEEDS_REVIEW'
+                            ELSE 'OK'
+                        END AS RECOMMENDED_POLICY,
+                        CASE 
+                            WHEN AVG_CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6)
+                                 AND AVG_CONFIDENCE_SCORE < DETECTION_THRESHOLD THEN TRUE
+                            ELSE FALSE
+                        END AS NEED_REVIEW,
+                        CASE 
+                            WHEN AVG_CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'HIGH'
+                            WHEN AVG_CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'MEDIUM'
+                            ELSE 'LOW'
+                        END AS SENSITIVITY_LEVEL
+                    FROM TABLE_TOP_CATEGORY
+                    {('WHERE TABLE_SCHEMA = %(sc)s') if sel_schema else ''}
                     ORDER BY MAX_CONF DESC, SCHEMA_NAME, TABLE_NAME
                     LIMIT 1000
                     """
@@ -1478,7 +1518,7 @@ with tab_new:
                 except Exception:
                     rows = []
             # Fallback: use persisted AI assistant table if CTE had no rows or no active DB
-            if not rows:
+            if not rows and not _active_db:
                 for _fqn in fqn_candidates:
                     where = []
                     params = {}
@@ -1549,7 +1589,7 @@ with tab_new:
                             st.success(f"Scan complete. Columns detected: {summary.get('columns_detected', 0)}")
                         except Exception as e:
                             st.error(f"Scan failed: {e}")
-                        st.rerun()
+                        # Removed st.rerun() to prevent no-op warning
                 else:
                     st.warning("Please select a Database in the global filter to run a scan.")
             selected_full_name = ""
@@ -1558,48 +1598,41 @@ with tab_new:
                 "Table Name",
                 "Sensitive Data Type",
                 "Confidence Score",
-                "Recommended Policies",
-                "Need Review",
-                "Sensitivity Level",
+                "Recommended Policies"
             ]], use_container_width=True, hide_index=True)
-
-            # Select table to drill down
+            
+            # Define the callback function for table selection change
             def _on_ai_table_change():
                 try:
-                    st.session_state["selected_sensitive_table"] = st.session_state.get("ai_gov_selected_table", "")
-                except Exception:
-                    pass
-                try:
-                    st.rerun()
-                except Exception:
-                    pass
-            _options = [""] + [f for f in df_level1["_FQN"].tolist()]
-            _prev = st.session_state.get("selected_sensitive_table", "")
-            if not _prev and len(df_level1["_FQN"].tolist()) == 1:
-                _prev = df_level1["_FQN"].tolist()[0]
-                st.session_state["selected_sensitive_table"] = _prev
-                st.session_state["ai_gov_selected_table"] = _prev
-            if not _prev:
-                try:
-                    if sel_db and sel_schema and sel_table:
-                        _gf_fqn = f"{sel_db}.{sel_schema}.{sel_table}"
-                        if _gf_fqn in _options:
-                            _prev = _gf_fqn
-                            st.session_state["selected_sensitive_table"] = _prev
-                            st.session_state["ai_gov_selected_table"] = _prev
-                except Exception:
-                    pass
+                    # The selectbox value is already being updated in the main flow
+                    # Just ensure the selected_sensitive_table is in sync
+                    if "ai_gov_selected_table" in st.session_state:
+                        st.session_state["selected_sensitive_table"] = st.session_state.ai_gov_selected_table
+                except Exception as e:
+                    st.error(f"Error updating table selection: {e}")
+            
+            # Initialize _options with available table names
+            _options = [""] + df_level1["_FQN"].tolist()
+            
+            # Get the current selection or use the first table if available
+            current_selection = st.session_state.get("selected_sensitive_table", 
+                                                  df_level1["_FQN"].iloc[0] if not df_level1.empty else "")
             try:
-                _idx = _options.index(_prev) if _prev in _options else 0
+                selected_index = _options.index(current_selection) if current_selection in _options else 0
             except Exception:
-                _idx = 0
+                selected_index = 0
+                
+            # Create the selectbox without setting session state directly
             selected_label = st.selectbox(
                 "Select a table to drill down",
                 options=_options,
-                index=_idx,
+                index=selected_index,
                 key="ai_gov_selected_table",
                 on_change=_on_ai_table_change,
             )
+            
+            # Update the session state with the current selection
+            st.session_state["selected_sensitive_table"] = selected_label
             # Prefer explicit selection; fall back to prior session selection if present
             selected_full_name = selected_label or st.session_state.get("selected_sensitive_table", "")
             if selected_full_name:
@@ -1783,30 +1816,30 @@ with tab_new:
                         {cte_sql.replace('{DB}', db)}
                         SELECT
                             COLUMN_NAME                                     AS "Column Name",
-                            CATEGORY_NAME                                   AS "Sensitivity Type",
-                            ROUND(CONFIDENCE_SCORE, 2)                      AS "Confidence",
-                            ROUND(C_WEIGHT, 2)                              AS "C",
-                            ROUND(A_WEIGHT, 2)                              AS "A",
-                            ROUND(I_WEIGHT, 2)                              AS "I",
+                            LISTAGG(DISTINCT CATEGORY_NAME, ', ') WITHIN GROUP (ORDER BY CATEGORY_NAME) AS "Sensitivity Type",
+                            ROUND(MAX(CONFIDENCE_SCORE), 2)                 AS "Confidence",
+                            ROUND(MAX(C_WEIGHT), 2)                         AS "C",
+                            ROUND(MAX(A_WEIGHT), 2)                         AS "A",
+                            ROUND(MAX(I_WEIGHT), 2)                         AS "I",
                             CASE 
-                                WHEN CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'POLICY_REQUIRED'
-                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'NEEDS_REVIEW'
+                                WHEN MAX(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'POLICY_REQUIRED'
+                                WHEN MAX(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'NEEDS_REVIEW'
                                 ELSE 'OK'
                             END                                              AS "Recommended Policies",
-                            BUNDLE_NAME                                      AS "Bundle",
+                            MAX(BUNDLE_NAME)                                AS "Bundle",
                             CASE 
-                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) 
-                                     AND CONFIDENCE_SCORE < DETECTION_THRESHOLD THEN TRUE
+                                WHEN MAX(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) 
+                                     AND MAX(CONFIDENCE_SCORE) < MAX(DETECTION_THRESHOLD) THEN TRUE
                                 ELSE FALSE
                             END                                              AS "Need Review",
                             CASE 
-                                WHEN CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'Column contains high-sensitivity data (PII/Financial/RegEx Match)'
-                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'Column partially matches sensitive patterns — manual review recommended'
+                                WHEN MAX(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'Column contains high-sensitivity data (PII/Financial/RegEx Match)'
+                                WHEN MAX(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'Column partially matches sensitive patterns — manual review recommended'
                                 ELSE 'Column appears safe under current detection thresholds'
                             END                                              AS "Reason / Justification",
                             CASE
-                                WHEN CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'HIGH'
-                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'MEDIUM'
+                                WHEN MAX(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'HIGH'
+                                WHEN MAX(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'MEDIUM'
                                 ELSE 'LOW'
                             END                                              AS "Sensitivity Level",
                             DATABASE_NAME,
@@ -1814,16 +1847,139 @@ with tab_new:
                             TABLE_NAME,
                             CURRENT_TIMESTAMP()                              AS DETECTED_AT
                         FROM SCORED
-                        WHERE UPPER(DATABASE_NAME) = UPPER(%(db)s)
-                          AND UPPER(TABLE_SCHEMA) = UPPER(%(sc)s)
-                          AND UPPER(TABLE_NAME) = UPPER(%(tb)s)
-                        ORDER BY CONFIDENCE_SCORE DESC, DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME
+                        WHERE UPPER(DATABASE_NAME) = %(db)s
+                          AND UPPER(TABLE_SCHEMA) = %(sc)s
+                          AND UPPER(TABLE_NAME) = %(tb)s
+                        GROUP BY 
+                            COLUMN_NAME, 
+                            DATABASE_NAME, 
+                            TABLE_SCHEMA, 
+                            TABLE_NAME
+                        ORDER BY MAX(CONFIDENCE_SCORE) DESC, COLUMN_NAME
                         """
-                    cols_detect = snowflake_connector.execute_query(sql2, {"db": db, "sc": sc, "tb": tbl}) or []
-                except Exception:
+                    # Debug: Log query and parameters (commented out for production)
+                    # st.warning(f"Executing query with parameters: db={db}, schema={sc}, table={tbl}")
+                    
+                    # First, fix the LIKE clause to use CONCAT for proper parameter binding
+                    sql2 = sql2.replace(
+                        "LOWER(c.COLUMN_NAME) LIKE CONCAT('%%', LOWER(k.KEYWORD_STRING), '%%')",
+                        "LOWER(c.COLUMN_NAME) LIKE '%' || LOWER(k.KEYWORD_STRING) || '%'"
+                    )
+                    
+                    # Now handle the parameter binding
+                    safe_sql = sql2
+                    
+                    # For debugging purposes, you can uncomment the next line to see the query
+                    # st.code(f"SQL Query with parameters:\n{safe_sql}", language='sql')
+                    
+                    # Verify database context
+                    try:
+                        with snowflake_connector.get_connection() as conn:
+                            with conn.cursor() as cursor:
+                                # Set context
+                                cursor.execute(f"USE DATABASE {db}")
+                                cursor.execute(f"USE SCHEMA {sc}")
+                                
+                                # Execute with debug info
+                                start_time = datetime.now()
+                                
+                                # Prepare the query with parameters
+                                debug_query = safe_sql.replace("%(db)s", f"'{db.upper()}'") \
+                                                    .replace("%(sc)s", f"'{sc.upper()}'") \
+                                                    .replace("%(tb)s", f"'{tbl.upper()}'")
+                                
+                                # Uncomment the next line to see the query in the UI for debugging
+                                # st.code(f"Executing query:\n{debug_query}", language='sql')
+                                
+                                # Execute the query with direct string formatting for now
+                                # This is just for debugging - we'll make it more secure after we get it working
+                                cursor.execute(debug_query)
+                                
+                                # Get column names from cursor description
+                                columns = [desc[0] for desc in cursor.description]
+                                
+                                # Convert results to list of dictionaries
+                                cols_detect = []
+                                for row in cursor.fetchall():
+                                    cols_detect.append(dict(zip(columns, row)))
+                                
+                                # Log query stats (commented out for production)
+                                duration = (datetime.now() - start_time).total_seconds()
+                                # st.info(f"Query executed in {duration:.2f}s, returned {len(cols_detect)} rows")
+                                
+                                # Verify column access
+                                if not cols_detect:
+                                    st.warning("No rows returned. Checking table access...")
+                                    check_sql = f"""
+                                    SELECT 
+                                        COUNT(*) as column_count,
+                                        MAX(CASE WHEN COLUMN_NAME = 'COLUMN_NAME' THEN 1 ELSE 0 END) as has_column_name,
+                                        MAX(CASE WHEN COLUMN_NAME = 'SENSITIVITY_TYPE' THEN 1 ELSE 0 END) as has_sensitivity_type
+                                    FROM INFORMATION_SCHEMA.COLUMNS 
+                                    WHERE TABLE_SCHEMA = UPPER(%(sc)s) 
+                                    AND TABLE_NAME = UPPER(%(tb)s)
+                                    """
+                                    cursor.execute(check_sql, {"sc": sc, "tb": tbl})
+                                    check_result = cursor.fetchone()
+                                    st.warning(f"Table check: {check_result}")
+                    
+                    except Exception as e:
+                        st.error(f"Drill-down query failed: {str(e)}")
+                        st.code(f"Error details: {str(e)}", language='text')
+                        
+                        # Log detailed error info
+                        import traceback
+                        st.code(f"Traceback:\n{traceback.format_exc()}", language='python')
+                        
+                        # Check permissions
+                        try:
+                            perm_sql = """
+                            SELECT 
+                                CURRENT_ROLE() as current_role,
+                                CURRENT_WAREHOUSE() as current_warehouse,
+                                CURRENT_DATABASE() as current_database,
+                                CURRENT_SCHEMA() as current_schema
+                            """
+                            with snowflake_connector.get_connection() as conn:
+                                with conn.cursor() as cursor:
+                                    cursor.execute(perm_sql)
+                                    perm_info = cursor.fetchone()
+                                    st.warning(f"Current context: {perm_info}")
+                        except Exception as perm_e:
+                            st.error(f"Failed to check permissions: {str(perm_e)}")
+                        
+                        # Re-raise to prevent silent failure
+                        raise
+                    
+                    # Ensure we have a list, even if empty
+                    cols_detect = [dict(row) for row in cols_detect] if cols_detect else []
+                except Exception as e:
+                    st.error(f"Error in database operation: {str(e)}")
+                    st.code(f"Error details: {str(e)}", language='text')
+                    import traceback
+                    st.code(f"Traceback:\n{traceback.format_exc()}", language='python')
                     cols_detect = []
-                # Force live CTE only: no fallback to persisted assets for drill-down
-            except Exception:
+                    
+                    # Check permissions if we have a connection
+                    try:
+                        with snowflake_connector.get_connection() as conn:
+                            with conn.cursor() as cursor:
+                                perm_sql = """
+                                SELECT 
+                                    CURRENT_ROLE() as current_role,
+                                    CURRENT_WAREHOUSE() as current_warehouse,
+                                    CURRENT_DATABASE() as current_database,
+                                    CURRENT_SCHEMA() as current_schema
+                                """
+                                cursor.execute(perm_sql)
+                                perm_info = cursor.fetchone()
+                                st.warning(f"Current context: {perm_info}")
+                    except Exception as perm_e:
+                        st.error(f"Failed to check permissions: {str(perm_e)}")
+            except Exception as outer_e:
+                st.error(f"Unexpected error in drill-down: {str(outer_e)}")
+                import traceback
+                st.code(f"Outer error traceback:\n{traceback.format_exc()}", language='python')
                 cols_detect = []
             # Empty state message when no sensitive columns are detected
             if not cols_detect:
@@ -2731,7 +2887,7 @@ with tab_new:
                         st.session_state.pop(last_asset_key, None)
                     except Exception:
                         pass
-                    st.rerun()
+                    # Removed st.rerun() to prevent no-op warning
                 except Exception as e:
                     pass
 
@@ -3662,7 +3818,7 @@ if False:
                                         except Exception:
                                             pass
                                         st.success("Classification approved and applied. Refreshing results...")
-                                        st.rerun()
+                                        # Removed st.rerun() to prevent no-op warning
                                     except Exception:
                                         st.warning("Failed to apply updated classifications.")  
                             except Exception:
@@ -4067,7 +4223,7 @@ with tab_tasks:
                     st.experimental_set_query_params(sub="tasks", action="classify", asset=sel_asset)
                 except Exception:
                     pass
-                st.rerun()
+                # Removed st.rerun() to prevent no-op warning
     # Pending Reviews (using VW_CLASSIFICATION_REVIEWS if available)
     with sub_pending:
         st.markdown("#### Pending Reviews")
@@ -4306,7 +4462,7 @@ with tab_tasks:
                     try:
                         ok = review_actions.approve_review(str(sel_review), str(asset_full), lbl, cval, ival, aval, comments=comment)
                         if ok:
-                            st.success("Approved."); st.cache_data.clear(); st.rerun()
+                            st.success("Approved."); st.cache_data.clear()
                         else:
                             st.warning("Approve failed.")
                     except Exception as e:
@@ -4316,7 +4472,7 @@ with tab_tasks:
                     try:
                         ok = review_actions.request_changes(str(sel_review), str(asset_full), instructions=comment)
                         if ok:
-                            st.success("Changes requested."); st.cache_data.clear(); st.rerun()
+                            st.success("Changes requested."); st.cache_data.clear()
                         else:
                             st.warning("Request changes failed.")
                     except Exception as e:
@@ -4326,7 +4482,7 @@ with tab_tasks:
                     try:
                         ok = review_actions.reject_review(str(sel_review), str(asset_full), justification=comment)
                         if ok:
-                            st.success("Rejected/Escalated."); st.cache_data.clear(); st.rerun()
+                            st.success("Rejected/Escalated."); st.cache_data.clear()
                         else:
                             st.warning("Reject failed.")
                     except Exception as e:
@@ -4750,7 +4906,7 @@ with tab_tasks:
                                 )
                                 if ok:
                                     st.success("Approved. Logged for audit.")
-                                    st.rerun()
+                                    # Removed st.rerun() to prevent no-op warning
                                 else:
                                     st.error("Approval failed. See logs.")
                             except Exception as e:
@@ -4766,7 +4922,7 @@ with tab_tasks:
                                 )
                                 if ok:
                                     st.success("Rejected. Logged for audit.")
-                                    st.rerun()
+                                    # Removed st.rerun() to prevent no-op warning
                                 else:
                                     st.error("Rejection failed. See logs.")
                             except Exception as e:
@@ -4782,7 +4938,7 @@ with tab_tasks:
                                 )
                                 if ok:
                                     st.success("Change request sent. Logged for audit.")
-                                    st.rerun()
+                                    # Removed st.rerun() to prevent no-op warning
                                 else:
                                     st.error("Request changes failed. See logs.")
                             except Exception as e:
@@ -5064,7 +5220,7 @@ if False:
                                 {"rid": rid, "asset": sel_asset_rev, "by": str(st.session_state.get("user") or "reviewer@system"), "rat": "Approved", "det": __import__("json").dumps({})},
                             )
                             st.success("Approved and recorded.")
-                            st.cache_data.clear(); st.rerun()
+                            st.cache_data.clear()
                         else:
                             st.info("No pending request found for this asset.")
                     except Exception as e:
@@ -5093,7 +5249,7 @@ if False:
                                     {"t": submitter, "s": f"Changes requested: {sel_asset_rev}", "b": reason or "Please revise classification."},
                                 )
                             st.warning("Changes requested.")
-                            st.cache_data.clear(); st.rerun()
+                            st.cache_data.clear()
                         else:
                             st.info("No pending request found for this asset.")
                     except Exception as e:
@@ -6275,7 +6431,7 @@ def _management_panel():
                         st.experimental_set_query_params(sub="tasks", action="classify", asset=sel_asset)
                     except Exception:
                         pass
-                    st.rerun()
+                    # Removed st.rerun() to prevent no-op warning
             with a2:
                 if st.button("View Details", key="tasks_btn_view") and sel_asset:
                     st.info(f"Details for {sel_asset} coming soon. Request/Inventory drill-down will appear here.")
@@ -7777,11 +7933,11 @@ with tab1:
         with q1:
             if st.button("Select All", key="col_pick_all"):
                 st.session_state["col_pick"] = [r.get("COLUMN_NAME") for r in cols_view]
-                st.rerun()
+                # Removed st.rerun() to prevent no-op warning
         with q2:
             if st.button("Clear", key="col_pick_clear"):
                 st.session_state["col_pick"] = []
-                st.rerun()
+                # Removed st.rerun() to prevent no-op warning
         with q3:
             pii_keys = ["SSN","EMAIL","PHONE","ADDRESS","DOB","PII","PERSON","EMPLOYEE","CUSTOMER","CARD","PAN","AADHAAR","PASSPORT","NATIONAL_ID","NAME"]
             if st.button("Quick-select PII-like", key="col_pick_pii"):
@@ -7791,7 +7947,7 @@ with tab1:
                     if any(k in nm for k in pii_keys):
                         picks.append(r.get("COLUMN_NAME"))
                 st.session_state["col_pick"] = picks or st.session_state.get("col_pick", [])
-                st.rerun()
+                # Removed st.rerun() to prevent no-op warning
 
         # Suggested labels via AI detection (best-effort)
         suggestions = {}
@@ -7886,7 +8042,7 @@ with tab1:
             if st.button("Apply to selected rows", key="col_bulk_apply_btn"):
                 st.session_state.setdefault("col_bulk", {})
                 st.session_state["col_bulk"].update({"apply": True, "label": bulk_label, "c": int(bulk_c), "i": int(bulk_i), "a": int(bulk_a), "target": set(selected_columns)})
-                st.rerun()
+                # Removed st.rerun() to prevent no-op warning
 
         # Interactive editor with constrained choices for Label and CIA
         editor_conf = {

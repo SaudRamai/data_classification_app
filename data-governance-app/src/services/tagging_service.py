@@ -79,6 +79,12 @@ TAG_DEFINITIONS = get_tag_definitions()
 TAG_DEFINITIONS.update({
     "MASKING_EXEMPT": ["TRUE", "FALSE"]
 })
+# Public constant for allowed classification labels (kept for backward-compatibility)
+# Used by pages (e.g., Administration) and within this module.
+ALLOWED_CLASSIFICATIONS = TAG_DEFINITIONS.get(
+    "DATA_CLASSIFICATION",
+    ["Public", "Internal", "Restricted", "Confidential"],
+)
 
 
 class TaggingService:

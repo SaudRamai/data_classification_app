@@ -306,8 +306,8 @@ class AISensitiveDetectionService:
         query = f"""
         SELECT "{column}" as sample_value
         FROM "{database}"."{schema}"."{table}"
-        WHERE "{column}" IS NOT NULL
         SAMPLE ({self.sample_size} ROWS)
+        WHERE "{column}" IS NOT NULL
         """
         
         try:

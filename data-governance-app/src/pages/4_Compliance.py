@@ -34,7 +34,6 @@ from src.services.dynamic_query_service import dynamic_query_service
 from src.services.dynamic_compliance_report_service import dynamic_compliance_report_service
 from src.services.system_classify_service import system_classify_service
 from src.ui.quick_links import render_quick_links
-from src.services.sensitive_scan_service import sensitive_scan_service
 from src.services.ai_classification_service import ai_classification_service
 from src.services.tagging_service import tagging_service
 from src.services.classification_decision_service import classification_decision_service
@@ -397,8 +396,11 @@ with st.sidebar:
             _apply_database(sel_db)
 
     with st.expander("filters", expanded=True):
-        # Use a distinct key prefix to avoid collisions with the sidebar session DB key "comp_db"
-        sel = render_data_filters(key_prefix="comp_filters")
+      # Use a distinct key prefix to avoid collisions with the sidebar session DB key "comp_db"
+      sel = render_data_filters(key_prefix="comp_filters")
+
+    # Compliance facet filters used in violations matrix below
+    facets = render_compliance_facets(key_prefix="comp_facets")
 
 # Manual refresh to clear cache and re-run queries
 if st.button("🔄 Refresh now", help="Clear cached data (5 min TTL) and refresh from Snowflake"):

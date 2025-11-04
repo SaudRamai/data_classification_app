@@ -1361,6 +1361,10 @@ with tab_new:
             )
         except Exception:
             sel_schema = None
+        try:
+            sel_table = (gf.get("table") if isinstance(gf, dict) else None)
+        except Exception:
+            sel_table = None
         st.caption("Scope is controlled by the sidebar global filter (Database/Schema).")
 
         # Level 1 — Sensitive Tables Overview
@@ -1447,6 +1451,13 @@ with tab_new:
                         GROUP BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME
                     )
                     """
+                    where_parts = []
+                    params = {}
+                    if sel_schema:
+                        where_parts.append("TABLE_SCHEMA = %(sc)s"); params["sc"] = sel_schema
+                    if sel_table:
+                        where_parts.append("TABLE_NAME = %(tb)s"); params["tb"] = sel_table
+                    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
                     agg_sql = f"""
                     {cte_sql.replace('{DB}', _active_db)}
                     SELECT
@@ -1459,11 +1470,11 @@ with tab_new:
                         NEED_REVIEW,
                         SENSITIVITY_LEVEL
                     FROM TABLE_SCORES
-                    {('WHERE TABLE_SCHEMA = %(sc)s') if sel_schema else ''}
+                    {where_sql}
                     ORDER BY MAX_CONF DESC, SCHEMA_NAME, TABLE_NAME
                     LIMIT 1000
                     """
-                    rows = snowflake_connector.execute_query(agg_sql, ({"sc": sel_schema} if sel_schema else {})) or []
+                    rows = snowflake_connector.execute_query(agg_sql, params) or []
                 except Exception:
                     rows = []
             # Fallback: use persisted AI assistant table if CTE had no rows or no active DB
@@ -1475,6 +1486,8 @@ with tab_new:
                         where.append("DATABASE_NAME = %(db)s"); params["db"] = sel_db
                     if sel_schema:
                         where.append("SCHEMA_NAME = %(sc)s"); params["sc"] = sel_schema
+                    if sel_table:
+                        where.append("TABLE_NAME = %(tb)s"); params["tb"] = sel_table
                     sql = f"""
                         SELECT DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, DETECTED_TYPE, MAX_CONF
                         FROM (
@@ -1512,7 +1525,7 @@ with tab_new:
                 level1_rows.append({
                     "Table Name": f"{db}.{sc}.{tbl}",
                     "Sensitive Data Type": cat,
-                    "Confidence Score": float(maxc) if r.get('MAX_CONF') is not None else "",
+                    "Confidence Score": (f"{round(float(maxc)*100, 2)}%") if r.get('MAX_CONF') is not None else "",
                     "Recommended Policies": pol,
                     "Need Review": need_review,
                     "Sensitivity Level": r.get("SENSITIVITY_LEVEL") or "",
@@ -1566,6 +1579,16 @@ with tab_new:
                 _prev = df_level1["_FQN"].tolist()[0]
                 st.session_state["selected_sensitive_table"] = _prev
                 st.session_state["ai_gov_selected_table"] = _prev
+            if not _prev:
+                try:
+                    if sel_db and sel_schema and sel_table:
+                        _gf_fqn = f"{sel_db}.{sel_schema}.{sel_table}"
+                        if _gf_fqn in _options:
+                            _prev = _gf_fqn
+                            st.session_state["selected_sensitive_table"] = _prev
+                            st.session_state["ai_gov_selected_table"] = _prev
+                except Exception:
+                    pass
             try:
                 _idx = _options.index(_prev) if _prev in _options else 0
             except Exception:

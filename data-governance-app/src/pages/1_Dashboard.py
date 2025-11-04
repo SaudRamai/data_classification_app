@@ -119,9 +119,15 @@ def _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_
     # Global compliance filters (if present in target table)
     try:
         sel_framework = st.session_state.get("rt_framework")
-        if sel_framework and sel_framework != "All" and "FRAMEWORK_NAME" in cols:
-            conds.append("FRAMEWORK_NAME = %(fw)s")
-            params["fw"] = sel_framework
+        if sel_framework and sel_framework != "All":
+            fw_col = None
+            if "FRAMEWORK_NAME" in cols:
+                fw_col = "FRAMEWORK_NAME"
+            elif "COMPLIANCE_STANDARD" in cols:
+                fw_col = "COMPLIANCE_STANDARD"
+            if fw_col:
+                conds.append(f"{fw_col} = %(fw)s")
+                params["fw"] = sel_framework
     except Exception:
         pass
     try:
@@ -157,8 +163,10 @@ def _rt_apply_compliance_filter(base_where: str, base_params: Dict[str, Any], as
         return base_where, base_params
     conds = [f"cm.ASSET_ID = {asset_id_ref}"]
     params = dict(base_params)
-    if fw:
-        conds.append("upper(coalesce(cm.FRAMEWORK_NAME,'')) = %(fw_up)s")
+    cmap_cols = _rt_get_table_columns(T_CMAP)
+    fw_col = "FRAMEWORK_NAME" if "FRAMEWORK_NAME" in cmap_cols else ("COMPLIANCE_STANDARD" if "COMPLIANCE_STANDARD" in cmap_cols else None)
+    if fw and fw_col:
+        conds.append(f"upper(coalesce(cm.{fw_col},'')) = %(fw_up)s")
         params["fw_up"] = str(fw).upper()
     if cs_up:
         # Flexible status mapping
@@ -546,26 +554,31 @@ def render_realtime_dashboard():
         where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
                                               start_date, end_date,
                                               T_CMAP, ["UPDATED_TIMESTAMP", "LAST_AUDIT_DATE", "NEXT_AUDIT_DATE"])
-        rows = _rt_run_query(f"""
-            with base as (
-              select * from {T_CMAP} {where}
-            ),
-            by_fw as (
-              select FRAMEWORK_NAME as FRAMEWORK,
-                     count(*) as TOTAL,
-                     sum(case when upper(COALESCE(COMPLIANCE_STATUS,'')) = 'COMPLIANT' then 1 else 0 end) as COMPLIANT,
-                     max(NEXT_AUDIT_DATE) as NEXT_AUDIT_DATE,
-                     sum(case when upper(COALESCE(COMPLIANCE_STATUS,'')) <> 'COMPLIANT' then 1 else 0 end) as GAPS
-              from base
-              group by 1
-            )
-            select FRAMEWORK,
-                   iff(TOTAL=0,0, round(100.0*COMPLIANT/TOTAL,2)) as COMPLIANCE_PCT,
-                   NEXT_AUDIT_DATE,
-                   GAPS,
-                   100 as COVERAGE_PCT
-            from by_fw
-        """, params)
+        _cmap_cols = _rt_get_table_columns(T_CMAP)
+        _fw_col = "FRAMEWORK_NAME" if "FRAMEWORK_NAME" in _cmap_cols else ("COMPLIANCE_STANDARD" if "COMPLIANCE_STANDARD" in _cmap_cols else None)
+        if not _fw_col:
+            rows = []
+        else:
+            rows = _rt_run_query(f"""
+                with base as (
+                  select * from {T_CMAP} {where}
+                ),
+                by_fw as (
+                  select {_fw_col} as FRAMEWORK,
+                         count(*) as TOTAL,
+                         sum(case when upper(COALESCE(COMPLIANCE_STATUS,'')) = 'COMPLIANT' then 1 else 0 end) as COMPLIANT,
+                         max(NEXT_AUDIT_DATE) as NEXT_AUDIT_DATE,
+                         sum(case when upper(COALESCE(COMPLIANCE_STATUS,'')) <> 'COMPLIANT' then 1 else 0 end) as GAPS
+                  from base
+                  group by 1
+                )
+                select FRAMEWORK,
+                       iff(TOTAL=0,0, round(100.0*COMPLIANT/TOTAL,2)) as COMPLIANCE_PCT,
+                       NEXT_AUDIT_DATE,
+                       GAPS,
+                       100 as COVERAGE_PCT
+                from by_fw
+            """, params)
         df = pd.DataFrame(rows or [])
         with pl_compliance:
             st.subheader("Compliance Status")
@@ -675,10 +688,18 @@ def render_realtime_dashboard():
             overdue = metrics_service.overdue_unclassified(database=active_db)
 
             k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Inventoried Assets", f"{int(cov.get('total_assets',0)):,}")
-            k2.metric("Tagged Assets", f"{int(cov.get('tagged_assets',0)):,}")
-            k3.metric("Coverage (Tags)", f"{cov.get('coverage_pct',0.0)}%")
-            k4.metric("Overdue Unclassified (\u22655d)", f"{int(overdue):,}")
+            k1.metric("Inventoried Assets", f"{int(cov.get('total_assets',0) or 0):,}")
+            k2.metric("Tagged Assets", f"{int(cov.get('classified_count',0) or 0):,}")
+            k3.metric("Coverage (Tags)", f"{float(cov.get('coverage_percentage',0.0) or 0.0)}%")
+            _ov = 0
+            try:
+                if isinstance(overdue, dict):
+                    _ov = int(sum(v for v in overdue.values() if isinstance(v, (int, float))))
+                else:
+                    _ov = int(overdue or 0)
+            except Exception:
+                _ov = 0
+            k4.metric("Overdue Unclassified (\u22655d)", f"{_ov:,}")
 
             # Framework counts table (best-effort from COMPLIANCE_CATEGORY)
             import pandas as _pd

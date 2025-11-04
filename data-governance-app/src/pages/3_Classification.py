@@ -1364,7 +1364,7 @@ with tab_new:
         st.caption("Scope is controlled by the sidebar global filter (Database/Schema).")
 
         # Level 1 — Sensitive Tables Overview
-        st.markdown("#### Level 1 — Sensitive Tables Overview")
+        st.markdown("####  Sensitive Tables Overview")
         import pandas as _pd
         level1_rows: list[dict] = []
         try:
@@ -1376,39 +1376,146 @@ with tab_new:
             ]
             fqn_candidates = [x for x in fqn_candidates if x]
             rows = []
-            for _fqn in fqn_candidates:
-                where = []
-                params = {}
-                if sel_db:
-                    where.append("DATABASE_NAME = %(db)s"); params["db"] = sel_db
-                if sel_schema:
-                    where.append("SCHEMA_NAME = %(sc)s"); params["sc"] = sel_schema
-                sql = f"""
-                    SELECT DATABASE_NAME, SCHEMA_NAME, TABLE_NAME,
-                           ANY_VALUE(DETECTED_TYPE) AS DETECTED_TYPE,
-                           MAX(COMBINED_CONFIDENCE) AS MAX_CONF
-                    FROM {_fqn}
-                    {('WHERE ' + ' AND '.join(where)) if where else ''}
-                    GROUP BY 1,2,3
-                    ORDER BY MAX_CONF DESC, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME
-                    LIMIT 1000
-                """
+            # Primary: run dynamic CTE over the active DB's INFORMATION_SCHEMA
+            if _active_db:
                 try:
-                    rows = snowflake_connector.execute_query(sql, params) or []
-                    if rows:
-                        break
+                    cte_sql = """
+                    WITH
+                    COLUMN_SCORES AS (
+                        SELECT
+                            c.TABLE_CATALOG AS DATABASE_NAME,
+                            c.TABLE_SCHEMA,
+                            c.TABLE_NAME,
+                            c.COLUMN_NAME,
+                            COALESCE(k.CATEGORY_ID, p.CATEGORY_ID) AS CATEGORY_ID,
+                            COALESCE(cat.CATEGORY_NAME, 'Unknown') AS CATEGORY_NAME,
+                            COALESCE(k.SENSITIVITY_WEIGHT, p.SENSITIVITY_WEIGHT, 1.0) AS MATCH_WEIGHT,
+                            COALESCE(cat.DETECTION_THRESHOLD, 0.7) AS DETECTION_THRESHOLD,
+                            CASE 
+                                WHEN k.KEYWORD_STRING IS NOT NULL THEN 'RULE_BASED'
+                                WHEN p.PATTERN_NAME IS NOT NULL THEN 'PATTERN_BASED'
+                                ELSE 'UNKNOWN'
+                            END AS DETECTION_TYPE
+                        FROM {DB}.INFORMATION_SCHEMA.COLUMNS c
+                        LEFT JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS k
+                          ON LOWER(c.COLUMN_NAME) LIKE CONCAT('%', LOWER(k.KEYWORD_STRING), '%')
+                         AND k.IS_ACTIVE = TRUE
+                        LEFT JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS p
+                          ON REGEXP_LIKE(LOWER(c.COLUMN_NAME), p.PATTERN_STRING, 'i')
+                         AND p.IS_ACTIVE = TRUE
+                        LEFT JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES cat
+                          ON COALESCE(k.CATEGORY_ID, p.CATEGORY_ID) = cat.CATEGORY_ID
+                         AND cat.IS_ACTIVE = TRUE
+                        WHERE (k.KEYWORD_STRING IS NOT NULL OR p.PATTERN_NAME IS NOT NULL)
+                    ),
+                    COLUMN_CONFIDENCE AS (
+                        SELECT
+                            DATABASE_NAME,
+                            TABLE_SCHEMA,
+                            TABLE_NAME,
+                            CATEGORY_NAME,
+                            AVG(MATCH_WEIGHT) AS CONFIDENCE_SCORE,
+                            MAX(DETECTION_THRESHOLD) AS DETECTION_THRESHOLD
+                        FROM COLUMN_SCORES
+                        GROUP BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME, CATEGORY_NAME
+                    ),
+                    TABLE_SCORES AS (
+                        SELECT
+                            DATABASE_NAME,
+                            TABLE_SCHEMA,
+                            TABLE_NAME,
+                            ARRAY_AGG(DISTINCT CATEGORY_NAME) AS SENSITIVE_DATA_TYPES,
+                            AVG(CONFIDENCE_SCORE) AS AVG_CONFIDENCE_SCORE,
+                            MAX(DETECTION_THRESHOLD) AS DETECTION_THRESHOLD,
+                            CASE 
+                                WHEN AVG(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'POLICY_REQUIRED'
+                                WHEN AVG(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'NEEDS_REVIEW'
+                                ELSE 'OK'
+                            END AS RECOMMENDED_POLICY,
+                            CASE 
+                                WHEN AVG(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6)
+                                  AND AVG(CONFIDENCE_SCORE) < MAX(DETECTION_THRESHOLD)
+                                THEN TRUE
+                                ELSE FALSE
+                            END AS NEED_REVIEW,
+                            CASE 
+                                WHEN AVG(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'HIGH'
+                                WHEN AVG(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'MEDIUM'
+                                ELSE 'LOW'
+                            END AS SENSITIVITY_LEVEL
+                        FROM COLUMN_CONFIDENCE
+                        GROUP BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME
+                    )
+                    """
+                    agg_sql = f"""
+                    {cte_sql.replace('{DB}', _active_db)}
+                    SELECT
+                        DATABASE_NAME,
+                        TABLE_SCHEMA AS SCHEMA_NAME,
+                        TABLE_NAME,
+                        ARRAY_TO_STRING(SENSITIVE_DATA_TYPES, ', ') AS DETECTED_TYPE,
+                        ROUND(AVG_CONFIDENCE_SCORE, 2) AS MAX_CONF,
+                        RECOMMENDED_POLICY,
+                        NEED_REVIEW,
+                        SENSITIVITY_LEVEL
+                    FROM TABLE_SCORES
+                    {('WHERE TABLE_SCHEMA = %(sc)s') if sel_schema else ''}
+                    ORDER BY MAX_CONF DESC, SCHEMA_NAME, TABLE_NAME
+                    LIMIT 1000
+                    """
+                    rows = snowflake_connector.execute_query(agg_sql, ({"sc": sel_schema} if sel_schema else {})) or []
                 except Exception:
-                    continue
+                    rows = []
+            # Fallback: use persisted AI assistant table if CTE had no rows or no active DB
+            if not rows:
+                for _fqn in fqn_candidates:
+                    where = []
+                    params = {}
+                    if sel_db:
+                        where.append("DATABASE_NAME = %(db)s"); params["db"] = sel_db
+                    if sel_schema:
+                        where.append("SCHEMA_NAME = %(sc)s"); params["sc"] = sel_schema
+                    sql = f"""
+                        SELECT DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, DETECTED_TYPE, MAX_CONF
+                        FROM (
+                          SELECT 
+                            DATABASE_NAME,
+                            SCHEMA_NAME,
+                            TABLE_NAME,
+                            DETECTED_TYPE,
+                            COMBINED_CONFIDENCE AS CONF,
+                            MAX(COMBINED_CONFIDENCE) OVER (PARTITION BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME) AS MAX_CONF,
+                            ROW_NUMBER() OVER (PARTITION BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME ORDER BY COMBINED_CONFIDENCE DESC) AS RN
+                          FROM {_fqn}
+                          {('WHERE ' + ' AND '.join(where)) if where else ''}
+                        ) t
+                        WHERE RN = 1
+                        ORDER BY MAX_CONF DESC, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME
+                        LIMIT 1000
+                    """
+                    try:
+                        rows = snowflake_connector.execute_query(sql, params) or []
+                        if rows:
+                            break
+                    except Exception:
+                        continue
             for r in rows:
                 db = r.get("DATABASE_NAME"); sc = r.get("SCHEMA_NAME"); tbl = r.get("TABLE_NAME")
                 fqn = f"{db}.{sc}.{tbl}"
+                cat = str(r.get("DETECTED_TYPE") or "")
+                try:
+                    maxc = float(r.get('MAX_CONF') or 0.0)
+                except Exception:
+                    maxc = 0.0
+                pol = r.get("RECOMMENDED_POLICY") or ""
+                need_review = bool(r.get("NEED_REVIEW")) if r.get("NEED_REVIEW") is not None else bool(maxc < 0.7)
                 level1_rows.append({
-                    "Table Name": f"{sc}.{tbl}",
-                    "Sensitive Data Type": r.get("DETECTED_TYPE") or "",
-                    "Confidence Score": f"{float(r.get('MAX_CONF') or 0.0)*100:.0f}%" if r.get('MAX_CONF') is not None else "",
-                    "Recommended Policies": "",  # filled in drill-down
-                    "OK Policies": "",
-                    "Need Review": False,  # compute via thresholds if needed
+                    "Table Name": f"{db}.{sc}.{tbl}",
+                    "Sensitive Data Type": cat,
+                    "Confidence Score": float(maxc) if r.get('MAX_CONF') is not None else "",
+                    "Recommended Policies": pol,
+                    "Need Review": need_review,
+                    "Sensitivity Level": r.get("SENSITIVITY_LEVEL") or "",
                     "_FQN": fqn,
                 })
         except Exception:
@@ -1439,25 +1546,49 @@ with tab_new:
                 "Sensitive Data Type",
                 "Confidence Score",
                 "Recommended Policies",
-                "OK Policies",
                 "Need Review",
+                "Sensitivity Level",
             ]], use_container_width=True, hide_index=True)
 
             # Select table to drill down
+            def _on_ai_table_change():
+                try:
+                    st.session_state["selected_sensitive_table"] = st.session_state.get("ai_gov_selected_table", "")
+                except Exception:
+                    pass
+                try:
+                    st.rerun()
+                except Exception:
+                    pass
+            _options = [""] + [f for f in df_level1["_FQN"].tolist()]
+            _prev = st.session_state.get("selected_sensitive_table", "")
+            if not _prev and len(df_level1["_FQN"].tolist()) == 1:
+                _prev = df_level1["_FQN"].tolist()[0]
+                st.session_state["selected_sensitive_table"] = _prev
+                st.session_state["ai_gov_selected_table"] = _prev
+            try:
+                _idx = _options.index(_prev) if _prev in _options else 0
+            except Exception:
+                _idx = 0
             selected_label = st.selectbox(
                 "Select a table to drill down",
-                options=[""] + [f for f in df_level1["_FQN"].tolist()],
-                index=0,
+                options=_options,
+                index=_idx,
                 key="ai_gov_selected_table",
+                on_change=_on_ai_table_change,
             )
-            selected_full_name = selected_label
+            # Prefer explicit selection; fall back to prior session selection if present
+            selected_full_name = selected_label or st.session_state.get("selected_sensitive_table", "")
+            if selected_full_name:
+                st.session_state["selected_sensitive_table"] = selected_full_name
 
         # Level 2 — Drill-Down: Sensitive Columns View (editable)
         if selected_full_name:
-            st.markdown("#### Level 2 — Sensitive Columns Drill-down")
+            st.markdown("#### Sensitive Columns Drill-down")
             cols_detect = []
             try:
                 db, sc, tbl = selected_full_name.split('.')
+                db, sc, tbl = db.strip(), sc.strip(), tbl.strip()
                 _active_db = sel_db or _active_db_from_filter() or db
                 _gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
                 fqn_candidates = [
@@ -1465,37 +1596,265 @@ with tab_new:
                     "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.AI_ASSISTANT_SENSITIVE_ASSETS",
                 ]
                 fqn_candidates = [x for x in fqn_candidates if x]
-                for _fqn in fqn_candidates:
-                    sql = f"""
-                        SELECT COLUMN_NAME, DETECTED_TYPE, COMBINED_CONFIDENCE, METHODS_USED, COMPLIANCE_TAGS
-                        FROM {_fqn}
-                        WHERE DATABASE_NAME = %(db)s AND SCHEMA_NAME = %(sc)s AND TABLE_NAME = %(tb)s
-                        ORDER BY COLUMN_NAME
-                    """
-                    try:
-                        rows = snowflake_connector.execute_query(sql, {"db": db, "sc": sc, "tb": tbl}) or []
-                        if rows:
-                            cols_detect = rows
-                            break
-                    except Exception:
-                        continue
+                try:
+                    cte_sql = """
+                        WITH
+                        -- 1️⃣ Active sensitivity categories (with default CIA weights)
+                        CATEGORIES AS (
+                          SELECT 
+                              CATEGORY_ID,
+                              CATEGORY_NAME,
+                              COALESCE(DETECTION_THRESHOLD, 0.7) AS DETECTION_THRESHOLD,
+                              0.5 AS C_WEIGHT,
+                              0.3 AS A_WEIGHT,
+                              0.2 AS I_WEIGHT
+                          FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES
+                          WHERE IS_ACTIVE = TRUE
+                        ),
+
+                        -- 2️⃣ Active detection weights
+                        WEIGHTS AS (
+                          SELECT
+                              MAX(CASE WHEN UPPER(SENSITIVITY_TYPE) = 'RULE_BASED' THEN WEIGHT END) AS RULE_BASED_WEIGHT,
+                              MAX(CASE WHEN UPPER(SENSITIVITY_TYPE) = 'PATTERN_BASED' THEN WEIGHT END) AS PATTERN_BASED_WEIGHT
+                          FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_WEIGHTS
+                          WHERE IS_ACTIVE = TRUE
+                        ),
+
+                        -- 3️⃣ Rule-based keyword matches
+                        RULE_BASED AS (
+                          SELECT
+                              c.TABLE_CATALOG AS DATABASE_NAME,
+                              c.TABLE_SCHEMA,
+                              c.TABLE_NAME,
+                              c.COLUMN_NAME,
+                              k.CATEGORY_ID,
+                              cat.CATEGORY_NAME,
+                              'RULE_BASED' AS DETECTION_TYPE,
+                              k.KEYWORD_STRING AS MATCHED_KEYWORD,
+                              NULL AS MATCHED_PATTERN,
+                              COALESCE(k.SENSITIVITY_WEIGHT, 1.0) AS MATCH_WEIGHT,
+                              cat.DETECTION_THRESHOLD,
+                              cat.C_WEIGHT,
+                              cat.A_WEIGHT,
+                              cat.I_WEIGHT
+                          FROM {DB}.INFORMATION_SCHEMA.COLUMNS c
+                          JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS k
+                            ON LOWER(c.COLUMN_NAME) LIKE CONCAT('%', LOWER(k.KEYWORD_STRING), '%')
+                           AND k.IS_ACTIVE = TRUE
+                          JOIN CATEGORIES cat ON k.CATEGORY_ID = cat.CATEGORY_ID
+                        ),
+
+                        -- 4️⃣ Pattern-based detections
+                        PATTERN_BASED AS (
+                          SELECT
+                              c.TABLE_CATALOG AS DATABASE_NAME,
+                              c.TABLE_SCHEMA,
+                              c.TABLE_NAME,
+                              c.COLUMN_NAME,
+                              p.CATEGORY_ID,
+                              cat.CATEGORY_NAME,
+                              'PATTERN_BASED' AS DETECTION_TYPE,
+                              NULL AS MATCHED_KEYWORD,
+                              p.PATTERN_NAME AS MATCHED_PATTERN,
+                              COALESCE(p.SENSITIVITY_WEIGHT, 1.0) AS MATCH_WEIGHT,
+                              cat.DETECTION_THRESHOLD,
+                              cat.C_WEIGHT,
+                              cat.A_WEIGHT,
+                              cat.I_WEIGHT
+                          FROM {DB}.INFORMATION_SCHEMA.COLUMNS c
+                          JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS p
+                            ON REGEXP_LIKE(LOWER(c.COLUMN_NAME), p.PATTERN_STRING, 'i')
+                           AND p.IS_ACTIVE = TRUE
+                          JOIN CATEGORIES cat ON p.CATEGORY_ID = cat.CATEGORY_ID
+                        ),
+
+                        -- 5️⃣ Combine detections
+                        COMBINED AS (
+                          SELECT * FROM RULE_BASED
+                          UNION ALL
+                          SELECT * FROM PATTERN_BASED
+                        ),
+
+                        -- 6️⃣ Aggregate detections by column
+                        AGGREGATED AS (
+                          SELECT
+                              DATABASE_NAME,
+                              TABLE_SCHEMA,
+                              TABLE_NAME,
+                              COLUMN_NAME,
+                              CATEGORY_NAME,
+                              ARRAY_AGG(DISTINCT MATCHED_KEYWORD) AS MATCHED_KEYWORDS,
+                              ARRAY_AGG(DISTINCT MATCHED_PATTERN) AS MATCHED_PATTERNS,
+                              SUM(MATCH_WEIGHT) AS RAW_SCORE,
+                              MAX(DETECTION_THRESHOLD) AS DETECTION_THRESHOLD,
+                              MAX(C_WEIGHT) AS C_WEIGHT,
+                              MAX(A_WEIGHT) AS A_WEIGHT,
+                              MAX(I_WEIGHT) AS I_WEIGHT,
+                              MAX(DETECTION_TYPE) AS DETECTION_TYPE
+                          FROM COMBINED
+                          GROUP BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, CATEGORY_NAME
+                        ),
+
+                        -- 7️⃣ Active bundles
+                        BUNDLES AS (
+                          SELECT 
+                              BUNDLE_ID,
+                              BUNDLE_NAME,
+                              CATEGORY_ID,
+                              MIN_MATCH_COUNT,
+                              CONFIDENCE_BOOST,
+                              COLUMNS,
+                              IS_ACTIVE
+                          FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_BUNDLES
+                          WHERE IS_ACTIVE = TRUE
+                        ),
+
+                        -- 8️⃣ Flattened bundle-category mapping
+                        BUNDLE_COLUMNS AS (
+                          SELECT
+                              b.BUNDLE_ID,
+                              b.BUNDLE_NAME,
+                              TRIM(LOWER(f.VALUE::STRING)) AS CATEGORY_NAME,
+                              b.MIN_MATCH_COUNT,
+                              b.CONFIDENCE_BOOST
+                          FROM BUNDLES b,
+                               TABLE(FLATTEN(INPUT => PARSE_JSON(b.COLUMNS))) f
+                        ),
+
+                        -- 9️⃣ Detect bundle matches by table
+                        BUNDLE_MATCHES AS (
+                          SELECT
+                              a.DATABASE_NAME,
+                              a.TABLE_SCHEMA,
+                              a.TABLE_NAME,
+                              bc.BUNDLE_NAME,
+                              bc.CONFIDENCE_BOOST,
+                              COUNT(DISTINCT a.COLUMN_NAME) AS MATCHED_COLUMNS,
+                              bc.MIN_MATCH_COUNT
+                          FROM AGGREGATED a
+                          JOIN BUNDLE_COLUMNS bc
+                            ON LOWER(a.CATEGORY_NAME) = bc.CATEGORY_NAME
+                          GROUP BY a.DATABASE_NAME, a.TABLE_SCHEMA, a.TABLE_NAME, bc.BUNDLE_NAME, bc.CONFIDENCE_BOOST, bc.MIN_MATCH_COUNT
+                          HAVING COUNT(DISTINCT a.COLUMN_NAME) >= bc.MIN_MATCH_COUNT
+                        ),
+
+                        -- 🔟 Weighted confidence score with bundle boost
+                        SCORED AS (
+                          SELECT
+                              a.*,
+                              COALESCE(m.BUNDLE_NAME, '') AS BUNDLE_NAME,
+                              CASE 
+                                  WHEN a.DETECTION_TYPE = 'RULE_BASED' THEN a.RAW_SCORE * COALESCE((SELECT RULE_BASED_WEIGHT FROM WEIGHTS), 1.0)
+                                  WHEN a.DETECTION_TYPE = 'PATTERN_BASED' THEN a.RAW_SCORE * COALESCE((SELECT PATTERN_BASED_WEIGHT FROM WEIGHTS), 1.0)
+                                  ELSE a.RAW_SCORE
+                              END * (1 + COALESCE(m.CONFIDENCE_BOOST, 0.0)) AS CONFIDENCE_SCORE
+                          FROM AGGREGATED a
+                          LEFT JOIN BUNDLE_MATCHES m
+                            ON a.TABLE_NAME = m.TABLE_NAME
+                           AND a.TABLE_SCHEMA = m.TABLE_SCHEMA
+                           AND a.DATABASE_NAME = m.DATABASE_NAME
+                        )
+                        """
+                    sql2 = f"""
+                        {cte_sql.replace('{DB}', db)}
+                        SELECT
+                            COLUMN_NAME                                     AS "Column Name",
+                            CATEGORY_NAME                                   AS "Sensitivity Type",
+                            ROUND(CONFIDENCE_SCORE, 2)                      AS "Confidence",
+                            ROUND(C_WEIGHT, 2)                              AS "C",
+                            ROUND(A_WEIGHT, 2)                              AS "A",
+                            ROUND(I_WEIGHT, 2)                              AS "I",
+                            CASE 
+                                WHEN CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'POLICY_REQUIRED'
+                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'NEEDS_REVIEW'
+                                ELSE 'OK'
+                            END                                              AS "Recommended Policies",
+                            BUNDLE_NAME                                      AS "Bundle",
+                            CASE 
+                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) 
+                                     AND CONFIDENCE_SCORE < DETECTION_THRESHOLD THEN TRUE
+                                ELSE FALSE
+                            END                                              AS "Need Review",
+                            CASE 
+                                WHEN CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'Column contains high-sensitivity data (PII/Financial/RegEx Match)'
+                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'Column partially matches sensitive patterns — manual review recommended'
+                                ELSE 'Column appears safe under current detection thresholds'
+                            END                                              AS "Reason / Justification",
+                            CASE
+                                WHEN CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'HIGH'
+                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'MEDIUM'
+                                ELSE 'LOW'
+                            END                                              AS "Sensitivity Level",
+                            DATABASE_NAME,
+                            TABLE_SCHEMA,
+                            TABLE_NAME,
+                            CURRENT_TIMESTAMP()                              AS DETECTED_AT
+                        FROM SCORED
+                        WHERE UPPER(DATABASE_NAME) = UPPER(%(db)s)
+                          AND UPPER(TABLE_SCHEMA) = UPPER(%(sc)s)
+                          AND UPPER(TABLE_NAME) = UPPER(%(tb)s)
+                        ORDER BY CONFIDENCE_SCORE DESC, DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME
+                        """
+                    cols_detect = snowflake_connector.execute_query(sql2, {"db": db, "sc": sc, "tb": tbl}) or []
+                except Exception:
+                    cols_detect = []
+                # Force live CTE only: no fallback to persisted assets for drill-down
             except Exception:
                 cols_detect = []
+            # Empty state message when no sensitive columns are detected
+            if not cols_detect:
+                st.info("No sensitive columns detected for this table under current thresholds.")
+
+            # Show detected table-level sensitive type (top category by total confidence across columns)
+            try:
+                tbl_type_sql = f"""
+                    {cte_sql.replace('{DB}', db)}
+                    SELECT DETECTED_TYPE
+                    FROM (
+                      SELECT 
+                        CATEGORY_NAME AS DETECTED_TYPE,
+                        SUM(CONFIDENCE_SCORE) AS TOTAL_SCORE,
+                        ROW_NUMBER() OVER (ORDER BY SUM(CONFIDENCE_SCORE) DESC) AS RN
+                      FROM SCORED
+                      WHERE UPPER(DATABASE_NAME) = UPPER(%(db)s)
+                        AND UPPER(TABLE_SCHEMA) = UPPER(%(sc)s)
+                        AND UPPER(TABLE_NAME) = UPPER(%(tb)s)
+                      GROUP BY CATEGORY_NAME
+                    ) t
+                    WHERE RN = 1
+                """
+                trow = snowflake_connector.execute_query(tbl_type_sql, {"db": db, "sc": sc, "tb": tbl}) or []
+                if trow and (trow[0].get("DETECTED_TYPE") is not None):
+                    st.caption(f"Table sensitive type: `{trow[0].get('DETECTED_TYPE')}`")
+            except Exception:
+                pass
 
             # Build editable grid
             editor_rows = []
             for c in (cols_detect or []):
+                _sens = c.get("Sensitivity Type") or c.get("DETECTED_TYPE") or ""
+                try:
+                    _conf = float(c.get("Confidence") if c.get("Confidence") is not None else (c.get("COMBINED_CONFIDENCE") if c.get("COMBINED_CONFIDENCE") is not None else (c.get("CONFIDENCE_SCORE") if c.get("CONFIDENCE_SCORE") is not None else 0.0)))
+                except Exception:
+                    _conf = 0.0
+                _need = c.get("Need Review")
+                if _need is None:
+                    try:
+                        _need = bool(_conf < 0.7)
+                    except Exception:
+                        _need = False
                 editor_rows.append({
-                    "Column Name": c.get("COLUMN_NAME") or c.get("column"),
-                    "Sensitivity Type": c.get("DETECTED_TYPE") or c.get("sensitivity_level") or c.get("category") or "",
-                    "C": 0,
-                    "A": 0,
-                    "I": 0,
-                    "Recommended Policies": ", ".join((c.get("METHODS_USED") or []) if isinstance(c.get("METHODS_USED"), list) else []),
-                    "Bundle": "",
-                    "Need Review": False,
-                    "Reason / Justification": "",
-                    "Keywords": "",
+                    "Column Name": c.get("Column Name") or c.get("COLUMN_NAME") or c.get("column"),
+                    "Sensitivity Type": _sens,
+                    "Confidence": _conf,
+                    "C": float(c.get("C") or 0.0),
+                    "A": float(c.get("A") or 0.0),
+                    "I": float(c.get("I") or 0.0),
+                    "Recommended Policies": c.get("Recommended Policies") or "",
+                    "Bundle": c.get("Bundle") or "",
+                    "Need Review": bool(_need),
+                    "Reason / Justification": c.get("Reason / Justification") or "",
                 })
             df_edit = _pd.DataFrame(editor_rows)
             _orig_key = f"orig_edit_{selected_full_name}"
@@ -3070,18 +3429,24 @@ if False:
             # Prefer service-driven fields; hide legacy Agg columns by default
             preferred = [
                 "FULL_NAME","SENSITIVITY","AI_CONFIDENCE","ROW_COUNT",
-                "C","I","A","LABEL","POLICY_SUGGESTION","POLICY_OK","REQUIRES_REVIEW","REASONING",
+                "C","I","A","LABEL","POLICY_SUGGESTION","REQUIRES_REVIEW","REASONING",
             ]
             display_cols = [c for c in preferred if c in sum_df.columns]
             def _style_row(row):
                 try:
-                    ok = str(row.get('POLICY_OK')).lower() in ('true','1','yes')
-                    bg = '#065f46' if ok else '#7f1d1d'  # darker green vs darker red
-                    fg = '#000000'  # black text as requested
+                    c_val = int(row.get('C') or 0)
+                    if c_val >= 3:
+                        bg = '#7f1d1d'  # high risk
+                    elif c_val == 2:
+                        bg = '#a16207'  # medium risk (amber)
+                    else:
+                        bg = '#065f46'  # low risk
+                    fg = '#000000'
                     style = f'background-color: {bg}; color: {fg};'
                     return [style for _ in row]
                 except Exception:
                     return ['' for _ in row]
+
             st.markdown("##### Sensitive Tables — AI Suggestions")
             # Compute and display Actual Row Count for each sensitive table (auto)
             st.session_state.setdefault("ai_actual_counts", {})

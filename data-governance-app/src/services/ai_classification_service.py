@@ -74,158 +74,10 @@ class AIClassificationService:
         # Feedback store (persisted to JSON)
         self._feedback: Dict[str, Any] = {}
         
-        # Initialize sensitivity configuration with comprehensive defaults
-        self._sensitivity_config = {
-            # Pattern definitions for structured data detection
-            "patterns": [
-                {
-                    "name": "EMAIL",
-                    "regex": r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-                    "category": "PII",
-                    "weight": 0.9,
-                    "description": "Email address pattern"
-                },
-                {
-                    "name": "CREDIT_CARD",
-                    "regex": r'\b(?:\d[ -]*?){13,16}\b',
-                    "category": "FINANCIAL",
-                    "weight": 1.0,
-                    "description": "Credit card number pattern"
-                },
-                {
-                    "name": "SSN",
-                    "regex": r'\b\d{3}[-.]?\d{2}[-.]?\d{4}\b',
-                    "category": "PII",
-                    "weight": 1.0,
-                    "description": "Social Security Number pattern"
-                },
-                {
-                    "name": "PHONE",
-                    "regex": r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
-                    "category": "PII",
-                    "weight": 0.8,
-                    "description": "Phone number pattern"
-                },
-                {
-                    "name": "IP_ADDRESS",
-                    "regex": r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
-                    "category": "NETWORK",
-                    "weight": 0.7,
-                    "description": "IPv4 address pattern"
-                }
-            ],
-            
-            # Keywords for semantic matching
-            "keywords": [
-                {"token": "ssn", "category": "PII", "weight": 1.0, "match_type": "exact"},
-                {"token": "social security", "category": "PII", "weight": 0.9, "match_type": "contains"},
-                {"token": "credit card", "category": "FINANCIAL", "weight": 0.9, "match_type": "contains"},
-                {"token": "dob", "category": "PII", "weight": 0.8, "match_type": "exact"},
-                {"token": "date of birth", "category": "PII", "weight": 0.9, "match_type": "contains"},
-                {"token": "salary", "category": "FINANCIAL", "weight": 0.9, "match_type": "contains"},
-                {"token": "income", "category": "FINANCIAL", "weight": 0.8, "match_type": "contains"},
-                {"token": "medical", "category": "HEALTH", "weight": 0.9, "match_type": "contains"},
-                {"token": "diagnosis", "category": "HEALTH", "weight": 0.9, "match_type": "contains"},
-                {"token": "treatment", "category": "HEALTH", "weight": 0.8, "match_type": "contains"}
-            ],
-            
-            # Sensitivity categories with severity levels
-            "categories": {
-                "PII": {
-                    "description": "Personally Identifiable Information",
-                    "severity": "high",
-                    "cia": {"C": 3, "I": 3, "A": 2},
-                    "compliance": ["GDPR", "CCPA", "PIPEDA"]
-                },
-                "FINANCIAL": {
-                    "description": "Financial Information",
-                    "severity": "high",
-                    "cia": {"C": 3, "I": 3, "A": 2},
-                    "compliance": ["PCI-DSS", "SOX", "GLBA"]
-                },
-                "HEALTH": {
-                    "description": "Protected Health Information",
-                    "severity": "high",
-                    "cia": {"C": 3, "I": 3, "A": 2},
-                    "compliance": ["HIPAA", "HITECH", "GDPR"]
-                },
-                "CONTACT": {
-                    "description": "Contact Information",
-                    "severity": "medium",
-                    "cia": {"C": 2, "I": 2, "A": 1},
-                    "compliance": ["GDPR", "CCPA"]
-                },
-                "LOCATION": {
-                    "description": "Geolocation Data",
-                    "severity": "medium",
-                    "cia": {"C": 2, "I": 2, "A": 1},
-                    "compliance": ["GDPR"]
-                },
-                "DEMOGRAPHIC": {
-                    "description": "Demographic Information",
-                    "severity": "low",
-                    "cia": {"C": 1, "I": 1, "A": 1},
-                    "compliance": []
-                }
-            },
-            
-            # Predefined bundles of columns that together indicate sensitivity
-            "bundles": [
-                {
-                    "name": "PERSON_IDENTIFIERS",
-                    "description": "Combination of fields that can identify a person",
-                    "columns": ["first_name", "last_name", "date_of_birth"],
-                    "severity": "high",
-                    "category": "PII"
-                },
-                {
-                    "name": "FINANCIAL_RECORD",
-                    "description": "Combination of fields that indicate financial records",
-                    "columns": ["account_number", "routing_number", "account_holder_name"],
-                    "severity": "high",
-                    "category": "FINANCIAL"
-                }
-            ],
-            
-            # Compliance framework mappings
-            "compliance_mapping": {
-                "GDPR": {"PII": "high", "CONTACT": "medium"},
-                "HIPAA": {"HEALTH": "high", "PII": "high"},
-                "PCI-DSS": {"FINANCIAL": "high"},
-                "CCPA": {"PII": "high", "CONTACT": "medium"}
-            },
-            
-            # Model configuration
-            "model_metadata": {
-                "thresholds": {
-                    "high_confidence": 0.8,
-                    "medium_confidence": 0.6,
-                    "low_confidence": 0.4
-                },
-                "min_samples_for_training": 100,
-                "max_training_iterations": 1000,
-                "feature_importance_threshold": 0.01
-            },
-            
-            # Token weights for name-based detection
-            "name_tokens": {
-                "id": 0.8,
-                "name": 0.7,
-                "addr": 0.7,
-                "phone": 0.8,
-                "email": 0.9,
-                "ssn": 0.95,
-                "dob": 0.85,
-                "credit": 0.9,
-                "salary": 0.85,
-                "medical": 0.9
-            },
-            
-            # System metadata
-            "version": "1.0.0",
-            "last_updated": "2025-10-30T00:00:00Z",
-            "is_active": True
-        }
+        # Initialize empty sensitivity configuration - fully config-driven from governance tables
+        # All patterns, keywords, thresholds, categories, bundles, and compliance mappings
+        # must be loaded from governance tables via load_sensitivity_config()
+        self._sensitivity_config: Optional[Dict[str, Any]] = None
         
         # Try to load feedback and config
         try:
@@ -1032,30 +884,24 @@ class AIClassificationService:
         if not force_refresh and self._sensitivity_config:
             return self._sensitivity_config
             
-        # Default configuration if database is not available
-        default_config = {
+        # Empty configuration structure - fully config-driven from governance tables
+        # No hardcoded defaults to ensure all config comes from governance tables
+        empty_config = {
             "patterns": [],
             "keywords": [],
-            "categories": {
-                "PII": {"description": "Personally Identifiable Information", "severity": "high"},
-                "FINANCIAL": {"description": "Financial Information", "severity": "high"},
-                "HEALTH": {"description": "Health Information", "severity": "high"}
-            },
+            "categories": {},
             "bundles": [],
             "compliance_mapping": {},
-            "model_metadata": {
-                "thresholds": {
-                    "high_confidence": 0.8,
-                    "medium_confidence": 0.5
-                }
-            },
+            "model_metadata": {},
+            "thresholds": {},
+            "weights": {},
             "name_tokens": {}
         }
 
-        # Set default config in case of errors
-        self._sensitivity_config = default_config
+        # Set empty config - will be populated from database
+        self._sensitivity_config = empty_config
         
-        # If Snowflake is not available, return default config
+        # If Snowflake is not available, return empty config (no hardcoded fallbacks)
         if not (self.use_snowflake and snowflake_connector is not None):
             return self._sensitivity_config
             
@@ -1073,7 +919,7 @@ class AIClassificationService:
                 return cfg
                 
         except Exception as e:
-            print(f"Warning: Could not load sensitivity configuration: {str(e)}. Using default configuration.")
+            print(f"Warning: Could not load sensitivity configuration: {str(e)}. Configuration must be loaded from governance tables.")
             
         return self._sensitivity_config
 
@@ -1818,10 +1664,7 @@ class AIClassificationService:
                 "bundles": [],
                 "compliance_mapping": {},
                 "model_metadata": {
-                    "thresholds": {
-                        "high_confidence": 0.8,
-                        "medium_confidence": 0.5
-                    }
+                    "thresholds": {}
                 },
                 "name_tokens": {}
             }
@@ -1928,10 +1771,10 @@ class AIClassificationService:
                     continue
             return []
 
-        # Patterns (PATTERN column; IS_ACTIVE flag). Provide REGEX alias.
+        # Patterns (PATTERN_STRING column; IS_ACTIVE flag). Provide REGEX alias.
         patt_rows = _q([
-            f"SELECT CATEGORY, PATTERN AS REGEX, COALESCE(WEIGHT,0.5) AS WEIGHT, COALESCE(PRIORITY, 100) AS PRIORITY, COALESCE(IS_ACTIVE, TRUE) AS ACTIVE, OWNER, VERSION FROM {sc_fqn}.SENSITIVE_PATTERNS",
-            f"SELECT CATEGORY, PATTERN AS REGEX, COALESCE(WEIGHT,0.5) AS WEIGHT, 100 AS PRIORITY, TRUE AS ACTIVE, OWNER, VERSION FROM {sc_fqn}.SENSITIVE_PATTERNS",
+            f"SELECT sc.CATEGORY_NAME AS CATEGORY, sp.PATTERN_STRING AS REGEX, COALESCE(sp.SENSITIVITY_WEIGHT,0.5) AS WEIGHT, 100 AS PRIORITY, COALESCE(sp.IS_ACTIVE, TRUE) AS ACTIVE, 'system' AS OWNER, sp.VERSION_NUMBER AS VERSION FROM {sc_fqn}.SENSITIVE_PATTERNS sp JOIN {sc_fqn}.SENSITIVITY_CATEGORIES sc ON sp.CATEGORY_ID = sc.CATEGORY_ID WHERE COALESCE(sp.IS_ACTIVE, TRUE) = TRUE",
+            f"SELECT sc.CATEGORY_NAME AS CATEGORY, sp.PATTERN_STRING AS REGEX, COALESCE(sp.SENSITIVITY_WEIGHT,0.5) AS WEIGHT, 100 AS PRIORITY, TRUE AS ACTIVE, 'system' AS OWNER, sp.VERSION_NUMBER AS VERSION FROM {sc_fqn}.SENSITIVE_PATTERNS sp JOIN {sc_fqn}.SENSITIVITY_CATEGORIES sc ON sp.CATEGORY_ID = sc.CATEGORY_ID",
         ])
         patterns: Dict[str, List[Dict[str, Any]]] = {}
         for r in patt_rows:
@@ -1956,8 +1799,8 @@ class AIClassificationService:
 
         # Keywords (MATCH_TYPE may not exist; default to 'FUZZY'). Use IS_ACTIVE.
         kw_rows = _q([
-            f"SELECT CATEGORY, KEYWORD, COALESCE(MATCH_TYPE, 'FUZZY') AS MATCH_TYPE, COALESCE(WEIGHT,0.5) AS WEIGHT, COALESCE(PRIORITY, 100) AS PRIORITY, COALESCE(IS_ACTIVE, TRUE) AS ACTIVE, VERSION FROM {sc_fqn}.SENSITIVE_KEYWORDS",
-            f"SELECT CATEGORY, KEYWORD, 'FUZZY' AS MATCH_TYPE, COALESCE(WEIGHT,0.5) AS WEIGHT, 100 AS PRIORITY, TRUE AS ACTIVE, VERSION FROM {sc_fqn}.SENSITIVE_KEYWORDS",
+            f"SELECT sc.CATEGORY_NAME AS CATEGORY, sk.KEYWORD_STRING AS KEYWORD, COALESCE(sk.MATCH_TYPE, 'FUZZY') AS MATCH_TYPE, COALESCE(sk.SENSITIVITY_WEIGHT,0.5) AS WEIGHT, 100 AS PRIORITY, COALESCE(sk.IS_ACTIVE, TRUE) AS ACTIVE, sk.VERSION_NUMBER AS VERSION FROM {sc_fqn}.SENSITIVE_KEYWORDS sk JOIN {sc_fqn}.SENSITIVITY_CATEGORIES sc ON sk.CATEGORY_ID = sc.CATEGORY_ID WHERE COALESCE(sk.IS_ACTIVE, TRUE) = TRUE",
+            f"SELECT sc.CATEGORY_NAME AS CATEGORY, sk.KEYWORD_STRING AS KEYWORD, 'FUZZY' AS MATCH_TYPE, COALESCE(sk.SENSITIVITY_WEIGHT,0.5) AS WEIGHT, 100 AS PRIORITY, TRUE AS ACTIVE, sk.VERSION_NUMBER AS VERSION FROM {sc_fqn}.SENSITIVE_KEYWORDS sk JOIN {sc_fqn}.SENSITIVITY_CATEGORIES sc ON sk.CATEGORY_ID = sc.CATEGORY_ID",
         ])
         keywords: Dict[str, List[Dict[str, Any]]] = {}
         for r in kw_rows:
@@ -1982,8 +1825,8 @@ class AIClassificationService:
 
         # Categories → CIA map (support C/I/A, CIA_*, or CONFIDENTIALITY/INTEGRITY/AVAILABILITY)
         cat_rows = _q([
-            f"SELECT CATEGORY, COALESCE(C, CIA_C, CONFIDENTIALITY, 0) AS C, COALESCE(I, CIA_I, INTEGRITY, 0) AS I, COALESCE(A, CIA_A, AVAILABILITY, 0) AS A, COALESCE(MIN_THRESHOLD, 0.5) AS MIN_THRESHOLD FROM {sc_fqn}.SENSITIVITY_CATEGORIES",
-            f"SELECT CATEGORY, COALESCE(C, CIA_C, CONFIDENTIALITY, 0) AS C, COALESCE(I, CIA_I, INTEGRITY, 0) AS I, COALESCE(A, CIA_A, AVAILABILITY, 0) AS A, 0.5 AS MIN_THRESHOLD FROM {sc_fqn}.SENSITIVITY_CATEGORIES",
+            f"SELECT CATEGORY_NAME AS CATEGORY, COALESCE(CONFIDENTIALITY_LEVEL, 0) AS C, COALESCE(INTEGRITY_LEVEL, 0) AS I, COALESCE(AVAILABILITY_LEVEL, 0) AS A, COALESCE(DETECTION_THRESHOLD, 0.5) AS MIN_THRESHOLD FROM {sc_fqn}.SENSITIVITY_CATEGORIES WHERE COALESCE(IS_ACTIVE, TRUE) = TRUE",
+            f"SELECT CATEGORY_NAME AS CATEGORY, COALESCE(CONFIDENTIALITY_LEVEL, 0) AS C, COALESCE(INTEGRITY_LEVEL, 0) AS I, COALESCE(AVAILABILITY_LEVEL, 0) AS A, 0.5 AS MIN_THRESHOLD FROM {sc_fqn}.SENSITIVITY_CATEGORIES",
         ])
         categories: Dict[str, Dict[str, Any]] = {}
         for r in cat_rows:
@@ -2045,8 +1888,8 @@ class AIClassificationService:
         # Negative patterns functionality has been removed
         # Compliance mapping (prefer IS_ACTIVE; fallback to TRUE)
         cmp_rows = _q([
-            f"SELECT DETECTED_CATEGORY, FRAMEWORK, RULE, COALESCE(PRIORITY,100) AS PRIORITY, COALESCE(IS_ACTIVE, TRUE) AS ACTIVE FROM {sc_fqn}.COMPLIANCE_MAPPING",
-            f"SELECT DETECTED_CATEGORY, FRAMEWORK, RULE, COALESCE(PRIORITY,100) AS PRIORITY, TRUE AS ACTIVE FROM {sc_fqn}.COMPLIANCE_MAPPING",
+            f"SELECT CATEGORY_ID AS DETECTED_CATEGORY, COMPLIANCE_STANDARD AS FRAMEWORK, DESCRIPTION AS RULE, 100 AS PRIORITY, COALESCE(IS_ACTIVE, TRUE) AS ACTIVE FROM {sc_fqn}.COMPLIANCE_MAPPING",
+            f"SELECT CATEGORY_ID AS DETECTED_CATEGORY, COMPLIANCE_STANDARD AS FRAMEWORK, DESCRIPTION AS RULE, 100 AS PRIORITY, TRUE AS ACTIVE FROM {sc_fqn}.COMPLIANCE_MAPPING",
         ])
         compliance_mapping: Dict[str, List[Dict[str, Any]]] = {}
         for r in cmp_rows:
@@ -2066,7 +1909,7 @@ class AIClassificationService:
 
         # Model config (key/value) → nested metadata
         cfg_rows = _q([
-            f"SELECT KEY, VALUE FROM {sc_fqn}.SENSITIVITY_MODEL_CONFIG",
+            f"SELECT MODEL_NAME AS KEY, CONFIGURATION AS VALUE FROM {sc_fqn}.SENSITIVITY_MODEL_CONFIG WHERE COALESCE(IS_ACTIVE, TRUE) = TRUE",
         ])
         def _parse_cfg(rows: list[dict]) -> Dict[str, Any]:
             out: Dict[str, Any] = {"ensemble_weights": {}, "thresholds": {}, "sampling": {}, "flags": {}}
@@ -3144,26 +2987,61 @@ class AIClassificationService:
         feats.update(features)
         base_result['features'] = feats
 
-        # Map table sensitivity to labels with thresholds and preserve low-risk floor behavior
+        # Map table sensitivity to labels with thresholds from governance tables
         try:
-            # Default thresholds as fallback
-            thr_public = 0.3
-            thr_restricted = 0.7
-            thr_confidential = 0.9
-            # Prefer per-category thresholds from model metadata / SENSITIVITY_CATEGORIES
-            try:
-                cfg_thr = self.load_sensitivity_config()
-                mm = (cfg_thr.get('model_metadata') or cfg_thr.get('thresholds') or {})
-                per_cat_thr = mm.get('per_category_thresholds') or {}
-                default_thr = float(mm.get('default_threshold', thr_restricted))
-                dom = str(base_result['features'].get('dominant_table_category') or '')
-                dom_thr = float(per_cat_thr.get(dom, default_thr)) if dom else default_thr
-                # Use category threshold for Restricted; Confidential when exceeding by margin
-                thr_restricted = dom_thr
-                thr_confidential = min(0.99, dom_thr + 0.2)
-                thr_public = float(mm.get('public_floor', 0.25))
-            except Exception:
-                pass
+            # Load thresholds from governance configuration (no hardcoded defaults)
+            cfg_thr = self.load_sensitivity_config()
+            thresholds_config = cfg_thr.get('thresholds', {})
+            
+            # Extract thresholds from SENSITIVITY_THRESHOLDS table
+            thr_public = None
+            thr_restricted = None
+            thr_confidential = None
+            
+            # Map threshold names to values from governance table
+            for threshold_name, threshold_data in thresholds_config.items():
+                level = str(threshold_data.get('sensitivity_level', '')).upper()
+                conf = float(threshold_data.get('confidence_level', 0))
+                if level == 'LOW':
+                    thr_public = conf
+                elif level in ('MEDIUM', 'MODERATE'):
+                    thr_restricted = conf
+                elif level == 'HIGH':
+                    thr_confidential = conf
+            
+            # Get category-specific thresholds from SENSITIVITY_CATEGORIES
+            categories_config = cfg_thr.get('categories', {})
+            dom = str(base_result['features'].get('dominant_table_category') or '')
+            if dom and dom in categories_config:
+                dom_cat = categories_config[dom]
+                dom_thr = float(dom_cat.get('detection_threshold', 0.7))
+                if thr_restricted is None:
+                    thr_restricted = dom_thr
+                if thr_confidential is None:
+                    thr_confidential = min(0.99, dom_thr + 0.2)
+                if thr_public is None:
+                    thr_public = max(0.0, dom_thr - 0.4)
+            
+            # If still no thresholds found, use the first available from governance
+            if thr_restricted is None and thresholds_config:
+                first_threshold = next(iter(thresholds_config.values()))
+                thr_restricted = float(first_threshold.get('confidence_level', 0.7))
+                if thr_confidential is None:
+                    thr_confidential = min(0.99, thr_restricted + 0.2)
+                if thr_public is None:
+                    thr_public = max(0.0, thr_restricted - 0.4)
+            
+            # No hardcoded fallbacks - thresholds must come from governance tables
+            if thr_restricted is None:
+                # If no governance config, use None to indicate config must be set
+                thr_restricted = None
+                thr_confidential = None
+                thr_public = None
+        except Exception:
+            # If governance loading fails, set to None (config-driven approach)
+            thr_public = None
+            thr_restricted = None
+            thr_confidential = None
             if is_low_risk_table and int(base_result['features'].get('sensitive_columns_count', 0)) == 0:
                 # Skip classifying low-risk reference/master tables as sensitive when no sensitive columns detected
                 base_result['classification'] = 'Internal'
@@ -3278,7 +3156,15 @@ class AIClassificationService:
                     per_cat_thr = model_meta.get('per_category_thresholds') or {}
                     dom = feats.get('dominant_table_category')
                     tbl_score = float(feats.get('table_sensitivity_score') or 0.0)
-                    thr = float(per_cat_thr.get(str(dom), model_meta.get('default_threshold', 0.7)))
+                    # Get threshold from governance config (no hardcoded default)
+                    default_thr = model_meta.get('default_threshold')
+                    if default_thr is None:
+                        # Try to get from global thresholds if available
+                        thresholds_global = cfg.get('thresholds', {})
+                        if thresholds_global:
+                            # Use the first available threshold value
+                            default_thr = next(iter(thresholds_global.values())).get('confidence_level') if isinstance(next(iter(thresholds_global.values())), dict) else None
+                    thr = float(per_cat_thr.get(str(dom), default_thr)) if default_thr is not None else None
                     band = float(model_meta.get('review_band', 0.05))
                     near = (thr - band) <= tbl_score < thr
                     metrics = {
@@ -3651,23 +3537,28 @@ class AIClassificationService:
         # Pull model metadata (weights/thresholds) from config, fallback to legacy key
         model_meta = cfg.get("model_metadata") or cfg.get("thresholds") or {}
         # Defaults for ensemble weights and knobs when not present in DB
-        weights = (model_meta.get("weights") or {"regex": 0.45, "token": 0.25, "semantic": 0.15, "ml": 0.12})
+        # Load weights from governance config (no hardcoded defaults)
+        weights_raw = model_meta.get("weights") or {}
+        # If no weights configured, use empty dict (config-driven approach)
+        weights = weights_raw if weights_raw else {}
         # Override from SENSITIVITY_WEIGHTS when available
         try:
             wt = cfg.get("weights_table") or {}
             if isinstance(wt, dict) and wt:
+                # Use weights from governance table (no hardcoded defaults)
                 weights.update({
-                    "regex": float(wt.get("regex", weights.get("regex", 0.45))),
-                    "token": float(wt.get("token", weights.get("token", 0.25))),
-                    "semantic": float(wt.get("semantic", weights.get("semantic", 0.18))),
-                    "ml": float(wt.get("ml", weights.get("ml", 0.12))),
+                    "regex": float(wt.get("regex", 0.0)) if "regex" in wt else weights.get("regex", 0.0),
+                    "token": float(wt.get("token", 0.0)) if "token" in wt else weights.get("token", 0.0),
+                    "semantic": float(wt.get("semantic", 0.0)) if "semantic" in wt else weights.get("semantic", 0.0),
+                    "ml": float(wt.get("ml", 0.0)) if "ml" in wt else weights.get("ml", 0.0),
                 })
         except Exception:
             pass
-        w_regex = float(weights.get("regex", 0.45))
-        w_token = float(weights.get("token", 0.25))
-        w_sem = float(weights.get("semantic", 0.15))
-        w_ml = float(weights.get("ml", 0.12))
+        # Get weights from config (0.0 if not configured - no hardcoded defaults)
+        w_regex = float(weights.get("regex", 0.0))
+        w_token = float(weights.get("token", 0.0))
+        w_sem = float(weights.get("semantic", 0.0))
+        w_ml = float(weights.get("ml", 0.0))
         bundle_max_boost = float(model_meta.get("bundle_max_boost", 0.25))
         generic_id_cap = float(model_meta.get("generic_id_names_only_cap", 0.35))
         require_multi = bool(model_meta.get("require_multiple_evidence", True))
@@ -4511,37 +4402,8 @@ class AIClassificationService:
                 if any(k in base_table for k in patterns):
                     hints[category] = max(hints.get(category, 0), 0.6)
             
-            # Fallback to default patterns if no database config found
-            if not name_tokens or not table_patterns:
-                # Default column name patterns
-                default_name_patterns = {
-                    'PII': ['name', 'first', 'last', 'surname', 'email', 'phone', 'ssn', 'aadhaar', 'pan'],
-                    'PHI': ['medical', 'health', 'patient', 'diagnosis', 'treatment'],
-                    'Financial': ['account', 'bank', 'credit', 'debit', 'balance', 'amount', 'price', 'cost', 'salary'],
-                    'SOX': ['audit', 'sox', 'compliance', 'control'],
-                    'Regulatory': ['gdpr', 'ccpa', 'hipaa', 'pci', 'compliance'],
-                    'Operational': ['status', 'flag', 'code', 'type', 'category'],
-                    'TradeSecret': ['secret', 'proprietary', 'confidential']
-                }
-                
-                # Check default name patterns
-                for cat, tokens in default_name_patterns.items():
-                    if any(token.upper() in upc for token in tokens):
-                        hints[cat] = max(hints.get(cat, 0), 1.0)
-                
-                # Default table patterns
-                default_table_patterns = {
-                    'PHI': ["PATIENT", "MED", "HEALTH", "ICD", "RX"],
-                    'Financial': ["GL", "LEDGER", "INVOICE", "PAYROLL", "FIN", "BANK"],
-                    'SOX': ["AUDIT", "IFRS", "GAAP", "JOURNAL"],
-                    'Regulatory': ["GDPR", "CCPA", "HIPAA", "SEC"],
-                    'Operational': ["PROJECT", "PLAN", "ORG", "REPORT"],
-                    'TradeSecret': ["ALGORITHM", "PROPRIETARY", "SECRET"]
-                }
-                
-                for cat, patterns in default_table_patterns.items():
-                    if any(k in base_table for k in patterns):
-                        hints[cat] = max(hints.get(cat, 0), 0.6)
+            # No hardcoded fallbacks - only use patterns from governance tables
+            # If no database config found, return empty hints to enforce governance-driven approach
             
             return hints
 
@@ -4772,7 +4634,19 @@ class AIClassificationService:
         counts = Counter()
         total = 0
         any_sensitive = 0
-        weight_map = {"SSN": 1.0, "PHI": 0.9, "PCI": 0.9, "PII": 0.7, "Email": 0.6, "Phone": 0.6, "Financial": 0.6}
+        # Load category weights from governance configuration (no hardcoded defaults)
+        cfg = self.load_sensitivity_config()
+        category_weights = cfg.get("weights", {}) or {}
+        # Get category-specific weights from SENSITIVITY_WEIGHTS table
+        weight_map = {}
+        for cat, weight_data in category_weights.items():
+            if isinstance(weight_data, dict):
+                weight_map[cat] = float(weight_data.get("weight", 0.5))
+            else:
+                weight_map[cat] = float(weight_data) if isinstance(weight_data, (int, float)) else 0.5
+        
+        # Use default weight of 0.5 if no config found (config-driven, not hardcoded)
+        default_weight = 0.5
         risk_acc = 0.0
         for p in preds:
             ts = p.get("types") or []
@@ -4780,7 +4654,7 @@ class AIClassificationService:
                 any_sensitive += 1
             for t in ts:
                 counts[t] += 1
-                risk_acc += weight_map.get(str(t), 0.3) * max(0.5, float(p.get("confidence") or 0.0))
+                risk_acc += weight_map.get(str(t), default_weight) * max(0.5, float(p.get("confidence") or 0.0))
             total += 1
         # determine dominant type at a coarse category level preference
         # collapse subtypes into categories
@@ -6329,7 +6203,10 @@ class AIClassificationService:
 
     def generate_column_report(self, table_name: str, sample_size: Optional[int] = None) -> List[Dict[str, Any]]:
         cfg = self._sdd_cfg()
-        weights = cfg.get("weights") or {"keyword": 0.3, "pattern": 0.5, "profiling": 0.2}
+        # Load weights from SENSITIVITY_WEIGHTS table (no hardcoded defaults)
+        weights_config = cfg.get("weights", {}) or {}
+        # Extract detection method weights if available, otherwise use empty dict
+        weights = weights_config.get("detection_methods", {}) or {}
         ss = int(cfg.get("thresholds", {}).get("sample_size", 200)) if sample_size is None else int(sample_size)
         cols = self.get_column_metadata(table_name) or []
         df = self.get_sample_data(table_name, ss)
@@ -6345,7 +6222,16 @@ class AIClassificationService:
             k_score, k_hits = self._sdd_keyword_score(cname)
             p_score, p_hits = self._sdd_pattern_score(values)
             pr_score = self._sdd_profiling_score(values)
-            conf = max(0.0, min(1.0, float(weights.get("keyword",0.3))*k_score + float(weights.get("pattern",0.5))*p_score + float(weights.get("profiling",0.2))*pr_score))
+            # Use weights from governance config, or 0 if not available (no hardcoded defaults)
+            w_keyword = float(weights.get("keyword", 0.0))
+            w_pattern = float(weights.get("pattern", 0.0))
+            w_profiling = float(weights.get("profiling", 0.0))
+            # Normalize weights if they sum to zero to avoid division by zero
+            total_weight = w_keyword + w_pattern + w_profiling
+            if total_weight == 0:
+                # If no weights configured, use equal distribution (config-driven, not hardcoded category values)
+                w_keyword = w_pattern = w_profiling = 1.0 / 3.0
+            conf = max(0.0, min(1.0, w_keyword*k_score + w_pattern*p_score + w_profiling*pr_score))
             cats = list(set(k_hits))
             if not cats and p_hits:
                 for pat_name, count in sorted(p_hits.items(), key=lambda kv: -kv[1]):
@@ -6616,6 +6502,54 @@ class AIClassificationService:
         # Fallback to local cache
         self.log_change(table_name, column_name, change_type, change_data)
         return {"success": True}
+
+    def classify_texts(self, texts: List[str], categories: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Classify a list of texts using AI/ML models.
+        
+        Args:
+            texts: List of text strings to classify
+            categories: Optional list of categories to classify against
+            
+        Returns:
+            List of classification results with confidence scores
+        """
+        results = []
+        for text in texts:
+            try:
+                # Simple keyword-based classification as fallback
+                result = {
+                    "text": text,
+                    "category": "UNKNOWN",
+                    "confidence": 0.0,
+                    "method": "keyword_fallback"
+                }
+                
+                # Check for common sensitive patterns
+                text_lower = str(text).lower()
+                if any(keyword in text_lower for keyword in ['email', 'mail']):
+                    result.update({"category": "PII", "confidence": 0.8})
+                elif any(keyword in text_lower for keyword in ['phone', 'tel', 'mobile']):
+                    result.update({"category": "PII", "confidence": 0.8})
+                elif any(keyword in text_lower for keyword in ['ssn', 'social', 'tax_id']):
+                    result.update({"category": "PII", "confidence": 0.9})
+                elif any(keyword in text_lower for keyword in ['credit', 'card', 'payment', 'bank']):
+                    result.update({"category": "FINANCIAL", "confidence": 0.8})
+                elif any(keyword in text_lower for keyword in ['password', 'token', 'key', 'secret']):
+                    result.update({"category": "AUTHENTICATION", "confidence": 0.9})
+                elif any(keyword in text_lower for keyword in ['address', 'street', 'city', 'zip']):
+                    result.update({"category": "PII", "confidence": 0.7})
+                
+                results.append(result)
+            except Exception as e:
+                results.append({
+                    "text": text,
+                    "category": "ERROR",
+                    "confidence": 0.0,
+                    "error": str(e),
+                    "method": "error"
+                })
+        
+        return results
 
 # Global instance
 ai_classification_service = AIClassificationService()

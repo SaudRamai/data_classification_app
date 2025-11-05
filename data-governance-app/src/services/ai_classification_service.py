@@ -6427,7 +6427,7 @@ class AIClassificationService:
             try:
                 schema_fqn = self._gov_schema_fqn()
                 rows = snowflake_connector.execute_query(
-                    f"SELECT DISTINCT TABLE_NAME FROM {schema_fqn}.SENSITIVE_AUDIT"
+                    f"SELECT DISTINCT TABLE_NAME FROM {schema_fqn}.AI_ASSISTANT_SENSITIVE_ASSETS"
                 )
                 return [str(r["TABLE_NAME"]) for r in rows]
             except Exception:

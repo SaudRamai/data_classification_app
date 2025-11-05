@@ -99,22 +99,22 @@ def _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_
     if sel_schema and sel_schema != "All" and "SCHEMA_NAME" in cols:
         conds.append("SCHEMA_NAME = %(schema)s")
         params["schema"] = sel_schema
-    # Support both legacy ASSET_TYPE and current TABLE_TYPE
+    # Asset type filter (prefer ASSET_TYPE, fallback to TABLE_TYPE if present)
     if sel_asset_type and sel_asset_type != "All":
-        if "TABLE_TYPE" in cols:
-            conds.append("TABLE_TYPE = %(atype)s")
-            params["atype"] = sel_asset_type
-        elif "ASSET_TYPE" in cols:
+        if "ASSET_TYPE" in cols:
             conds.append("ASSET_TYPE = %(atype)s")
             params["atype"] = sel_asset_type
-    # Classification status via presence of CLASSIFICATION_TAG
-    if sel_class_status and sel_class_status != "All" and "CLASSIFICATION_TAG" in cols:
+        elif "TABLE_TYPE" in cols:
+            conds.append("TABLE_TYPE = %(atype)s")
+            params["atype"] = sel_asset_type
+    # Classification status via CLASSIFICATION_LABEL presence
+    if sel_class_status and sel_class_status != "All" and "CLASSIFICATION_LABEL" in cols:
         if sel_class_status == "Classified":
-            conds.append("coalesce(CLASSIFICATION_TAG,'') <> ''")
+            conds.append("coalesce(CLASSIFICATION_LABEL,'') <> ''")
         else:
-            conds.append("coalesce(CLASSIFICATION_TAG,'') = ''")
-    if sel_risk and sel_risk != "All" and "RISK_LEVEL" in cols:
-        conds.append("RISK_LEVEL = %(risk)s")
+            conds.append("coalesce(CLASSIFICATION_LABEL,'') = ''")
+    if sel_risk and sel_risk != "All" and "OVERALL_RISK_CLASSIFICATION" in cols:
+        conds.append("OVERALL_RISK_CLASSIFICATION = %(risk)s")
         params["risk"] = sel_risk
     # Global compliance filters (if present in target table)
     try:
@@ -267,12 +267,12 @@ def render_realtime_dashboard():
 
         # Asset Type from ASSETS (TABLE_TYPE or ASSET_TYPE)
         try:
-            # Get distinct TABLE_TYPE values from ASSETS
+            # Get distinct ASSET_TYPE values from ASSETS
             at_rows = snowflake_connector.execute_query(
                 f"""
-                SELECT DISTINCT TABLE_TYPE as T 
+                SELECT DISTINCT ASSET_TYPE as T 
                 FROM {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS 
-                WHERE TABLE_TYPE IS NOT NULL
+                WHERE ASSET_TYPE IS NOT NULL
                 ORDER BY 1
                 """
             ) if sel_db else []
@@ -286,8 +286,8 @@ def render_realtime_dashboard():
 
         # Risk Level from ASSETS
         try:
-            rk_rows = snowflake_connector.execute_query(f"SELECT DISTINCT RISK_LEVEL FROM {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE RISK_LEVEL IS NOT NULL ORDER BY 1") if sel_db else []
-            rk_opts = ["All"] + [r.get("RISK_LEVEL") for r in (rk_rows or []) if r.get("RISK_LEVEL")]
+            rk_rows = snowflake_connector.execute_query(f"SELECT DISTINCT OVERALL_RISK_CLASSIFICATION FROM {sel_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE OVERALL_RISK_CLASSIFICATION IS NOT NULL ORDER BY 1") if sel_db else []
+            rk_opts = ["All"] + [r.get("OVERALL_RISK_CLASSIFICATION") for r in (rk_rows or []) if r.get("OVERALL_RISK_CLASSIFICATION")]
         except Exception:
             rk_opts = ["All"]
         sel_risk = st.selectbox("Risk Level", options=rk_opts, index=0, key="rt_risk")
@@ -356,511 +356,568 @@ def render_realtime_dashboard():
     except Exception:
         pass
 
-    # Placeholders
-    col1, col2, col3 = st.columns([1,1,1])
-    pl_metrics = col1.empty()
-    pl_breakdown = col2.empty()
-    pl_unclassified = col3.empty()
-    pl_compliance = st.container()
-    pl_risk = st.container()
-    pl_kpis = st.container()
-    pl_sot = st.container()
-    pl_alerts = st.container()
-    pl_priority_cost = st.container()
-    pl_quick = st.container()
-    pl_tag_drift = st.container()
-
-    # Component 1: Health (from ASSETS)
+    # 🟢 Classification Health Score
+    st.header("🟢 Classification Health Score")
     try:
         where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
                                               start_date, end_date,
-                                              T_ASSETS, ["UPDATED_TIMESTAMP", "CREATED_TIMESTAMP", "LAST_CLASSIFIED_DATE", "LAST_MODIFIED_DATE"])
-        # Apply compliance filter to asset scope
+                                              T_ASSETS, ["CLASSIFICATION_DATE", "CREATED_TIMESTAMP", "LAST_MODIFIED_TIMESTAMP"])
         where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
         rows = _rt_run_query(f"""
-            select
-              count(*) as TOTAL_ASSETS,
-              sum(case when coalesce(CLASSIFICATION_TAG,'') <> '' then 1 else 0 end) as CLASSIFIED_COUNT,
-              sum(case when coalesce(CLASSIFICATION_TAG,'') = '' then 1 else 0 end) as UNCLASSIFIED_COUNT,
-              iff(count(*)=0, 0, round(100.0 * sum(case when coalesce(CLASSIFICATION_TAG,'') <> '' then 1 else 0 end)/count(*),2)) as COVERAGE_PCT
-            from {T_ASSETS}
-            {where}
-        """, params)
-        m = rows[0] if rows else {"TOTAL_ASSETS":0,"CLASSIFIED_COUNT":0,"UNCLASSIFIED_COUNT":0,"COVERAGE_PCT":0}
-        with pl_metrics:
-            st.subheader("Classification Health")
-            k1, k2, k3, k4 = st.columns(4)
-            safe_int = lambda v: int(v) if isinstance(v, (int, float)) else int((v or 0))
-            k1.metric("Total Assets", f"{safe_int(m.get('TOTAL_ASSETS')):,}")
-            k2.metric("Classified", f"{safe_int(m.get('CLASSIFIED_COUNT')):,}")
-            k3.metric("Unclassified", f"{safe_int(m.get('UNCLASSIFIED_COUNT')):,}")
-            cov = m.get('COVERAGE_PCT', 0) or 0
-            try:
-                cov_int = int(float(cov))
-            except Exception:
-                cov_int = 0
-            k4.progress(min(100, max(0, cov_int)), text=f"Coverage {cov}%")
-    except Exception as e:
-        with pl_metrics:
-            _rt_show_error("Failed to load Classification Health", e)
-
-    # Component 2: Breakdown
-    try:
-        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                              start_date, end_date,
-                                              T_ASSETS, ["UPDATED_TIMESTAMP", "CREATED_TIMESTAMP", "LAST_CLASSIFIED_DATE", "LAST_MODIFIED_DATE"])
-        where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
-        rows = _rt_run_query(f"""
-            select coalesce(CLASSIFICATION_TAG,'Unclassified') as LEVEL, count(*) as CNT
-            from {T_ASSETS}
-            {where}
-            group by 1
-            order by 1
-        """, params)
-        df = pd.DataFrame(rows or [])
-        with pl_breakdown:
-            st.subheader("Classification Breakdown")
-            if df.empty:
-                st.info("No data available for breakdown.")
-            else:
-                fig = px.pie(df, names="LEVEL", values="CNT", hole=0.4)
-                st.plotly_chart(fig, use_container_width=True)
-    except Exception as e:
-        with pl_breakdown:
-            _rt_show_error("Failed to load Classification Breakdown", e)
-
-    # Component 3: Unclassified Priority
-    try:
-        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                              start_date, end_date,
-                                              T_ASSETS, ["UPDATED_TIMESTAMP", "CREATED_TIMESTAMP", "LAST_CLASSIFIED_DATE", "LAST_MODIFIED_DATE"])
-        where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
-        where_u = (where + ((" AND " if where else " WHERE ") + "coalesce(CLASSIFICATION_TAG,'') = ''"))
-        rows = _rt_run_query(f"""
-            select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, TABLE_TYPE,
-                   PII_DETECTED as PII_FLAG,
-                   FINANCIAL_DATA_DETECTED as FINANCIAL_FLAG,
-                   (REGULATORY_FLAGS > 0) as REGULATORY_FLAG,
-                   case upper(coalesce(USAGE_FREQUENCY,'')) when 'HIGH' then 2 when 'MEDIUM' then 1 else 0 end as USAGE_SCORE,
-                   datediff('day', coalesce(LAST_CLASSIFIED_DATE, CREATED_DATE), current_date()) as DAYS_UNCLASSIFIED,
-                   ((case when PII_DETECTED then 3 else 0 end) +
-                    (case when FINANCIAL_DATA_DETECTED then 2 else 0 end) +
-                    (case when REGULATORY_FLAGS > 0 then 2 else 0 end) +
-                    case upper(coalesce(USAGE_FREQUENCY,'')) when 'HIGH' then 2 when 'MEDIUM' then 1 else 0 end +
-                    least(3, nvl(datediff('day', coalesce(LAST_CLASSIFIED_DATE, CREATED_DATE), current_date()),0)/30)) as PRIORITY
-            from {T_ASSETS}
-            {where_u}
-            qualify row_number() over (order by PRIORITY desc) <= 500
-        """, params)
-        df = pd.DataFrame(rows or [])
-        with pl_unclassified:
-            st.subheader("Unclassified Assets Priority")
-            if df.empty:
-                st.info("No unclassified assets found.")
-            else:
-                c1, c2, c3 = st.columns(3)
-                pr_level = c1.selectbox("Priority Level", ["All", "High (>=6)", "Medium (3-5)", "Low (<3)"])
-                # Robust max days computation
-                md_series = pd.to_numeric(df["DAYS_UNCLASSIFIED"], errors="coerce") if "DAYS_UNCLASSIFIED" in df.columns else pd.Series(dtype="float64")
-                max_days = int(md_series.max()) if md_series.notna().any() else 0
-                if max_days > 0:
-                    day_range = c2.slider("Days Unclassified", 0, max_days, (0, max_days))
-                else:
-                    day_range = (0, 0)
-                    c2.caption("No day range available")
-                domain = c3.selectbox("Data Domain", ["All", "PII", "Financial", "Regulatory"])
-                f = df.copy()
-                if pr_level == "High (>=6)":
-                    f = f[f["PRIORITY"] >= 6]
-                elif pr_level == "Medium (3-5)":
-                    f = f[(f["PRIORITY"] >= 3) & (f["PRIORITY"] <= 5)]
-                elif pr_level == "Low (<3)":
-                    f = f[f["PRIORITY"] < 3]
-                f = f[(f["DAYS_UNCLASSIFIED"] >= day_range[0]) & (f["DAYS_UNCLASSIFIED"] <= day_range[1])]
-                if domain == "PII":
-                    f = f[f["PII_FLAG"] == True]
-                elif domain == "Financial":
-                    f = f[f["FINANCIAL_FLAG"] == True]
-                elif domain == "Regulatory":
-                    f = f[f["REGULATORY_FLAG"] == True]
-                page_size = 25
-                page = st.number_input("Page", min_value=1, value=1, step=1)
-                page_df, total = _rt_paginate_df(f, page, page_size)
-                st.caption(f"Showing {len(page_df)} of {total} items")
-                st.dataframe(page_df, use_container_width=True, hide_index=True)
-    except Exception as e:
-        with pl_unclassified:
-            _rt_show_error("Failed to load Unclassified Priority", e)
-
-    # Component 3b: High-Risk/High-Cost Unclassified Priority (hidden when REVERT_SIMPLE_DASHBOARD is True)
-    if not REVERT_SIMPLE_DASHBOARD:
-        try:
-            with pl_priority_cost:
-                st.subheader("High-Risk / High-Cost Unclassified")
-                # Build base where with global filters + unclassified
-                where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                                      start_date, end_date,
-                                                      T_ASSETS, ["UPDATED_TIMESTAMP", "CREATED_TIMESTAMP", "LAST_MODIFIED_DATE"])
-                where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
-                where_u = (where + ((" AND " if where else " WHERE ") + "coalesce(CLASSIFICATION_TAG,'') = ''"))
-
-                cols = _rt_get_table_columns(T_ASSETS)
-                has_cost = "ESTIMATED_MONTHLY_COST" in cols
-                has_storage = "STORAGE_BYTES" in cols
-                # Cost term selection: prefer ESTIMATED_MONTHLY_COST, else rough from STORAGE_BYTES
-                if has_cost:
-                    cost_term = "coalesce(ESTIMATED_MONTHLY_COST,0)"
-                elif has_storage:
-                    # 0.023 $/GB-month heuristic
-                    cost_term = "round(nvl(STORAGE_BYTES,0)/power(1024,3)*0.023,6)"
-                else:
-                    cost_term = "0.0"
-
-                # Risk numeric mapping (fallback to 0)
-                risk_score = (
-                    "case upper(coalesce(RISK_LEVEL,'')) when 'CRITICAL' then 4 when 'HIGH' then 3 when 'MEDIUM' then 2 when 'LOW' then 1 else 0 end"
-                    if "RISK_LEVEL" in cols else "0"
-                )
-
-                # Priority score combining risk and cost (scaled)
-                sql = f"""
-                    select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, TABLE_TYPE,
-                           {risk_score} as RISK_SCORE,
-                           {cost_term} as MONTHLY_COST,
-                           ({risk_score} * 2 + least(5, {cost_term}/100.0)) as PRIORITY_SCORE
-                    from {T_ASSETS}
-                    {where_u}
-                    qualify row_number() over (order by PRIORITY_SCORE desc) <= 500
-                """
-                rows = _rt_run_query(sql, params)
-                df = pd.DataFrame(rows or [])
-                c1, c2 = st.columns([3,1])
-                with c1:
-                    if df.empty:
-                        st.info("No unclassified assets with risk/cost signals.")
-                    else:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                with c2:
-                    if not df.empty:
-                        # Quick summary
-                        st.metric("Avg Cost", f"${float(df['MONTHLY_COST'].mean()):,.2f}")
-                        st.metric("Avg Risk Score", f"{float(df['RISK_SCORE'].mean()):.2f}")
-        except Exception as e:
-            with pl_priority_cost:
-                _rt_show_error("Failed to load High-Risk/High-Cost Priorities", e)
-
-    # Component 4: Compliance Status (from COMPLIANCE_MAPPING)
-    try:
-        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                              start_date, end_date,
-                                              T_CMAP, ["UPDATED_TIMESTAMP", "LAST_AUDIT_DATE", "NEXT_AUDIT_DATE"])
-        _cmap_cols = _rt_get_table_columns(T_CMAP)
-        _fw_col = "FRAMEWORK_NAME" if "FRAMEWORK_NAME" in _cmap_cols else ("COMPLIANCE_STANDARD" if "COMPLIANCE_STANDARD" in _cmap_cols else None)
-        if not _fw_col:
-            rows = []
-        else:
-            rows = _rt_run_query(f"""
-                with base as (
-                  select * from {T_CMAP} {where}
-                ),
-                by_fw as (
-                  select {_fw_col} as FRAMEWORK,
-                         count(*) as TOTAL,
-                         sum(case when upper(COALESCE(COMPLIANCE_STATUS,'')) = 'COMPLIANT' then 1 else 0 end) as COMPLIANT,
-                         max(NEXT_AUDIT_DATE) as NEXT_AUDIT_DATE,
-                         sum(case when upper(COALESCE(COMPLIANCE_STATUS,'')) <> 'COMPLIANT' then 1 else 0 end) as GAPS
-                  from base
-                  group by 1
-                )
-                select FRAMEWORK,
-                       iff(TOTAL=0,0, round(100.0*COMPLIANT/TOTAL,2)) as COMPLIANCE_PCT,
-                       NEXT_AUDIT_DATE,
-                       GAPS,
-                       100 as COVERAGE_PCT
-                from by_fw
+                select
+                  count(*) as TOTAL_ASSETS,
+                  sum(case when coalesce(CLASSIFICATION_LABEL,'') <> '' then 1 else 0 end) as CLASSIFIED_COUNT,
+                  sum(case when coalesce(CLASSIFICATION_LABEL,'') = '' then 1 else 0 end) as UNCLASSIFIED_COUNT,
+                  iff(count(*)=0, 0, round(100.0 * sum(case when coalesce(CLASSIFICATION_LABEL,'') <> '' then 1 else 0 end)/count(*),2)) as COVERAGE_PCT
+                from {T_ASSETS}
+                {where}
             """, params)
-        df = pd.DataFrame(rows or [])
-        with pl_compliance:
-            st.subheader("Compliance Status")
-            if df.empty:
-                st.info("No compliance status available.")
-            else:
-                c1, c2 = st.columns([2,1])
-                with c1:
-                    fig = px.bar(df, x="FRAMEWORK", y="COMPLIANCE_PCT", color="FRAMEWORK", range_y=[0,100])
-                    st.plotly_chart(fig, use_container_width=True)
-                with c2:
-                    for _, r in df.sort_values("COMPLIANCE_PCT", ascending=False).iterrows():
-                        st.metric(r["FRAMEWORK"], f"{r['COMPLIANCE_PCT']}%", help=f"Coverage: {r.get('COVERAGE_PCT','-')}% | Next audit: {r.get('NEXT_AUDIT_DATE','-')} | Gaps: {r.get('GAPS','-')}")
+        m = rows[0] if rows else {"TOTAL_ASSETS":0,"CLASSIFIED_COUNT":0,"UNCLASSIFIED_COUNT":0,"COVERAGE_PCT":0}
+        k1, k2, k3, k4 = st.columns(4)
+        safe_int = lambda v: int(v) if isinstance(v, (int, float)) else int((v or 0))
+        k1.metric("Total Assets", f"{safe_int(m.get('TOTAL_ASSETS')):,}")
+        k2.metric("Classified", f"{safe_int(m.get('CLASSIFIED_COUNT')):,}")
+        k3.metric("Unclassified", f"{safe_int(m.get('UNCLASSIFIED_COUNT')):,}")
+        cov = m.get('COVERAGE_PCT', 0) or 0
+        try:
+            cov_int = int(float(cov))
+        except Exception:
+            cov_int = 0
+        k4.progress(min(100, max(0, cov_int)), text=f"Coverage {cov}%")
     except Exception as e:
-        with pl_compliance:
-            _rt_show_error("Failed to load Compliance Status", e)
+        _rt_show_error("Failed to load Classification Health", e)
 
-    # Component 5: Risk Distribution (from RISK_ASSESSMENTS join ASSETS)
+    # 📈 Data Sensitivity Overview
+    st.header("📈 Data Sensitivity Overview")
+
+    # Assets by Classification Level (pie)
+    st.subheader("Assets by Classification Level")
     try:
-        # Build where for assets and risk assessments
-        where_a, params_a = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                                  start_date, end_date, T_ASSETS,
-                                                  ["UPDATED_TIMESTAMP", "CREATED_TIMESTAMP", "LAST_MODIFIED_DATE"])
-        # Apply compliance filter on assets side (alias a)
-        where_a, params_a = _rt_apply_compliance_filter(where_a, params_a, "a.ASSET_ID", T_CMAP)
+        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+                                              start_date, end_date,
+                                              T_ASSETS, ["CLASSIFICATION_DATE", "CREATED_TIMESTAMP", "LAST_MODIFIED_TIMESTAMP"])
+        where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
         rows = _rt_run_query(f"""
-            select a.BUSINESS_UNIT,
-                   r.RISK_CATEGORY,
-                   r.RISK_LEVEL,
-                   count(*) as CNT
-            from {T_RISK} r
-            join {T_ASSETS} a on a.ASSET_ID = r.ASSET_ID
-            {where_a}
-            group by 1,2,3
-        """, params_a)
+                    select coalesce(CLASSIFICATION_LABEL,'Unclassified') as LEVEL, count(*) as CNT
+                    from {T_ASSETS}
+                    {where}
+                    group by 1
+                    order by 1
+                """, params)
         df = pd.DataFrame(rows or [])
-        with pl_risk:
-            st.subheader("Risk Distribution")
-            c1, c2 = st.columns(2)
-            risk_lv = c1.selectbox("Risk Level", ["All", "Low", "Medium", "High", "Critical"], index=0, key="rt_risk_lv")
-            bu_lv = c2.selectbox("Business Unit", ["All"] + sorted(df.get("BUSINESS_UNIT", pd.Series(dtype=str)).dropna().unique().tolist()))
+        if df.empty:
+            st.info("No data available for breakdown.")
+        else:
+            fig = px.pie(df, names="LEVEL", values="CNT", hole=0.4)
+            st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        _rt_show_error("Failed to load Classification Breakdown", e)
+
+    # Unclassified Assets Alert (priority list)
+    st.subheader("Unclassified Assets Alert")
+    try:
+        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+                                              start_date, end_date,
+                                              T_ASSETS, ["CLASSIFICATION_DATE", "CREATED_TIMESTAMP", "LAST_MODIFIED_TIMESTAMP"])
+        # Build base where clause for unclassified/non-compliant assets
+        base_where = (where + (" AND " if where else " WHERE ") + 
+                     "(CLASSIFICATION_LABEL IS NULL OR COMPLIANCE_STATUS = 'NON_COMPLIANT')")
+        where_u, params = _rt_apply_compliance_filter(base_where, params, "ASSET_ID", T_CMAP)
+        
+        # Execute the new query for unclassified/non-compliant assets
+        rows = _rt_run_query(f"""
+            SELECT
+                ASSET_ID,
+                ASSET_NAME,
+                ASSET_TYPE,
+                DATABASE_NAME,
+                SCHEMA_NAME,
+                OBJECT_NAME,
+                CONCAT_WS('.', NULLIF(DATABASE_NAME,''), NULLIF(SCHEMA_NAME,''), OBJECT_NAME) as FULLY_QUALIFIED_NAME,
+                DATA_OWNER,
+                CLASSIFICATION_LABEL,
+                CLASSIFICATION_DATE,
+                COMPLIANCE_STATUS,
+                CONTAINS_PII,
+                CONTAINS_FINANCIAL_DATA,
+                SOX_RELEVANT,
+                SOC_RELEVANT,
+                REGULATORY_DATA,
+                DATEDIFF('day', CLASSIFICATION_DATE, CURRENT_TIMESTAMP()) AS DAYS_UNCLASSIFIED,
+                CASE 
+                    WHEN CLASSIFICATION_DATE IS NULL THEN 'High'
+                    WHEN DATEDIFF('day', CLASSIFICATION_DATE, CURRENT_TIMESTAMP()) <= 3 THEN 'Low'
+                    WHEN DATEDIFF('day', CLASSIFICATION_DATE, CURRENT_TIMESTAMP()) BETWEEN 4 AND 7 THEN 'Medium'
+                    ELSE 'High'
+                END AS PRIORITY_LEVEL
+            FROM {T_ASSETS}
+            {where_u}
+            ORDER BY 
+                CASE PRIORITY_LEVEL
+                    WHEN 'High' THEN 1
+                    WHEN 'Medium' THEN 2
+                    WHEN 'Low' THEN 3
+                    ELSE 4
+                END,
+                DAYS_UNCLASSIFIED DESC,
+                DATABASE_NAME, 
+                SCHEMA_NAME, 
+                ASSET_NAME
+            LIMIT 500
+        """, params)
+        
+        df = pd.DataFrame(rows or [])
+        if df.empty:
+            st.info("No unclassified or non-compliant assets found.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            
+            # Priority level filter
+            pr_level = c1.selectbox("Priority Level", ["All", "High", "Medium", "Low"])
+            
+            # Days unclassified filter
+            md_series = pd.to_numeric(df["DAYS_UNCLASSIFIED"], errors="coerce") 
+            if not md_series.empty and not md_series.isna().all():
+                max_days = int(md_series.max())
+                day_range = c2.slider("Days Unclassified", 0, max(1, max_days), (0, max_days))
+            else:
+                day_range = (0, 0)
+                c2.caption("No classification date available")
+            
+            # Domain filter
+            domain = c3.selectbox("Data Domain", ["All", "PII", "Financial", "Regulatory", "SOX", "SOC"])
+            
+            # Apply filters
             f = df.copy()
-            if risk_lv != "All":
-                f = f[f["RISK_LEVEL"] == risk_lv]
-            if bu_lv != "All":
-                f = f[f["BUSINESS_UNIT"] == bu_lv]
-            if f.empty:
-                st.info("No risk data available.")
-            else:
-                pivot = f.pivot_table(index="RISK_CATEGORY", columns="RISK_LEVEL", values="CNT", aggfunc="sum", fill_value=0)
-                fig = px.imshow(pivot, color_continuous_scale="YlOrRd", aspect="auto")
-                st.plotly_chart(fig, use_container_width=True)
+            
+            # Apply priority filter
+            if pr_level != "All":
+                f = f[f["PRIORITY_LEVEL"] == pr_level]
+            
+            # Apply days unclassified filter
+            if "DAYS_UNCLASSIFIED" in f.columns:
+                f = f[
+                    (f["DAYS_UNCLASSIFIED"] >= day_range[0]) & 
+                    (f["DAYS_UNCLASSIFIED"] <= day_range[1])
+                ]
+            
+            # Apply domain filter
+            if domain == "PII":
+                f = f[f["CONTAINS_PII"] == True]
+            elif domain == "Financial":
+                f = f[f["CONTAINS_FINANCIAL_DATA"] == True]
+            elif domain == "Regulatory":
+                f = f[f["REGULATORY_DATA"] == True]
+            elif domain == "SOX":
+                f = f[f["SOX_RELEVANT"] == True]
+            elif domain == "SOC":
+                f = f[f["SOC_RELEVANT"] == True]
+            page_size = 25
+            page = st.number_input("Page", min_value=1, value=1, step=1)
+            page_df, total = _rt_paginate_df(f, page, page_size)
+            st.caption(f"Showing {len(page_df)} of {total} items")
+            st.dataframe(page_df, use_container_width=True, hide_index=True)
     except Exception as e:
-        with pl_risk:
-            _rt_show_error("Failed to load Risk Distribution", e)
+        _rt_show_error("Failed to load Unclassified Priority", e)
 
-    # Component 6: KPIs
+    # Classification Progress Tracking
+    st.subheader("Classification Progress Tracking")
     try:
-        # Derived metrics from current tables
-        r1 = _rt_run_query(f"""
-            select count(*) as CNT
-            from {T_ALERTS}
-            where upper(coalesce(ALERT_TYPE,'')) like '%POLICY%'
-              and upper(coalesce(ALERT_STATUS,'')) in ('OPEN','NEW','ACTIVE')
-        """)
-        r2 = _rt_run_query(f"""
-            select count(*) as CNT
+        # Execute the Classification Progress Tracking query
+        query = """
+        WITH AssetClassification AS (
+            SELECT
+                COUNT(*) AS total_assets,
+                COUNT(CASE WHEN CLASSIFICATION_LABEL IS NOT NULL THEN 1 END) AS tagged_assets
+            FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+        )
+        SELECT
+            total_assets,
+            tagged_assets,
+            ROUND((tagged_assets * 100.0 / total_assets), 2) AS coverage_percentage
+        FROM AssetClassification
+        """
+        
+        # Execute the query
+        result = _rt_run_query(query)
+        
+        if result and result[0]:
+            total_assets = result[0].get('TOTAL_ASSETS', 0) or 0
+            tagged_assets = result[0].get('TAGGED_ASSETS', 0) or 0
+            coverage_percent = result[0].get('COVERAGE_PERCENTAGE', 0) or 0
+            
+            # Display key metrics
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Total Assets", f"{int(total_assets):,}")
+            k2.metric("Tagged Assets", f"{int(tagged_assets):,}")
+            k3.metric("Coverage", f"{float(coverage_percent)}%")
+            
+            # Simple progress bar for visualization
+            progress_value = min(100, max(0, float(coverage_percent)))
+            st.progress(progress_value / 100.0)
+            
+            # Add some spacing
+            st.write("")
+            
+            # Show classification status
+            if coverage_percent == 0:
+                st.warning("No assets have been classified yet.")
+            elif coverage_percent < 50:
+                st.warning(f"Only {coverage_percent}% of assets are classified. More work needed!")
+            elif coverage_percent < 90:
+                st.info(f"{coverage_percent}% of assets are classified. Good progress!")
+            else:
+                st.success(f"Great job! {coverage_percent}% of assets are classified.")
+        else:
+            st.error("Failed to load classification metrics. Please try again later.")
+            
+    except Exception as e:
+        _rt_show_error("Failed to load Classification Progress", e)
+
+    # ⚖️ Compliance Status Widget
+    st.header("⚖️ Compliance Status Widget")
+
+    # Policy Compliance Score
+    st.subheader("Policy Compliance Score")
+    try:
+        # Build filters from sidebar selections
+        where_clause, params = _rt_build_filters_for(
+            sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+            start_date, end_date,
+            f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS",
+            ["CREATED_AT", "UPDATED_AT"]
+        )
+        
+        # Base query with dynamic table reference
+        base_table = f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
+        
+        # Execute the Policy Compliance Score query with filters
+        query = f"""
+        WITH filtered_assets AS (
+            SELECT * 
+            FROM {base_table}
+            {where_clause}
+        )
+        SELECT
+            COUNT(*) AS total_assets,
+            COUNT(CASE WHEN UPPER(COALESCE(compliance_status,'')) = 'COMPLIANT' THEN 1 END) AS compliant_assets,
+            ROUND(
+                100.0 * COUNT(CASE WHEN UPPER(COALESCE(compliance_status,'')) = 'COMPLIANT' THEN 1 END) 
+                / NULLIF(COUNT(*), 0), 2
+            ) AS policy_compliance_score_percent
+        FROM filtered_assets
+        """
+        
+        # Execute the query
+        result = _rt_run_query(query)
+        
+        if result and result[0]:
+            total_assets = result[0].get('TOTAL_ASSETS', 0) or 0
+            compliant_assets = result[0].get('COMPLIANT_ASSETS', 0) or 0
+            compliance_score = result[0].get('POLICY_COMPLIANCE_SCORE_PERCENT', 0) or 0
+            
+            # Display key metrics
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Assets", f"{int(total_assets):,}")
+            col2.metric("Compliant Assets", f"{int(compliant_assets):,}")
+            col3.metric("Compliance Score", f"{float(compliance_score)}%")
+            
+            # Simple progress bar for visualization
+            progress_value = min(100, max(0, float(compliance_score)))
+            st.progress(progress_value / 100.0)
+            
+            # Add some spacing
+            st.write("")
+        else:
+            st.info("No compliance data available.")
+    except Exception as e:
+        _rt_show_error("Failed to load Compliance Status", e)
+
+    # Review Completion Rate
+    st.subheader("Review Completion Rate")
+    try:
+        # Build filters from sidebar selections
+        where_clause, params = _rt_build_filters_for(
+            sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+            start_date, end_date,
+            f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS",
+            ["CREATED_AT", "UPDATED_AT", "NEXT_REVIEW_DATE"]
+        )
+        
+        # Base table with dynamic reference
+        base_table = f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
+        
+        # Execute the Review Completion Rate query with filters
+        query = f"""
+        WITH filtered_assets AS (
+            SELECT * 
+            FROM {base_table}
+            {where_clause}
+        )
+        SELECT
+            COUNT(*) AS total_assets,
+            COUNT(CASE 
+                     WHEN peer_review_completed = TRUE 
+                          AND management_review_completed = TRUE 
+                          AND technical_review_completed = TRUE 
+                     THEN 1 
+                 END) AS completed_reviews,
+            ROUND(
+                100.0 * COUNT(CASE 
+                                 WHEN peer_review_completed = TRUE 
+                                      AND management_review_completed = TRUE 
+                                      AND technical_review_completed = TRUE 
+                                 THEN 1 
+                             END) 
+                / NULLIF(COUNT(*), 0), 2
+            ) AS completion_rate_percent,
+            COUNT(CASE 
+                     WHEN next_review_date > CURRENT_DATE 
+                     THEN 1 
+                 END) AS upcoming_reviews,
+            COUNT(CASE 
+                     WHEN next_review_date <= CURRENT_DATE 
+                          AND COALESCE(review_status, '') != 'CURRENT' 
+                     THEN 1 
+                 END) AS overdue_reviews
+        FROM filtered_assets
+        """
+        
+        # Execute the query
+        result = _rt_run_query(query, params)
+        
+        if result and result[0]:
+            total_assets = result[0].get('TOTAL_ASSETS', 0) or 0
+            completed_reviews = result[0].get('COMPLETED_REVIEWS', 0) or 0
+            completion_rate = result[0].get('COMPLETION_RATE_PERCENT', 0) or 0
+            upcoming_reviews = result[0].get('UPCOMING_REVIEWS', 0) or 0
+            overdue_reviews = result[0].get('OVERDUE_REVIEWS', 0) or 0
+            
+            # Display metrics in columns
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Completed Reviews", f"{int(completed_reviews):,}")
+            col2.metric("Upcoming Reviews", f"{int(upcoming_reviews):,}")
+            col3.metric("Completion Rate", f"{float(completion_rate)}%")
+            
+            # Show overdue reviews as a warning below
+            if overdue_reviews > 0:
+                st.warning(f"⚠️ {int(overdue_reviews):,} reviews are overdue")
+            
+            # Add a progress bar for completion rate
+            progress_value = min(100, max(0, float(completion_rate)))
+            st.progress(progress_value / 100.0)
+        else:
+            st.info("No review data available.")
+    except Exception as e:
+        _rt_show_error("Failed to load Review Completion Rate", e)
+
+    # Exception Count (policy-related alerts)
+    st.subheader("Exception Count")
+    try:
+        # Build filters from sidebar selections
+        where_clause, params = _rt_build_filters_for(
+            sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+            start_date, end_date,
+            f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS",
+            ["CREATED_AT", "UPDATED_AT"]
+        )
+        
+        # Base table with dynamic reference
+        base_table = f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
+        
+        # Execute the Exception Count query with filters
+        query = f"""
+        WITH filtered_assets AS (
+            SELECT * 
+            FROM {base_table}
+            {where_clause}
+        )
+        SELECT
+            COUNT(CASE WHEN has_exception = TRUE THEN 1 END) AS total_assets_with_exceptions,
+            COUNT(CASE 
+                     WHEN has_exception = TRUE 
+                          AND (exception_expiry_date IS NULL OR exception_expiry_date >= CURRENT_DATE)
+                     THEN 1 
+                 END) AS open_policy_exceptions
+        FROM filtered_assets
+        """
+        
+        # Execute the query
+        result = _rt_run_query(query, params)
+        
+        if result and result[0]:
+            total_exceptions = result[0].get('TOTAL_ASSETS_WITH_EXCEPTIONS', 0) or 0
+            open_exceptions = result[0].get('OPEN_POLICY_EXCEPTIONS', 0) or 0
+            
+            # Display metrics in columns
+            col1, col2 = st.columns(2)
+            col1.metric("Total Assets with Exceptions", f"{int(total_exceptions):,}")
+            
+            # Show open exceptions with a warning if there are any
+            if open_exceptions > 0:
+                col2.metric("Open Policy Exceptions", 
+                          f"{int(open_exceptions):,}",
+                          delta=None,
+                          help="Exceptions that are either not expired or have no expiry date")
+                if open_exceptions > 0:
+                    st.warning(f"⚠️ {int(open_exceptions):,} active policy exceptions need attention")
+            else:
+                col2.metric("Open Policy Exceptions", "0", delta=None, help="No active policy exceptions")
+                
+        else:
+            st.info("No exception data available.")
+            
+    except Exception as e:
+        _rt_show_error("Failed to load Exception Count", e)
+
+    # 🔄 Recent Activity Feed
+    st.header("🔄 Recent Activity Feed")
+
+    # New Classifications
+    st.subheader("New Classifications")
+    try:
+        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+                                              start_date, end_date,
+                                              T_ASSETS, ["CLASSIFICATION_DATE", "CREATED_TIMESTAMP", "LAST_MODIFIED_TIMESTAMP"])
+        where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
+        where_cls = where + ((" AND " if where else " WHERE ") + "coalesce(CLASSIFICATION_LABEL,'') <> ''")
+        rows = _rt_run_query(f"""
+            select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, ASSET_TYPE as ASSET_TYPE, CLASSIFICATION_LABEL as CLASSIFICATION_LEVEL, CLASSIFICATION_DATE as LAST_CLASSIFIED_AT
             from {T_ASSETS}
-            where NEXT_REVIEW_DATE is not null and NEXT_REVIEW_DATE < current_date()
-        """)
-        r3 = _rt_run_query(f"""
-            select round(avg(OVERALL_QUALITY_SCORE),2) as AVG_SCORE
-            from {T_DQ}
-        """)
-        r4 = _rt_run_query(f"""
-            with recent as (
-              select count(*) as CHG
-              from {T_CHIST}
-              where CHANGE_TIMESTAMP >= dateadd('day', -7, current_timestamp())
-            )
-            select round((select CHG from recent)/7.0, 2) as VELOCITY
-        """)
-        r = {
-            "POLICY_VIOLATIONS": (r1[0].get("CNT") if r1 else 0) or 0,
-            "OVERDUE_REVIEWS": (r2[0].get("CNT") if r2 else 0) or 0,
-            "DATA_QUALITY_SCORE": (r3[0].get("AVG_SCORE") if r3 else 0) or 0,
-            "CLASSIFICATION_VELOCITY": (r4[0].get("VELOCITY") if r4 else 0) or 0,
-        }
-        with pl_kpis:
-            st.subheader("Key Performance Indicators")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Policy Violations", f"{int(r.get('POLICY_VIOLATIONS',0)):,}")
-            c2.metric("Overdue Reviews", f"{int(r.get('OVERDUE_REVIEWS',0)):,}")
-            c3.metric("Data Quality Score", f"{r.get('DATA_QUALITY_SCORE',0)}")
-            c4.metric("Classification Velocity", f"{r.get('CLASSIFICATION_VELOCITY',0)} /day")
+            {where_cls}
+            order by LAST_CLASSIFIED_AT desc
+            limit 200
+        """, params)
+        df = pd.DataFrame(rows or [])
+        st.info("No recent classifications.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
-        with pl_kpis:
-            _rt_show_error("Failed to load KPIs", e)
+        _rt_show_error("Failed to load New Classifications", e)
 
-    # Component 6b: Source-of-Truth Metrics (Tags + Governance Tables)
+    # Reclassification Requests (pending approvals)
+    st.subheader("Reclassification Requests")
     try:
-        with pl_sot:
-            st.subheader("Source-of-Truth Metrics (Tags + Governance)")
-            cov = metrics_service.classification_coverage(database=active_db)
-            fw_counts = metrics_service.framework_counts(database=active_db)
-            hist = metrics_service.historical_classifications(database=active_db, days=30)
-            overdue = metrics_service.overdue_unclassified(database=active_db)
-
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Inventoried Assets", f"{int(cov.get('total_assets',0) or 0):,}")
-            k2.metric("Tagged Assets", f"{int(cov.get('classified_count',0) or 0):,}")
-            k3.metric("Coverage (Tags)", f"{float(cov.get('coverage_percentage',0.0) or 0.0)}%")
-            _ov = 0
-            try:
-                if isinstance(overdue, dict):
-                    _ov = int(sum(v for v in overdue.values() if isinstance(v, (int, float))))
-                else:
-                    _ov = int(overdue or 0)
-            except Exception:
-                _ov = 0
-            k4.metric("Overdue Unclassified (\u22655d)", f"{_ov:,}")
-
-            # Framework counts table (best-effort from COMPLIANCE_CATEGORY)
-            import pandas as _pd
-            fdf = _pd.DataFrame([fw_counts])
-            st.caption("Framework Counts (from COMPLIANCE_CATEGORY tag)")
-            st.dataframe(fdf, use_container_width=True, hide_index=True)
-
-            # Classification decisions time series (last 30 days)
-            try:
-                if hist:
-                    hdf = _pd.DataFrame(hist)
-                    import plotly.express as _px
-                    fig = _px.line(hdf, x="DAY", y="DECISIONS", title="Classification Decisions (30d)")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("No recent classification decisions recorded.")
-            except Exception:
-                pass
+        where_appr, params_appr = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+                                                        start_date, end_date,
+                                                        T_CHIST, ["CHANGE_TIMESTAMP"])
+        where_appr, params_appr = _rt_apply_compliance_filter(where_appr, params_appr, "ASSET_ID", T_CMAP)
+        extra = (" AND " if where_appr else " WHERE ") + "APPROVAL_REQUIRED = TRUE AND APPROVAL_TIMESTAMP IS NULL"
+        rows = _rt_run_query(f"""
+            select HISTORY_ID, ASSET_ID, PREVIOUS_CLASSIFICATION, NEW_CLASSIFICATION,
+                   APPROVAL_REQUIRED, APPROVED_BY, APPROVAL_TIMESTAMP, CHANGE_TIMESTAMP
+            from {T_CHIST}
+            {where_appr}{extra}
+            order by CHANGE_TIMESTAMP desc
+            limit 200
+        """, params_appr)
+        df = pd.DataFrame(rows or [])
+        st.info("No reclassification requests pending.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
-        with pl_sot:
-            _rt_show_error("Failed to load Source-of-Truth Metrics", e)
+        _rt_show_error("Failed to load Reclassification Requests", e)
 
-    # Component 6c: Tag Drift & Sync Status (ASSETS vs Snowflake tag references)
-    try:
-        with pl_tag_drift:
-            st.subheader("Tag Drift & Sync Status")
-            with st.spinner("Analyzing tag drift..."):
-                drift = analyze_tag_drift(database=active_db, limit=1000)
-            summary = drift.get("summary", {}) if drift else {}
-            items = drift.get("items", []) if drift else []
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Assets Sampled", f"{int(summary.get('total_assets_sampled', 0)):,}")
-            c2.metric("Tagged Assets", f"{int(summary.get('tagged_assets', 0)):,}")
-            c3.metric("Drifted Assets", f"{int(summary.get('drift_assets', 0)):,}")
-            c4.metric("Drift %", f"{float(summary.get('drift_pct', 0.0)):.2f}%")
-            if items:
-                df = pd.DataFrame(items)
-                # Filters
-                fcol1, fcol2 = st.columns([1.2, 1.2])
-                with fcol1:
-                    only_drift = st.checkbox("Show drift only", value=True, key="td_only")
-                with fcol2:
-                    schema_sel = st.selectbox("Schema", options=["All"] + sorted(df["schema"].dropna().unique().tolist()))
-                fdf = df.copy()
-                if only_drift:
-                    fdf = fdf[fdf["drift"] == True]
-                if schema_sel and schema_sel != "All":
-                    fdf = fdf[fdf["schema"] == schema_sel]
-                st.dataframe(fdf, use_container_width=True, hide_index=True)
-            else:
-                st.info("No items to display or insufficient privileges to read tag references.")
-    except Exception as e:
-        with pl_tag_drift:
-            _rt_show_error("Failed to analyze Tag Drift", e)
-
-    # Component 7: Alerts (from ALERT_LOGS)
+    # Policy Updates (alerts filtered by policy)
+    st.subheader("Policy Updates")
     try:
         where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
                                               start_date, end_date,
                                               T_ALERTS, ["CREATED_TIMESTAMP"])
+        extra_pol = (" AND " if where else " WHERE ") + "upper(coalesce(ALERT_TYPE,'')) like '%POLICY%'"
         rows = _rt_run_query(f"""
             select ALERT_TYPE, ALERT_PRIORITY as PRIORITY, ALERT_STATUS as STATUS, ALERT_MESSAGE as MESSAGE, CREATED_TIMESTAMP as CREATED_AT
             from {T_ALERTS}
-            {where}
+            {where}{extra_pol}
             order by CREATED_AT desc
             limit 500
         """, params)
         df = pd.DataFrame(rows or [])
-        with pl_alerts:
-            st.subheader("Alerts & Notifications")
-            if df.empty:
-                st.info("No active alerts.")
-            else:
-                c1, c2, c3 = st.columns(3)
-                a_type = c1.selectbox("Alert Type", ["All"] + sorted(df["ALERT_TYPE"].dropna().unique().tolist()))
-                pri = c2.selectbox("Priority", ["All"] + sorted(df["PRIORITY"].dropna().unique().tolist()))
-                stat = c3.selectbox("Status", ["All"] + sorted(df["STATUS"].dropna().unique().tolist()))
-                f = df.copy()
-                if a_type != "All":
-                    f = f[f["ALERT_TYPE"] == a_type]
-                if pri != "All":
-                    f = f[f["PRIORITY"] == pri]
-                if stat != "All":
-                    f = f[f["STATUS"] == stat]
-                st.dataframe(f, use_container_width=True, hide_index=True)
+        st.info("No policy updates.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
-        with pl_alerts:
-            _rt_show_error("Failed to load Alerts", e)
+        _rt_show_error("Failed to load Policy Updates", e)
 
-    # Component 8: Quick Access (from ASSETS, CLASSIFICATION_HISTORY)
+    # 🚀 Quick Action Buttons
+    st.header("🚀 Quick Action Buttons")
+    c1, c2, c3, c4 = st.columns(4)
+    if c1.button("Classify New Asset"):
+        st.session_state["nav_target"] = "3_Classification.py"
+        try:
+            if hasattr(st, "switch_page"):
+                st.switch_page("src/pages/3_Classification.py")
+        except Exception:
+            pass
+    if c2.button("Run Compliance Report"):
+        st.session_state["nav_target"] = "6_Data_Intelligence.py"
+        try:
+            if hasattr(st, "switch_page"):
+                st.switch_page("src/pages/6_Data_Intelligence.py")
+        except Exception:
+            pass
+    if c3.button("Review Overdue Tasks"):
+        st.session_state["nav_target"] = "1_Dashboard.py#reviews"
+        st.info("See '📅 Upcoming Review Tasks' section below.")
+    if c4.button("View Policy Guidelines"):
+        st.session_state["nav_target"] = "docs/COMPLIANCE_STANDARDS.md"
+        st.info("Open the documentation section to view policy guidelines.")
+
+    # 📅 Upcoming Review Tasks
+    st.header("📅 Upcoming Review Tasks")
+
+    # Due This Week
+    st.subheader("Due This Week")
     try:
-        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                              start_date, end_date,
-                                              T_ASSETS, ["LAST_CLASSIFIED_DATE", "UPDATED_TIMESTAMP", "CREATED_TIMESTAMP"]) 
-        with pl_quick:
-            st.subheader("Quick Access")
-            t1, t2, t3, t4 = st.tabs(["Recently Classified", "Top Risk Assets", "Pending Approvals", "Upcoming Reviews"]) 
-            with t1:
-                where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
-                where_cls = where + ((" AND " if where else " WHERE ") + "coalesce(CLASSIFICATION_TAG,'') <> ''")
-                rows = _rt_run_query(f"""
-                    select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, TABLE_TYPE as ASSET_TYPE, CLASSIFICATION_TAG as CLASSIFICATION_LEVEL, LAST_CLASSIFIED_DATE as LAST_CLASSIFIED_AT
-                    from {T_ASSETS}
-                    {where_cls}
-                    order by LAST_CLASSIFIED_AT desc
-                    limit 200
-                """, params)
-                df = pd.DataFrame(rows or [])
-                st.info("No recent classifications.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
-            with t2:
-                where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
-                rows = _rt_run_query(f"""
-                    select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, TABLE_TYPE as ASSET_TYPE, RISK_SCORE,
-                           case 
-                             when RISK_SCORE >= 8 then 'Critical'
-                             when RISK_SCORE >= 6 then 'High'
-                             when RISK_SCORE >= 3 then 'Medium'
-                             else 'Low'
-                           end as RISK_LEVEL
-                    from {T_ASSETS}
-                    {where}
-                    order by RISK_SCORE desc nulls last
-                    limit 200
-                """, params)
-                df = pd.DataFrame(rows or [])
-                st.info("No high-risk assets.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
-            with t3:
-                where_appr, params_appr = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                                                start_date, end_date,
-                                                                T_CHIST, ["CHANGE_TIMESTAMP"]) 
-                # Apply compliance exists using ASSET_ID from history
-                where_appr, params_appr = _rt_apply_compliance_filter(where_appr, params_appr, "ASSET_ID", T_CMAP)
-                extra = (" AND " if where_appr else " WHERE ") + "APPROVAL_REQUIRED = TRUE AND APPROVAL_TIMESTAMP IS NULL"
-                rows = _rt_run_query(f"""
-                    select HISTORY_ID, ASSET_ID, PREVIOUS_CLASSIFICATION, NEW_CLASSIFICATION,
-                           APPROVAL_REQUIRED, APPROVED_BY, APPROVAL_TIMESTAMP, CHANGE_TIMESTAMP
-                    from {T_CHIST}
-                    {where_appr}{extra}
-                    order by CHANGE_TIMESTAMP desc
-                    limit 200
-                """, params_appr)
-                df = pd.DataFrame(rows or [])
-                st.info("No pending approvals.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
-            with t4:
-                where_rev, params_rev = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                                              start_date, end_date,
-                                                              T_ASSETS, ["NEXT_REVIEW_DATE"]) 
-                where_rev, params_rev = _rt_apply_compliance_filter(where_rev, params_rev, "ASSET_ID", T_CMAP)
-                extra_rev = (" AND " if where_rev else " WHERE ") + "NEXT_REVIEW_DATE >= current_date()"
-                rows = _rt_run_query(f"""
-                    select ASSET_ID, ASSET_NAME, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, NEXT_REVIEW_DATE as REVIEW_DATE
-                    from {T_ASSETS}
-                    {where_rev}{extra_rev}
-                    order by REVIEW_DATE
-                    limit 200
-                """, params_rev)
-                df = pd.DataFrame(rows or [])
-                st.info("No upcoming reviews.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
+        where_rev, params_rev = _rt_build_filters_for(
+            sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+            start_date, end_date, T_ASSETS, ["NEXT_REVIEW_DATE"]
+        )
+        where_rev, params_rev = _rt_apply_compliance_filter(where_rev, params_rev, "ASSET_ID", T_CMAP)
+        extra_rev = (" AND " if where_rev else " WHERE ") + "NEXT_REVIEW_DATE between current_date() and dateadd('day',7,current_date())"
+        rows = _rt_run_query(f"""
+            select ASSET_ID, ASSET_NAME, DATABASE_NAME, SCHEMA_NAME, OBJECT_NAME, NEXT_REVIEW_DATE as REVIEW_DATE
+            from {T_ASSETS}
+            {where_rev}{extra_rev}
+            order by REVIEW_DATE
+            limit 200
+        """, params_rev)
+        df = pd.DataFrame(rows or [])
+        st.info("No reviews due this week.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
-        with pl_quick:
-            _rt_show_error("Failed to load Quick Access", e)
+        _rt_show_error("Failed to load Due This Week", e)
+
+    # Overdue Reviews
+    st.subheader("Overdue Reviews")
+    try:
+        rows = _rt_run_query(f"""
+            select ASSET_ID, ASSET_NAME, DATABASE_NAME, SCHEMA_NAME, OBJECT_NAME, NEXT_REVIEW_DATE as REVIEW_DATE
+            from {T_ASSETS}
+            where NEXT_REVIEW_DATE is not null and NEXT_REVIEW_DATE < current_date()
+            order by REVIEW_DATE
+            limit 200
+        """)
+        df = pd.DataFrame(rows or [])
+        st.info("No overdue reviews.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        _rt_show_error("Failed to load Overdue Reviews", e)
+
+    # My Pending Approvals
+    st.subheader("My Pending Approvals")
+    try:
+        where_appr, params_appr = _rt_build_filters_for(
+            sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
+            start_date, end_date, T_CHIST, ["CHANGE_TIMESTAMP"]
+        )
+        where_appr, params_appr = _rt_apply_compliance_filter(where_appr, params_appr, "ASSET_ID", T_CMAP)
+        base_cond = "APPROVAL_REQUIRED = TRUE AND APPROVAL_TIMESTAMP IS NULL"
+        extra = (" AND " if where_appr else " WHERE ") + base_cond
+        rows = _rt_run_query(f"""
+            select HISTORY_ID, ASSET_ID, PREVIOUS_CLASSIFICATION, NEW_CLASSIFICATION,
+                   APPROVAL_REQUIRED, APPROVED_BY, APPROVAL_TIMESTAMP, CHANGE_TIMESTAMP
+            from {T_CHIST}
+            {where_appr}{extra}
+            order by CHANGE_TIMESTAMP desc
+            limit 200
+        """, params_appr)
+        df = pd.DataFrame(rows or [])
+        st.info("No pending approvals assigned to you.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        _rt_show_error("Failed to load My Pending Approvals", e)
 
     st.caption("Data updates live from Snowflake. Use Refresh to fetch latest.")
 

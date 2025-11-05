@@ -26,25 +26,32 @@ class MetricsService:
             Dictionary containing coverage metrics
         """
         try:
-            # First get the base query for total and classified counts
-            base_query = """
-                SELECT 
-                    COUNT(*) as total_assets,
-                    SUM(CASE WHEN classification_status = 'CLASSIFIED' THEN 1 ELSE 0 END) as classified_count
-                FROM governance.classification_summary
+            # Base query for coverage metrics
+            query = """
+                SELECT
+                    COUNT(*) AS total_assets,
+                    COUNT(CASE WHEN classification_label IS NOT NULL AND classification_label != 'UNCLASSIFIED' 
+                             THEN 1 END) AS tagged_assets,
+                    ROUND(
+                        100.0 * COUNT(CASE WHEN classification_label IS NOT NULL AND classification_label != 'UNCLASSIFIED' THEN 1 END) 
+                        / NULLIF(COUNT(*), 0), 2
+                    ) AS coverage_percent
+                FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                WHERE 1=1
             """
             
             # Add database filter if provided
             if database:
-                base_query += f" WHERE database_name = '{database}'"
+                query += f" AND database_name = '{database}'"
             
-            # Execute the base query
-            result = self.connector.execute_query(base_query)
+            # Execute the query
+            result = self.connector.execute_query(query)
             
             if result and result[0]:
                 total_assets = result[0].get('TOTAL_ASSETS', 0) or 0
-                classified_count = result[0].get('CLASSIFIED_COUNT', 0) or 0
-                coverage_pct = round((classified_count / total_assets * 100), 2) if total_assets > 0 else 0
+                classified_count = result[0].get('TAGGED_ASSETS', 0) or 0
+                coverage_pct = result[0].get('COVERAGE_PERCENT', 0) or 0
+                unclassified_count = total_assets - classified_count
                 
                 return {
                     'total_assets': int(total_assets),

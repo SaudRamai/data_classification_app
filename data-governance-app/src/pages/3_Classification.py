@@ -1337,6 +1337,118 @@ with tab_new:
     st.subheader("New Classification")
     sub_guided, sub_bulk, sub_ai = st.tabs(["Guided Workflow", "Bulk Upload", "AI Assistant"])
     
+    # Bulk Upload
+    with sub_bulk:
+        st.markdown("#### Bulk Classification Tool")
+        up = st.file_uploader("Upload CSV/XLSX template", type=["csv","xlsx"], key="nc_bulk_upl")
+        if up is not None:
+            import pandas as _pd
+            try:
+                if up.name.lower().endswith('.csv'):
+                    bdf = _pd.read_csv(up)
+                else:
+                    bdf = _pd.read_excel(up)
+            except Exception as e:
+                st.error(f"Bulk parse failed: {e}")
+                bdf = _pd.DataFrame()
+
+            if not bdf.empty:
+                # Normalize columns
+                cols_up = {c.strip().upper(): c for c in bdf.columns}
+                req = ["FULL_NAME","C","I","A"]
+                missing_cols = [c for c in req if c not in cols_up]
+                if missing_cols:
+                    st.error(f"Missing required columns: {', '.join(missing_cols)}")
+                else:
+                    # Enrich rows with inventory defaults and sensitive detection summary
+                    _db_active2 = _active_db_from_filter()
+                    _gv2 = st.session_state.get("governance_schema") or "DATA_GOVERNANCE"
+                    @st.cache_data(ttl=30)
+                    def _inv_lookup_many(db: str, gv: str, names: List[str]) -> Dict:
+                        try:
+                            if not names:
+                                return {}
+                            in_list = ",".join([f"'%(x)s'" for x in range(len(names))])
+                        except Exception:
+                            pass
+                        # Simpler: fetch all and map in python to avoid dynamic params limits
+                        rows = snowflake_connector.execute_query(
+                            f"SELECT FULL_NAME, COALESCE(ASSET_TYPE, OBJECT_TYPE) AS ASSET_TYPE, COALESCE(DATA_DOMAIN, OBJECT_DOMAIN) AS DATA_DOMAIN, COALESCE(OWNER, CUSTODIAN) AS OWNER FROM {db}.{gv}.ASSET_INVENTORY"
+                        ) or []
+                        return {r.get("FULL_NAME"): r for r in rows}
+
+                    inv_map2 = _inv_lookup_many(_db_active2, _gv2, bdf[cols_up["FULL_NAME"]].astype(str).tolist()) if _db_active2 else {}
+
+                    view = []
+                    violations = 0
+                    for idx, row in bdf.iterrows():
+                        full = str(row[cols_up["FULL_NAME"]]).strip()
+                        try:
+                            c = int(row[cols_up["C"]]); i = int(row[cols_up["I"]]); a = int(row[cols_up["A"]])
+                        except Exception:
+                            c = i = a = -1
+                        inv = inv_map2.get(full) or {}
+                        # Sensitive detection at table level
+                        det_types = []
+                        try:
+                            dets = ai_classification_service.detect_sensitive_columns(full)
+                            det_types = sorted({t for d in (dets or []) for t in (d.get('categories') or [])})
+                            # Display rename: Financial -> SOX
+                            det_types = ["SOX" if str(t).upper() == "FINANCIAL" else t for t in det_types]
+                        except Exception:
+                            det_types = []
+                        # Suggest label based on C (highest-of-CIA mapping)
+                        try:
+                            label = ["Public","Internal","Restricted","Confidential"][max(0, min(max(c,i,a), 3))]
+                        except Exception:
+                            label = "Internal"
+                        ok_dm3, reasons3 = (False, ["Invalid CIA"]) if (c < 0 or i < 0 or a < 0 or c>3 or i>3 or a>3) else dm_validate(label, c, i, a)
+                        issue = None
+                        if not ok_dm3:
+                            violations += 1
+                            issue = "; ".join([str(r) for r in (reasons3 or [])])
+                        view.append({
+                            "FULL_NAME": full,
+                            "C": c, "I": i, "A": a,
+                            "LABEL": label,
+                            "ASSET_TYPE": inv.get("ASSET_TYPE"),
+                            "DATA_DOMAIN": inv.get("DATA_DOMAIN"),
+                            "OWNER": inv.get("OWNER"),
+                            "SENSITIVE_TYPES": ", ".join(det_types),
+                            "POLICY_OK": ok_dm3,
+                            "ISSUE": issue,
+                        })
+                    vdf = _pd.DataFrame(view)
+                    st.dataframe(vdf, width='stretch')
+
+                    # Block submission until all pass validation
+                    can_submit = (violations == 0 and not vdf.empty)
+                    st.caption("All rows must pass validation before submission.")
+                    if not can_submit:
+                        st.warning("Fix policy violations or invalid CIA values in the upload before submitting.")
+
+                    if st.button("Submit Batch", type="primary", disabled=not can_submit, key="bulk_submit_btn"):
+                        success = 0; failed = 0
+                        for _, r in vdf.iterrows():
+                            full = r.get("FULL_NAME")
+                            c = int(r.get("C") or 0); i = int(r.get("I") or 0); a = int(r.get("A") or 0)
+                            label = str(r.get("LABEL") or "Internal")
+                            try:
+                                _sf_apply_tags(full, {
+                                    "data_classification": label,
+                                    "confidentiality_level": f"C{c}",
+                                    "integrity_level": f"I{i}",
+                                    "availability_level": f"A{a}",
+                                })
+                                _sf_audit_log_classification(full, "BULK_CLASSIFICATION_APPLIED", {"label": label, "c": c, "i": i, "a": a})
+                                success += 1
+                            except Exception:
+                                failed += 1
+                        if failed == 0:
+                            st.success(f"Batch applied: {success} assets")
+                        else:
+                            st.warning(f"Batch completed with errors. Success: {success}, Failed: {failed}")
+
     # AI Assistant tab
     with sub_ai:
         st.caption("AI Assistant: Filter by database/schema to view sensitive tables, then drill down into editable sensitive columns.")
@@ -1480,45 +1592,31 @@ with tab_new:
                     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
                     agg_sql = f"""
                     {cte_sql.replace('{DB}', _active_db).replace('{SCHEMA_FILTER}', _schema_filter)}
-                    -- 5️⃣ Final Output aligned to app's expected columns
                     SELECT
-                        DATABASE_NAME,
-                        TABLE_SCHEMA AS SCHEMA_NAME,
-                        TABLE_NAME,
-                        ARRAY_TO_STRING(SENSITIVE_DATA_TYPES, ', ') AS DETECTED_TYPE,
-                        ROUND(AVG_CONFIDENCE_SCORE, 2) AS MAX_CONF,
-                        RECOMMENDED_POLICY,
-                        NEED_REVIEW,
-                        SENSITIVITY_LEVEL
-                    FROM TABLE_SCORES
-                    {where_sql}
-                        MOST_RELEVANT_CATEGORY AS DETECTED_TYPE,
-                        ROUND(LEAST(AVG_CONFIDENCE_SCORE, 1.0), 2) AS MAX_CONF,
+                        CONCAT(DATABASE_NAME, '.', TABLE_SCHEMA, '.', TABLE_NAME) AS "Table Name",
+                        MOST_RELEVANT_CATEGORY AS "Sensitive Data Type",
+                        CONCAT(TO_VARCHAR(ROUND(LEAST(AVG_CONFIDENCE_SCORE, 1.0) * 100, 2)), '%') AS "Confidence Score",
                         CASE 
                             WHEN AVG_CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'POLICY_REQUIRED'
                             WHEN AVG_CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'NEEDS_REVIEW'
                             ELSE 'OK'
-                        END AS RECOMMENDED_POLICY,
-                        CASE 
-                            WHEN AVG_CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6)
-                                 AND AVG_CONFIDENCE_SCORE < DETECTION_THRESHOLD THEN TRUE
-                            ELSE FALSE
-                        END AS NEED_REVIEW,
+                        END AS "Recommended Policy",
                         CASE 
                             WHEN AVG_CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'HIGH'
                             WHEN AVG_CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'MEDIUM'
                             ELSE 'LOW'
-                        END AS SENSITIVITY_LEVEL
+                        END AS "Sensitivity Level",
+                        CURRENT_TIMESTAMP() AS DETECTED_AT
                     FROM TABLE_TOP_CATEGORY
-                    {('WHERE TABLE_SCHEMA = %(sc)s') if sel_schema else ''}
-                    ORDER BY MAX_CONF DESC, SCHEMA_NAME, TABLE_NAME
-                    LIMIT 1000
+                    {where_sql}
+                    {" AND " if where_sql else " WHERE "} MOST_RELEVANT_CATEGORY IS NOT NULL AND AVG_CONFIDENCE_SCORE > 0
+                    ORDER BY AVG_CONFIDENCE_SCORE DESC, DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME
                     """
                     rows = snowflake_connector.execute_query(agg_sql, params) or []
                 except Exception:
                     rows = []
-            # Fallback: use persisted AI assistant table if CTE had no rows or no active DB
-            if not rows and not _active_db:
+            # Fallback: use persisted AI assistant table if CTE had no rows
+            if not rows:
                 for _fqn in fqn_candidates:
                     where = []
                     params = {}
@@ -1529,20 +1627,31 @@ with tab_new:
                     if sel_table:
                         where.append("TABLE_NAME = %(tb)s"); params["tb"] = sel_table
                     sql = f"""
-                        SELECT DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, DETECTED_TYPE, MAX_CONF
+                        SELECT 
+                          DATABASE_NAME, 
+                          SCHEMA_NAME, 
+                          TABLE_NAME, 
+                          COALESCE(DETECTED_CATEGORY, DETECTED_TYPE) AS DETECTED_TYPE,
+                          MAX_CONF,
+                          LAST_SCAN_TS
                         FROM (
                           SELECT 
                             DATABASE_NAME,
                             SCHEMA_NAME,
                             TABLE_NAME,
+                            DETECTED_CATEGORY,
                             DETECTED_TYPE,
+                            LAST_SCAN_TS,
                             COMBINED_CONFIDENCE AS CONF,
                             MAX(COMBINED_CONFIDENCE) OVER (PARTITION BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME) AS MAX_CONF,
-                            ROW_NUMBER() OVER (PARTITION BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME ORDER BY COMBINED_CONFIDENCE DESC) AS RN
+                            ROW_NUMBER() OVER (
+                              PARTITION BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME 
+                              ORDER BY LAST_SCAN_TS DESC, COMBINED_CONFIDENCE DESC
+                            ) AS RN
                           FROM {_fqn}
                           {('WHERE ' + ' AND '.join(where)) if where else ''}
                         ) t
-                        WHERE RN = 1
+                        WHERE RN = 1 AND COALESCE(DETECTED_CATEGORY, DETECTED_TYPE) IS NOT NULL
                         ORDER BY MAX_CONF DESC, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME
                         LIMIT 1000
                     """
@@ -1553,24 +1662,46 @@ with tab_new:
                     except Exception:
                         continue
             for r in rows:
-                db = r.get("DATABASE_NAME"); sc = r.get("SCHEMA_NAME"); tbl = r.get("TABLE_NAME")
-                fqn = f"{db}.{sc}.{tbl}"
-                cat = str(r.get("DETECTED_TYPE") or "")
-                try:
-                    maxc = float(r.get('MAX_CONF') or 0.0)
-                except Exception:
-                    maxc = 0.0
-                pol = r.get("RECOMMENDED_POLICY") or ""
-                need_review = bool(r.get("NEED_REVIEW")) if r.get("NEED_REVIEW") is not None else bool(maxc < 0.7)
-                level1_rows.append({
-                    "Table Name": f"{db}.{sc}.{tbl}",
-                    "Sensitive Data Type": cat,
-                    "Confidence Score": (f"{round(float(maxc)*100, 2)}%") if r.get('MAX_CONF') is not None else "",
-                    "Recommended Policies": pol,
-                    "Need Review": need_review,
-                    "Sensitivity Level": r.get("SENSITIVITY_LEVEL") or "",
-                    "_FQN": fqn,
-                })
+                if "Table Name" in r:
+                    fqn = str(r.get("Table Name") or "").strip()
+                    if not fqn or not r.get("Sensitive Data Type"):
+                        continue
+                    level1_rows.append({
+                        "Table Name": fqn,
+                        "Sensitive Data Type": r.get("Sensitive Data Type"),
+                        "Confidence Score": r.get("Confidence Score"),
+                        "Recommended Policy": r.get("Recommended Policy"),
+                        "Sensitivity Level": r.get("Sensitivity Level"),
+                        "_FQN": fqn,
+                    })
+                else:
+                    db = r.get("DATABASE_NAME"); sc = r.get("SCHEMA_NAME"); tbl = r.get("TABLE_NAME")
+                    fqn = f"{db}.{sc}.{tbl}"
+                    cat = str(r.get("DETECTED_TYPE") or "")
+                    if not cat:
+                        continue
+                    try:
+                        maxc = float(r.get('MAX_CONF') or 0.0)
+                    except Exception:
+                        maxc = 0.0
+                    _thr = 0.7
+                    if maxc >= _thr:
+                        pol = 'POLICY_REQUIRED'
+                        level = 'HIGH'
+                    elif maxc >= (_thr * 0.6):
+                        pol = 'NEEDS_REVIEW'
+                        level = 'MEDIUM'
+                    else:
+                        pol = 'OK'
+                        level = 'LOW'
+                    level1_rows.append({
+                        "Table Name": fqn,
+                        "Sensitive Data Type": cat,
+                        "Confidence Score": f"{round(maxc*100, 2)}%",
+                        "Recommended Policy": pol,
+                        "Sensitivity Level": level,
+                        "_FQN": fqn,
+                    })
         except Exception:
             level1_rows = []
 
@@ -1584,7 +1715,8 @@ with tab_new:
                         try:
                             summary = ai_sensitive_detection_service.run_scan_and_persist(
                                 _db_to_scan,
-                                schema_name=(sel_schema or None)
+                                schema_name=(sel_schema or None),
+                                table_name=(sel_table or None)
                             )
                             st.success(f"Scan complete. Columns detected: {summary.get('columns_detected', 0)}")
                         except Exception as e:
@@ -1598,7 +1730,7 @@ with tab_new:
                 "Table Name",
                 "Sensitive Data Type",
                 "Confidence Score",
-                "Recommended Policies"
+                "Recommended Policy"
             ]], use_container_width=True, hide_index=True)
             
             # Define the callback function for table selection change
@@ -1653,6 +1785,17 @@ with tab_new:
                 ]
                 fqn_candidates = [x for x in fqn_candidates if x]
                 try:
+                    # Check if semantic similarity UDF exists; if not, we will fallback to rule/pattern-only
+                    _sem_udf_available = False
+                    try:
+                        with snowflake_connector.get_connection() as _c:
+                            with _c.cursor() as _cur:
+                                _cur.execute("SHOW USER FUNCTIONS LIKE 'SEMANTIC_SIMILARITY_UDF'")
+                                _rows = _cur.fetchall() or []
+                                _sem_udf_available = bool(_rows)
+                    except Exception:
+                        _sem_udf_available = False
+
                     cte_sql = """
                         WITH
                         -- 1️⃣ Active sensitivity categories (with default CIA weights)
@@ -1661,7 +1804,7 @@ with tab_new:
                               CATEGORY_ID,
                               CATEGORY_NAME,
                               COALESCE(DETECTION_THRESHOLD, 0.7) AS DETECTION_THRESHOLD,
-                              0.5 AS C_WEIGHT,
+                              0.3 AS C_WEIGHT,
                               0.3 AS A_WEIGHT,
                               0.2 AS I_WEIGHT
                           FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES
@@ -1757,7 +1900,6 @@ with tab_new:
                           SELECT 
                               BUNDLE_ID,
                               BUNDLE_NAME,
-                              CATEGORY_ID,
                               MIN_MATCH_COUNT,
                               CONFIDENCE_BOOST,
                               COLUMNS,
@@ -1804,7 +1946,9 @@ with tab_new:
                                   WHEN a.DETECTION_TYPE = 'RULE_BASED' THEN a.RAW_SCORE * COALESCE((SELECT RULE_BASED_WEIGHT FROM WEIGHTS), 1.0)
                                   WHEN a.DETECTION_TYPE = 'PATTERN_BASED' THEN a.RAW_SCORE * COALESCE((SELECT PATTERN_BASED_WEIGHT FROM WEIGHTS), 1.0)
                                   ELSE a.RAW_SCORE
-                              END * (1 + COALESCE(m.CONFIDENCE_BOOST, 0.0)) AS CONFIDENCE_SCORE
+                              END * (1 + COALESCE(m.CONFIDENCE_BOOST, 0.0)) AS CONFIDENCE_SCORE,
+                              {SEMANTIC_COL}
+                              {COMBINED_EXPR} AS COMBINED_CONFIDENCE
                           FROM AGGREGATED a
                           LEFT JOIN BUNDLE_MATCHES m
                             ON a.TABLE_NAME = m.TABLE_NAME
@@ -1812,34 +1956,42 @@ with tab_new:
                            AND a.DATABASE_NAME = m.DATABASE_NAME
                         )
                         """
+                    # Build semantic placeholders safely
+                    if _sem_udf_available:
+                        _sem_col = "TRY_TO_NUMBER(SEMANTIC_SIMILARITY_UDF(LOWER(a.COLUMN_NAME), LOWER(a.CATEGORY_NAME))) AS SEMANTIC_SCORE,"
+                        _combined_expr = "(0.7 * CONFIDENCE_SCORE + 0.3 * COALESCE(TRY_TO_NUMBER(SEMANTIC_SIMILARITY_UDF(LOWER(a.COLUMN_NAME), LOWER(a.CATEGORY_NAME))), 0.0))"
+                    else:
+                        _sem_col = "0::NUMBER AS SEMANTIC_SCORE,"
+                        _combined_expr = "CONFIDENCE_SCORE"
+                    cte_sql = cte_sql.replace('{SEMANTIC_COL}', _sem_col).replace('{COMBINED_EXPR}', _combined_expr)
                     sql2 = f"""
                         {cte_sql.replace('{DB}', db)}
                         SELECT
                             COLUMN_NAME                                     AS "Column Name",
                             LISTAGG(DISTINCT CATEGORY_NAME, ', ') WITHIN GROUP (ORDER BY CATEGORY_NAME) AS "Sensitivity Type",
-                            ROUND(MAX(CONFIDENCE_SCORE), 2)                 AS "Confidence",
+                            ROUND(MAX(COMBINED_CONFIDENCE), 2)              AS "Confidence",
                             ROUND(MAX(C_WEIGHT), 2)                         AS "C",
                             ROUND(MAX(A_WEIGHT), 2)                         AS "A",
                             ROUND(MAX(I_WEIGHT), 2)                         AS "I",
                             CASE 
-                                WHEN MAX(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'POLICY_REQUIRED'
-                                WHEN MAX(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'NEEDS_REVIEW'
+                                WHEN MAX(COMBINED_CONFIDENCE) >= MAX(DETECTION_THRESHOLD) THEN 'POLICY_REQUIRED'
+                                WHEN MAX(COMBINED_CONFIDENCE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'NEEDS_REVIEW'
                                 ELSE 'OK'
                             END                                              AS "Recommended Policies",
                             MAX(BUNDLE_NAME)                                AS "Bundle",
                             CASE 
-                                WHEN MAX(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) 
-                                     AND MAX(CONFIDENCE_SCORE) < MAX(DETECTION_THRESHOLD) THEN TRUE
+                                WHEN MAX(COMBINED_CONFIDENCE) >= (MAX(DETECTION_THRESHOLD) * 0.6) 
+                                     AND MAX(COMBINED_CONFIDENCE) < MAX(DETECTION_THRESHOLD) THEN TRUE
                                 ELSE FALSE
                             END                                              AS "Need Review",
                             CASE 
-                                WHEN MAX(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'Column contains high-sensitivity data (PII/Financial/RegEx Match)'
-                                WHEN MAX(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'Column partially matches sensitive patterns — manual review recommended'
+                                WHEN MAX(COMBINED_CONFIDENCE) >= MAX(DETECTION_THRESHOLD) THEN 'Column contains high-sensitivity data (PII/Financial/RegEx Match/Semantic)'
+                                WHEN MAX(COMBINED_CONFIDENCE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'Column partially matches sensitive signals — manual review recommended'
                                 ELSE 'Column appears safe under current detection thresholds'
                             END                                              AS "Reason / Justification",
                             CASE
-                                WHEN MAX(CONFIDENCE_SCORE) >= MAX(DETECTION_THRESHOLD) THEN 'HIGH'
-                                WHEN MAX(CONFIDENCE_SCORE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'MEDIUM'
+                                WHEN MAX(COMBINED_CONFIDENCE) >= MAX(DETECTION_THRESHOLD) THEN 'HIGH'
+                                WHEN MAX(COMBINED_CONFIDENCE) >= (MAX(DETECTION_THRESHOLD) * 0.6) THEN 'MEDIUM'
                                 ELSE 'LOW'
                             END                                              AS "Sensitivity Level",
                             DATABASE_NAME,
@@ -1855,14 +2007,14 @@ with tab_new:
                             DATABASE_NAME, 
                             TABLE_SCHEMA, 
                             TABLE_NAME
-                        ORDER BY MAX(CONFIDENCE_SCORE) DESC, COLUMN_NAME
+                        ORDER BY MAX(COMBINED_CONFIDENCE) DESC, COLUMN_NAME
                         """
                     # Debug: Log query and parameters (commented out for production)
                     # st.warning(f"Executing query with parameters: db={db}, schema={sc}, table={tbl}")
                     
                     # First, fix the LIKE clause to use CONCAT for proper parameter binding
                     sql2 = sql2.replace(
-                        "LOWER(c.COLUMN_NAME) LIKE CONCAT('%%', LOWER(k.KEYWORD_STRING), '%%')",
+                        "LOWER(c.COLUMN_NAME) LIKE CONCAT('%', LOWER(k.KEYWORD_STRING), '%')",
                         "LOWER(c.COLUMN_NAME) LIKE '%' || LOWER(k.KEYWORD_STRING) || '%'"
                     )
                     
@@ -1993,8 +2145,8 @@ with tab_new:
                     FROM (
                       SELECT 
                         CATEGORY_NAME AS DETECTED_TYPE,
-                        SUM(CONFIDENCE_SCORE) AS TOTAL_SCORE,
-                        ROW_NUMBER() OVER (ORDER BY SUM(CONFIDENCE_SCORE) DESC) AS RN
+                        SUM(COMBINED_CONFIDENCE) AS TOTAL_SCORE,
+                        ROW_NUMBER() OVER (ORDER BY SUM(COMBINED_CONFIDENCE) DESC) AS RN
                       FROM SCORED
                       WHERE UPPER(DATABASE_NAME) = UPPER(%(db)s)
                         AND UPPER(TABLE_SCHEMA) = UPPER(%(sc)s)

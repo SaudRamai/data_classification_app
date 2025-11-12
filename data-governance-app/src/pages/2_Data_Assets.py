@@ -639,9 +639,9 @@ def compute_policy_fields(df: pd.DataFrame) -> pd.DataFrame:
                 in_list = ','.join(safe_vals)
                 inv_rows = snowflake_connector.execute_query(
                     f"""
-                    SELECT FULL_NAME, CLASSIFIED, FIRST_DISCOVERED
-                    FROM {dbn}.DATA_GOVERNANCE.ASSET_INVENTORY
-                    WHERE FULL_NAME IN ({in_list})
+                    SELECT FULLY_QUALIFIED_NAME AS FULL_NAME, CLASSIFICATION_LABEL, CREATED_TIMESTAMP AS FIRST_DISCOVERED
+                    FROM {dbn}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                    WHERE FULLY_QUALIFIED_NAME IN ({in_list})
                     """
                 ) or []
                 inv_map.update({r["FULL_NAME"]: r for r in inv_rows})
@@ -927,9 +927,9 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
                 in_list = ','.join([f"'{x}'" for x in fns])
                 rows = snowflake_connector.execute_query(
                     f"""
-                    SELECT FULL_NAME, FIRST_DISCOVERED, CLASSIFIED
-                    FROM {dbn}.DATA_GOVERNANCE.ASSET_INVENTORY
-                    WHERE FULL_NAME IN ({in_list})
+                    SELECT FULLY_QUALIFIED_NAME AS FULL_NAME, CREATED_TIMESTAMP AS FIRST_DISCOVERED, CLASSIFICATION_LABEL
+                    FROM {dbn}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                    WHERE FULLY_QUALIFIED_NAME IN ({in_list})
                     """
                 ) or []
                 result.update({r['FULL_NAME']: r for r in rows})
@@ -1213,7 +1213,7 @@ with tab_inv_browser:
                                 dbi = st.session_state.get('sf_database') or settings.SNOWFLAKE_DATABASE
                                 if dbi:
                                     snowflake_connector.execute_non_query(
-                                        f"UPDATE {dbi}.DATA_GOVERNANCE.ASSET_INVENTORY SET OWNER = %(o)s WHERE FULL_NAME = %(f)s",
+                                        f"UPDATE {dbi}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS SET DATA_OWNER_EMAIL = %(o)s WHERE FULLY_QUALIFIED_NAME = %(f)s",
                                         {"o": owner_email_db, "f": full},
                                     )
                                     updated += 1
@@ -1545,9 +1545,9 @@ with tab_inv_browser:
                 db_ctx = asset_fqn.split('.')[0]
                 rows = snowflake_connector.execute_query(
                     f"""
-                    SELECT FULL_NAME, OWNER, CLASSIFIED, FIRST_DISCOVERED
-                    FROM {db_ctx}.DATA_GOVERNANCE.ASSET_INVENTORY
-                    WHERE FULL_NAME = %(f)s
+                    SELECT FULLY_QUALIFIED_NAME AS FULL_NAME, DATA_OWNER_EMAIL AS OWNER, CLASSIFICATION_LABEL, CREATED_TIMESTAMP AS FIRST_DISCOVERED
+                    FROM {db_ctx}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                    WHERE FULLY_QUALIFIED_NAME = %(f)s
                     LIMIT 1
                     """,
                     {"f": asset_fqn}

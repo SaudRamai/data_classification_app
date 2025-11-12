@@ -13,7 +13,6 @@ from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-DB = settings.SNOWFLAKE_DATABASE
 SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 TABLE = "AUDIT_LOG"
 DIGEST_TABLE = "DAILY_AUDIT_DIGESTS"
@@ -24,15 +23,34 @@ class AuditService:
         self.connector = snowflake_connector
         self._ensure_table()
 
+    def _get_db(self) -> Optional[str]:
+        """Get database from settings or session state, with validation."""
+        db = settings.SNOWFLAKE_DATABASE
+        # Also try to get from streamlit session if available
+        try:
+            import streamlit as st
+            if hasattr(st, 'session_state'):
+                db = st.session_state.get('sf_database') or db
+        except Exception:
+            pass
+        # Validate database is not None or 'NONE'
+        if db and str(db).upper() not in ('NONE', 'NULL', ''):
+            return str(db)
+        return None
+
     def _ensure_table(self) -> None:
         try:
+            db = self._get_db()
+            if not db:
+                logger.warning("No database configured for audit service, skipping table creation")
+                return
             self.connector.execute_non_query(
-                f"CREATE SCHEMA IF NOT EXISTS {DB}.{SCHEMA}"
+                f"CREATE SCHEMA IF NOT EXISTS {db}.{SCHEMA}"
             )
             # Align with DDL from sql/001_governance_schema.sql (AUDIT_LOG)
             self.connector.execute_non_query(
                 f"""
-                CREATE TABLE IF NOT EXISTS {DB}.{SCHEMA}.{TABLE} (
+                CREATE TABLE IF NOT EXISTS {db}.{SCHEMA}.{TABLE} (
                   TIMESTAMP TIMESTAMP_NTZ,
                   USER_ID STRING,
                   ACTION STRING,
@@ -45,7 +63,7 @@ class AuditService:
             # Daily digests for tamper-evident summaries
             self.connector.execute_non_query(
                 f"""
-                CREATE TABLE IF NOT EXISTS {DB}.{SCHEMA}.{DIGEST_TABLE} (
+                CREATE TABLE IF NOT EXISTS {db}.{SCHEMA}.{DIGEST_TABLE} (
                   DATE_KEY DATE,
                   RECORD_COUNT NUMBER,
                   SHA256_HEX STRING,
@@ -59,7 +77,7 @@ class AuditService:
             for col, typ in [("PREV_SHA256_HEX","STRING"),("CHAIN_SHA256_HEX","STRING")]:
                 try:
                     self.connector.execute_non_query(
-                        f"ALTER TABLE {DB}.{SCHEMA}.{DIGEST_TABLE} ADD COLUMN {col} {typ}"
+                        f"ALTER TABLE {db}.{SCHEMA}.{DIGEST_TABLE} ADD COLUMN {col} {typ}"
                     )
                 except Exception:
                     pass
@@ -74,11 +92,15 @@ class AuditService:
         resource_id: str,
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
+        db = self._get_db()
+        if not db:
+            logger.warning("No database configured for audit service, skipping log")
+            return
         details_sql = "TO_VARIANT(PARSE_JSON(%(details)s))" if details is not None else "NULL"
         try:
             self.connector.execute_non_query(
                 f"""
-                INSERT INTO {DB}.{SCHEMA}.{TABLE} (TIMESTAMP, USER_ID, ACTION, RESOURCE_TYPE, RESOURCE_ID, DETAILS)
+                INSERT INTO {db}.{SCHEMA}.{TABLE} (TIMESTAMP, USER_ID, ACTION, RESOURCE_TYPE, RESOURCE_ID, DETAILS)
                 SELECT CURRENT_TIMESTAMP, %(user)s, %(action)s, %(rtype)s, %(rid)s, {details_sql}
                 """,
                 {
@@ -94,9 +116,13 @@ class AuditService:
             raise
 
     def query(self, limit: int = 100) -> List[Dict[str, Any]]:
+        db = self._get_db()
+        if not db:
+            logger.warning("No database configured for audit service")
+            return []
         try:
             return self.connector.execute_query(
-                f"SELECT * FROM {DB}.{SCHEMA}.{TABLE} ORDER BY TIMESTAMP DESC LIMIT %(limit)s",
+                f"SELECT * FROM {db}.{SCHEMA}.{TABLE} ORDER BY TIMESTAMP DESC LIMIT %(limit)s",
                 {"limit": limit},
             )
         except Exception as e:
@@ -108,6 +134,10 @@ class AuditService:
         day format: 'YYYY-MM-DD'. If None, uses current UTC date.
         Returns a dict with date_key, count, sha256.
         """
+        db = self._get_db()
+        if not db:
+            logger.warning("No database configured for audit service")
+            return {"date_key": day or "", "count": 0, "sha256": "", "prev_sha256": None, "chain_sha256": ""}
         from hashlib import sha256
         from datetime import datetime as _dt
         if not day:
@@ -121,7 +151,7 @@ class AuditService:
                        COALESCE(RESOURCE_TYPE,'' ) AS RT,
                        COALESCE(RESOURCE_ID,'' ) AS RID,
                        COALESCE(TO_JSON(DETAILS),'') AS D
-                FROM {DB}.{SCHEMA}.{TABLE}
+                FROM {db}.{SCHEMA}.{TABLE}
                 WHERE TO_DATE(TIMESTAMP) = TO_DATE(%(d)s)
                 ORDER BY TS, U, A, RT, RID
                 """,
@@ -147,7 +177,7 @@ class AuditService:
             # Upsert digest for the day (idempotent overwrite)
             self.connector.execute_non_query(
                 f"""
-                MERGE INTO {DB}.{SCHEMA}.{DIGEST_TABLE} t
+                MERGE INTO {db}.{SCHEMA}.{DIGEST_TABLE} t
                 USING (
                   SELECT TO_DATE(%(d)s) AS DATE_KEY, %(c)s AS RECORD_COUNT, %(s)s AS SHA256_HEX,
                          %(ps)s AS PREV_SHA256_HEX, %(cs)s AS CHAIN_SHA256_HEX
@@ -167,9 +197,13 @@ class AuditService:
             raise
 
     def get_daily_digest(self, day: str) -> Optional[Dict[str, Any]]:
+        db = self._get_db()
+        if not db:
+            logger.warning("No database configured for audit service")
+            return None
         try:
             res = self.connector.execute_query(
-                f"SELECT DATE_KEY, RECORD_COUNT, SHA256_HEX, PREV_SHA256_HEX, CHAIN_SHA256_HEX, CREATED_AT FROM {DB}.{SCHEMA}.{DIGEST_TABLE} WHERE DATE_KEY = TO_DATE(%(d)s) LIMIT 1",
+                f"SELECT DATE_KEY, RECORD_COUNT, SHA256_HEX, PREV_SHA256_HEX, CHAIN_SHA256_HEX, CREATED_AT FROM {db}.{SCHEMA}.{DIGEST_TABLE} WHERE DATE_KEY = TO_DATE(%(d)s) LIMIT 1",
                 {"d": day},
             ) or []
             return res[0] if res else None

@@ -117,7 +117,7 @@ Reviewed code and docs:
   - Coverage derived from `DATA_CLASSIFICATION` tag references (`1_Dashboard.py`).
 - **Dependencies:**
   - `settings.SNOWFLAKE_DATABASE` configured and Snowflake privileges.
-  - Inventory tables referenced (e.g., `DATA_GOVERNANCE.ASSET_INVENTORY`, `RECLASSIFICATION_REQUESTS`, `REVIEW_SCHEDULES`) must exist.
+  - Inventory tables referenced (e.g., `DATA_CLASSIFICATION_GOVERNANCE.ASSETS`, `RECLASSIFICATION_REQUESTS`, `REVIEW_SCHEDULES`) must exist.
 
 ---
 

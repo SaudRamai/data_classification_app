@@ -51,7 +51,7 @@ The Data Assets page has been significantly enhanced with advanced inventory man
 
 #### **Asset Registration Workflow**
 - Assets are automatically discovered from `INFORMATION_SCHEMA`
-- Tracked in `DATA_GOVERNANCE.ASSET_INVENTORY` table
+- Tracked in `DATA_CLASSIFICATION_GOVERNANCE.ASSETS` table
 - First discovery date recorded for SLA tracking
 
 #### **Deprecation & Archival Tracking**
@@ -357,8 +357,8 @@ The following tables are automatically created if they don't exist:
   - UPDATED_AT
 
 -- Asset inventory (discovery)
-{DATABASE}.DATA_GOVERNANCE.ASSET_INVENTORY
-  - FULL_NAME, CLASSIFIED, FIRST_DISCOVERED
+{DATABASE}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+  - FULLY_QUALIFIED_NAME, CLASSIFICATION_LABEL, CREATED_TIMESTAMP
 
 -- QA reviews
 {DATABASE}.DATA_GOVERNANCE.QA_REVIEWS

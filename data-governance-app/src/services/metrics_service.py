@@ -6,10 +6,27 @@ including classification coverage, framework counts, and historical data.
 """
 from typing import Dict, List, Optional, Any
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
+
 from src.connectors.snowflake_connector import snowflake_connector
+from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+GOV_SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
+
+
+def _active_db() -> Optional[str]:
+    db = getattr(settings, "SNOWFLAKE_DATABASE", None)
+    if not db or str(db).strip().upper() in {"", "NONE", "(NONE)", "NULL", "UNKNOWN"}:
+        return None
+    return str(db)
+
+
+def _fqn(db: str, obj: str) -> str:
+    return f"{db}.{GOV_SCHEMA}.{obj}"
+
 
 class MetricsService:
     def __init__(self):
@@ -17,162 +34,131 @@ class MetricsService:
 
     def classification_coverage(self, database: Optional[str] = None) -> Dict[str, Any]:
         """
-        Calculate classification coverage metrics.
-        
-        Args:
-            database: Optional database name to filter results
-            
-        Returns:
-            Dictionary containing coverage metrics
+        Calculate classification coverage metrics based on ASSETS table
+        in <DB>.DATA_CLASSIFICATION_GOVERNANCE.
         """
         try:
-            # Base query for coverage metrics
-            query = """
-                SELECT
-                    COUNT(*) AS total_assets,
-                    COUNT(CASE WHEN classification_label IS NOT NULL AND classification_label != 'UNCLASSIFIED' 
-                             THEN 1 END) AS tagged_assets,
-                    ROUND(
-                        100.0 * COUNT(CASE WHEN classification_label IS NOT NULL AND classification_label != 'UNCLASSIFIED' THEN 1 END) 
-                        / NULLIF(COUNT(*), 0), 2
-                    ) AS coverage_percent
-                FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                WHERE 1=1
-            """
-            
-            # Add database filter if provided
-            if database:
-                query += f" AND database_name = '{database}'"
-            
-            # Execute the query
-            result = self.connector.execute_query(query)
-            
-            if result and result[0]:
-                total_assets = result[0].get('TOTAL_ASSETS', 0) or 0
-                classified_count = result[0].get('TAGGED_ASSETS', 0) or 0
-                coverage_pct = result[0].get('COVERAGE_PERCENT', 0) or 0
-                unclassified_count = total_assets - classified_count
-                
+            db = database or _active_db()
+            if not db:
                 return {
-                    'total_assets': int(total_assets),
-                    'classified_count': int(classified_count),
-                    'coverage_percentage': float(coverage_pct)
+                    'total_assets': 0,
+                    'tagged_assets': 0,
+                    'coverage_pct': 0.0,
+                    'error': 'No active database context'
                 }
-                
-            return {
-                'total_assets': 0,
-                'classified_count': 0,
-                'coverage_percentage': 0.0
-            }
-            
+            assets_fqn = _fqn(db, 'ASSETS')
+            query = f"""
+                SELECT
+                    COUNT(*) AS TOTAL_ASSETS,
+                    COUNT(CASE WHEN COALESCE(CLASSIFICATION_LABEL,'') <> '' AND UPPER(CLASSIFICATION_LABEL) <> 'UNCLASSIFIED' THEN 1 END) AS TAGGED_ASSETS,
+                    ROUND(
+                        100.0 * COUNT(CASE WHEN COALESCE(CLASSIFICATION_LABEL,'') <> '' AND UPPER(CLASSIFICATION_LABEL) <> 'UNCLASSIFIED' THEN 1 END)
+                        / NULLIF(COUNT(*), 0), 2
+                    ) AS COVERAGE_PCT
+                FROM {assets_fqn}
+            """
+            rows = self.connector.execute_query(query) or []
+            if rows:
+                total = int(rows[0].get('TOTAL_ASSETS', 0) or 0)
+                tagged = int(rows[0].get('TAGGED_ASSETS', 0) or 0)
+                pct = float(rows[0].get('COVERAGE_PCT', 0.0) or 0.0)
+                return {'total_assets': total, 'tagged_assets': tagged, 'coverage_pct': pct}
+            return {'total_assets': 0, 'tagged_assets': 0, 'coverage_pct': 0.0}
         except Exception as e:
-            logger.error(f"Error calculating classification coverage: {str(e)}")
-            return {
-                'total_assets': 0,
-                'classified_count': 0,
-                'coverage_percentage': 0.0,
-                'error': str(e)
-            }
+            logger.error(f"Error calculating classification coverage: {e}")
+            return {'total_assets': 0, 'tagged_assets': 0, 'coverage_pct': 0.0, 'error': str(e)}
 
     def framework_counts(self, database: Optional[str] = None) -> Dict[str, int]:
         """
-        Get counts by framework.
-        
-        Args:
-            database: Optional database name to filter results
-            
-        Returns:
-            Dictionary with framework counts
+        Approximate framework counts. Without a canonical summary view, use ASSETS.COMPLIANCE_STATUS
+        if present; otherwise return empty.
         """
         try:
-            query = """
-                SELECT 
-                    COALESCE(framework, 'UNKNOWN') as framework,
-                    COUNT(*) as count
-                FROM governance.classification_summary
+            db = database or _active_db()
+            if not db:
+                return {}
+            assets_fqn = _fqn(db, 'ASSETS')
+            # Best-effort: use COMPLIANCE_STATUS if exists; otherwise fallback to DATA_CLASSIFICATION buckets
+            query = f"""
+                SELECT
+                  COALESCE(COMPLIANCE_STATUS, 'UNKNOWN') AS FRAMEWORK,
+                  COUNT(*) AS COUNT
+                FROM {assets_fqn}
+                GROUP BY 1
+                ORDER BY 2 DESC
             """
-            
-            if database:
-                query += f" WHERE database_name = '{database}'"
-                
-            query += " GROUP BY framework ORDER BY count DESC"
-            
-            results = self.connector.execute_query(query)
-            return {row['FRAMEWORK']: row['COUNT'] for row in results if row['FRAMEWORK']}
-            
+            rows = self.connector.execute_query(query) or []
+            out: Dict[str, int] = {}
+            for r in rows:
+                fw = str(r.get('FRAMEWORK') or 'UNKNOWN')
+                cnt = int(r.get('COUNT') or 0)
+                out[fw] = cnt
+            return out
         except Exception as e:
-            logger.error(f"Error getting framework counts: {str(e)}")
+            logger.error(f"Error getting framework counts: {e}")
             return {}
 
     def historical_classifications(self, days: int = 30, database: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Get historical classification data.
-        
-        Args:
-            days: Number of days of history to retrieve
-            database: Optional database name to filter results
-            
-        Returns:
-            List of daily classification metrics
+        Return daily counts from CLASSIFICATION_DECISIONS if available.
         """
         try:
-            query = """
-                SELECT 
-                    DATE(classification_date) as day,
-                    classification_status,
-                    COUNT(*) as count
-                FROM governance.classification_events
-                WHERE classification_date >= DATEADD(day, -%s, CURRENT_DATE())
+            db = database or _active_db()
+            if not db:
+                return []
+            decisions_fqn = _fqn(db, 'CLASSIFICATION_DECISIONS')
+            query = f"""
+                SELECT
+                  DATE(COALESCE(CREATED_AT, CURRENT_DATE())) AS DAY,
+                  COALESCE(STATUS, ACTION, 'UNKNOWN') AS CLASSIFICATION_STATUS,
+                  COUNT(*) AS DECISIONS
+                FROM {decisions_fqn}
+                WHERE COALESCE(CREATED_AT, CURRENT_DATE()) >= DATEADD(day, -%(d)s, CURRENT_DATE())
+                GROUP BY 1,2
+                ORDER BY 1,2
             """
-            
-            params = [days]
-            
-            if database:
-                query += " AND database_name = %s"
-                params.append(database)
-                
-            query += """
-                GROUP BY day, classification_status
-                ORDER BY day, classification_status
-            """
-            
-            results = self.connector.execute_query(query, tuple(params))
-            return [dict(row) for row in results]
-            
+            rows = self.connector.execute_query(query, {"d": int(days)}) or []
+            return [
+                {
+                    'DAY': r.get('DAY'),
+                    'classification_status': r.get('CLASSIFICATION_STATUS'),
+                    'DECISIONS': int(r.get('DECISIONS') or 0),
+                }
+                for r in rows
+            ]
         except Exception as e:
-            logger.error(f"Error getting historical classifications: {str(e)}")
+            logger.error(f"Error getting historical classifications: {e}")
             return []
 
     def overdue_unclassified(self, database: Optional[str] = None) -> Dict[str, int]:
         """
-        Get count of overdue unclassified assets.
-        
-        Args:
-            database: Optional database name to filter results
-            
-        Returns:
-            Dictionary with overdue counts by risk level
+        Count overdue unclassified assets (no classification label and older than 7 days by timestamps).
+        Group by OVERALL_RISK_CLASSIFICATION when available; otherwise return total.
         """
         try:
-            query = """
-                SELECT 
-                    COALESCE(risk_level, 'UNKNOWN') as risk_level,
-                    COUNT(*) as count
-                FROM governance.unclassified_assets
-                WHERE last_scan_date < DATEADD(day, -7, CURRENT_DATE())
+            db = database or _active_db()
+            if not db:
+                return {}
+            assets_fqn = _fqn(db, 'ASSETS')
+            query = f"""
+                SELECT
+                  COALESCE(OVERALL_RISK_CLASSIFICATION, 'UNKNOWN') AS RISK_LEVEL,
+                  COUNT(*) AS COUNT
+                FROM {assets_fqn}
+                WHERE (CLASSIFICATION_LABEL IS NULL OR CLASSIFICATION_LABEL = '')
+                  AND COALESCE(LAST_MODIFIED_TIMESTAMP, CREATED_TIMESTAMP, CURRENT_TIMESTAMP()) < DATEADD(day, -7, CURRENT_TIMESTAMP())
+                GROUP BY 1
             """
-            
-            if database:
-                query += f" AND database_name = '{database}'"
-                
-            query += " GROUP BY risk_level"
-            
-            results = self.connector.execute_query(query)
-            return {row['RISK_LEVEL']: row['COUNT'] for row in results}
-            
+            rows = self.connector.execute_query(query) or []
+            out: Dict[str, int] = {}
+            for r in rows:
+                rk = str(r.get('RISK_LEVEL') or 'UNKNOWN')
+                out[rk] = int(r.get('COUNT') or 0)
+            return out
         except Exception as e:
-            logger.error(f"Error getting overdue unclassified assets: {str(e)}")
-            {}
+            logger.error(f"Error getting overdue unclassified assets: {e}")
+            return {}
+
 
 # Singleton instance
 metrics_service = MetricsService()

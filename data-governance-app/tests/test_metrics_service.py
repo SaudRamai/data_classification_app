@@ -16,11 +16,11 @@ class FakeConnector:
         # INFORMATION_SCHEMA.TABLES presence checks
         if "INFORMATION_SCHEMA.TABLES" in sql_up:
             return [{"X": 1}] if self.tables_exist else []
-        # Coverage total count from ASSET_INVENTORY
-        if "FROM" in sql_up and "ASSET_INVENTORY" in sql_up and "COUNT(*)" in sql_up and "TAG_REFERENCES" not in sql_up:
+        # Coverage total count from ASSETS
+        if "FROM" in sql_up and "ASSETS" in sql_up and "COUNT(*)" in sql_up and "TAG_REFERENCES" not in sql_up:
             return [{"C": 10}]  # 10 assets in inventory
         # Coverage tagged count join TAG_REFERENCES
-        if "TAG_REFERENCES" in sql_up and "ASSET_INVENTORY" in sql_up:
+        if "TAG_REFERENCES" in sql_up and "ASSETS" in sql_up:
             return [{"C": 7}]  # 7 have any classification tags
         # COMPLIANCE_MAPPING canonical counts
         if "FROM" in sql_up and "COMPLIANCE_MAPPING" in sql_up and "GROUP BY" in sql_up and "FRAMEWORK_NAME" in sql_up:
@@ -37,7 +37,7 @@ class FakeConnector:
                 {"DAY": today - dt.timedelta(days=1), "DECISIONS": 3},
             ]
         # Overdue unclassified
-        if "FROM" in sql_up and "ASSET_INVENTORY" in sql_up and "CLASSIFIED" in sql_up and "FIRST_DISCOVERED" in sql_up:
+        if "FROM" in sql_up and "ASSETS" in sql_up and "CLASSIFICATION_LABEL" in sql_up and "CREATED_TIMESTAMP" in sql_up:
             return [{"C": 2}]
         return []
 

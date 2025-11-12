@@ -39,6 +39,10 @@ from src.services.tagging_service import tagging_service
 from src.services.classification_decision_service import classification_decision_service
 from src.services.audit_service import audit_service
 try:
+    from src.services.comprehensive_detection_methods import comprehensive_detection_service
+except Exception as _cdm_err:
+    comprehensive_detection_service = None  # Fallback: disable comprehensive detection if import fails
+try:
     from src.pages._compliance_center import render as render_compliance_center
 except ModuleNotFoundError:
     render_compliance_center = None
@@ -56,7 +60,7 @@ st.set_page_config(
 apply_global_theme()
 
 # Page title
-st.title("Data Classification")
+st.title("Compliance")
 render_quick_links()
 
 # Redirect to policy-aligned Compliance Center (keeps only mandated components)
@@ -204,7 +208,6 @@ def _table_exists(db: Optional[str], schema: str, table: str) -> bool:
     except Exception:
         return False
 
-
 # Cached helper: list sensitive tables from ASSET_INVENTORY with AI sensitivity hints & CIA suggestions
 @st.cache_data(ttl=300)
 def _get_sensitive_tables(db: str, limit: int = 200) -> pd.DataFrame:
@@ -342,65 +345,97 @@ except Exception as _hc_err:
     comp_ok = False
     comp_err = str(_hc_err)
     # Suppress banner on health check failures
-# Global filters and facets (applied best-effort to results)
+
+# Helper functions to list schemas, objects, and columns
+@st.cache_data(ttl=300)
+def _list_schemas(db: Optional[str]) -> List[str]:
+    if not db or db == "All":
+        return []
+    try:
+        rows = snowflake_connector.execute_query(
+            f"""
+            SELECT SCHEMA_NAME
+            FROM {db}.INFORMATION_SCHEMA.SCHEMATA
+            ORDER BY SCHEMA_NAME
+            """
+        ) or []
+        return [r.get('SCHEMA_NAME') for r in rows if r.get('SCHEMA_NAME')]
+    except Exception:
+        return []
+
+@st.cache_data(ttl=300)
+def _list_objects(db: Optional[str], schema: Optional[str]) -> List[str]:
+    if not db or db == "All" or not schema or schema == "All":
+        return []
+    try:
+        rows = snowflake_connector.execute_query(
+            f"""
+            SELECT TABLE_NAME AS NAME, 'TABLE' AS TYPE
+            FROM {db}.INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = %(s)s
+            UNION ALL
+            SELECT TABLE_NAME AS NAME, 'VIEW' AS TYPE
+            FROM {db}.INFORMATION_SCHEMA.VIEWS
+            WHERE TABLE_SCHEMA = %(s)s
+            ORDER BY NAME
+            """,
+            {"s": schema},
+        ) or []
+        return [r.get('NAME') for r in rows if r.get('NAME')]
+    except Exception:
+        return []
+
+@st.cache_data(ttl=300)
+def _list_columns(db: Optional[str], schema: Optional[str], obj: Optional[str]) -> List[str]:
+    if not db or db == "All" or not schema or schema == "All" or not obj or obj == "All":
+        return []
+    try:
+        rows = snowflake_connector.execute_query(
+            f"""
+            SELECT COLUMN_NAME
+            FROM {db}.INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
+            ORDER BY ORDINAL_POSITION
+            """,
+            {"s": schema, "t": obj},
+        ) or []
+        return [r.get('COLUMN_NAME') for r in rows if r.get('COLUMN_NAME')]
+    except Exception:
+        return []
+
+# Single Filters set (Database, Schema, Table/View, Column)
 with st.sidebar:
-    # Make filters section clearly visible
-    st.header("filters")
-    # Global Filters (preferred) to drive active database/schema/table
-    with st.expander("🌐 Global Filters", expanded=True):
-        try:
-            _gf = render_data_filters(key_prefix="global")
-            if _gf.get("database"):
-                # Persist selected DB for use across the page/services
-                st.session_state["sf_database"] = _gf.get("database")
-            # Persist all filters for downstream usage
-            st.session_state["global_filters"] = {
-                "database": _gf.get("database"),
-                "schema": _gf.get("schema"),
-                "table": _gf.get("table"),
-            }
-        except Exception as _gf_err:
-            st.caption(f"Global Filters unavailable: {_gf_err}")
-    # Session controls (warehouse)
-    with st.expander("session", expanded=True):
-        try:
-            wh_opts = _list_warehouses()
-        except Exception:
-            wh_opts = []
-        cur_wh = st.session_state.get('sf_warehouse')
-        # Keep current selection visible even if not in list
-        if cur_wh and cur_wh not in wh_opts:
-            wh_display = [cur_wh] + wh_opts
-        else:
-            wh_display = wh_opts
-        wh = st.selectbox("Warehouse", options=wh_display or [""], index=(wh_display.index(cur_wh) if (cur_wh and cur_wh in wh_display) else 0) if wh_display else 0)
-        if wh:
-            _apply_warehouse(wh)
+    st.header("Filters")
+    # Database
+    db_opts = ["All"] + _list_databases()
+    cur_db = st.session_state.get('sf_database')
+    try:
+        db_index = db_opts.index(cur_db) if (cur_db and cur_db in db_opts) else 0
+    except Exception:
+        db_index = 0
+    sel_db = st.selectbox("Database", options=db_opts, index=db_index, key="flt_db")
+    if sel_db and sel_db != "All":
+        _apply_database(sel_db)
+        st.session_state['sf_database'] = sel_db
+    # Schema
+    schema_opts = ["All"] + _list_schemas(sel_db if sel_db and sel_db != "All" else _resolve_db())
+    sel_schema = st.selectbox("Schema", options=schema_opts, index=0, key="flt_schema")
+    # Table / View
+    obj_opts = ["All"] + _list_objects(sel_db if sel_db != "All" else _resolve_db(), sel_schema)
+    sel_obj = st.selectbox("Table / View", options=obj_opts, index=0, key="flt_obj")
+    # Column (optional)
+    col_opts = [""] + _list_columns(sel_db if sel_db != "All" else _resolve_db(), sel_schema, sel_obj)
+    sel_col = st.selectbox("Column (optional)", options=col_opts, index=0, key="flt_col")
 
-        # Database selection (with 'All') — shown only if Global Filters did not provide a DB
-        if not (st.session_state.get("global_filters") and st.session_state["global_filters"].get("database")):
-            try:
-                db_opts = _list_databases()
-            except Exception:
-                db_opts = []
-            cur_db = st.session_state.get('sf_database')
-            db_display = ["All"] + db_opts
-            try:
-                if cur_db and cur_db in db_opts:
-                    db_index = db_display.index(cur_db)
-                else:
-                    db_index = 0
-            except Exception:
-                db_index = 0
-            sel_db = st.selectbox("Database", options=db_display, index=db_index, key="comp_db")
-            _apply_database(sel_db)
-
-    with st.expander("filters", expanded=True):
-      # Use a distinct key prefix to avoid collisions with the sidebar session DB key "comp_db"
-      sel = render_data_filters(key_prefix="comp_filters")
-
-    # Compliance facet filters used in violations matrix below
-    facets = render_compliance_facets(key_prefix="comp_facets")
+    # Persist unified selection dict
+    sel = {
+        "database": None if (not sel_db or sel_db == "All") else sel_db,
+        "schema": None if (not sel_schema or sel_schema == "All") else sel_schema,
+        "table": None if (not sel_obj or sel_obj == "All") else sel_obj,
+        "column": None if (not sel_col) else sel_col,
+    }
+    st.session_state["global_filters"] = sel
+    facets = render_compliance_facets()
 
 # Manual refresh to clear cache and re-run queries
 if st.button("🔄 Refresh now", help="Clear cached data (5 min TTL) and refresh from Snowflake"):
@@ -591,8 +626,8 @@ if ref_cov:
     st.rerun()
 
 # Tabs aligned to Monitoring & Compliance structure
-tab_dash, tab_reviews, tab_viol, tab_ai = st.tabs([
-    "📊 Compliance Dashboard", "🔄 Review Management", "🚨 Policy Violations", "🤖 AI Assistant"
+tab_dash, tab_reviews, tab_viol, tab_ai, tab_auto = st.tabs([
+    "📊 Compliance Dashboard", "🔄 Review Management", "🚨 Policy Violations", "🤖 AI Assistant", "🚀 Automated Classification"
 ])
 
 with tab_dash:
@@ -626,274 +661,257 @@ with tab_dash:
         c1, c2, c3, c4 = st.columns(4)
         # Coverage %
         try:
-            cov_pct = None
-            if metrics and metrics.get("coverage_rate") is not None:
-                cov_pct = round(100.0 * float(metrics.get("coverage_rate") or 0), 2)
-            if cov_pct is None:
-                db = _resolve_db()
-                rows = snowflake_connector.execute_query(
-                    f"select iff(count(*)=0,0, round(100.0*sum(case when coalesce(CLASSIFICATION_TAG,'')<>'' then 1 else 0 end)/count(*),2)) as COV from {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
-                ) or [] if db else []
-                cov_pct = float(rows[0].get('COV', 0)) if rows else 0.0
-        except Exception:
-            cov_pct = 0.0
-        c1.metric("Classification Coverage", f"{cov_pct}%")
-        # Timeliness
-        try:
             db = _resolve_db()
-            r_pd = snowflake_connector.execute_query(
-                f"select count(*) as CNT from {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS where coalesce(LAST_CLASSIFIED_DATE, CREATED_DATE, dateadd('day', -6, current_date())) < dateadd('day', -5, current_date())"
-            ) or [] if db else []
-            past_due = int(r_pd[0].get('CNT',0)) if r_pd else 0
+            cov_pct = None
+            past_due = None
+            acc_disp = None
+            open_exc = None
+            if db and _view_exists(db, 'DATA_CLASSIFICATION_GOVERNANCE', 'VW_POLICY_COMPLIANCE_METRICS'):
+                vw = snowflake_connector.execute_query(
+                    f"SELECT * FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_POLICY_COMPLIANCE_METRICS"
+                ) or []
+                if vw:
+                    row = vw[0]
+                    try:
+                        cov_pct = float(row.get('CLASSIFICATION_COVERAGE_PERCENT') or 0.0)
+                    except Exception:
+                        cov_pct = 0.0
+                    try:
+                        acc_val = row.get('ACCURACY_SCORE')
+                        acc_disp = f"{float(acc_val):.2f}%" if acc_val is not None else "-"
+                    except Exception:
+                        acc_disp = "-"
+                    try:
+                        past_due = int(row.get('AVG_CLASSIFICATION_AGE_DAYS') or 0)
+                    except Exception:
+                        past_due = 0
+            # Fallbacks
+            if cov_pct is None:
+                if metrics and metrics.get("coverage_rate") is not None:
+                    cov_pct = round(100.0 * float(metrics.get("coverage_rate") or 0), 2)
+                else:
+                    rows = snowflake_connector.execute_query(
+                        f"select iff(count(*)=0,0, round(100.0*sum(case when coalesce(CLASSIFICATION_TAG,'')<>'' then 1 else 0 end)/count(*),2)) as COV from {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
+                    ) or [] if db else []
+                    cov_pct = float(rows[0].get('COV', 0)) if rows else 0.0
+            if past_due is None:
+                r_pd = snowflake_connector.execute_query(
+                    f"select count(*) as CNT from {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS where coalesce(LAST_CLASSIFIED_DATE, CREATED_DATE, dateadd('day', -6, current_date())) < dateadd('day', -5, current_date())"
+                ) or [] if db else []
+                past_due = int(r_pd[0].get('CNT',0)) if r_pd else 0
+            if acc_disp is None:
+                try:
+                    acc = metrics.get("accuracy_score") if isinstance(metrics, dict) else None
+                    if acc is None:
+                        acc = metrics.get("accuracy") if isinstance(metrics, dict) else None
+                    acc_disp = f"{float(acc)*100:.2f}%" if acc is not None and float(acc) <= 1 else (f"{float(acc):.2f}%" if acc is not None else "-")
+                except Exception:
+                    acc_disp = "-"
+            if open_exc is None:
+                try:
+                    open_exc = len(exception_service.list(status="Pending", limit=10000) or [])
+                except Exception:
+                    open_exc = 0
         except Exception:
-            past_due = 0
-        c2.metric("Past Due (≥5d)", f"{past_due}")
-        # Accuracy
-        try:
-            acc = metrics.get("accuracy_score") if isinstance(metrics, dict) else None
-            if acc is None:
-                acc = metrics.get("accuracy") if isinstance(metrics, dict) else None
-            acc_disp = f"{float(acc)*100:.2f}%" if acc is not None and float(acc) <= 1 else (f"{float(acc):.2f}%" if acc is not None else "-")
-        except Exception:
-            acc_disp = "-"
+            cov_pct, past_due, acc_disp, open_exc = 0.0, 0, "-", 0
+        c1.metric("Classification Coverage", f"{cov_pct}%")
+        c2.metric("Avg Classification Age (days)", f"{past_due}")
         c3.metric("Accuracy vs Expected", acc_disp)
-        # Open exceptions
-        try:
-            open_exc = len(exception_service.list(status="Pending", limit=10000) or [])
-        except Exception:
-            open_exc = 0
         c4.metric("Open Exceptions", f"{open_exc}")
-
-        # Optional: tag usage
-        if compliance_data.get('tag_usage'):
-            tag_df = pd.DataFrame(compliance_data['tag_usage']).rename(columns={'TAG_NAME': 'Tag', 'USAGE_COUNT': 'Usage'})
-            st.plotly_chart(px.bar(tag_df, x='Tag', y='Usage', title='Top Tag Usage'), use_container_width=True)
 
     # 2) Classification Coverage Reports
     with t_coverage:
         db = _resolve_db()
-        # Latest by Framework
         try:
-            if db and (_table_exists(db, 'DATA_GOVERNANCE', 'COMPLIANCE_COVERAGE') or _view_exists(db, 'DATA_GOVERNANCE', 'COMPLIANCE_COVERAGE')):
-                rows_cov = snowflake_connector.execute_query(
-                    f"select FRAMEWORK, GENERATED_AT, METRICS from {db}.DATA_GOVERNANCE.COMPLIANCE_COVERAGE order by FRAMEWORK"
+            if db and _view_exists(db, 'DATA_CLASSIFICATION_GOVERNANCE', 'VW_CLASSIFICATION_COVERAGE_REPORTS'):
+                rows = snowflake_connector.execute_query(
+                    f"SELECT BUSINESS_UNIT, ASSET_TYPE, MONTH, TOTAL_ASSETS, CLASSIFIED_ASSETS, COVERAGE_PERCENT FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_CLASSIFICATION_COVERAGE_REPORTS"
                 ) or []
             else:
-                rows_cov = []
-            if rows_cov:
-                for rec in rows_cov:
-                    fw = rec.get('FRAMEWORK'); gen = rec.get('GENERATED_AT'); m = rec.get('METRICS') or {}
-                    total = int(m.get('total_assets', 0) or 0); comp = int(m.get('compliant_assets', 0) or 0); nonc = int(m.get('non_compliant_assets', 0) or 0)
-                    st.markdown(f"- **{fw}** — Generated: {gen} — Total: {total} | Compliant: {comp} | Non-compliant: {nonc}")
-            else:
-                st.info("Coverage snapshots not available in this database.")
+                rows = []
         except Exception as e:
-            st.warning(f"Coverage snapshot failed: {e}")
+            rows = []
+            st.warning(f"Coverage view unavailable: {e}")
 
-        st.markdown("---")
-        # By Business Unit
-        try:
-            rows_bu = snowflake_connector.execute_query(
-                f"select coalesce(BUSINESS_UNIT,'Unknown') as BU, count(*) as TOTAL, sum(case when coalesce(CLASSIFICATION_TAG,'')<>'' then 1 else 0 end) as TAGGED from {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS group by 1 order by 1"
-            ) or [] if db else []
-            if rows_bu:
-                df_bu = pd.DataFrame(rows_bu)
-                df_bu['COVERAGE_PCT'] = (df_bu['TAGGED'].astype(float) / df_bu['TOTAL'].replace(0, pd.NA).astype(float) * 100).fillna(0).round(2)
-                st.subheader("By Business Unit")
-                st.plotly_chart(px.bar(df_bu, x='BU', y='COVERAGE_PCT', range_y=[0,100]), use_container_width=True)
-                st.dataframe(df_bu, use_container_width=True)
-        except Exception as e:
-            st.info(f"BU breakdown unavailable: {e}")
-
-        st.markdown("---")
-        # By Data Type
-        try:
-            rows_dt = snowflake_connector.execute_query(
-                f"select coalesce(TABLE_TYPE, ASSET_TYPE, 'Unknown') as DATA_TYPE, count(*) as TOTAL, sum(case when coalesce(CLASSIFICATION_TAG,'')<>'' then 1 else 0 end) as TAGGED from {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS group by 1 order by 1"
-            ) or [] if db else []
-            if rows_dt:
-                df_dt = pd.DataFrame(rows_dt)
-                df_dt['COVERAGE_PCT'] = (df_dt['TAGGED'].astype(float) / df_dt['TOTAL'].replace(0, pd.NA).astype(float) * 100).fillna(0).round(2)
-                st.subheader("By Data Type")
-                st.plotly_chart(px.bar(df_dt, x='DATA_TYPE', y='COVERAGE_PCT', range_y=[0,100]), use_container_width=True)
-                st.dataframe(df_dt, use_container_width=True)
-        except Exception as e:
-            st.info(f"Data Type breakdown unavailable: {e}")
-
-        st.markdown("---")
-        # Trend over time
-        try:
-            if db and (_table_exists(db, 'DATA_GOVERNANCE', 'COMPLIANCE_REPORTS') or _view_exists(db, 'DATA_GOVERNANCE', 'COMPLIANCE_REPORTS')):
-                rows_tr = snowflake_connector.execute_query(
-                    f"select to_date(GENERATED_AT) as DT, try_cast(METRICS:coverage_rate as float) as COVERAGE_RATE from {db}.DATA_GOVERNANCE.COMPLIANCE_REPORTS order by DT asc limit 365"
-                ) or []
-            else:
-                rows_tr = []
-            df_tr = pd.DataFrame(rows_tr)
-            if not df_tr.empty and 'COVERAGE_RATE' in df_tr.columns:
-                df_tr['COVERAGE_PCT'] = (df_tr['COVERAGE_RATE'].astype(float) * 100).round(2)
-                st.subheader("Trend Analysis")
-                st.plotly_chart(px.line(df_tr, x='DT', y='COVERAGE_PCT', markers=True), use_container_width=True)
-                st.dataframe(df_tr, use_container_width=True)
-            else:
-                st.info("No coverage trend data available.")
-        except Exception as e:
-            st.warning(f"Trend analysis failed: {e}")
-
-    # 3) Exception Tracking
-    with t_exceptions:
-        st.subheader("Active Exceptions")
-        status_sel = st.selectbox("Status", ["All","Pending","Approved","Rejected","Expired"], index=1)
-        lim = st.number_input("Limit", 10, 2000, 200, 10)
-        try:
-            rows = exception_service.list(status=None if status_sel=="All" else status_sel, limit=int(lim))
+        if rows:
             df = pd.DataFrame(rows)
-        except Exception as e:
-            df = pd.DataFrame(); st.warning(f"Unable to list exceptions: {e}")
-        if df.empty:
-            st.info("No exceptions for current filter.")
-        else:
-            st.dataframe(df, use_container_width=True)
-            sel_id = st.selectbox("Select Exception ID", options=df['ID'].tolist()) if 'ID' in df.columns else None
-            colx1, colx2, colx3 = st.columns(3)
-            with colx1:
-                if st.button("Approve", disabled=not sel_id):
-                    try:
-                        exception_service.approve(sel_id, approver=str(st.session_state.get('user') or 'system'))
-                        st.success("Approved."); st.rerun()
-                    except Exception as e:
-                        st.error(f"Approve failed: {e}")
-            with colx2:
-                rej_reason = st.text_input("Rejection reason", key="rej_reason")
-                if st.button("Reject", disabled=not sel_id):
-                    try:
-                        exception_service.reject(sel_id, approver=str(st.session_state.get('user') or 'system'), justification=rej_reason)
-                        st.success("Rejected."); st.rerun()
-                    except Exception as e:
-                        st.error(f"Reject failed: {e}")
-            with colx3:
-                ev_url = st.text_input("Evidence URL", key="evid_url")
-                if st.button("Attach Evidence", disabled=not sel_id):
-                    try:
-                        exception_service.set_evidence_link(sel_id, ev_url)
-                        st.success("Evidence attached."); st.rerun()
-                    except Exception as e:
-                        st.error(f"Attach failed: {e}")
+            try:
+                st.subheader("By Business Unit")
+                bu_df = df.groupby('BUSINESS_UNIT', as_index=False).agg({'TOTAL_ASSETS':'sum','CLASSIFIED_ASSETS':'sum'})
+                bu_df['COVERAGE_PERCENT'] = (bu_df['CLASSIFIED_ASSETS'] / bu_df['TOTAL_ASSETS'].replace(0, pd.NA) * 100).fillna(0).round(2)
+                st.plotly_chart(px.bar(bu_df, x='BUSINESS_UNIT', y='COVERAGE_PERCENT', range_y=[0,100]), use_container_width=True)
+                st.dataframe(bu_df, use_container_width=True)
+            except Exception:
+                pass
 
-    # 4) Audit Ready Reports
-    with t_audit:
-        st.subheader("Compliance Certifications & Evidence")
-        db = _resolve_db()
-        try:
-            if db and (_table_exists(db, 'DATA_GOVERNANCE', 'COMPLIANCE_REPORTS') or _view_exists(db, 'DATA_GOVERNANCE', 'COMPLIANCE_REPORTS')):
-                reports = snowflake_connector.execute_query(
-                    f"select ID, FRAMEWORK, GENERATED_AT, GENERATED_BY, METRICS from {db}.DATA_GOVERNANCE.COMPLIANCE_REPORTS order by GENERATED_AT desc limit 200"
-                )
-            else:
-                reports = []
-        except Exception as e:
-            reports = []; st.warning(f"Unable to load reports: {e}")
-        rdf = pd.DataFrame(reports)
-        if rdf.empty:
-            st.info("No reports available to export.")
+            st.markdown("---")
+            try:
+                st.subheader("By Data Type")
+                dt_df = df.groupby('ASSET_TYPE', as_index=False).agg({'TOTAL_ASSETS':'sum','CLASSIFIED_ASSETS':'sum'})
+                dt_df['COVERAGE_PERCENT'] = (dt_df['CLASSIFIED_ASSETS'] / dt_df['TOTAL_ASSETS'].replace(0, pd.NA) * 100).fillna(0).round(2)
+                st.plotly_chart(px.bar(dt_df, x='ASSET_TYPE', y='COVERAGE_PERCENT', range_y=[0,100]), use_container_width=True)
+                st.dataframe(dt_df, use_container_width=True)
+            except Exception:
+                pass
+
+            st.markdown("---")
+            try:
+                st.subheader("Trend Analysis")
+                trend_df = df.groupby('MONTH', as_index=False).agg({'TOTAL_ASSETS':'sum','CLASSIFIED_ASSETS':'sum'})
+                trend_df['COVERAGE_PERCENT'] = (trend_df['CLASSIFIED_ASSETS'] / trend_df['TOTAL_ASSETS'].replace(0, pd.NA) * 100).fillna(0).round(2)
+                st.plotly_chart(px.line(trend_df, x='MONTH', y='COVERAGE_PERCENT', markers=True), use_container_width=True)
+                st.dataframe(trend_df, use_container_width=True)
+            except Exception:
+                pass
         else:
-            st.dataframe(rdf, use_container_width=True)
-            csv = rdf.to_csv(index=False).encode('utf-8')
-            st.download_button("Download CSV", data=csv, file_name="compliance_reports.csv", mime="text/csv")
-        st.caption("PDF exports can be integrated with your reporting service. Evidence links can be attached in Exception Tracking.")
-    # (AI Non-compliance quick scan removed per Monitoring & Compliance spec)
+            st.info("Classification coverage view not found; fallback snapshots/tables will be used when available.")
+
+    # 3) Exception Tracking (handled below in t_exceptions)
 
 with tab_reviews:
-    st.subheader("📅 Scheduled Reviews")
-    st.caption("Annual calendar, trigger-based reviews, and assignment")
-    col_sr1, col_sr2 = st.columns(2)
-    with col_sr1:
-        asset_full = st.text_input("Asset (DATABASE.SCHEMA.OBJECT)", key="comp_rev_asset")
-        frequency = st.selectbox("Frequency", ["Monthly", "Quarterly", "Semiannually", "Annually"], index=1, key="comp_rev_freq")
-        owner = st.text_input("Owner (email)", key="comp_rev_owner")
-        if st.button("Schedule Review", key="comp_rev_btn") and asset_full and owner:
-            try:
-                rid = compliance_service.schedule_review(asset_full, frequency, owner)
-                st.success(f"Review scheduled. ID: {rid}")
-            except Exception as e:
-                st.error(f"Failed to schedule review: {e}")
-    with col_sr2:
-        st.caption("Upcoming reviews:")
-        try:
-            db = _resolve_db()
-            if db and (_table_exists(db, 'DATA_GOVERNANCE', 'REVIEW_SCHEDULES') or _view_exists(db, 'DATA_GOVERNANCE', 'REVIEW_SCHEDULES')):
-                schedules = snowflake_connector.execute_query(
-                    f"SELECT * FROM {db}.DATA_GOVERNANCE.REVIEW_SCHEDULES ORDER BY NEXT_RUN ASC LIMIT 200"
-                ) or []
-            else:
-                schedules = []
-            if schedules:
-                st.dataframe(pd.DataFrame(schedules), use_container_width=True)
-            else:
-                st.info("No schedules yet.")
-        except Exception as e:
-            st.warning(f"Unable to list schedules: {e}")
-
-    st.markdown("---")
-    st.subheader("⏰ Overdue Tasks")
-    col_od1, col_od2, col_od3 = st.columns(3)
+    # Scheduled Reviews
+    db = _resolve_db()
     try:
-        db = _resolve_db()
-        # Past Due Classifications (>=5 days)
-        r_pd = snowflake_connector.execute_query(
-            f"""
-            select count(*) as CNT
-            from {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-            where coalesce(LAST_CLASSIFIED_DATE, CREATED_DATE, dateadd('day', -6, current_date())) < dateadd('day', -5, current_date())
-            """
-        ) or [] if db else []
-        col_od1.metric("Past Due Classifications", f"{int(r_pd[0].get('CNT',0)) if r_pd else 0}")
-    except Exception:
-        col_od1.metric("Past Due Classifications", "-")
-    try:
-        # Missed Reviews (NEXT_RUN in past)
-        if db and (_table_exists(db, 'DATA_GOVERNANCE', 'REVIEW_SCHEDULES') or _view_exists(db, 'DATA_GOVERNANCE', 'REVIEW_SCHEDULES')):
-            r_mr = snowflake_connector.execute_query(
-                f"""
-                select count(*) as CNT
-                from {db}.DATA_GOVERNANCE.REVIEW_SCHEDULES
-                where NEXT_RUN < current_date()
-                """
+        if db and _view_exists(db, 'DATA_CLASSIFICATION_GOVERNANCE', 'VW_SCHEDULED_REVIEWS'):
+            rows = snowflake_connector.execute_query(
+                f"SELECT * FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_SCHEDULED_REVIEWS"
             ) or []
         else:
-            r_mr = []
-        col_od2.metric("Missed Reviews", f"{int(r_mr[0].get('CNT',0)) if r_mr else 0}")
-    except Exception:
-        col_od2.metric("Missed Reviews", "-")
-    col_od3.metric("Escalation Notifications", "Configured via alerting")
-
-    st.markdown("---")
-    st.subheader("🗂️ Review History")
-    try:
-        db = _resolve_db()
-        if db and (_table_exists(db, 'DATA_GOVERNANCE', 'REVIEW_HISTORY') or _view_exists(db, 'DATA_GOVERNANCE', 'REVIEW_HISTORY')):
-            hist = snowflake_connector.execute_query(
-                f"""
-                select *
-                from {db}.DATA_GOVERNANCE.REVIEW_HISTORY
-                order by COMPLETED_AT desc
-                limit 300
-                """
-            ) or []
-        else:
-            hist = []
-        if hist:
-            st.dataframe(pd.DataFrame(hist), use_container_width=True)
-        else:
-            st.info("No review history found.")
+            rows = []
     except Exception as e:
-        st.info("Review history table not available.")
+        rows = []
+        st.warning(f"Scheduled reviews view unavailable: {e}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        st.subheader("Scheduled Reviews")
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("Scheduled reviews view not found; fallback snapshots/tables will be used when available.")
 
     st.markdown("---")
-    st.subheader("✅ Approval Workflows")
-    st.caption("Multi-level approvals, delegation rules, and approval chains")
-    st.info("Configure advanced workflows in policy engine or integrate with your IAM/ITSM. Current UI supports single-level approvals in Exceptions.")
 
+    # Overdue Tasks
+    try:
+        if db and _view_exists(db, 'DATA_CLASSIFICATION_GOVERNANCE', 'VW_OVERDUE_TASKS'):
+            rows = snowflake_connector.execute_query(
+                f"SELECT * FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_OVERDUE_TASKS"
+            ) or []
+        else:
+            rows = []
+    except Exception as e:
+        rows = []
+        st.warning(f"Overdue tasks view unavailable: {e}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        st.subheader("Overdue Tasks")
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("Overdue tasks view not found; fallback snapshots/tables will be used when available.")
+
+    st.markdown("---")
+
+    # Review History
+    try:
+        if db and _view_exists(db, 'DATA_CLASSIFICATION_GOVERNANCE', 'VW_REVIEW_HISTORY'):
+            rows = snowflake_connector.execute_query(
+                f"SELECT * FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_REVIEW_HISTORY"
+            ) or []
+        else:
+            rows = []
+    except Exception as e:
+        rows = []
+        st.warning(f"Review history view unavailable: {e}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        st.subheader("Review History")
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("Review history view not found; fallback snapshots/tables will be used when available.")
+
+    st.markdown("---")
+
+    # Approval Workflows
+    try:
+        if db and _view_exists(db, 'DATA_CLASSIFICATION_GOVERNANCE', 'VW_APPROVAL_WORKFLOWS'):
+            rows = snowflake_connector.execute_query(
+                f"SELECT * FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_APPROVAL_WORKFLOWS"
+            ) or []
+        else:
+            rows = []
+    except Exception as e:
+        rows = []
+        st.warning(f"Approval workflows view unavailable: {e}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        st.subheader("Approval Workflows")
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("Approval workflows view not found; fallback snapshots/tables will be used when available.")
+
+    st.markdown("---")
+
+    # Violations
+    try:
+        if db and _view_exists(db, 'DATA_CLASSIFICATION_GOVERNANCE', 'VW_POLICY_VIOLATIONS'):
+            rows = snowflake_connector.execute_query(
+                f"SELECT * FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_POLICY_VIOLATIONS"
+            ) or []
+        else:
+            rows = []
+    except Exception as e:
+        rows = []
+        st.warning(f"Violations view unavailable: {e}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        st.subheader("Violations")
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("Violations view not found; fallback snapshots/tables will be used when available.")
+
+    st.markdown("---")
+    # Corrective Actions
+    try:
+        if db and _view_exists(db, 'DATA_CLASSIFICATION_GOVERNANCE', 'VW_CORRECTIVE_ACTIONS'):
+            rows = snowflake_connector.execute_query(
+                f"SELECT * FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_CORRECTIVE_ACTIONS"
+            ) or []
+        else:
+            rows = []
+    except Exception as e:
+        rows = []
+        st.warning(f"Corrective actions view unavailable: {e}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        st.subheader("Corrective Actions")
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("Corrective actions view not found; fallback snapshots/tables will be used when available.")
+
+    st.markdown("---")
+    # Disciplinary Actions
+    try:
+        if db and _view_exists(db, 'DATA_CLASSIFICATION_GOVERNANCE', 'VW_DISCIPLINARY_ACTIONS'):
+            rows = snowflake_connector.execute_query(
+                f"SELECT * FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_DISCIPLINARY_ACTIONS"
+            ) or []
+        else:
+            rows = []
+    except Exception as e:
+        rows = []
+        st.warning(f"Disciplinary actions view unavailable: {e}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        st.subheader("Disciplinary Actions")
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("Disciplinary actions view not found; fallback snapshots/tables will be used when available.")
 
 with tab_viol:
     # Controls to run detection and manage exceptions
@@ -985,9 +1003,9 @@ with tab_viol:
         if db and (_table_exists(db, 'DATA_GOVERNANCE', 'ASSET_INVENTORY') or _view_exists(db, 'DATA_GOVERNANCE', 'ASSET_INVENTORY')):
             inv = snowflake_connector.execute_query(
                 f"""
-                SELECT FULL_NAME, COALESCE(BUSINESS_UNIT, SPLIT_PART(FULL_NAME,'.',2)) AS BU_OR_SCHEMA,
-                       CLASSIFICATION_LEVEL, CIA_CONF, CIA_INT, CIA_AVAIL
-                FROM {db}.DATA_GOVERNANCE.ASSET_INVENTORY
+                SELECT FULLY_QUALIFIED_NAME AS FULL_NAME, COALESCE(BUSINESS_UNIT, SPLIT_PART(FULLY_QUALIFIED_NAME,'.',2)) AS BU_OR_SCHEMA,
+                       CLASSIFICATION_LABEL AS CLASSIFICATION_LEVEL, CONFIDENTIALITY_LEVEL AS CIA_CONF, INTEGRITY_LEVEL AS CIA_INT, AVAILABILITY_LEVEL AS CIA_AVAIL
+                FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
                 """
             ) or []
         else:
@@ -1336,9 +1354,9 @@ with tab_ai:
                     try:
                         prev = snowflake_connector.execute_query(
                             f"""
-                            SELECT COALESCE(CIA_CONF,0) AS C, COALESCE(CIA_INT,0) AS I, COALESCE(CIA_AVAIL,0) AS A
-                            FROM {db}.DATA_GOVERNANCE.ASSET_INVENTORY
-                            WHERE FULL_NAME = %(f)s
+                            SELECT CAST(COALESCE(CONFIDENTIALITY_LEVEL,'0') AS INT) AS C, CAST(COALESCE(INTEGRITY_LEVEL,'0') AS INT) AS I, CAST(COALESCE(AVAILABILITY_LEVEL,'0') AS INT) AS A
+                            FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                            WHERE FULLY_QUALIFIED_NAME = %(f)s
                             LIMIT 1
                             """,
                             {"f": sel_tbl},
@@ -1361,10 +1379,138 @@ with tab_ai:
                     else:
                         st.success("Classification applied and logged.")
 
+with tab_auto:
+    st.subheader("🚀 Automated Data Classification Pipeline")
+    st.markdown("""
+    **Snowflake-native AI assistant system** that automatically discovers data assets,
+    performs semantic category detection, recommends CIA levels, and applies governance tags.
+    """)
+
+    # Pipeline controls
+    db = _resolve_db()
+    if not db:
+        st.info("Select a database from the sidebar to proceed.")
+    else:
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            schema_filter = st.selectbox(
+                "Schema Filter (optional)",
+                options=["All"] + _list_schemas(db),
+                index=0,
+                help="Limit discovery to specific schema"
+            )
+            schema_filter = None if schema_filter == "All" else schema_filter
+
+        with col2:
+            max_assets = st.number_input(
+                "Max Assets to Process",
+                min_value=10,
+                max_value=10000,
+                value=1000,
+                step=100,
+                help="Limit for scalability and testing"
+            )
+
+        with col3:
+            if st.button("🔍 Discover & Classify Assets", type="primary"):
+                if comprehensive_detection_service is None:
+                    st.error("Comprehensive detection service not available.")
+                else:
+                    with st.spinner("Running automated classification pipeline..."):
+                        try:
+                            # Execute full pipeline
+                            result = comprehensive_detection_service.execute_full_pipeline(
+                                database=db,
+                                schema_filter=schema_filter,
+                                max_assets=max_assets
+                            )
+
+                            if result.get('status') == 'COMPLETED':
+                                st.success("✅ Pipeline completed successfully!")
+
+                                # Display results
+                                col_a, col_b, col_c = st.columns(3)
+                                with col_a:
+                                    st.metric("Assets Processed", result.get('total_assets_processed', 0))
+                                with col_b:
+                                    st.metric("Detection Accuracy", f"{result.get('detection_accuracy', 0):.1%}")
+                                with col_c:
+                                    st.metric("Duration", f"{result.get('duration_seconds', 0):.1f}s")
+
+                                # Classification distribution
+                                if result.get('classification_distribution'):
+                                    st.subheader("📊 Classification Results")
+                                    dist_df = pd.DataFrame(
+                                        list(result['classification_distribution'].items()),
+                                        columns=['Category', 'Count']
+                                    )
+                                    st.bar_chart(dist_df.set_index('Category'))
+
+                                # Success details
+                                with st.expander("📋 Pipeline Details"):
+                                    st.json(result)
+
+                            else:
+                                st.error(f"❌ Pipeline failed: {result.get('error', 'Unknown error')}")
+
+                        except Exception as e:
+                            st.error(f"❌ Pipeline execution error: {str(e)}")
+
+        # Pipeline status and monitoring
+        st.markdown("---")
+        st.subheader("📈 Pipeline Monitoring")
+
+        # Recent pipeline runs
+        try:
+            if db and _table_exists(db, 'DATA_GOVERNANCE', 'CLASSIFICATION_AUDIT_LOG'):
+                recent_runs = snowflake_connector.execute_query(f"""
+                    SELECT EVENT_TYPE, ASSET_PATH, CREATED_AT, DETAILS
+                    FROM {db}.DATA_GOVERNANCE.CLASSIFICATION_AUDIT_LOG
+                    WHERE EVENT_TYPE LIKE 'PIPELINE%'
+                    ORDER BY CREATED_AT DESC
+                    LIMIT 10
+                """) or []
+
+                if recent_runs:
+                    runs_df = pd.DataFrame(recent_runs)
+                    runs_df['CREATED_AT'] = pd.to_datetime(runs_df['CREATED_AT']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                    st.dataframe(runs_df, use_container_width=True)
+                else:
+                    st.info("No recent pipeline runs found.")
+        except Exception as e:
+            st.warning(f"Could not load pipeline history: {e}")
+
+        # Quick actions
+        st.markdown("---")
+        st.subheader("⚡ Quick Actions")
+
+        action_col1, action_col2, action_col3 = st.columns(3)
+
+        with action_col1:
+            if st.button("🔄 Refresh Configuration", help="Reload governance configuration"):
+                if comprehensive_detection_service:
+                    comprehensive_detection_service._config = comprehensive_detection_service._load_configuration()
+                    st.success("Configuration refreshed!")
+                else:
+                    st.error("Service not available")
+
+        with action_col2:
+            if st.button("📊 Update Dashboard Metrics", help="Refresh compliance metrics"):
+                st.cache_data.clear()
+                st.success("Metrics refreshed!")
+
+        with action_col3:
+            if st.button("🧹 Clear Cache", help="Clear cached data"):
+                st.cache_data.clear()
+                st.success("Cache cleared!")
+
 # Explanation for non-technical users
-st.info("""💡 **What you're seeing:**
+st.info("""� **What you're seeing:**
 - Compliance Dashboard: policy compliance metrics, classification coverage (by framework, BU, data type), trend analysis, and audit-ready reports
 - Review Management: schedule reviews, see overdue tasks (5-day rule), and view review history
 - Policy Violations: violation log, corrective action tracking, and evidence pack export for audits
+- AI Assistant: manual classification with AI suggestions
+- **Automated Classification**: Full pipeline for automatic discovery, classification, and tagging
 - Data sources are Snowflake metadata (ACCOUNT_USAGE, INFORMATION_SCHEMA) and governance tables where available
 """)

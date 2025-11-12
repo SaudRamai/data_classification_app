@@ -137,7 +137,7 @@ Dashboard (📊) | Review Management (🔄) | Policy Violations (🚨)
   - Corrective Action: text input and best-effort `compliance_service.record_corrective_action(...)`.
 - **Compliance Matrix & Evidence Packs**
   - Violations: `{db}.DATA_GOVERNANCE.VIOLATIONS` (ID, RULE_CODE, SEVERITY, DESCRIPTION, ASSET_FULL_NAME, DETECTED_AT, STATUS).
-  - Inventory join: `{db}.DATA_GOVERNANCE.ASSET_INVENTORY` (FULL_NAME, BU/Schema, classification level, CIA triad fields) – optional.
+  - Inventory join: `{db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS` (FULLY_QUALIFIED_NAME, BU/Schema, classification level, CIA triad fields) – optional.
   - Filtering: Uses `sel` (database/schema/table). Intended severity/time facets reference an undefined `facets` variable (see Known Issues).
   - Matrix: pivot by `RULE_CODE` x `BU_OR_SCHEMA` with counts.
   - Drill-down: rule + BU/Schema selection shows subset table.

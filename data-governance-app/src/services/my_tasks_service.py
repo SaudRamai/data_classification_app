@@ -70,7 +70,7 @@ def _resolve_objects() -> Dict[str, Optional[str]]:
         pass
 
     # Defaults if not provided
-    schema = schema or "DATA_GOVERNANCE"
+    schema = schema or "DATA_CLASSIFICATION_GOVERNANCE"
     tasks_name = tasks_name or "CLASSIFICATION_TASKS"
     decisions_name = decisions_name or "CLASSIFICATION_DECISIONS"
 

@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 # Expected governance schema and at least one of these tables
 _EXPECTED_SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 _EXPECTED_TABLES = (
-    "ASSET_INVENTORY",
     "ASSETS",
     "CLASSIFICATION_HISTORY",
     "RECLASSIFICATION_REQUESTS",

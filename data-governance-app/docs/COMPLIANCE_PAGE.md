@@ -161,7 +161,7 @@ tab_dash, tab_reviews, tab_viol = st.tabs([
   - Shows violation details (JSON) and allows recording a corrective action (best-effort API call, with local capture fallback).
 - **Compliance Matrix & Evidence Packs**
   - Violations: `{db}.DATA_GOVERNANCE.VIOLATIONS`.
-  - Inventory (merge): `{db}.DATA_GOVERNANCE.ASSET_INVENTORY` for BU/Schema and CIA attributes.
+  - Inventory join: `{db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS` (FULLY_QUALIFIED_NAME, BU/Schema, classification level, CIA triad fields) – optional.
   - Applies dataset filters from `sel` (database/schema/table). Note: code references an undefined `facets` object for severity/time filtering.
   - Displays a pivot matrix: `RULE_CODE` x `BU_OR_SCHEMA` with counts.
   - Drill down by rule and BU/Schema and export an Evidence Pack ZIP containing:

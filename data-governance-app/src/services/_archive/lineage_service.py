@@ -63,11 +63,11 @@ class lineage_service:
             # Prefer inventory if available
             q = f"""
                 SELECT FULL_NAME, COALESCE(DATA_CLASSIFICATION,'Unclassified') AS DATA_CLASSIFICATION,
-                       COALESCE(C,0) AS C, COALESCE(I,0) AS I, COALESCE(A,0) AS A,
-                       COALESCE(BUSINESS_UNIT, SPLIT_PART(FULL_NAME,'.',2)) AS BU,
-                       OWNER, CUSTODIAN, UPDATED_AT AS LAST_UPDATED_AT
-                FROM {db}.DATA_GOVERNANCE.ASSET_INVENTORY
-                WHERE FULL_NAME IN ({','.join(['%s']*len(full_names))})
+                       CAST(COALESCE(CONFIDENTIALITY_LEVEL,'0') AS INT) AS C, CAST(COALESCE(INTEGRITY_LEVEL,'0') AS INT) AS I, CAST(COALESCE(AVAILABILITY_LEVEL,'0') AS INT) AS A,
+                       COALESCE(BUSINESS_UNIT, SPLIT_PART(FULLY_QUALIFIED_NAME,'.',2)) AS BU,
+                       DATA_OWNER_EMAIL AS OWNER, DATA_CUSTODIAN_EMAIL AS CUSTODIAN, LAST_MODIFIED_TIMESTAMP AS LAST_UPDATED_AT
+                FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                WHERE FULLY_QUALIFIED_NAME IN ({','.join(['%s']*len(full_names))})
             """
             rows = snowflake_connector.execute_query(q, tuple(full_names)) or []
             return pd.DataFrame(rows)

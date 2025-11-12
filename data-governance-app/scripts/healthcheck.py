@@ -54,9 +54,9 @@ def main():
     try:
         rows = snowflake_connector.execute_query(
             """
-            SELECT FULL_NAME
-            FROM PILOT_DB.DATA_GOVERNANCE.ASSET_INVENTORY
-            ORDER BY ROW_COUNT DESC NULLS LAST, LAST_SEEN DESC
+            SELECT FULLY_QUALIFIED_NAME AS FULL_NAME
+            FROM PILOT_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+            ORDER BY CREATED_TIMESTAMP DESC
             LIMIT %(lim)s
             """,
             {'lim': args.test_limit},

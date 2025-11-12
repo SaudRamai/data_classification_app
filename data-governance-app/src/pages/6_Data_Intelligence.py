@@ -60,6 +60,12 @@ def _run(query: str, params: Optional[Dict] = None) -> List[Dict]:
         List of dictionaries where each dictionary represents a row with column names as keys
     """
     try:
+        # Short-circuit invalid queries that reference an unknown DB placeholder
+        # e.g. "from None.INFORMATION_SCHEMA..." or "from NONE.INFORMATION_SCHEMA..."
+        q_upper = (query or '').upper()
+        if ('NONE.INFORMATION_SCHEMA' in q_upper) or (' NONE.' in q_upper) or (' FROM NONE.' in q_upper):
+            st.info("Select a database to view details.")
+            return []
         # Defensive: do not attempt a connection if credentials are missing
         if not _has_sf_creds():
             st.info("Snowflake session not established. Please login first.")
@@ -102,8 +108,8 @@ def _get_quality_dimensions(database: str = None, schema: str = None, table: str
                 COUNT(DISTINCT TABLE_NAME) as table_count,
                 SUM(CASE WHEN IS_NULLABLE = 'NO' THEN 1 ELSE 0 END) as non_nullable_cols,
                 COUNT(*) as total_columns
-            FROM INFORMATION_SCHEMA.COLUMNS 
-            WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
+            FROM SNOWFLAKE.ACCOUNT_USAGE.COLUMNS 
+            WHERE TABLE_CATALOG NOT LIKE 'SNOWFLAKE%'
         )
         SELECT 
             -- Calculate completeness (based on non-nullable columns)
@@ -157,8 +163,16 @@ def _get_quality_dimensions(database: str = None, schema: str = None, table: str
     except Exception as e:
         st.warning(f"Could not fetch quality dimensions: {e}")
 
-    # Return default values if there's an error or no data
-    return _empty_quality_dimension_metrics(datetime.utcnow().isoformat())
+    # Return simple flat default values if there's an error or no data
+    return {
+        'completeness': 0.0,
+        'accuracy': 0.0,
+        'consistency': 0.0,
+        'timeliness': 0.0,
+        'validity': 0.0,
+        'uniqueness': 0.0,
+        'overall_score': 0.0,
+    }
 
 
 def _empty_quality_dimension_metrics(timestamp: str) -> Dict[str, Dict[str, Any]]:
@@ -223,19 +237,14 @@ def _get_rule_status(database: str = None, schema: str = None, table: str = None
         # Build a simple query to get table statistics
         query = """
         SELECT 
-            -- Estimate passing rules based on non-nullable columns
-            (SELECT COUNT(*) * 0.8 FROM INFORMATION_SCHEMA.COLUMNS 
-             WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
-             AND IS_NULLABLE = 'NO') as passing,
+            -- Estimate passing rules based on non-nullable columns (account-wide)
+            (SELECT COUNT(*) * 0.8 FROM SNOWFLAKE.ACCOUNT_USAGE.COLUMNS WHERE IS_NULLABLE = 'NO') as passing,
             
             -- Estimate warnings (placeholder)
             5 as warning,
             
             -- Estimate failing (placeholder)
             2 as failing
-        FROM INFORMATION_SCHEMA.TABLES 
-        WHERE TABLE_SCHEMA = 'INFORMATION_SCHEMA'
-        LIMIT 1
         """
         
         result = _run(query)
@@ -339,12 +348,12 @@ def _get_quality_metrics(database: str = None, schema: str = None, table: str = 
         st.error(f"Error in _get_quality_metrics: {str(e)}")
         rows = _run(
             """
-            select database_name 
-            from information_schema.databases 
-            where not regexp_like(database_name, '^_')
-            and database_name not like 'SNOWFLAKE%'  # Exclude system databases
-            order by database_name
-            limit 500  # Safety limit
+            select DATABASE_NAME 
+            from SNOWFLAKE.ACCOUNT_USAGE.DATABASES 
+            where not regexp_like(DATABASE_NAME, '^_')
+              and DATABASE_NAME not like 'SNOWFLAKE%'
+            order by DATABASE_NAME
+            limit 500
             """
         ) or []
         return [r["DATABASE_NAME"] for r in rows if r.get("DATABASE_NAME")]
@@ -869,10 +878,21 @@ def _databases(warehouse: Optional[str] = None) -> List[str]:
         return []
 
 @st.cache_data(ttl=300, show_spinner=False)  # Cache for 5 minutes
-def _schemas(database: str, warehouse: Optional[str] = None) -> List[str]:
-    """Return list of schemas for a database, optionally filtered by warehouse."""
+def _schemas(database: Optional[str], warehouse: Optional[str] = None) -> List[str]:
+    """Return list of schemas for a database, or account-level if no database is selected."""
     if not database or database == "(none)":
-        return []
+        # No DB selected: show account-level schemas (best-effort, exclude INFORMATION_SCHEMA)
+        try:
+            if warehouse and warehouse != "(none)":
+                _use_warehouse(warehouse)
+            rows = _run("SHOW SCHEMAS IN ACCOUNT LIMIT 1000") or []
+            return [
+                r.get("name") or r.get("NAME")
+                for r in rows
+                if (r.get("name") or r.get("NAME")) and (r.get("name") or r.get("NAME")).upper() != 'INFORMATION_SCHEMA'
+            ]
+        except Exception:
+            return []
         
     cache_key = f"schemas_{database}_{warehouse or 'none'}"
     
@@ -955,10 +975,9 @@ def _get_object_type(database: str, schema: str, object_name: str) -> str:
     except Exception:
         return "UNKNOWN"
 
-def _objects(database: str, schema: Optional[str], warehouse: Optional[str] = None) -> List[Dict[str, str]]:
-    """Return list of tables/views for a database and schema, optionally filtered by warehouse.
-    Returns a list of dictionaries with 'name' and 'type' keys."""
-    if not database or not schema or schema == "All":
+def _objects(database: Optional[str], schema: Optional[str], warehouse: Optional[str] = None) -> List[str]:
+    """Return list of FQN tables/views. If schema is None/'All', list across all schemas for the DB."""
+    if not database or database == "(none)":
         return []
         
     try:
@@ -966,49 +985,84 @@ def _objects(database: str, schema: Optional[str], warehouse: Optional[str] = No
         if warehouse:
             _use_warehouse(warehouse)
             
-        # First try INFORMATION_SCHEMA
+        # Build WHERE clause depending on schema selection
+        schema_filter = "" if (schema is None or schema == "All") else "WHERE TABLE_SCHEMA = %(schema)s"
         try:
-            # Use proper SQL identifier quoting for the database name
             query = f"""
-                SELECT 
-                    TABLE_SCHEMA, 
-                    TABLE_NAME, 
-                    TABLE_TYPE 
-                FROM "{database}".INFORMATION_SCHEMA.TABLES 
-                WHERE TABLE_SCHEMA = %(schema)s
-                AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')
-                ORDER BY TABLE_NAME
+                SELECT TABLE_SCHEMA, TABLE_NAME
+                FROM "{database}".INFORMATION_SCHEMA.TABLES
+                {schema_filter}
+                  {"" if schema_filter else "WHERE"} TABLE_TYPE IN ('BASE TABLE','VIEW')
+                  {"AND" if schema_filter else "AND"} TABLE_SCHEMA <> 'INFORMATION_SCHEMA'
+                ORDER BY TABLE_SCHEMA, TABLE_NAME
             """
-            
-            rows = _run(query, {"schema": schema}) or []
-            return [
-                f"{database}.{r['TABLE_SCHEMA']}.{r['TABLE_NAME']}" 
-                for r in rows 
-                if r.get("TABLE_NAME") and r.get("TABLE_SCHEMA")
-            ]
-        except Exception as e:
-            st.warning(f"INFORMATION_SCHEMA query failed, falling back to SHOW TABLES: {str(e)}")
-            pass
-            
-        # Fallback to SHOW TABLES if INFORMATION_SCHEMA fails
-        try:
-            rows = _run(f"SHOW TABLES IN {database}.{schema}") or []
-            return [
-                f"{database}.{schema}.{r.get('name') or r.get('NAME')}" 
-                for r in rows 
-                if r.get("name") or r.get("NAME")
-            ]
-        except Exception as e:
-            st.error(f"Error loading objects: {str(e)}")
+            params = ({"schema": schema} if (schema and schema != "All") else None)
+            rows = _run(query, params) or []
+            return [f"{database}.{r['TABLE_SCHEMA']}.{r['TABLE_NAME']}" for r in rows if r.get("TABLE_NAME") and r.get("TABLE_SCHEMA")]
+        except Exception:
+            # Fallback to SHOW if INFORMATION_SCHEMA fails and schema provided
+            if schema and schema != "All":
+                try:
+                    rows = _run(f"SHOW TABLES IN {database}.{schema}") or []
+                    return [f"{database}.{schema}.{r.get('name') or r.get('NAME')}" for r in rows if r.get('name') or r.get('NAME')]
+                except Exception:
+                    return []
             return []
             
     except Exception as e:
         st.error(f"Error: {str(e)}")
         return []
 
+@st.cache_data(ttl=300)
+def _objects_with_types(database: Optional[str], schema: Optional[str], warehouse: Optional[str] = None) -> List[Dict[str, str]]:
+    """Return list of objects with their types for a database, optionally filtered by schema.
+    Each item: { 'FQN': 'DB.SCHEMA.NAME', 'SCHEMA': ..., 'NAME': ..., 'TYPE': 'BASE TABLE'|'VIEW'|<other> }
+    """
+    if not database or database == "(none)":
+        return []
+    try:
+        if warehouse:
+            _use_warehouse(warehouse)
+
+        schema_filter_tbl = "" if (schema is None or schema == "All") else "WHERE TABLE_SCHEMA = %(schema)s"
+        schema_filter_vw = "" if (schema is None or schema == "All") else "WHERE TABLE_SCHEMA = %(schema)s"
+        query = f"""
+            SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+            FROM "{database}".INFORMATION_SCHEMA.TABLES
+            {schema_filter_tbl}
+              {"AND" if schema_filter_tbl else "WHERE"} TABLE_SCHEMA <> 'INFORMATION_SCHEMA'
+            UNION ALL
+            SELECT TABLE_SCHEMA, TABLE_NAME, 'VIEW' AS TABLE_TYPE
+            FROM "{database}".INFORMATION_SCHEMA.VIEWS
+            {schema_filter_vw}
+              {"AND" if schema_filter_vw else "WHERE"} TABLE_SCHEMA <> 'INFORMATION_SCHEMA'
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
+        """
+        params = ({"schema": schema} if (schema and schema != "All") else None)
+        rows = _run(query, params) or []
+        out: List[Dict[str, str]] = []
+        for r in rows:
+            sch = r.get("TABLE_SCHEMA")
+            nm = r.get("TABLE_NAME")
+            typ = r.get("TABLE_TYPE") or "UNKNOWN"
+            if sch and nm:
+                out.append({
+                    "FQN": f"{database}.{sch}.{nm}",
+                    "SCHEMA": sch,
+                    "NAME": nm,
+                    "TYPE": typ
+                })
+        return out
+    except Exception as e:
+        st.warning(f"Could not list objects with types: {str(e)[:200]}")
+        return []
+
 @st.cache_data(ttl=DEFAULT_TTL)
 def _columns(db: str, schema: str, object_name: str) -> List[str]:
     try:
+        if not db or not schema or not object_name or db.upper() in ("NONE", "NULL"):
+            st.info("Select a database, schema, and table to view columns.")
+            return []
         rows = _run(
             f"""
             select COLUMN_NAME
@@ -1060,6 +1114,8 @@ def _estimate_size(fqn: str) -> Optional[int]:
 @st.cache_data(ttl=DEFAULT_TTL)
 def _storage_metrics(db: str, schema: str, table: str) -> Optional[Dict[str, Any]]:
     try:
+        if not db or not schema or not table or db.upper() in ("NONE", "NULL"):
+            return None
         rows = _run(
             f"""
             select coalesce(ACTIVE_BYTES,0) as ACTIVE_BYTES,
@@ -1316,30 +1372,31 @@ with st.sidebar:
             else:
                 wh_display = wh_opts or []
             
-            # Show warehouse selector if we have options or a current warehouse
-            if wh_display:
-                sel_wh = st.selectbox(
-                    "Warehouse", 
-                    options=wh_display,
-                    index=wh_display.index(cur_wh) if (cur_wh and cur_wh in wh_display) else 0,
-                    key="int_warehouse",
-                    help="Select a warehouse to run queries against"
-                )
-                
-                # Update warehouse in session state if changed
-                if sel_wh and sel_wh != cur_wh:
-                    try:
-                        _use_warehouse(sel_wh)
-                        st.session_state['sf_warehouse'] = sel_wh
-                        st.caption(f"Using warehouse: {sel_wh}")
-                        # Clear database cache when warehouse changes
-                        st.cache_data.clear()
-                        st.rerun()
-                    except Exception as e:
-                        st.warning(f"Failed to set warehouse: {e}")
-                        # If warehouse change fails, revert to previous selection
-                        if cur_wh:
-                            st.session_state['int_warehouse'] = cur_wh
+            # Show warehouse selector with 'All' default
+            options_wh = ["All"] + (wh_display or [])
+            default_wh_idx = options_wh.index(cur_wh) if (cur_wh and cur_wh in options_wh) else 0
+            sel_wh = st.selectbox(
+                "Warehouse", 
+                options=options_wh,
+                index=default_wh_idx,
+                key="int_warehouse",
+                help="Select a warehouse to run queries against"
+            )
+            
+            # Update warehouse in session state if changed
+            if sel_wh and sel_wh != "All" and sel_wh != cur_wh:
+                try:
+                    _use_warehouse(sel_wh)
+                    st.session_state['sf_warehouse'] = sel_wh
+                    st.caption(f"Using warehouse: {sel_wh}")
+                    # Clear database cache when warehouse changes
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.warning(f"Failed to set warehouse: {e}")
+                    # If warehouse change fails, revert to previous selection
+                    if cur_wh:
+                        st.session_state['int_warehouse'] = cur_wh
             
             # No manual warehouse input, only use the dropdown
             
@@ -1359,7 +1416,7 @@ with st.sidebar:
     
     # 2. Database Selection (filtered by selected warehouse)
     db_opts = []
-    if sel_wh and sel_wh != "(none)":
+    if sel_wh and sel_wh not in ("All", "(none)"):
         try:
             db_opts = _databases(warehouse=sel_wh)
         except Exception as e:
@@ -1368,14 +1425,14 @@ with st.sidebar:
     cur_db = st.session_state.get('sf_database')
     active_db = st.selectbox(
         "Database",
-        options=["(none)"] + (db_opts or []),
-        index=((["(none)"] + db_opts).index(cur_db) if cur_db in db_opts else 0) if db_opts else 0,
+        options=["All"] + (db_opts or []),
+        index=((["All"] + (db_opts or [])).index(cur_db) if (cur_db and cur_db in (["All"] + (db_opts or []))) else 0),
         key="int_database",
         help="Select a database to filter schemas and objects"
     )
     
     # Update database in session state if changed
-    if active_db and active_db != "(none)" and active_db != cur_db:
+    if active_db and active_db not in ("All", "(none)") and active_db != cur_db:
         st.session_state['sf_database'] = active_db
         # Clear schema and object selections when database changes
         if 'prev_schema' in st.session_state:
@@ -1383,108 +1440,62 @@ with st.sidebar:
         if 'prev_object' in st.session_state:
             del st.session_state['prev_object']
     
-    # 3. Schema Selection (filtered by selected database and warehouse)
-    if active_db and active_db != "(none)":
-        with st.spinner("Loading schemas..."):
-            schemas = _schemas(active_db, warehouse=sel_wh if sel_wh != "(none)" else None)
-        sch_opts = ["All"] + (schemas or [])
-        
-        # Try to maintain the previously selected schema if it still exists
-        prev_schema = st.session_state.get('prev_schema')
-        default_schema_idx = 0
-        if prev_schema and prev_schema in sch_opts:
-            default_schema_idx = sch_opts.index(prev_schema)
-            
-        sel_schema = st.selectbox(
-            "Schema",
-            options=sch_opts,
-            index=default_schema_idx,
-            key="int_schema",
-            help="Select a schema to filter objects"
+    # 3. Schema Selection (shows even when database is none)
+    with st.spinner("Loading schemas..."):
+        schemas = _schemas(active_db if active_db and active_db not in ("All", "(none)") else None, warehouse=sel_wh if sel_wh not in ("All", "(none)") else None)
+    sch_opts = ["All"] + (schemas or [])
+    prev_schema = st.session_state.get('prev_schema')
+    default_schema_idx = sch_opts.index(prev_schema) if (prev_schema and prev_schema in sch_opts) else 0
+    sel_schema = st.selectbox(
+        "Schema",
+        options=sch_opts,
+        index=default_schema_idx,
+        key="int_schema",
+        help="Select a schema to filter objects"
+    )
+    st.session_state.prev_schema = sel_schema
+    if 'prev_schema' in st.session_state and prev_schema != sel_schema and 'prev_object' in st.session_state:
+        del st.session_state['prev_object']
+
+    # 4. Object Selection (works when schema is 'All' by listing across all schemas)
+    objects_typed: List[Dict[str, str]] = []
+    if active_db and active_db not in ("All", "(none)"):
+        with st.spinner("Loading objects..."):
+            objects_typed = _objects_with_types(
+                active_db,
+                None if sel_schema == "All" else sel_schema,
+                warehouse=sel_wh if sel_wh not in ("All", "(none)") else None,
+            )
+    display_names = ["All"]
+    obj_map = {"All": "All"}
+    for o in (objects_typed or []):
+        try:
+            fqn = o.get("FQN")
+            obj_schema = o.get("SCHEMA")
+            obj_name = o.get("NAME")
+            obj_type = o.get("TYPE") or "UNKNOWN"
+            display_name = f"{obj_schema}.{obj_name} ({obj_type})"
+            display_names.append(display_name)
+            obj_map[display_name] = fqn
+        except Exception:
+            if fqn:
+                display_names.append(fqn)
+                obj_map[fqn] = fqn
+    prev_object = st.session_state.get('prev_object')
+    prev_display_name = next((k for k,v in obj_map.items() if v == prev_object), "All") if prev_object else "All"
+    try:
+        selected_display = st.selectbox(
+            "Object (table/view)",
+            options=display_names,
+            index=(display_names.index(prev_display_name) if prev_display_name in display_names else 0),
+            key="int_object_display_2",
+            help="Select a table or view to analyze"
         )
-        
-        # Update the previous schema in session state
-        st.session_state.prev_schema = sel_schema
-        
-        # Clear object selection if schema changes
-        if 'prev_schema' in st.session_state and prev_schema != sel_schema:
-            if 'prev_object' in st.session_state:
-                del st.session_state['prev_object']
-        
-        # 4. Object Selection (filtered by selected schema, database, and warehouse)
-        if sel_schema and sel_schema != "All":
-            with st.spinner("Loading objects..."):
-                # Get objects with their types
-                objects = _objects(active_db, sel_schema, warehouse=sel_wh if sel_wh != "(none)" else None) if sel_schema != "All" else []
-                
-                # Create display names that include the object type
-                display_names = ["None"]
-                obj_map = {"None": None}  # Maps display name to object info
-                
-                for obj in (objects or []):
-                    try:
-                        obj_name = obj.get('name')
-                        obj_type = obj.get('type', 'UNKNOWN').upper()
-                        display_name = f"{obj_name} ({obj_type})"
-                        display_names.append(display_name)
-                        obj_map[display_name] = obj
-                    except Exception as e:
-                        continue
-                
-                # Removed duplicate 'Table/View' selectbox to avoid double filtering
-            
-            # Create display names that include the object type
-            display_names = ["None"]
-            obj_map = {"None": "None"}  # Maps display name to full object name
-            
-            for obj in (objects or []):
-                try:
-                    # Extract the object name (last part of the FQN)
-                    obj_name = obj.split('.')[-1] if '.' in obj else obj
-                    # Get object type (TABLE/VIEW) from INFORMATION_SCHEMA
-                    obj_type = _get_object_type(active_db, sel_schema, obj_name)
-                    display_name = f"{obj_name} ({obj_type})" if obj_type else obj_name
-                    display_names.append(display_name)
-                    obj_map[display_name] = obj
-                except Exception:
-                    display_names.append(obj)
-                    obj_map[obj] = obj
-            
-            # Try to maintain the previously selected object if it still exists
-            prev_object = st.session_state.get('prev_object')
-            default_obj_idx = 0
-            
-            # Find the display name for the previously selected object
-            prev_display_name = "None"
-            if prev_object and prev_object != "None":
-                for disp_name, full_name in obj_map.items():
-                    if full_name == prev_object:
-                        prev_display_name = disp_name
-                        break
-            
-            # Show the selectbox with display names
-            try:
-                selected_display = st.selectbox(
-                    "Object (table/view)",
-                    options=display_names,
-                    index=display_names.index(prev_display_name) if prev_display_name in display_names else 0,
-                    key="int_object_display_2",
-                    help="Select a table or view to analyze"
-                )
-                
-                # Map the selected display name back to the full object name
-                sel_object = obj_map.get(selected_display, "None")
-                
-                # Update the previous object in session state
-                st.session_state.prev_object = sel_object
-            except Exception as e:
-                st.error(f"Error loading objects: {str(e)}")
-                sel_object = "None"
-        else:
-            sel_object = "None"
-    else:
-        sel_schema = "All"
-        sel_object = "None"
+        sel_object = obj_map.get(selected_display, "All")
+        st.session_state.prev_object = sel_object
+    except Exception as e:
+        st.error(f"Error loading objects: {str(e)}")
+        sel_object = "All"
     
     # Time Range selector at the bottom of Filters section
     st.markdown("---")
@@ -1518,12 +1529,11 @@ q_tab, l_tab = st.tabs(["📈 Data Quality", "🕸️ Data Lineage"])
 # Data Quality
 # =====================================
 with q_tab:
-    dq_dash, dq_profile, dq_issues, dq_resolve, dq_rt = st.tabs([
+    dq_dash, dq_profile, dq_issues, dq_resolve = st.tabs([
         "Quality Metrics Dashboard",
         "Data Profiling Tools",
         "Quality Issues Log",
         "Resolution Tracking",
-        "Real-time (Info Schema)",
     ])
 
     # ---- Quality Metrics Dashboard ----
@@ -2007,75 +2017,206 @@ with q_tab:
         # Removed dataset-level details
         if sel_object and sel_object != "None":
             try:
-                db, schema, table = sel_object.split('.')
-                # Get table stats (parameterized and quoted)
-                stats = _run(
-                    f"""
-                    SELECT 
-                        ROW_COUNT,
-                        BYTES,
-                        LAST_ALTERED,
-                        DATEDIFF('hour', LAST_ALTERED, CURRENT_TIMESTAMP()) as hours_since_update
-                    FROM "{db}".INFORMATION_SCHEMA.TABLES 
-                    WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
-                    """,
-                    {"s": schema, "t": table},
-                )
-                
-                if stats:
-                    st.metric("Row Count", f"{int(stats[0].get('ROW_COUNT', 0)):,}")
-                    hours_since_update = int(stats[0].get('HOURS_SINCE_UPDATE', 0))
-                    last_updated = f"{hours_since_update} hours ago" if hours_since_update < 24 else f"{hours_since_update//24} days ago"
-                    st.metric("Last Updated", last_updated)
+                db, schema, table = _split_fqn(sel_object)
+                if db and schema and table:
+                    # Get table stats (parameterized and quoted)
+                    stats = _run(
+                        f"""
+                        SELECT 
+                            ROW_COUNT,
+                            BYTES,
+                            LAST_ALTERED,
+                            DATEDIFF('hour', LAST_ALTERED, CURRENT_TIMESTAMP()) as hours_since_update
+                        FROM "{db}".INFORMATION_SCHEMA.TABLES 
+                        WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
+                        """,
+                        {"s": schema, "t": table},
+                    )
+                    
+                    if stats:
+                        st.metric("Row Count", f"{int(stats[0].get('ROW_COUNT', 0)):,}")
+                        hours_since_update = int(stats[0].get('HOURS_SINCE_UPDATE', 0))
+                        last_updated = f"{hours_since_update} hours ago" if hours_since_update < 24 else f"{hours_since_update//24} days ago"
+                        st.metric("Last Updated", last_updated)
+                else:
+                    st.info("Select a fully-qualified object (DB.SCHEMA.TABLE) to show table statistics.")
             except Exception as e:
                 st.warning(f"Could not fetch table statistics: {str(e)}")
         
 
     # ---- Data Profiling Tools ----
     with dq_profile:
-        st.subheader("Data Profiling Tools")
+        st.subheader("")
         if sel_object and sel_object != "None":
             db, sch, name = _split_fqn(sel_object)
-            cols = _columns(db, sch, name)
-            st.caption(f"Object: {sel_object}")
-            # Information Schema and Account Usage views
-            cA, cB = st.columns(2)
-            with cA:
+            has_fqn = bool(db and sch and name)
+            if not has_fqn:
+                st.info("Select a fully-qualified object (DB.SCHEMA.TABLE) to view column metadata and statistics.")
+            cols = _columns(db, sch, name) if has_fqn else []
+            # Dimensions & Metrics — table-level for selected object
+            st.markdown("---")
+            st.subheader("Dimensions & Metrics")
+            d: Dict[str, Any] = {}
+            if has_fqn:
+                fqn = f"{db}.{sch}.{name}"
+                # Row count
                 try:
-                    rows = _run(
-                        f"""
-                        select COLUMN_NAME, DATA_TYPE, IS_NULLABLE
-                        from {db}.INFORMATION_SCHEMA.COLUMNS
-                        where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s
-                        order by ORDINAL_POSITION
-                        """,
+                    rc = _run(f"select count(*) as N from {fqn}") or []
+                    d["TOTAL_ROWS"] = int(rc[0].get("N") or 0) if rc else 0
+                except Exception:
+                    d["TOTAL_ROWS"] = 0
+                # Columns list for selectors/guards
+                try:
+                    crow = _run(
+                        f"select COLUMN_NAME from {db}.INFORMATION_SCHEMA.COLUMNS where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s order by ORDINAL_POSITION",
                         {"s": sch, "t": name}
                     ) or []
-                    st.markdown("**INFORMATION_SCHEMA.COLUMNS**")
-                    df_cols = pd.DataFrame(rows)
-                    st.dataframe(df_cols, width='stretch')
-                except Exception as e:
-                    st.info(f"Columns unavailable: {e}")
-            with cB:
+                    table_cols = [r.get("COLUMN_NAME") for r in crow if r.get("COLUMN_NAME")]
+                except Exception:
+                    table_cols = []
+                # Key column for uniqueness
+                default_key = next((c for c in table_cols if c and "ID" in c.upper()), (table_cols[0] if table_cols else None))
+                key_col = st.selectbox("Key column for uniqueness", options=table_cols, index=(table_cols.index(default_key) if (default_key in table_cols) else 0) if table_cols else None, key="dm_key_col") if table_cols else None
+                if key_col:
+                    try:
+                        uq = _run(f"select count(distinct \"{key_col}\") as D from {fqn}") or []
+                        distinct_c = int(uq[0].get("D") or 0) if uq else 0
+                        total = d.get("TOTAL_ROWS", 0)
+                        d["DISTINCT_ASSETS"] = distinct_c
+                        d["UNIQUENESS_PCT"] = round((distinct_c * 100.0 / (total or 1)), 2) if total else 0.0
+                        d["DUPLICATE_RECORDS"] = max(total - distinct_c, 0)
+                    except Exception:
+                        d["DISTINCT_ASSETS"] = 0
+                        d["UNIQUENESS_PCT"] = 0.0
+                        d["DUPLICATE_RECORDS"] = 0
+                # Completeness: compute % nulls for up to three indicative columns if they exist
+                def _pct_null(col: str) -> float:
+                    try:
+                        r = _run(f"select sum(iff(\"{col}\" is null,1,0)) as N, count(*) as T from {fqn}") or []
+                        n = int(r[0].get("N") or 0) if r else 0
+                        t = int(r[0].get("T") or 0) if r else 0
+                        return round((n * 100.0 / (t or 1)), 2) if t else 0.0
+                    except Exception:
+                        return 0.0
+                if "CLASSIFICATION_LABEL" in [c.upper() for c in table_cols]:
+                    d["NULL_PCT_CLASSIFICATION"] = _pct_null(next(c for c in table_cols if c.upper()=="CLASSIFICATION_LABEL"))
+                if "DATA_OWNER" in [c.upper() for c in table_cols]:
+                    d["NULL_PCT_OWNER"] = _pct_null(next(c for c in table_cols if c.upper()=="DATA_OWNER"))
+                if "BUSINESS_UNIT" in [c.upper() for c in table_cols]:
+                    d["NULL_PCT_BUSINESS_UNIT"] = _pct_null(next(c for c in table_cols if c.upper()=="BUSINESS_UNIT"))
+                # Validity examples (optional, guarded)
+                if "DATA_OWNER_EMAIL" in [c.upper() for c in table_cols]:
+                    try:
+                        vr = _run(
+                            f"select sum(iff(DATA_OWNER_EMAIL is not null and not regexp_like(DATA_OWNER_EMAIL, '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\\\.[A-Z]{{2,}}$', 'i'),1,0)) as BAD, count(*) as T from {fqn}"
+                        ) or []
+                        bad = int(vr[0].get("BAD") or 0) if vr else 0
+                        t = int(vr[0].get("T") or 0) if vr else 0
+                        d["INVALID_EMAIL_PCT"] = round((bad * 100.0 / (t or 1)), 2) if t else 0.0
+                    except Exception:
+                        d["INVALID_EMAIL_PCT"] = None
+                if "REVIEW_FREQUENCY_DAYS" in [c.upper() for c in table_cols]:
+                    try:
+                        rr = _run(
+                            f"select sum(iff(REVIEW_FREQUENCY_DAYS < 0 or REVIEW_FREQUENCY_DAYS > 1095,1,0)) as BAD, count(*) as T from {fqn}"
+                        ) or []
+                        bad = int(rr[0].get("BAD") or 0) if rr else 0
+                        t = int(rr[0].get("T") or 0) if rr else 0
+                        d["OUT_OF_RANGE_REVIEW_FREQ_PCT"] = round((bad * 100.0 / (t or 1)), 2) if t else 0.0
+                    except Exception:
+                        d["OUT_OF_RANGE_REVIEW_FREQ_PCT"] = None
+                if set([c.upper() for c in table_cols]) >= {"CLASSIFICATION_LABEL","PREVIOUS_CLASSIFICATION_LABEL"}:
+                    try:
+                        rr = _run(
+                            f"select sum(iff(CLASSIFICATION_LABEL != PREVIOUS_CLASSIFICATION_LABEL,1,0)) as CHG, count(*) as T from {fqn}"
+                        ) or []
+                        chg = int(rr[0].get("CHG") or 0) if rr else 0
+                        t = int(rr[0].get("T") or 0) if rr else 0
+                        d["CLASSIFICATION_CHANGE_PCT"] = round((chg * 100.0 / (t or 1)), 2) if t else 0.0
+                    except Exception:
+                        d["CLASSIFICATION_CHANGE_PCT"] = None
+                # Timeliness from INFORMATION_SCHEMA.TABLES
+                try:
+                    tmeta = _run(
+                        f"select LAST_ALTERED from {db}.INFORMATION_SCHEMA.TABLES where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s",
+                        {"s": sch, "t": name}
+                    ) or []
+                    if tmeta and tmeta[0].get("LAST_ALTERED"):
+                        d["LAST_UPDATED"] = tmeta[0]["LAST_ALTERED"]
+                        dd = _run("select datediff('day', %(ts)s, current_timestamp()) as DD", {"ts": d["LAST_UPDATED"]}) or []
+                        if dd:
+                            d["DATA_STALENESS_DAYS"] = int(dd[0].get("DD") or 0)
+                except Exception:
+                    pass
+            # Render if we have any metrics
+            if d:
+                # Top metric cards
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("Uniqueness %", f"{float(d.get('UNIQUENESS_PCT') or 0):.2f}%")
+                with c2:
+                    st.metric("Duplicate Records", f"{int(d.get('DUPLICATE_RECORDS') or 0):,}")
+                with c3:
+                    st.metric("Total Rows", f"{int(d.get('TOTAL_ROWS') or 0):,}")
+                with c4:
+                    st.metric("Distinct Assets", f"{int(d.get('DISTINCT_ASSETS') or 0):,}")
+
+                # Completeness mini-chart (null % by key attributes)
+                null_df = pd.DataFrame([
+                    {"DIMENSION": "Classification", "NULL_PCT": float(d.get('NULL_PCT_CLASSIFICATION') or 0)},
+                    {"DIMENSION": "Owner", "NULL_PCT": float(d.get('NULL_PCT_OWNER') or 0)},
+                    {"DIMENSION": "Business Unit", "NULL_PCT": float(d.get('NULL_PCT_BUSINESS_UNIT') or 0)},
+                ])
+                st.plotly_chart(
+                    px.bar(null_df, x="DIMENSION", y="NULL_PCT", title="Completeness: % Nulls by Attribute", text="NULL_PCT")
+                    .update_traces(texttemplate='%{text:.2f}%', textposition='outside'),
+                    use_container_width=True
+                )
+
+                # Validity mini-cards
+                v1, v2, v3 = st.columns(3)
+                with v1:
+                    st.metric("Invalid Email %", f"{float(d.get('INVALID_EMAIL_PCT') or 0):.2f}%")
+                with v2:
+                    st.metric("Out-of-range Review Freq %", f"{float(d.get('OUT_OF_RANGE_REVIEW_FREQ_PCT') or 0):.2f}%")
+                with v3:
+                    st.metric("Classification Change %", f"{float(d.get('CLASSIFICATION_CHANGE_PCT') or 0):.2f}%")
+
+                # Timeliness
+                t1, t2, t3 = st.columns(3)
+                with t1:
+                    st.metric("Avg Record Age (days)", f"{float(d.get('AVG_RECORD_AGE_DAYS') or 0):.1f}")
+                with t2:
+                    st.metric("Last Updated", str(d.get('LAST_UPDATED') or '—'))
+                with t3:
+                    st.metric("Data Staleness (days)", f"{int(d.get('DATA_STALENESS_DAYS') or 0)}")
+            else:
+                st.info("No metrics available for the selected table.")
+            # Column metadata (ACCOUNT_USAGE only)
+            if has_fqn:
                 try:
                     rows = _run(
                         f"select * from SNOWFLAKE.ACCOUNT_USAGE.COLUMNS where TABLE_CATALOG=%(d)s and TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s limit 500",
                         {"d": db, "s": sch, "t": name}
                     ) or []
-                    st.markdown("**ACCOUNT_USAGE.COLUMNS**")
+                    st.subheader("COLUMNS LEVEL DETAILED VIEW")
+                    st.caption("Source: SNOWFLAKE.ACCOUNT_USAGE.COLUMNS")
                     st.dataframe(pd.DataFrame(rows), width='stretch')
                 except Exception as e:
                     st.info(f"Account usage columns unavailable: {e}")
             # Table metadata + size
             try:
-                tmeta = _run(
-                    f"select * from {db}.INFORMATION_SCHEMA.TABLES where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s",
-                    {"s": sch, "t": name}
-                ) or []
+                if has_fqn:
+                    tmeta = _run(
+                        f"select * from {db}.INFORMATION_SCHEMA.TABLES where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s",
+                        {"s": sch, "t": name}
+                    ) or []
+                else:
+                    tmeta = []
             except Exception:
                 tmeta = []
             size_b = _estimate_size(sel_object)
-            rc = _table_rowcount(db, sch, name)
+            rc = _table_rowcount(db, sch, name) if has_fqn else None
             k1, k2, k3 = st.columns(3)
             k1.metric("Row Count", f"{rc:,}" if rc is not None else "—")
             k2.metric("Estimated Size (MB)", f"{(size_b/1024/1024):,.2f}" if size_b else "—")
@@ -2090,15 +2231,18 @@ with q_tab:
             chosen_cols = st.multiselect("Columns to profile", options=cols, default=default_cols) if cols else []
             # Type map for consistency checks
             try:
-                type_rows = _run(
-                    f"""
-                    select upper(COLUMN_NAME) as CN, upper(DATA_TYPE) as DT
-                    from {db}.INFORMATION_SCHEMA.COLUMNS
-                    where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s
-                    """,
-                    {"s": sch, "t": name}
-                ) or []
-                type_map = {r.get("CN"): (r.get("DT") or "").upper() for r in type_rows}
+                if has_fqn:
+                    type_rows = _run(
+                        f"""
+                        select upper(COLUMN_NAME) as CN, upper(DATA_TYPE) as DT
+                        from {db}.INFORMATION_SCHEMA.COLUMNS
+                        where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s
+                        """,
+                        {"s": sch, "t": name}
+                    ) or []
+                    type_map = {r.get("CN"): (r.get("DT") or "").upper() for r in type_rows}
+                else:
+                    type_map = {}
             except Exception:
                 type_map = {}
 
@@ -2243,273 +2387,17 @@ with q_tab:
                         st.plotly_chart(px.bar(dfv, x="V", y="C", title=f"Distribution: {col0}"), width='stretch')
                 except Exception:
                     pass
-        else:
-            st.info("Select an object to profile from the sidebar.")
+
+
+            # Section variables for example SQL rendering
+            f_db = db or active_db or "DB"
+            f_sch = sch or (sel_schema if (sel_schema and sel_schema != "All") else None) or "SCHEMA"
+            f_tbl = name or "TABLE"
+            f_obj = sel_object if sel_object and sel_object != "All" else f"{f_db}.{f_sch}.{f_tbl}"
+            tgt_col = (chosen_cols[0] if chosen_cols else None)
+            # Removed Quality Profiling, Semantic Profiling, and Completeness UI sections
 
     # ---- Standard DQ removed per INFORMATION_SCHEMA-only design ----
-    st.caption("Standard DQ (custom tables) removed — using live INFORMATION_SCHEMA only.")
-
-    # ---- Real-time (Info Schema) ----
-    with dq_rt:
-        st.subheader("Real-time Issues (Information Schema)")
-        st.caption("Live detection without custom tables. Uses INFORMATION_SCHEMA views directly.")
-        colA, colB = st.columns(2)
-        with colA:
-            stale_days = st.number_input("Stale if last_altered older than (days)", min_value=1, max_value=3650, value=7, step=1, key="rt_stale_days")
-        with colB:
-            sch_filter = sel_schema if sel_schema != "All" else None
-            st.write("")
-        if not active_db:
-            st.info("Select a database to run real-time checks.")
-        else:
-            # Stale tables
-            try:
-                rows = _run(
-                    f"""
-                    select TABLE_CATALOG as DATABASE_NAME, TABLE_SCHEMA as SCHEMA_NAME, TABLE_NAME,
-                           LAST_ALTERED,
-                           datediff('day', LAST_ALTERED, current_timestamp()) as STALE_DAYS
-                    from {active_db}.INFORMATION_SCHEMA.TABLES
-                    where TABLE_TYPE='BASE TABLE'
-                      {("and TABLE_SCHEMA=%(s)s" if sch_filter else "")}
-                      and LAST_ALTERED < dateadd('day', -%(d)s, current_timestamp())
-                    order by STALE_DAYS desc
-                    limit 1000
-                    """,
-                    ({"s": sch_filter, "d": int(stale_days)} if sch_filter else {"d": int(stale_days)})
-                ) or []
-            except Exception as e:
-                rows = []
-                st.info(f"Stale scan unavailable: {e}")
-            st.markdown("**Stale Tables**")
-            st.dataframe(pd.DataFrame(rows), width='stretch')
-
-            # Empty tables
-            try:
-                empty = _run(
-                    f"""
-                    select TABLE_CATALOG as DATABASE_NAME, TABLE_SCHEMA as SCHEMA_NAME, TABLE_NAME,
-                           coalesce(ROW_COUNT,0) as ROW_COUNT
-                    from {active_db}.INFORMATION_SCHEMA.TABLES
-                    where TABLE_TYPE='BASE TABLE'
-                      {("and TABLE_SCHEMA=%(s)s" if sch_filter else "")}
-                      and coalesce(ROW_COUNT,0) = 0
-                    order by TABLE_SCHEMA, TABLE_NAME
-                    limit 1000
-                    """,
-                    ({"s": sch_filter} if sch_filter else None)
-                ) or []
-            except Exception as e:
-                empty = []
-                st.info(f"Empty table scan unavailable: {e}")
-            st.markdown("**Empty Tables**")
-            st.dataframe(pd.DataFrame(empty), width='stretch')
-
-            # Schema quality (nullability summary)
-            try:
-                query = """
-                with cols as (
-                  select 
-                    TABLE_CATALOG as DATABASE_NAME, 
-                    TABLE_SCHEMA as SCHEMA_NAME, 
-                    TABLE_NAME,
-                    sum(case when IS_NULLABLE='YES' then 1 else 0 end) as NULLABLE_COLS,
-                    count(*) as TOTAL_COLS
-                  from {db}.INFORMATION_SCHEMA.COLUMNS
-                  {where_clause}
-                  group by 1, 2, 3
-                )
-                select 
-                  DATABASE_NAME,
-                  SCHEMA_NAME,
-                  TABLE_NAME,
-                  NULLABLE_COLS,
-                  TOTAL_COLS,
-                  round(NULLABLE_COLS * 100.0 / nullif(TOTAL_COLS, 0), 2) as NULLABLE_PCT
-                from cols
-                order by NULLABLE_PCT desc
-                limit 1000
-                """
-                
-                # Format the query with proper schema filtering
-                query = query.format(
-                    db=active_db,
-                    where_clause=f"WHERE TABLE_SCHEMA = %(s)s" if sch_filter else ""
-                )
-                
-                # Execute with parameters if schema filter is provided
-                params = {"s": sch_filter} if sch_filter else None
-                schq = _run(query, params) or []
-            except Exception as e:
-                schq = []
-                st.info(f"Schema quality summary unavailable: {e}")
-            st.markdown("**Schema Quality (Nullability Summary)**")
-            st.dataframe(pd.DataFrame(schq), width='stretch')
-
-            st.markdown("**Prompt 2: Automated DQ Monitoring System**")
-            st.code("""
-Build an automated data quality monitoring system for Snowflake standard account that:
-
-1. Creates scheduled tasks to run DQ checks daily
-2. Uses Snowflake's TASK feature to automate monitoring
-3. Implements these specific checks:
-   - Table growth anomalies (>50% change in row count)
-   - Data freshness (tables not updated in 7 days)
-   - Schema drift detection (new columns, changed data types)
-   - Referential integrity checks
-   - Custom business rules from a config table
-
-4. Sends alerts via Snowflake notifications or email
-5. Maintains 90 days of DQ history for trending
-
-Provide complete SQL implementation including:
-- DQ configuration tables
-- Stored procedures for each check type
-- Task scheduling setup
-- Alerting mechanism
-""", language="text")
-
-            st.markdown("**Prompt 3: Streamlit DQ Dashboard**")
-            st.code("""
-Create a Streamlit data quality dashboard that connects to Snowflake standard account and displays:
-
-1. Executive Summary:
-   - Overall DQ Score (%) 
-   - Critical vs Warning Issues
-   - Trending (improvement/decline)
-
-2. Detailed DQ Issues:
-   - Tables with most failures
-   - Freshness violations
-   - Completeness issues
-   - Schema changes
-
-3. Interactive Features:
-   - Filter by database/schema
-   - Date range selection  
-   - Drill-down to table level
-   - Export reports
-
-4. Automated Features:
-   - Refresh every 5 minutes
-   - Color-coded severity indicators
-   - Historical trends charts
-
-Generate the complete Streamlit Python code that uses only INFORMATION_SCHEMA and custom DQ tables. Include proper error handling and connection management.
-""", language="text")
-
-            st.markdown("**Prompt 4: Column-Level Data Quality**")
-            st.code("""
-Implement column-level data quality checks for Snowflake standard account focusing on:
-
-1. Data Type Validation:
-   - Email format validation
-   - Phone number patterns
-   - Date format consistency
-   - Numeric range checks
-
-2. Completeness Checks:
-   - Null percentage per column
-   - Empty string detection
-   - Default value overuse
-
-3. Uniqueness & Distribution:
-   - Duplicate detection
-   - Cardinality analysis
-   - Value distribution skew
-
-4. Cross-Table Validation:
-   - Foreign key relationships
-   - Reference data compliance
-   - Business rule validation across tables
-
-Create SQL stored procedures for each check type that:
-- Can be configured per table/column
-- Store results in a central DQ repository
-- Support threshold-based alerting
-- Handle large tables efficiently with sampling
-""", language="text")
-
-            st.markdown("**Prompt 5: Data Quality Alerting & SLA**")
-            st.code("""
-Design a data quality SLA monitoring system for Snowflake standard account with:
-
-1. SLA Definitions:
-   - Freshness SLA (max 24h old)
-   - Completeness SLA (<5% nulls)
-   - Accuracy SLA (business rule compliance)
-   - Availability SLA (table accessibility)
-
-2. Alerting Rules:
-   - Critical: Breaches SLA for 2 consecutive days
-   - Warning: Single day SLA breach
-   - Info: Approaching thresholds
-
-3. Notification System:
-   - Daily summary reports
-   - Immediate critical alerts
-   - Escalation paths
-
-4. SLA Reporting:
-   - Monthly SLA compliance reports
-   - Root cause analysis tracking
-   - Improvement initiatives tracking
-
-Provide complete implementation including:
-- SLA configuration tables
-- Alerting logic as stored procedures
-- Notification templates
-- Escalation workflow
-""", language="text")
-
-        # Tags and masking integration (best-effort)
-        if sel_object and sel_object != "None":
-            st.markdown("---")
-            st.subheader("Tags & Masking (Column-level)")
-            db, sch, name = _split_fqn(sel_object)
-            c1, c2 = st.columns(2)
-            with c1:
-                # Prefer INFORMATION_SCHEMA.TAG_REFERENCES; fallback to ACCOUNT_USAGE.TAG_REFERENCES
-                try:
-                    tr = _run(
-                        f"""
-                        select OBJECT_DATABASE, OBJECT_SCHEMA, OBJECT_NAME, COLUMN_NAME, TAG_NAME, TAG_VALUE
-                        from {db}.INFORMATION_SCHEMA.TAG_REFERENCES
-                        where OBJECT_SCHEMA=%(s)s and OBJECT_NAME=%(t)s and COLUMN_NAME is not null
-                        limit 1000
-                        """,
-                        {"s": sch, "t": name}
-                    ) or []
-                except Exception:
-                    try:
-                        tr = _run(
-                            """
-                            select OBJECT_DATABASE, OBJECT_SCHEMA, OBJECT_NAME, COLUMN_NAME, TAG_NAME, TAG_VALUE
-                            from SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
-                            where OBJECT_DATABASE=%(d)s and OBJECT_SCHEMA=%(s)s and OBJECT_NAME=%(t)s and COLUMN_NAME is not null
-                            limit 1000
-                            """,
-                            {"d": db, "s": sch, "t": name}
-                        ) or []
-                    except Exception:
-                        tr = []
-                st.caption("Column Tags")
-                st.dataframe(pd.DataFrame(tr), use_container_width=True)
-            with c2:
-                try:
-                    rows = _run(
-                        f"""
-                        select COLUMN_NAME, DATA_TYPE, MASKING_POLICY
-                        from {db}.INFORMATION_SCHEMA.COLUMNS
-                        where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s
-                        order by ORDINAL_POSITION
-                        """,
-                        {"s": sch, "t": name}
-                    ) or []
-                    st.caption("Masking Policies")
-                    st.dataframe(pd.DataFrame(rows), width='stretch')
-                except Exception as e:
-                    st.info(f"Masking policy info unavailable: {e}")
 
     # ---- Quality Issues Log ----
     with dq_issues:
@@ -3003,7 +2891,7 @@ with l_tab:
                 fig.add_trace(go.Scatter(x=node_x, y=node_y, mode='markers+text', text=[n.split('.')[-1] if not n.startswith('PIPELINE::') else n.replace('PIPELINE::','') for n in nodes], textposition='top center',
                                          marker=dict(size=12, color=marker_colors),
                                          hovertext=hover_text, hoverinfo='text'))
-                fig.update_layout(showlegend=False, margin=dict(l=10,r=10,t=10,b=10), height=560)
+                fig.update_layout(showlegend=False, margin=dict(l=10,r=10,t=30,b=30), height=560)
                 st.plotly_chart(fig, width='stretch')
         else:
             st.info("Select an object from the sidebar to visualize lineage.")

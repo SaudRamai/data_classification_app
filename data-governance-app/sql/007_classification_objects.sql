@@ -4,7 +4,7 @@
 
 -- Configuration
 set dbname = coalesce($DATABASE, current_database());
-set sch    = 'DATA_GOVERNANCE';
+set sch    = 'DATA_CLASSIFICATION_GOVERNANCE';
 
 use database identifier($dbname);
 create schema if not exists identifier($sch);
@@ -14,15 +14,15 @@ create schema if not exists identifier($sch);
 -- =============================
 -- Tasks assigned to users for classification work
 create table if not exists identifier($dbname)||'.'||identifier($sch)||'.CLASSIFICATION_TASKS' (
-  ID string,
+  TASK_ID string,
+  DATASET_NAME string,            -- added to support the view
   ASSET_FULL_NAME string,         -- DB.SCHEMA.OBJECT
-  TITLE string,
-  DESCRIPTION string,
-  PRIORITY string,                -- Low/Medium/High/Urgent
+  ASSIGNED_TO string,             -- added to support the view (user or group)
   STATUS string,                  -- Assigned/In Progress/Pending Review/Completed/Closed
-  ASSIGNED_TO string,             -- user or group
-  CREATED_BY string,
-  DUE_DATE date,
+  CONFIDENTIALITY_LEVEL string,   -- added for CIA display
+  INTEGRITY_LEVEL string,
+  AVAILABILITY_LEVEL string,
+  DUE_DATE date,                  -- added for view output
   CREATED_AT timestamp_ntz default current_timestamp(),
   UPDATED_AT timestamp_ntz,
   DETAILS variant
@@ -70,8 +70,18 @@ create table if not exists identifier($dbname)||'.'||identifier($sch)||'.ALERT_L
 -- My Classification Tasks
 create or replace view identifier($dbname)||'.'||identifier($sch)||'.VW_MY_CLASSIFICATION_TASKS' as
 select 
-  ID, ASSET_FULL_NAME, TITLE, DESCRIPTION, PRIORITY, STATUS, ASSIGNED_TO,
-  CREATED_BY, DUE_DATE, CREATED_AT, UPDATED_AT, DETAILS
+  TASK_ID,
+  DATASET_NAME,
+  ASSET_FULL_NAME,
+  ASSIGNED_TO,
+  STATUS,
+  CONFIDENTIALITY_LEVEL,
+  INTEGRITY_LEVEL,
+  AVAILABILITY_LEVEL,
+  DUE_DATE,
+  CREATED_AT,
+  UPDATED_AT,
+  DETAILS
 from identifier($dbname)||'.'||identifier($sch)||'.CLASSIFICATION_TASKS'
 where upper(coalesce(ASSIGNED_TO,'')) = upper(current_user());
 
@@ -146,12 +156,12 @@ select * from identifier($dbname)||'.'||identifier($sch)||'.VW_CLASSIFICATION_AU
 create or replace view identifier($dbname)||'.'||identifier($sch)||'.VW_MY_TASKS' as
 with my_tasks as (
   select 
-    ID,
+    TASK_ID as ID,
     'CLASSIFICATION' as TASK_TYPE,
     ASSET_FULL_NAME,
-    TITLE,
+    DATASET_NAME as TITLE,
     STATUS,
-    PRIORITY,
+    'MEDIUM' as PRIORITY,
     DUE_DATE,
     CREATED_AT,
     DETAILS

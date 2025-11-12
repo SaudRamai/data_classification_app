@@ -33,6 +33,11 @@ try:
     import streamlit as st  # type: ignore
 except Exception:
     st = None  # type: ignore
+try:
+    # Governance DB resolver to locate seeded glossary/policy artifacts
+    from src.services.governance_db_resolver import resolve_governance_db  # type: ignore
+except Exception:
+    resolve_governance_db = None  # type: ignore
 
 # Optional dynamic sampling (MODEL_CONFIG-driven)
 try:
@@ -73,6 +78,13 @@ class AIClassificationService:
         self._zsc = None
         # Feedback store (persisted to JSON)
         self._feedback: Dict[str, Any] = {}
+        # Canonical category embeddings cache for local SBERT
+        self._canonical_cat_vecs: Dict[str, Any] = {}
+        # Governance-derived category embeddings and thresholds cache
+        self._gov_cat_vecs: Dict[str, Any] = {}
+        self._gov_cat_thresholds: Dict[str, float] = {}
+        self._gov_cat_compliance: Dict[str, List[str]] = {}
+        self._gov_cat_sig: Optional[str] = None
         
         # Initialize empty sensitivity configuration - fully config-driven from governance tables
         # All patterns, keywords, thresholds, categories, bundles, and compliance mappings
@@ -307,14 +319,87 @@ class AIClassificationService:
               CREATED_TIMESTAMP TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
               UPDATED_TIMESTAMP TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()
             );
-            create table if not exists {schema_fqn}.ASSET_INVENTORY (
-              full_name string,
-              table_catalog string,
-              table_schema string,
-              table_name string,
-              table_type string,
-              created timestamp_ntz,
-              last_altered timestamp_ntz
+            create table if not exists {schema_fqn}.ASSETS (
+              ASSET_ID VARCHAR(100) NOT NULL,
+              ASSET_NAME VARCHAR(500) NOT NULL,
+              ASSET_TYPE VARCHAR(50) NOT NULL,
+              DATABASE_NAME VARCHAR(255),
+              SCHEMA_NAME VARCHAR(255),
+              OBJECT_NAME VARCHAR(255),
+              FULLY_QUALIFIED_NAME VARCHAR(1000),
+              BUSINESS_UNIT VARCHAR(100),
+              DATA_OWNER VARCHAR(100) NOT NULL,
+              DATA_OWNER_EMAIL VARCHAR(255),
+              DATA_CUSTODIAN VARCHAR(100),
+              DATA_CUSTODIAN_EMAIL VARCHAR(255),
+              BUSINESS_PURPOSE VARCHAR(2000),
+              DATA_DESCRIPTION VARCHAR(4000),
+              CLASSIFICATION_LABEL VARCHAR(20),
+              CLASSIFICATION_LABEL_COLOR VARCHAR(20),
+              CONFIDENTIALITY_LEVEL VARCHAR(2),
+              INTEGRITY_LEVEL VARCHAR(2),
+              AVAILABILITY_LEVEL VARCHAR(2),
+              OVERALL_RISK_CLASSIFICATION VARCHAR(20),
+              CONTAINS_PII BOOLEAN DEFAULT FALSE,
+              CONTAINS_FINANCIAL_DATA BOOLEAN DEFAULT FALSE,
+              SOX_RELEVANT BOOLEAN DEFAULT FALSE,
+              SOC_RELEVANT BOOLEAN DEFAULT FALSE,
+              REGULATORY_DATA BOOLEAN DEFAULT FALSE,
+              CLASSIFICATION_RATIONALE VARCHAR(4000),
+              CONFIDENTIALITY_IMPACT_ASSESSMENT VARCHAR(2000),
+              INTEGRITY_IMPACT_ASSESSMENT VARCHAR(2000),
+              AVAILABILITY_IMPACT_ASSESSMENT VARCHAR(2000),
+              CLASSIFICATION_DATE TIMESTAMP_NTZ(9),
+              CLASSIFIED_BY VARCHAR(100),
+              CLASSIFICATION_METHOD VARCHAR(50),
+              CLASSIFICATION_REVIEWED_BY VARCHAR(100),
+              CLASSIFICATION_REVIEW_DATE TIMESTAMP_NTZ(9),
+              CLASSIFICATION_APPROVED_BY VARCHAR(100),
+              CLASSIFICATION_APPROVAL_DATE TIMESTAMP_NTZ(9),
+              LAST_RECLASSIFICATION_DATE TIMESTAMP_NTZ(9),
+              RECLASSIFICATION_TRIGGER VARCHAR(500),
+              RECLASSIFICATION_COUNT NUMBER(10,0) DEFAULT 0,
+              PREVIOUS_CLASSIFICATION_LABEL VARCHAR(20),
+              LAST_REVIEW_DATE TIMESTAMP_NTZ(9),
+              NEXT_REVIEW_DATE TIMESTAMP_NTZ(9),
+              REVIEW_FREQUENCY_DAYS NUMBER(10,0) DEFAULT 365,
+              REVIEW_STATUS VARCHAR(20),
+              PEER_REVIEW_COMPLETED BOOLEAN DEFAULT FALSE,
+              PEER_REVIEWER VARCHAR(100),
+              MANAGEMENT_REVIEW_COMPLETED BOOLEAN DEFAULT FALSE,
+              MANAGEMENT_REVIEWER VARCHAR(100),
+              TECHNICAL_REVIEW_COMPLETED BOOLEAN DEFAULT FALSE,
+              TECHNICAL_REVIEWER VARCHAR(100),
+              CONSISTENCY_CHECK_DATE TIMESTAMP_NTZ(9),
+              CONSISTENCY_CHECK_STATUS VARCHAR(20),
+              DATA_CREATION_DATE TIMESTAMP_NTZ(9),
+              DATA_SOURCE_SYSTEM VARCHAR(255),
+              DATA_RETENTION_PERIOD_DAYS NUMBER(10,0),
+              DATA_DISPOSAL_DATE TIMESTAMP_NTZ(9),
+              SENSITIVE_DATA_USAGE_COUNT NUMBER(10,0) DEFAULT 0,
+              LAST_ACCESSED_DATE TIMESTAMP_NTZ(9),
+              ACCESS_FREQUENCY VARCHAR(20),
+              NUMBER_OF_CONSUMERS NUMBER(10,0),
+              HAS_EXCEPTION BOOLEAN DEFAULT FALSE,
+              EXCEPTION_TYPE VARCHAR(100),
+              EXCEPTION_JUSTIFICATION VARCHAR(2000),
+              EXCEPTION_APPROVED_BY VARCHAR(100),
+              EXCEPTION_APPROVAL_DATE TIMESTAMP_NTZ(9),
+              EXCEPTION_EXPIRY_DATE TIMESTAMP_NTZ(9),
+              EXCEPTION_MITIGATION_MEASURES VARCHAR(2000),
+              COMPLIANCE_STATUS VARCHAR(20),
+              NON_COMPLIANCE_REASON VARCHAR(1000),
+              CORRECTIVE_ACTION_REQUIRED BOOLEAN DEFAULT FALSE,
+              CORRECTIVE_ACTION_DESCRIPTION VARCHAR(2000),
+              CORRECTIVE_ACTION_DUE_DATE TIMESTAMP_NTZ(9),
+              CREATED_TIMESTAMP TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+              CREATED_BY VARCHAR(100),
+              LAST_MODIFIED_TIMESTAMP TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+              LAST_MODIFIED_BY VARCHAR(100),
+              RECORD_VERSION NUMBER(10,0) DEFAULT 1,
+              ADDITIONAL_NOTES VARCHAR(4000),
+              STAKEHOLDER_COMMENTS VARCHAR(4000),
+              primary key (ASSET_ID)
             );
             create table if not exists {schema_fqn}.CLASSIFICATION_DECISIONS (
               decision_id number autoincrement,
@@ -329,14 +414,18 @@ class AIClassificationService:
               primary key (decision_id)
             );
             create table if not exists {schema_fqn}.CLASSIFICATION_TASKS (
-              task_id number autoincrement,
-              table_name string,
-              column_name string,
-              assignee string,
-              due_date date,
-              status string,
-              created_at timestamp_ntz default current_timestamp(),
-              primary key (task_id)
+              TASK_ID STRING,
+              DATASET_NAME STRING,
+              ASSET_FULL_NAME STRING,
+              ASSIGNED_TO STRING,
+              STATUS STRING,
+              CONFIDENTIALITY_LEVEL STRING,
+              INTEGRITY_LEVEL STRING,
+              AVAILABILITY_LEVEL STRING,
+              DUE_DATE DATE,
+              CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+              UPDATED_AT TIMESTAMP_NTZ,
+              DETAILS VARIANT
             );
             create table if not exists {schema_fqn}.CLASSIFICATION_REVIEWS (
               review_id number autoincrement,
@@ -745,7 +834,7 @@ class AIClassificationService:
             try:
                 sc = self._gov_schema_fqn()
                 rows = snowflake_connector.execute_query(
-                    f"select DYNAMIC_SENSITIVE_FLAGS from {sc}.ASSETS where upper(ASSET_NAME)=upper(%(f)s) limit 1",
+                    f"select DYNAMIC_SENSITIVE_FLAGS from {sc}.ASSETS where upper(FULL_NAME)=upper(%(f)s) limit 1",
                     {"f": table_name},
                 ) or []
                 if rows:
@@ -2242,12 +2331,12 @@ class AIClassificationService:
                     """,
                     params,
                 ) or []
-                # Merge pre-flags from ASSET_INVENTORY when present
+                # Merge pre-flags from ASSETS when present
                 pre_flags: Dict[str, Dict[str, Any]] = {}
                 try:
                     sc = self._gov_schema_fqn()
                     inv = snowflake_connector.execute_query(
-                        f"select FULL_NAME, PII_DETECTED, FINANCIAL_DATA_DETECTED, IP_DATA_DETECTED, SOC_RELEVANT, SOX_RELEVANT from {sc}.ASSET_INVENTORY"
+                        f"select FULLY_QUALIFIED_NAME AS FULL_NAME, CONTAINS_PII AS PII_DETECTED, CONTAINS_FINANCIAL_DATA AS FINANCIAL_DATA_DETECTED, REGULATORY_DATA AS IP_DATA_DETECTED, SOC_RELEVANT, SOX_RELEVANT from {sc}.ASSETS"
                     ) or []
                     for r in inv:
                         pre_flags[str(r.get("FULL_NAME") or "").upper()] = r
@@ -2416,7 +2505,9 @@ class AIClassificationService:
                     DATA_TYPE,
                     IS_NULLABLE,
                     COLUMN_DEFAULT,
-                    CHARACTER_MAXIMUM_LENGTH
+                    CHARACTER_MAXIMUM_LENGTH,
+                    COMMENT as COLUMN_COMMENT,
+                    ORDINAL_POSITION
                 FROM {database}.INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}'
                 ORDER BY ORDINAL_POSITION
@@ -2474,10 +2565,321 @@ class AIClassificationService:
             return None
         return None
 
-    def _ensure_category_embeddings(self, patterns: Dict[str, Any]) -> None:
-        """Precompute embeddings for category tokens and synonyms."""
-        if not (self._embedding_backend != 'none' and self._embedder is not None):
+    def _preprocess_text(self, txt: Optional[str]) -> str:
+        t = (txt or "").lower()
+        t = re.sub(r"[^a-z0-9_\s]+", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        # Basic stopwords removal (minimal, offline)
+        sw = {
+            "the","a","an","of","and","or","to","in","for","on","at","by","with","from","is","are","as","be","this","that","these","those","it","its","their","our","your","my"
+        }
+        tokens = [w for w in t.split() if w not in sw]
+        return " ".join(tokens)
+
+    def _validate_semantic_evidence(self, table_name: str, predicted_category: str, table_metadata: Dict[str, Any], sample_data: pd.DataFrame) -> List[str]:
+        """
+        Validate semantic prediction against column-level evidence.
+        Checks column names and sample data for consistency with predicted category.
+        Returns list of validation notes (positive/negative evidence).
+        """
+        evidence: List[str] = []
+        try:
+            # Get column metadata
+            columns = self.get_column_metadata(table_name) or []
+            col_names = [str(c.get("COLUMN_NAME") or "").lower() for c in columns]
+            col_comments = [str(c.get("COLUMN_COMMENT") or "").lower() for c in columns]
+
+            # Category-specific keywords for validation
+            cat_keywords = {
+                "PERSONAL_DATA": ["name", "email", "phone", "address", "ssn", "dob", "passport", "id", "identifier", "customer", "individual"],
+                "FINANCIAL_DATA": ["salary", "payroll", "account", "bank", "credit", "debit", "transaction", "ledger", "sox", "revenue", "expense", "invoice", "payment"],
+                "REGULATORY_DATA": ["compliance", "gdpr", "ccpa", "hipaa", "pci", "law", "regulation", "consent", "data subject", "rights"],
+                "PROPRIETARY_DATA": ["trade secret", "intellectual", "property", "confidential", "design", "source code", "roadmap", "pricing"],
+                "INTERNAL_DATA": ["internal", "business", "operational", "non sensitive", "standard", "general", "reference", "lookup", "config"]
+            }
+            keywords = cat_keywords.get(predicted_category, [])
+
+            # Check column names for matching keywords
+            name_matches = sum(1 for name in col_names for kw in keywords if kw in name)
+            comment_matches = sum(1 for comment in col_comments for kw in keywords if kw in comment)
+            if name_matches > 0:
+                evidence.append(f"Column names match: {name_matches} columns contain category keywords")
+            if comment_matches > 0:
+                evidence.append(f"Column comments match: {comment_matches} columns have relevant comments")
+
+            # Check sample data for patterns (e.g., email-like for PERSONAL_DATA)
+            if isinstance(sample_data, pd.DataFrame) and not sample_data.empty:
+                sample_str = sample_data.astype(str).values.flatten()
+                sample_text = " ".join([str(v).lower() for v in sample_str[:100]])  # limit to avoid overload
+                sample_matches = sum(1 for kw in keywords if kw in sample_text)
+                if sample_matches > 0:
+                    evidence.append(f"Sample data patterns match: found {sample_matches} keyword occurrences")
+
+            # Negative evidence if no matches
+            if not evidence:
+                evidence.append("No strong column-level evidence supporting prediction")
+
+        except Exception as e:
+            evidence.append(f"Validation error: {e}")
+        return evidence
+
+    def _canonical_category_texts(self) -> Dict[str, str]:
+        return {
+            "PERSONAL_DATA": "personal data pii name email phone address ssn passport dob identifier customer individual",
+            "FINANCIAL_DATA": "financial salary payroll account bank credit debit transaction ledger sox revenue expense invoice payment",
+            "REGULATORY_DATA": "regulatory compliance gdpr ccpa hipaa pci law regulation consent data subject rights",
+            "PROPRIETARY_DATA": "proprietary trade secret intellectual property confidential design source code roadmap pricing",
+            "INTERNAL_DATA": "internal business operational non sensitive standard data general reference lookup config"
+        }
+
+    def _ensure_canonical_category_embeddings(self) -> None:
+        # Prefer governance-derived embeddings if available; fallback to static texts
+        try:
+            self._ensure_gov_category_embeddings()
+            if self._gov_cat_vecs:
+                self._canonical_cat_vecs = dict(self._gov_cat_vecs)
+                return
+        except Exception:
+            pass
+        if self._canonical_cat_vecs:
             return
+        try:
+            if self._embedding_backend != 'st' or self._embedder is None or np is None:
+                return
+            texts = self._canonical_category_texts()
+            out: Dict[str, Any] = {}
+            for k, v in texts.items():
+                pv = self._preprocess_text(v)
+                vec = self._get_embedding(pv)
+                if vec is not None:
+                    out[k] = vec
+            self._canonical_cat_vecs = out
+        except Exception:
+            self._canonical_cat_vecs = {}
+
+    def _ensure_gov_category_embeddings(self, force_refresh: bool = False) -> None:
+        """Build and cache category embeddings from governance tables (name, description, examples, threshold).
+
+        Caches in-memory and in st.session_state with a signature of category defs to avoid recompute.
+        Populates self._gov_cat_vecs and self._gov_cat_thresholds when backend is available.
+        """
+        try:
+            # Need embedding backend
+            if self._embedding_backend != 'st' or self._embedder is None or np is None:
+                return
+            cfg = self.load_sensitivity_config(force_refresh=force_refresh) or {}
+            cats_cfg = cfg.get("categories") or {}
+            if not isinstance(cats_cfg, dict) or not cats_cfg:
+                return
+            # Build canonical strings and thresholds from config rows (best-effort)
+            names: List[str] = []
+            canon: Dict[str, str] = {}
+            thresholds: Dict[str, float] = {}
+            compliance_map: Dict[str, List[str]] = {}
+            ex_map: Dict[str, List[str]] = {}
+            for name, row in cats_cfg.items():
+                try:
+                    cname = str(name).strip()
+                    if not cname:
+                        continue
+                    desc = str(row.get("DESCRIPTION") or row.get("DESC") or row.get("DETAILS") or "")
+                    # EXAMPLES may be array, JSON, or CSV string; flatten to short list
+                    ex_raw = row.get("EXAMPLES") or row.get("EXAMPLE") or []
+                    examples: List[str] = []
+                    if isinstance(ex_raw, list):
+                        examples = [str(x) for x in ex_raw if str(x).strip()][:3]
+                    elif isinstance(ex_raw, str):
+                        examples = [e.strip() for e in ex_raw.split(',') if e.strip()][:3]
+                    thr = None
+                    for k in ("DETECTION_THRESHOLD", "MIN_THRESHOLD", "THRESHOLD"):
+                        if row.get(k) is not None:
+                            try:
+                                thr = float(row.get(k))
+                                break
+                            except Exception:
+                                pass
+                    if thr is None:
+                        # fallback to model metadata default
+                        mm = (cfg.get("model_metadata") or cfg.get("thresholds") or {})
+                        try:
+                            thr = float(mm.get("default_threshold", 0.7))
+                        except Exception:
+                            thr = 0.7
+                    thresholds[cname] = float(thr)
+                    parts = [f"Category: {cname}"]
+                    if desc:
+                        parts.append(desc)
+                    if examples:
+                        parts.append("Examples: " + "; ".join([str(e)[:80] for e in examples]))
+                    # Add compliance frameworks
+                    compliance_raw = row.get("COMPLIANCE_FRAMEWORKS") or row.get("COMPLIANCE") or []
+                    compliance = [str(c).strip() for c in compliance_raw] if isinstance(compliance_raw, list) else [str(compliance_raw).strip()] if compliance_raw else []
+                    compliance_map[cname] = compliance
+                    canon[cname] = ". ".join(parts)
+                    names.append(cname)
+                    ex_list: List[str] = []
+                    if desc:
+                        ex_list.append(desc)
+                    if examples:
+                        ex_list.extend(examples)
+                    if ex_list:
+                        ex_map[cname] = ex_list
+                except Exception:
+                    continue
+            if not canon:
+                return
+            # Compute signature of config to cache embeddings
+            try:
+                sig_src = json.dumps({"names": names, "canon": canon, "thr": thresholds, "comp": compliance_map}, sort_keys=True)[:4096]
+                sig = hashlib.sha1(sig_src.encode("utf-8")).hexdigest()
+            except Exception:
+                sig = None
+            # Check st.session_state cache
+            cache_hit = False
+            if st is not None and hasattr(st, "session_state") and not force_refresh:
+                cache = st.session_state.get("cat_embed_cache_v1") or {}
+                entry = cache.get("data") if cache.get("sig") == sig else None
+                if entry and isinstance(entry, dict):
+                    self._gov_cat_vecs = entry.get("vecs") or {}
+                    self._gov_cat_thresholds = entry.get("thr") or {}
+                    self._gov_cat_compliance = entry.get("comp") or {}
+                    self._gov_cat_exemplars = entry.get("ex") or {}
+                    self._gov_cat_sig = sig
+                    if self._gov_cat_vecs:
+                        return
+            # Compute embeddings
+            out: Dict[str, Any] = {}
+            ex_out: Dict[str, List[Any]] = {}
+            for cname, text in canon.items():
+                pv = self._preprocess_text(text)
+                vec = self._get_embedding(pv)
+                if vec is not None:
+                    out[cname] = vec
+                ex_vecs: List[Any] = []
+                for ex in ex_map.get(cname, [])[:5]:
+                    ev = self._get_embedding(self._preprocess_text(ex))
+                    if ev is not None:
+                        ex_vecs.append(ev)
+                if ex_vecs:
+                    ex_out[cname] = ex_vecs
+            self._gov_cat_vecs = out
+            self._gov_cat_thresholds = thresholds
+            self._gov_cat_compliance = compliance_map
+            self._gov_cat_exemplars = ex_out
+            self._gov_cat_sig = sig
+            # Store in st.session_state
+            if st is not None and hasattr(st, "session_state") and sig:
+                st.session_state["cat_embed_cache_v1"] = {"sig": sig, "data": {"vecs": out, "thr": thresholds, "comp": compliance_map, "ex": ex_out}}
+        except Exception:
+            # Keep previous cache if any
+            return
+
+    def _get_semantic_matches_gov(self, enriched_context: str, categories: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Get semantic category matches using governance-derived MiniLM embeddings (Step 3).
+
+        Prefers governance vectors/thresholds; falls back to legacy if unavailable.
+        Returns {'category': str, 'confidence': float, 'threshold': float, 'compliance': List[str]} or error dict.
+        """
+        try:
+            # Ensure embedding backend is ready
+            self._ensure_embedder()
+            # Ensure governance embeddings are loaded (caches in session state)
+            self._ensure_gov_category_embeddings()
+            cat_vecs, cat_thresholds, cat_compliance = self.get_category_embeddings_and_thresholds()
+            ex = getattr(self, "_gov_cat_exemplars", {}) or {}
+            if categories:
+                cat_vecs = {k: v for k, v in cat_vecs.items() if k in categories}
+                cat_thresholds = {k: v for k, v in cat_thresholds.items() if k in categories}
+                cat_compliance = {k: v for k, v in cat_compliance.items() if k in categories}
+                ex = {k: v for k, v in ex.items() if k in categories}
+            if not cat_vecs:
+                return {'category': 'UNKNOWN', 'confidence': 0.0, 'reason': 'No matching governance category embeddings available'}
+
+            # Preprocess context to improve cosine similarity quality
+            context_vec = self._get_embedding(self._preprocess_text(enriched_context))
+            if context_vec is None:
+                return {'category': 'UNKNOWN', 'confidence': 0.0, 'reason': 'Failed to embed context'}
+
+            semantic_scores = {}
+            for cat, vec in cat_vecs.items():
+                try:
+                    base = float(np.dot(context_vec, vec))
+                except Exception:
+                    base = 0.0
+                best = base
+                for ev in ex.get(cat, [])[:5]:
+                    try:
+                        s2 = float(np.dot(context_vec, ev))
+                        if s2 > best:
+                            best = s2
+                    except Exception:
+                        continue
+                semantic_scores[cat] = best
+
+            # Get pattern boosts
+            cfg = self.load_sensitivity_config() or {}
+            pattern_boosts = self._detect_patterns_in_context(enriched_context, cfg.get('patterns', {}))
+
+            # Combine scores: weighted average (semantic 0.7, pattern 0.3)
+            combined_scores = {}
+            for cat in cat_vecs.keys():
+                sem = semantic_scores.get(cat, 0.0)
+                pat = pattern_boosts.get(cat, 0.0)
+                combined = 0.7 * sem + 0.3 * pat
+                combined_scores[cat] = combined
+
+            # Find best category
+            best_cat = max(combined_scores, key=combined_scores.get) if combined_scores else None
+            best_score = combined_scores.get(best_cat, 0.0) if best_cat else 0.0
+
+            # Return as list for compatibility
+            threshold = cat_thresholds.get(best_cat, 0.7) if best_cat else 0.7
+            compliance = cat_compliance.get(best_cat, []) if best_cat else []
+            if best_cat and best_score >= threshold:
+                return [{'category': best_cat, 'confidence': float(best_score), 'threshold': threshold, 'compliance': compliance}]
+            else:
+                return []
+
+        except Exception as e:
+            return []
+
+    def _detect_patterns_in_context(self, enriched_context: str, category_patterns: Dict[str, Any]) -> Dict[str, float]:
+        """Detect regex/pattern matches in enriched context and return category confidence boosts.
+
+        Returns dict of category -> confidence boost (0-1), based on pattern hits.
+        """
+        boosts = {}
+        try:
+            if not category_patterns or not enriched_context:
+                return boosts
+            context_lower = enriched_context.lower()
+            for cat, patterns in category_patterns.items():
+                if not isinstance(patterns, dict):
+                    continue
+                boost = 0.0
+                # Check keyword matches
+                keywords = patterns.get('keywords', []) or patterns.get('keyword_list', [])
+                if isinstance(keywords, list):
+                    for kw in keywords:
+                        if str(kw).lower() in context_lower:
+                            boost += 0.3  # Keyword hit boost
+                # Check regex patterns
+                regexes = patterns.get('patterns', []) or patterns.get('regex_list', [])
+                if isinstance(regexes, list):
+                    for rex in regexes:
+                        try:
+                            import re
+                            if re.search(str(rex), enriched_context, re.IGNORECASE):
+                                boost += 0.5  # Regex hit boost
+                        except Exception:
+                            pass
+                if boost > 0:
+                    boosts[cat] = min(boost, 1.0)  # Cap at 1.0
+        except Exception:
+            pass
+        return boosts
+
+    def _ensure_category_embeddings(self, patterns: Dict[str, Any]) -> None:
         if self._category_embeds and self._category_centroids:
             return
         # Build token lists per category
@@ -2728,6 +3130,589 @@ class AIClassificationService:
             return df.head(sample).reset_index(drop=True)
         return df.reset_index(drop=True)
 
+    # --- Public semantic utilities for special category detection ---
+    def get_semantic_matches(self, text: str, categories: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Compute semantic similarity of the given text against category centroids and
+        return ranked matches. Relies on initialize_sensitive_detection() to set up
+        the embedding backend and centroids. Non-fatal if embeddings are unavailable.
+
+        Returns list of {category, confidence} with confidence in [0,1].
+        """
+        try:
+            # Normalize categories mapping to internal keys
+            requested = categories or [
+                "PII", "Financial", "Regulatory", "TradeSecret", "Internal", "Public"
+            ]
+            # Initialize embeddings (no-op if backend not available)
+            self.initialize_sensitive_detection(categories=requested)
+            if self._embedding_backend == 'none' or self._embedder is None:
+                return []
+            v = self._get_embedding(text)
+            if v is None:
+                return []
+            # Unit normalize for cosine
+            try:
+                if np is not None:
+                    n = float(np.linalg.norm(v) or 0.0)
+                    if n > 0:
+                        v = v / n
+            except Exception:
+                pass
+            out: List[Dict[str, Any]] = []
+            cents = self._category_centroids or {}
+            for cat, c in cents.items():
+                if cat not in requested:
+                    continue
+                try:
+                    if c is None:
+                        continue
+                    # Cosine similarity ~ dot due to normalization
+                    sim = float(np.dot(v, c)) if np is not None else 0.0
+                    # Clamp to [0,1]
+                    conf = max(0.0, min(1.0, (sim + 1.0) / 2.0))  # map [-1,1] -> [0,1]
+                    out.append({"category": cat, "confidence": conf})
+                except Exception:
+                    continue
+            out.sort(key=lambda r: r.get("confidence", 0.0), reverse=True)
+            return out
+        except Exception:
+            return []
+
+    def build_semantic_context(self, table_name: str, max_sample_values: int = 5) -> str:
+        """
+        Build contextual text from table/column metadata, descriptions, and sample values
+        to support semantic detection. Non-fatal if Snowflake is unavailable.
+        """
+        parts: List[str] = []
+        try:
+            meta = self.get_table_metadata(table_name) or {}
+            t_db = str(meta.get("TABLE_CATALOG") or "")
+            t_sc = str(meta.get("TABLE_SCHEMA") or "")
+            t_nm = str(meta.get("TABLE_NAME") or "")
+            t_desc = str(meta.get("COMMENT") or meta.get("DESCRIPTION") or "")
+            if t_db or t_sc or t_nm:
+                parts.append(f"Table {t_db}.{t_sc}.{t_nm}")
+            if t_desc:
+                parts.append(f"Description: {t_desc}")
+            # Columns
+            cols = self.get_column_metadata(table_name) or []
+            col_names = [str(c.get("COLUMN_NAME") or "") for c in cols]
+            if col_names:
+                parts.append("Columns: " + ", ".join([c for c in col_names if c]))
+            # Sample values
+            df = self.get_sample_data(table_name, 100)
+            if df is not None and not df.empty:
+                for c in df.columns:
+                    try:
+                        vals = [str(v) for v in pd.Series(df[c]).dropna().astype(str).unique().tolist()[:max_sample_values]]
+                        if vals:
+                            parts.append(f"{c} samples: " + ", ".join(vals))
+                    except Exception:
+                        continue
+            # Optional governance glossary/policy snippets from governance DB; fallback to config
+            try:
+                gov_db = None
+                try:
+                    if resolve_governance_db is not None:
+                        gov_db = resolve_governance_db()
+                except Exception:
+                    gov_db = None
+                use_gloss = bool(getattr(self, "use_governance_glossary", True))
+                if use_gloss and gov_db and self.use_snowflake and snowflake_connector is not None:
+                    try:
+                        gloss = snowflake_connector.execute_query(
+                            f"SELECT TERM_NAME, DEFINITION FROM {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.BUSINESS_GLOSSARY LIMIT 5"
+                        ) or []
+                        if gloss:
+                            parts.append(
+                                "Glossary: "
+                                + "; ".join([f"{g.get('TERM_NAME')}: {str(g.get('DEFINITION') or '')[:80]}" for g in gloss[:3]])
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        pol = snowflake_connector.execute_query(
+                            f"SELECT POLICY_NAME, EXCERPT FROM {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.POLICY_TEXT LIMIT 5"
+                        ) or []
+                        if pol:
+                            parts.append(
+                                "Policy: "
+                                + "; ".join([f"{p.get('POLICY_NAME')}: {str(p.get('EXCERPT') or '')[:80]}" for p in pol[:2]])
+                            )
+                    except Exception:
+                        pass
+                else:
+                    cfg = self.load_sensitivity_config()
+                    glossary = cfg.get("glossary") or []
+                    policy_texts = cfg.get("policies") or []
+                    if isinstance(glossary, list):
+                        parts.extend([str(g.get("definition") or g.get("term") or "") for g in glossary[:3]])
+                    if isinstance(policy_texts, list):
+                        parts.extend([str(p.get("text") or p.get("policy") or "") for p in policy_texts[:3]])
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return "\n".join([p for p in parts if p])
+
+    def collect_metadata_and_samples(self, table_name: str, sample_rows: int = 10) -> Dict[str, Any]:
+        """
+        Step 1: Collect metadata and sample data for a table from Snowflake INFORMATION_SCHEMA
+        and enrich with glossary/policy context. Returns a structure suitable for embedding.
+
+        Output keys:
+          - table: table metadata dict (TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COMMENT, CREATED, LAST_ALTERED)
+          - columns: list of column metadata dicts (COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, CHARACTER_MAXIMUM_LENGTH, COLUMN_COMMENT, ORDINAL_POSITION)
+          - samples: List[Dict[str, Any]] of up to sample_rows
+          - glossary: optional list of glossary snippets
+          - policies: optional list of policy snippets
+          - context_text: concatenated text summary for embedding
+        """
+        out: Dict[str, Any] = {
+            "table": {},
+            "columns": [],
+            "samples": [],
+            "glossary": [],
+            "policies": [],
+            "context_text": "",
+        }
+        try:
+            parts = (table_name or "").split(".")
+            if len(parts) != 3:
+                return out
+            database, schema, table = parts
+            q = lambda s: '"' + str(s).replace('"', '""') + '"'
+            fqn = f"{q(database)}.{q(schema)}.{q(table)}"
+
+            # Table metadata
+            tbl_rows = []
+            try:
+                if self.use_snowflake and snowflake_connector is not None:
+                    tbl_rows = snowflake_connector.execute_query(
+                        f"""
+                        SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COMMENT, CREATED, LAST_ALTERED
+                        FROM {database}.INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
+                        LIMIT 1
+                        """,
+                        {"s": schema, "t": table},
+                    ) or []
+            except Exception:
+                tbl_rows = []
+            if tbl_rows:
+                out["table"] = dict(tbl_rows[0])
+
+            # Column metadata with comments
+            col_rows = []
+            try:
+                if self.use_snowflake and snowflake_connector is not None:
+                    col_rows = snowflake_connector.execute_query(
+                        f"""
+                        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, CHARACTER_MAXIMUM_LENGTH, COMMENT as COLUMN_COMMENT, ORDINAL_POSITION
+                        FROM {database}.INFORMATION_SCHEMA.COLUMNS
+                        WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
+                        ORDER BY ORDINAL_POSITION
+                        """,
+                        {"s": schema, "t": table},
+                    ) or []
+            except Exception:
+                col_rows = []
+            out["columns"] = col_rows
+
+            # Sample rows (top N). Prefer Snowflake SAMPLE (n ROWS), fallback to LIMIT
+            rows = []
+            try:
+                if self.use_snowflake and snowflake_connector is not None:
+                    n = max(1, int(sample_rows or 10))
+                    try:
+                        rows = snowflake_connector.execute_query(
+                            f"SELECT * FROM {fqn} SAMPLE ({n} ROWS)"
+                        ) or []
+                    except Exception:
+                        rows = snowflake_connector.execute_query(
+                            f"SELECT * FROM {fqn} LIMIT {n}"
+                        ) or []
+            except Exception:
+                rows = []
+            out["samples"] = rows[: max(0, int(sample_rows or 10))]
+
+            # Governance glossary/policy enrichment if available; else config fallback
+            gloss_snips: List[str] = []
+            pol_snips: List[str] = []
+            try:
+                gov_db = None
+                try:
+                    if resolve_governance_db is not None:
+                        gov_db = resolve_governance_db()
+                except Exception:
+                    gov_db = None
+                if gov_db and self.use_snowflake and snowflake_connector is not None:
+                    try:
+                        gloss = snowflake_connector.execute_query(
+                            f"SELECT TERM_NAME, DEFINITION FROM {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.BUSINESS_GLOSSARY LIMIT 5"
+                        ) or []
+                        gloss_snips = [f"{g.get('TERM_NAME')}: {str(g.get('DEFINITION') or '')[:120]}" for g in gloss[:3]]
+                    except Exception:
+                        gloss_snips = []
+                    try:
+                        pol = snowflake_connector.execute_query(
+                            f"SELECT POLICY_NAME, EXCERPT FROM {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.POLICY_TEXT LIMIT 5"
+                        ) or []
+                        pol_snips = [f"{p.get('POLICY_NAME')}: {str(p.get('EXCERPT') or '')[:120]}" for p in pol[:3]]
+                    except Exception:
+                        pol_snips = []
+                else:
+                    cfg = self.load_sensitivity_config()
+                    glossary = cfg.get("glossary") or []
+                    policy_texts = cfg.get("policies") or []
+                    if isinstance(glossary, list):
+                        gloss_snips = [str(g.get("definition") or g.get("term") or "") for g in glossary[:3]]
+                    if isinstance(policy_texts, list):
+                        pol_snips = [str(p.get("text") or p.get("policy") or "") for p in policy_texts[:3]]
+            except Exception:
+                gloss_snips, pol_snips = [], []
+            out["glossary"] = gloss_snips
+            out["policies"] = pol_snips
+
+            # Build context text
+            ctx_parts: List[str] = []
+            tmeta = out.get("table") or {}
+            if tmeta:
+                ctx_parts.append(
+                    f"Table {tmeta.get('TABLE_CATALOG')}.{tmeta.get('TABLE_SCHEMA')}.{tmeta.get('TABLE_NAME')}"
+                )
+                if tmeta.get("COMMENT"):
+                    ctx_parts.append(f"Description: {tmeta.get('COMMENT')}")
+            # Columns with comments
+            if out["columns"]:
+                cols_txt = []
+                for c in out["columns"][:50]:
+                    nm = str(c.get("COLUMN_NAME") or "")
+                    ty = str(c.get("DATA_TYPE") or "")
+                    cm = c.get("COLUMN_COMMENT")
+                    seg = nm
+                    if ty:
+                        seg += f" : {ty}"
+                    if cm:
+                        seg += f" ({str(cm)[:60]})"
+                    cols_txt.append(seg)
+                if cols_txt:
+                    ctx_parts.append("Columns: " + ", ".join(cols_txt))
+            if rows and out["columns"]:
+                try:
+                    from collections import Counter
+                    top_map: Dict[str, List[str]] = {}
+                    for c in out["columns"][:20]:
+                        nm = str(c.get("COLUMN_NAME") or "")
+                        vals: List[str] = []
+                        for r in rows:
+                            if isinstance(r, dict) and nm in r and r[nm] is not None:
+                                vals.append(str(r[nm]))
+                        if vals:
+                            freq = Counter(vals)
+                            top_vals = [k for (k, _cnt) in freq.most_common(2)]
+                            if top_vals:
+                                top_map[nm] = top_vals
+                    if top_map:
+                        pairs = []
+                        for k in list(top_map.keys())[:5]:
+                            pairs.append(f"{k}=" + "|".join([str(v)[:32] for v in top_map[k]]))
+                        if pairs:
+                            ctx_parts.append("ColumnSamples: " + "; ".join(pairs))
+                except Exception:
+                    try:
+                        first = rows[0]
+                        if isinstance(first, dict):
+                            sv = "; ".join([f"{k}={str(v)[:64]}" for k, v in first.items()])
+                            if sv:
+                                ctx_parts.append("Samples: " + sv)
+                    except Exception:
+                        pass
+            if gloss_snips:
+                ctx_parts.append("Glossary: " + "; ".join(gloss_snips))
+            if pol_snips:
+                ctx_parts.append("Policy: " + "; ".join(pol_snips))
+            out["context_text"] = " \n".join([p for p in ctx_parts if p])
+        except Exception:
+            return out
+        return out
+
+    # ---- Step 2: Preprocessing & Context Enrichment ----
+    def _normalize_text(self, text: Optional[str]) -> str:
+        """
+        Normalize textual fields:
+        - lowercase
+        - insert spaces for camelCase and digit-alpha boundaries
+        - replace underscores and multiple spaces with single spaces
+        - remove most punctuation (keep alphanumerics and spaces)
+        - expand common abbreviations (best-effort)
+        """
+        try:
+            s = str(text or "")
+            # Insert spaces between camelCase and around digits/letters boundaries
+            s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
+            s = re.sub(r"([A-Za-z])(\d)", r"\1 \2", s)
+            s = re.sub(r"(\d)([A-Za-z])", r"\1 \2", s)
+            # Replace underscores/dots with spaces
+            s = s.replace("_", " ").replace(".", " ")
+            # Lowercase
+            s = s.lower()
+            # Remove punctuation except spaces and alphanumerics
+            s = re.sub(r"[^a-z0-9\s]", " ", s)
+            # Collapse whitespace
+            s = re.sub(r"\s+", " ", s).strip()
+            # Abbreviation expansions (lightweight)
+            abbr = {
+                "dob": "date of birth",
+                "ssn": "social security number",
+                "addr": "address",
+                "cust": "customer",
+                "acct": "account",
+                "tel": "telephone",
+                "ph": "phone",
+                "qty": "quantity",
+                "amt": "amount",
+                "num": "number",
+                "txn": "transaction",
+                "emp": "employee",
+            }
+            tokens = s.split()
+            s = " ".join([abbr.get(t, t) for t in tokens])
+            return s
+        except Exception:
+            return str(text or "")
+
+    def _tokenize(self, text: str) -> List[str]:
+        try:
+            return re.findall(r"\b\w+\b", (text or "").lower())
+        except Exception:
+            return []
+
+    def _value_fingerprint(self, values: List[str]) -> List[str]:
+        feats: List[str] = []
+        try:
+            has_email = False
+            has_phone = False
+            high_digit = False
+            for v in values[:50]:
+                s = str(v)
+                if not has_email and re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", s):
+                    has_email = True
+                if not has_phone and re.search(r"\b\+?\d[\d\s().-]{6,}\b", s):
+                    has_phone = True
+                ds = sum(ch.isdigit() for ch in s)
+                if len(s) >= 8 and ds / max(1, len(s)) >= 0.6:
+                    high_digit = True
+            if has_email:
+                feats.append("email_like")
+            if has_phone:
+                feats.append("phone_like")
+            if high_digit:
+                feats.append("high_digit_ratio")
+        except Exception:
+            return feats
+        return feats
+
+    def _top_relevant(self, query_text: str, candidates: List[str], limit: int) -> List[str]:
+        """
+        Return top-N candidates by simple token-overlap relevance to query_text.
+        Deterministic and lightweight (no embedding requirement).
+        """
+        try:
+            q_tokens = set(self._tokenize(self._normalize_text(query_text)))
+            scored: List[Tuple[float, str]] = []
+            for c in candidates or []:
+                c_norm = self._normalize_text(c)
+                c_tokens = set(self._tokenize(c_norm))
+                if not c_tokens:
+                    continue
+                inter = len(q_tokens & c_tokens)
+                score = inter / max(1, len(c_tokens))
+                if inter > 0:
+                    scored.append((score, str(c)))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [s for _, s in scored[: max(0, int(limit or 0))]]
+        except Exception:
+            return (candidates or [])[: max(0, int(limit or 0))]
+
+    def build_column_contexts(self, table_name: str, sample_rows: int = 10) -> Dict[str, str]:
+        """
+        Build enriched context strings per column using table/column metadata, comments,
+        small sample values, and top relevant glossary/policy excerpts.
+
+        Returns: { column_name: context_string }
+        """
+        contexts: Dict[str, str] = {}
+        try:
+            data = self.collect_metadata_and_samples(table_name, sample_rows=sample_rows) or {}
+            tbl = data.get("table") or {}
+            cols = data.get("columns") or []
+            rows = data.get("samples") or []
+            gloss = data.get("glossary") or []
+            pol = data.get("policies") or []
+
+            t_db = str(tbl.get("TABLE_CATALOG") or "")
+            t_sc = str(tbl.get("TABLE_SCHEMA") or "")
+            t_nm = str(tbl.get("TABLE_NAME") or "")
+            table_fqn = f"{t_db}.{t_sc}.{t_nm}" if (t_db and t_sc and t_nm) else str(table_name)
+
+            # Prebuild per-column sample strings (first 2 non-empty values)
+            def sample_for_column(col_name: str, max_vals: int = 2) -> List[str]:
+                out: List[str] = []
+                try:
+                    for r in rows:
+                        if not isinstance(r, dict):
+                            continue
+                        # Try exact, then case-insensitive match
+                        if col_name in r and r[col_name] is not None:
+                            out.append(str(r[col_name]))
+                        else:
+                            # Find key matching case-insensitively
+                            for k, v in r.items():
+                                if str(k).lower() == str(col_name).lower() and v is not None:
+                                    out.append(str(v))
+                                    break
+                        if len(out) >= max_vals:
+                            break
+                except Exception:
+                    return out[:max_vals]
+                return out[:max_vals]
+
+            for c in cols:
+                try:
+                    cname = str(c.get("COLUMN_NAME") or "")
+                    ctype = str(c.get("DATA_TYPE") or "")
+                    ccomm = str(c.get("COLUMN_COMMENT") or "")
+
+                    # Build query text for relevance (table + column names/comments)
+                    qtxt = " ".join([table_fqn, cname, ctype, ccomm])
+                    top_gloss = self._top_relevant(qtxt, gloss, limit=3)
+                    top_pol = self._top_relevant(qtxt, pol, limit=2)
+
+                    # Prepare normalized fields for insertion
+                    norm_comm = self._normalize_text(ccomm)
+                    samples = sample_for_column(cname, max_vals=2)
+                    samples_norm = [self._normalize_text(s) for s in samples if s]
+                    fps = self._value_fingerprint(samples)
+
+                    # Compose context per spec
+                    parts: List[str] = []
+                    parts.append(f"Table: {table_fqn}")
+                    parts.append(f"Column: {cname} ({ctype})")
+                    parts.append(f"Column comment: {norm_comm}" if norm_comm else "Column comment: ")
+                    if samples_norm:
+                        parts.append("Samples: " + "; ".join(samples_norm))
+                    if fps:
+                        parts.append("Signals: " + ",".join(fps))
+                    if top_gloss:
+                        parts.append("Glossary: " + "; ".join([str(g)[:160] for g in top_gloss]))
+                    if top_pol:
+                        parts.append("Policy: " + "; ".join([str(p)[:160] for p in top_pol]))
+
+                    contexts[cname] = "; ".join(parts)
+                except Exception:
+                    continue
+        except Exception:
+            return contexts
+        return contexts
+
+    def build_enriched_context(self, table_name: str, sample_rows: int = 10) -> str:
+        """
+        Step 2: Construct a single enriched context string for semantic understanding.
+
+        Format example:
+          "Table CUSTOMERS in schema SALES. Columns: EMAIL STRING, DOB DATE. Sample row: EMAIL=a@corp.com; DOB=1990-01-01. Glossary: Customer. Policy: GDPR Art.6, Art.9."
+        """
+        try:
+            pkg = self.collect_metadata_and_samples(table_name, sample_rows=sample_rows) or {}
+            t = pkg.get("table") or {}
+            cols = pkg.get("columns") or []
+            rows = pkg.get("samples") or []
+            glossary = pkg.get("glossary") or []
+            policies = pkg.get("policies") or []
+
+            parts: List[str] = []
+            # Table sentence
+            tnm = str(t.get("TABLE_NAME") or "")
+            tsc = str(t.get("TABLE_SCHEMA") or "")
+            if tnm and tsc:
+                parts.append(f"Table {tnm} in schema {tsc}.")
+            elif tnm:
+                parts.append(f"Table {tnm}.")
+
+            # Columns sentence (name type)
+            if cols:
+                col_bits: List[str] = []
+                for c in cols[:20]:
+                    nm = str(c.get("COLUMN_NAME") or "")
+                    ty = str(c.get("DATA_TYPE") or "")
+                    if nm and ty:
+                        col_bits.append(f"{nm} {ty}")
+                    elif nm:
+                        col_bits.append(nm)
+                if col_bits:
+                    parts.append("Columns: " + ", ".join(col_bits) + ".")
+
+            # Sample row sentence
+            if rows and isinstance(rows[0], dict):
+                first = rows[0]
+                kvs = [f"{k}={str(v)[:64]}" for k, v in first.items()]
+                if kvs:
+                    parts.append("Sample row: " + "; ".join(kvs) + ".")
+
+            # Glossary sentence
+            if glossary:
+                parts.append("Glossary: " + ", ".join(glossary[:5]) + ".")
+
+            # Policy sentence
+            if policies:
+                parts.append("Policy: " + ", ".join(policies[:5]) + ".")
+
+            return " ".join(parts).strip()
+        except Exception:
+            return ""
+
+    def semantic_detect_for_table(self, table_name: str, categories: Optional[List[str]] = None,
+                                  min_confidence: float = 0.5) -> Dict[str, Any]:
+        """
+        Run semantic detection for a table and return a compact result with scores and
+        top prediction. Provides failure_reason when embeddings are unavailable or low-confidence.
+        """
+        ctx = self.build_semantic_context(table_name)
+        if not ctx:
+            return {
+                "table_name": table_name,
+                "category_scores": {},
+                "detected_category": None,
+                "confidence": 0.0,
+                "method": "semantic",
+                "failure_reason": "insufficient metadata"
+            }
+        matches = self._get_semantic_matches_gov(ctx, categories=categories)
+        if not matches:
+            reason = "embedding backend unavailable" if (self._embedding_backend == 'none' or self._embedder is None) else "low confidence embedding"
+            return {
+                "table_name": table_name,
+                "category_scores": {},
+                "detected_category": None,
+                "confidence": 0.0,
+                "method": "semantic",
+                "failure_reason": reason
+            }
+        top = matches[0]
+        cat_scores = {m["category"]: float(m.get("confidence", 0.0)) for m in matches}
+        result = {
+            "table_name": table_name,
+            "category_scores": cat_scores,
+            "detected_category": top.get("category"),
+            "confidence": float(top.get("confidence", 0.0)),
+            "method": "semantic"
+        }
+        if float(top.get("confidence", 0.0)) < float(min_confidence):
+            result["failure_reason"] = "low confidence embedding"
+        return result
+
     # ---- Type Inference Helpers ----
     def _infer_type_from_name(self, name: Optional[str]) -> str:
         up = (name or "").upper()
@@ -2759,7 +3744,7 @@ class AIClassificationService:
             pass
         return "STRING"
     
-    def classify_table(self, table_name: str) -> Dict[str, Any]:
+    def classify_table(self, table_name: str, context: Optional[str] = None) -> Dict[str, Any]:
         """
         Classify a table using AI techniques.
         
@@ -2783,6 +3768,140 @@ class AIClassificationService:
 
         # Enrich features with semantic and pattern summaries
         features: Dict[str, Any] = {}
+        # --- Semantic embeddings scoring (name/comment/columns/samples/glossary/policy) ---
+        semantic_scores: Dict[str, float] = {}
+        semantic_selected: Optional[str] = None
+        semantic_score: float = 0.0
+        semantic_threshold: Optional[float] = None
+        semantic_failure_reason: Optional[str] = None
+        semantic_method: str = 'CTE_FALLBACK'
+        try:
+            # Build enriched context if not supplied
+            if context is None:
+                ctx_parts: List[str] = []
+                if table_metadata.get('TABLE_NAME') or table_metadata.get('table_name'):
+                    ctx_parts.append(str(table_metadata.get('TABLE_NAME') or table_metadata.get('table_name')))
+                if table_metadata.get('COMMENT'):
+                    ctx_parts.append(str(table_metadata.get('COMMENT')))
+                try:
+                    if isinstance(sample_data, pd.DataFrame) and not sample_data.empty:
+                        cols = list(sample_data.columns)[:10]
+                        if cols:
+                            ctx_parts.append("Columns: " + ", ".join([str(c) for c in cols]))
+                        # include a couple of sample values
+                        row0 = sample_data.iloc[0].to_dict()
+                        sv = "; ".join([f"{k}={str(v)[:64]}" for k, v in row0.items() if k in cols])
+                        if sv:
+                            ctx_parts.append("Samples: " + sv)
+                except Exception:
+                    pass
+                context_text = " \n".join([p for p in ctx_parts if p])
+            else:
+                context_text = str(context)
+
+            # Prefer local SBERT embeddings if available
+            v_ctx_arr = None
+            try:
+                self._ensure_embedder()
+                self._ensure_canonical_category_embeddings()
+                if self._embedding_backend == 'st' and self._embedder is not None and np is not None:
+                    v_ctx_arr = self._get_embedding(self._preprocess_text(context_text))
+            except Exception:
+                v_ctx_arr = None
+
+            # Load canonical categories and thresholds from config
+            cfg_cats = self.load_sensitivity_config() or {}
+            categories_cfg = cfg_cats.get('categories', {}) or {}
+            model_meta = (cfg_cats.get('model_metadata') or cfg_cats.get('thresholds') or {})
+            default_thr = float(model_meta.get('default_threshold', 0.7))
+
+            # Canonical definitions fallback and vectors
+            canonical_defs = self._canonical_category_texts()
+            cat_vecs_sbert: Dict[str, Any] = dict(self._canonical_cat_vecs)
+            # Build bag-of-words vectors only if SBERT unavailable
+            cat_vecs_bow: Dict[str, Dict[str, float]] = {}
+            cat_thresholds: Dict[str, float] = {}
+            for key, text in canonical_defs.items():
+                thr = default_thr
+                cfg = categories_cfg.get(key) or categories_cfg.get(key.title()) or categories_cfg.get(key.replace('_', ' ').title())
+                if cfg and isinstance(cfg, dict):
+                    try:
+                        thr = float(cfg.get('detection_threshold', default_thr))
+                    except Exception:
+                        pass
+                cat_thresholds[key] = thr
+                if not cat_vecs_sbert.get(key):
+                    # Fallback bow vector
+                    toks = re.findall(r"[a-z0-9_]+", text.lower())
+                    vec: Dict[str, float] = {}
+                    for t in toks:
+                        vec[t] = vec.get(t, 0.0) + 1.0
+                    nrm = sum(v*v for v in vec.values()) ** 0.5 or 1.0
+                    for k2 in list(vec.keys()):
+                        vec[k2] = vec[k2] / nrm
+                    cat_vecs_bow[key] = vec
+
+            # Compute similarities
+            if v_ctx_arr is not None and cat_vecs_sbert:
+                for k, v in cat_vecs_sbert.items():
+                    try:
+                        sim = float(np.dot(v_ctx_arr, v)) if np is not None else 0.0
+                        semantic_scores[k] = round(max(0.0, min(1.0, (sim + 1.0) / 2.0)), 3)
+                    except Exception:
+                        continue
+                semantic_method = 'SEMANTIC'
+            else:
+                # Bag-of-words cosine fallback
+                def _cos(a: Dict[str, float], b: Dict[str, float]) -> float:
+                    if not a or not b:
+                        return 0.0
+                    if len(a) > len(b):
+                        a, b = b, a
+                    s = 0.0
+                    for kk, vv in a.items():
+                        bv = b.get(kk)
+                        if bv:
+                            s += vv * bv
+                    return float(max(0.0, min(1.0, s)))
+                # Build bow for context
+                tokens = re.findall(r"[a-z0-9_]+", (context_text or '').lower())
+                v_ctx_bow: Dict[str, float] = {}
+                for tkn in tokens:
+                    v_ctx_bow[tkn] = v_ctx_bow.get(tkn, 0.0) + 1.0
+                nrm2 = sum(v*v for v in v_ctx_bow.values()) ** 0.5 or 1.0
+                for k2 in list(v_ctx_bow.keys()):
+                    v_ctx_bow[k2] = v_ctx_bow[k2] / nrm2
+                for k, vec in cat_vecs_bow.items():
+                    semantic_scores[k] = round(_cos(v_ctx_bow, vec), 3)
+
+            # Select best category and compare to threshold
+            semantic_confidence_level: str = 'low'
+            semantic_requires_review: bool = False
+            semantic_auto_tag_candidate: bool = False
+            semantic_validation_evidence: List[str] = []
+            if semantic_scores:
+                semantic_selected = max(semantic_scores.keys(), key=lambda c: semantic_scores[c])
+                semantic_score = float(semantic_scores[semantic_selected])
+                semantic_threshold = float(cat_thresholds.get(semantic_selected, default_thr))
+                if semantic_score >= 0.85:
+                    semantic_confidence_level = 'high'
+                    semantic_auto_tag_candidate = True
+                elif semantic_score >= 0.7:
+                    semantic_confidence_level = 'medium'
+                    semantic_requires_review = True
+                else:
+                    semantic_confidence_level = 'low'
+                    semantic_requires_review = True  # or fallback
+                # Validate column-level evidence
+                semantic_validation_evidence = self._validate_semantic_evidence(table_name, semantic_selected, table_metadata, sample_data)
+                if semantic_score >= semantic_threshold:
+                    semantic_method = 'SEMANTIC'
+                else:
+                    semantic_failure_reason = 'LOW_CONFIDENCE'
+            else:
+                semantic_failure_reason = 'NO_METADATA'
+        except Exception:
+            semantic_failure_reason = 'CLASSIFICATION_ERROR'
         detections: List[Dict[str, Any]] = []
         try:
             # Perform column sampling before assigning any table sensitivity
@@ -2906,13 +4025,13 @@ class AIClassificationService:
                         schema_fqn = self._gov_schema_fqn()
                         rows_inv = snowflake_connector.execute_query(
                             f"""
-                            select coalesce(PII_DETECTED,false) as PII,
-                                   coalesce(FINANCIAL_DATA_DETECTED,false) as FINANCIAL,
-                                   coalesce(IP_DATA_DETECTED,false) as IP,
+                            select coalesce(CONTAINS_PII,false) as PII,
+                                   coalesce(CONTAINS_FINANCIAL_DATA,false) as FINANCIAL,
+                                   coalesce(REGULATORY_DATA,false) as IP,
                                    coalesce(SOC_RELEVANT,false) as SOC,
                                    coalesce(SOX_RELEVANT,false) as SOX
-                            from {schema_fqn}.ASSET_INVENTORY
-                            where upper(FULL_NAME) = upper(%(f)s)
+                            from {schema_fqn}.ASSETS
+                            where upper(FULLY_QUALIFIED_NAME) = upper(%(f)s)
                             limit 1
                             """,
                             {"f": table_name},
@@ -2970,6 +4089,48 @@ class AIClassificationService:
             ]))
             is_low_risk_table = any(k in base_table for k in low_ctx)
 
+            # Attach semantic signals to features
+            try:
+                features['semantic_scores'] = semantic_scores
+                features['semantic_selected'] = semantic_selected
+                features['semantic_score'] = semantic_score
+                features['semantic_threshold'] = semantic_threshold
+                features['semantic_failure_reason'] = semantic_failure_reason
+                features['semantic_method'] = semantic_method
+                features['semantic_confidence_level'] = semantic_confidence_level
+                features['semantic_requires_review'] = semantic_requires_review
+                features['semantic_auto_tag_candidate'] = semantic_auto_tag_candidate
+                features['semantic_validation_evidence'] = semantic_validation_evidence
+                # If semantic succeeded, prefer its category as dominant when present
+                if semantic_method == 'SEMANTIC' and semantic_selected:
+                    features['dominant_table_category'] = features.get('dominant_table_category') or semantic_selected.replace('_DATA','')
+                # Step 6: CIA minimums and suggested policy label
+                cat_for_policy = None
+                try:
+                    if semantic_selected:
+                        cat_for_policy = str(semantic_selected).upper()
+                    else:
+                        cat_for_policy = str(features.get('dominant_table_category') or '').upper()
+                    norm = 'INTERNAL_DATA'
+                    if cat_for_policy:
+                        if ('PERSONAL' in cat_for_policy) or ('PII' in cat_for_policy):
+                            norm = 'PERSONAL_DATA'
+                        elif ('FINANCIAL' in cat_for_policy) or ('SOX' in cat_for_policy) or ('PCI' in cat_for_policy):
+                            norm = 'FINANCIAL_DATA'
+                        elif ('REGULATORY' in cat_for_policy) or ('GDPR' in cat_for_policy) or ('HIPAA' in cat_for_policy) or ('CCPA' in cat_for_policy):
+                            norm = 'REGULATORY_DATA'
+                        elif ('PROPRIETARY' in cat_for_policy) or ('TRADE' in cat_for_policy):
+                            norm = 'PROPRIETARY_DATA'
+                        elif ('INTERNAL' in cat_for_policy):
+                            norm = 'INTERNAL_DATA'
+                    cia_min, pol_lab = self._policy_cia_minimum_from_category(norm)
+                    features['cia_minimum'] = cia_min
+                    if pol_lab:
+                        features['policy_label_suggested'] = pol_lab
+                except Exception:
+                    pass
+            except Exception:
+                pass
             # Table-level boosts must be governance-config driven; no static boosts here
         except Exception:
             table_sensitivity_score = 0.0
@@ -3057,6 +4218,15 @@ class AIClassificationService:
                     label = 'Internal'
                 else:
                     label = 'Public'
+                # Step 6: enforce minimum policy label if suggested
+                try:
+                    pol_lab = feats.get('policy_label_suggested')
+                    if pol_lab:
+                        order = {'Public': 0, 'Internal': 1, 'Restricted': 2, 'Confidential': 3}
+                        if order.get(str(pol_lab), 0) > order.get(str(label), 0):
+                            label = str(pol_lab)
+                except Exception:
+                    pass
                 base_result['classification'] = label
                 base_result['confidence'] = max(float(base_result.get('confidence', 0.0)), round(score, 2))
         except Exception:
@@ -3065,6 +4235,29 @@ class AIClassificationService:
         # Governance-driven only: do not apply hard-coded compliance/CIA rules here
         try:
             base_result['compliance_frameworks'] = list(base_result.get('compliance_frameworks') or [])
+        except Exception:
+            pass
+
+        # Step 7: Workflow decision routing
+        try:
+            feats = base_result.get('features') or {}
+            sem_level = str(feats.get('semantic_confidence_level') or '').lower()
+            tbl_score = float(feats.get('table_sensitivity_score') or 0.0)
+            evid = feats.get('semantic_validation_evidence') or []
+            no_support = any(isinstance(x, str) and 'no strong' in x.lower() for x in evid)
+            route = 'MANUAL_REVIEW'
+            # High-confidence: semantic high or strong CTE score
+            if sem_level == 'high' or tbl_score >= 0.85:
+                route = 'AUTO_APPROVE'
+            # Medium confidence: semantic medium or table between 0.7 and 0.85
+            elif sem_level == 'medium' or (0.7 <= tbl_score < 0.85):
+                route = 'REVIEW'
+            # Conflict/insufficient evidence: keep MANUAL_REVIEW
+            if no_support and route == 'AUTO_APPROVE':
+                route = 'REVIEW'
+            feats['workflow_route'] = route
+            base_result['features'] = feats
+            base_result['workflow_route'] = route
         except Exception:
             pass
 
@@ -3091,24 +4284,6 @@ class AIClassificationService:
             dom = result['features'].get('dominant_table_category')
             tbl_score = float(result['features'].get('table_sensitivity_score') or 0.0)
             thr = float(per_cat_thr.get(str(dom), model_meta.get('default_threshold', 0.7)))
-            near = (thr - band) <= tbl_score < thr
-            # If near-threshold and UI toggle enabled, force a full scan once and recompute detections
-            try:
-                if near and st is not None and hasattr(st, 'session_state') and bool(st.session_state.get('ai_full_table_scan', False)):
-                    st.session_state['ai_force_full_scan'] = True
-                    # Re-run detections quickly to refine score
-                    redet = self.detect_sensitive_columns(table_name, sample_size=int(st.session_state.get('ai_table_sample_size', 200)))
-                    result['features']['column_detections'] = redet
-                    # Recompute table-level sensitivity from new detections
-                    agg = self.aggregate_table_sensitivity(redet)
-                    result['features']['table_sensitivity_score'] = agg.get('table_sensitivity_score', tbl_score)
-                    result['features']['dominant_table_category'] = agg.get('dominant_table_category', dom)
-                    tbl_score = float(result['features'].get('table_sensitivity_score') or tbl_score)
-                    dom = result['features'].get('dominant_table_category')
-                    thr = float(per_cat_thr.get(str(dom), thr))
-                    near = (thr - band) <= tbl_score < thr
-            except Exception:
-                pass
 
             # Compute metrics locally (do not push to UI session state)
             metrics = {
@@ -3235,6 +4410,10 @@ class AIClassificationService:
                     'threshold_applied': metrics.get('threshold_applied'),
                     'requires_review': metrics.get('requires_review'),
                     'flags_active': metrics.get('flags_active'),
+                    'method': feats.get('method') or 'CTE',
+                    'semantic_failure_reason': feats.get('semantic_failure_reason'),
+                    'semantic_scores': feats.get('semantic_scores'),
+                    'fallback_used': feats.get('fallback_used', False),
                     'run_id': run_id,
                     'timestamp_utc': datetime.now(timezone.utc).isoformat(),
                     'suggestions': suggestions,
@@ -3251,7 +4430,41 @@ class AIClassificationService:
         - Table-level summary persisted via _persist_audit
         - Updates ASSET_INVENTORY AI_* columns when available
         """
-        res = self.classify_table(table_name) or {}
+        # Run CTE detection first
+        cte_cols = self.detect_sensitive_columns(table_name, sample_size=sample_size) or []
+        # Compute CTE table score
+        if cte_cols:
+            table_sensitivity_score = sum(d['confidence'] for d in cte_cols) / len(cte_cols)
+            dominant_category = max(set(d['categories'][0] for d in cte_cols if d.get('categories')), key=lambda c: sum(d['confidence'] for d in cte_cols if d.get('categories') and d['categories'][0] == c))
+        else:
+            table_sensitivity_score = 0.0
+            dominant_category = 'INTERNAL'
+        if table_sensitivity_score >= 0.7:
+            # Use CTE results
+            res = {
+                'classification': dominant_category,
+                'confidence': table_sensitivity_score,
+                'features': {
+                    'dominant_table_category': dominant_category,
+                    'table_sensitivity_score': table_sensitivity_score,
+                    'column_detections': cte_cols,
+                    'method': 'CTE'
+                }
+            }
+        else:
+            # Run semantic classification
+            try:
+                ctx_text = self.build_enriched_context(table_name, sample_rows=min(10, max(1, int(sample_size/10))))
+            except Exception:
+                ctx_text = None
+            res = self.classify_table(table_name, context=ctx_text) or {}
+            feats = res.get("features") or {}
+            # Merge CTE columns
+            feats['column_detections'] = cte_cols  # keep CTE columns
+            if 'dominant_table_category' not in feats or not feats['dominant_table_category']:
+                feats['dominant_table_category'] = dominant_category
+            feats['method'] = 'SEMANTIC_FALLBACK'
+            res['features'] = feats
         feats = res.get("features") or {}
         cols = feats.get("column_detections") or []
         # Build column audit rows with suggested CIA/policies
@@ -3280,6 +4493,66 @@ class AIClassificationService:
                 "table_sensitivity_score": feats.get("table_sensitivity_score"),
                 "dominant_table_category": feats.get("dominant_table_category"),
             }, sample_info={"sample_size": sample_size})
+        except Exception:
+            pass
+        # Step 9: Audit logging to CLASSIFICATION_AUDIT
+        try:
+            if self.use_snowflake and snowflake_connector is not None:
+                sc = self._gov_schema_fqn()
+                feats = res.get("features") or {}
+                # Determine source of decision
+                route = str(res.get("workflow_route") or feats.get("workflow_route") or "").upper()
+                src = "UNKNOWN"
+                if str(feats.get("semantic_method") or "").upper() == "SEMANTIC":
+                    src = "SEMANTIC"
+                elif str(feats.get("method") or "").upper() == "CTE":
+                    src = "CTE"
+                elif route in ("REVIEW","MANUAL_REVIEW"):
+                    src = "REVIEW"
+                # Build evidence snapshot (truncate to avoid oversized payloads)
+                col_ev = []
+                for r in (feats.get("column_detections") or [])[:10]:
+                    try:
+                        col_ev.append({
+                            "column": r.get("column"),
+                            "category": r.get("dominant_category"),
+                            "confidence": r.get("confidence"),
+                            "pattern_ids": r.get("pattern_ids"),
+                        })
+                    except Exception:
+                        continue
+                details = {
+                    "table": table_name,
+                    "final_label": res.get("classification"),
+                    "workflow_route": route or None,
+                    "source": src,
+                    "cia_minimum": feats.get("cia_minimum"),
+                    "policy_label_suggested": feats.get("policy_label_suggested"),
+                    "semantic": {
+                        "selected": feats.get("semantic_selected"),
+                        "score": feats.get("semantic_score"),
+                        "confidence_level": feats.get("semantic_confidence_level"),
+                        "requires_review": feats.get("semantic_requires_review"),
+                        "validation_evidence": (feats.get("semantic_validation_evidence") or [])[:20],
+                    },
+                    "cte": {
+                        "table_sensitivity_score": feats.get("table_sensitivity_score"),
+                        "dominant_table_category": feats.get("dominant_table_category"),
+                        "sensitive_columns_count": feats.get("sensitive_columns_count"),
+                        "column_evidence": col_ev,
+                    },
+                    "rationale": {
+                        "suggestions": res.get("suggestions"),
+                    },
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                try:
+                    det_sql = json.dumps(details).replace("'", "''")
+                    snowflake_connector.execute_non_query(
+                        f"insert into {sc}.CLASSIFICATION_AUDIT (DETAILS) select parse_json('{det_sql}')"
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
         return res
@@ -4600,6 +5873,34 @@ class AIClassificationService:
         # Unknown or no config => neutral CIA
         return {"C": 0, "I": 0, "A": 0}
 
+    def _policy_cia_minimum_from_category(self, category: str) -> Tuple[Dict[str, int], Optional[str]]:
+        """
+        Step 6 helper: CIA baseline and policy label by category.
+        Falls back to static mapping when governance config is unavailable.
+        Returns (cia_min, label_suggested).
+        """
+        cat = (category or "").upper()
+        mapping = {
+            "PERSONAL_DATA": ({"C": 2, "I": 3, "A": 2}, "Restricted"),
+            "FINANCIAL_DATA": ({"C": 2, "I": 3, "A": 2}, "Restricted"),
+            "REGULATORY_DATA": ({"C": 3, "I": 3, "A": 2}, "Confidential"),
+            "PROPRIETARY_DATA": ({"C": 2, "I": 2, "A": 1}, "Restricted"),
+            "INTERNAL_DATA": ({"C": 1, "I": 1, "A": 1}, "Internal"),
+        }
+        # Governance-configured override when available
+        try:
+            cfg = self.load_sensitivity_config() or {}
+            cats = cfg.get("categories") or {}
+            if cat in cats and isinstance(cats[cat], dict):
+                c = int(cats[cat].get("cia_c", cats[cat].get("C", mapping.get(cat, ({"C":1,"I":1,"A":1}, None))[0]["C"])) )
+                i = int(cats[cat].get("cia_i", cats[cat].get("I", mapping.get(cat, ({"C":1,"I":1,"A":1}, None))[0]["I"])) )
+                a = int(cats[cat].get("cia_a", cats[cat].get("A", mapping.get(cat, ({"C":1,"I":1,"A":1}, None))[0]["A"])) )
+                lab = cats[cat].get("policy_label") or mapping.get(cat, ({"C":1,"I":1,"A":1}, None))[1]
+                return {"C": c, "I": i, "A": a}, (str(lab) if lab else None)
+        except Exception:
+            pass
+        return mapping.get(cat, ({"C": 1, "I": 1, "A": 1}, None))
+
     def _suggest_cia_from_sensitivity(self, sensitivity_score: float) -> Dict[str, int]:
         """Map 0–10 sensitivity score to CIA levels via decision thresholds.
 
@@ -4737,13 +6038,12 @@ class AIClassificationService:
         def _best_category(cats: List[str]) -> Optional[str]:
             if not cats:
                 return None
-            wanted = [c for c in (cats or []) if c in PRIORITY]
+            wanted = [c for c in cats if c in PRIORITY]
             if not wanted:
                 return None
-            return sorted(set(wanted), key=lambda c: PRIORITY[c])[0]
+            return min(wanted, key=lambda c: PRIORITY[c])
 
-        detections = self.detect_sensitive_columns(table_name, sample_size=sample_size) or []
-
+        column_detections = self.detect_sensitive_columns(table_name, sample_size=sample_size) or []
         from collections import Counter, defaultdict
         col_best: Dict[str, Optional[str]] = {}
         col_conf: Dict[str, int] = {}
@@ -5411,9 +6711,8 @@ class AIClassificationService:
                 db = getattr(settings, "SCAN_CATALOG_DB", None) or getattr(settings, "SNOWFLAKE_DATABASE", None)
             inv_fqn_candidates = []
             if db:
-                inv_fqn_candidates.append(f"{db}.DATA_GOVERNANCE.ASSET_INVENTORY")
-                inv_fqn_candidates.append(f"{db}.DATA_CLASSIFICATION_GOVERNANCE.ASSET_INVENTORY")
-            inv_fqn_candidates.append("DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSET_INVENTORY")
+                inv_fqn_candidates.append(f"{db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS")
+            inv_fqn_candidates.append("DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS")
             # Ensure AI columns exist and update JSON flags
             full_name = tbl_row.get("fullname") or table_name
             for inv_fqn in inv_fqn_candidates:
@@ -5429,7 +6728,7 @@ class AIClassificationService:
                     )
                     flags_json = __import__('json').dumps({"flags": active_flags}) if 'active_flags' in locals() else __import__('json').dumps({"flags": []})
                     snowflake_connector.execute_non_query(
-                        f"update {inv_fqn} set AI_FLAGS = PARSE_JSON(%(f)s), AI_DOMINANT_CATEGORY=%(c)s, AI_SENSITIVITY_SCORE=%(s)s where FULL_NAME=%(n)s",
+                        f"update {inv_fqn} set AI_FLAGS = PARSE_JSON(%(f)s), AI_DOMINANT_CATEGORY=%(c)s, AI_SENSITIVITY_SCORE=%(s)s where FULLY_QUALIFIED_NAME=%(n)s",
                         {"f": flags_json, "c": str(tbl_row.get("dominant_category") or ""), "s": float(tbl_row.get("table_sensitivity_score") or 0.0), "n": str(full_name)},
                     )
                     break

@@ -1,6 +1,6 @@
 """
 Migration utilities to evolve metadata structures.
-Adds BUSINESS_UNIT and REGULATORY to ASSET_INVENTORY and backfills from tags/reference.
+Adds BUSINESS_UNIT and REGULATORY to ASSETS and backfills from tags/reference.
 """
 from typing import Dict, Any
 import logging
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 DB = settings.SNOWFLAKE_DATABASE
 SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
-INV = f"{DB}.{SCHEMA}.ASSET_INVENTORY"
+INV = f"{DB}.{SCHEMA}.ASSETS"
 
 
 class MigrationService:
@@ -70,7 +70,7 @@ class MigrationService:
                   WHERE UPPER(TAG_NAME) IN ('BUSINESS_UNIT','BUSINESSUNIT','DEPARTMENT','OWNER_BU')
                   GROUP BY 1
                 ) src
-                WHERE UPPER(inv.FULL_NAME) = src.FULL_NAME
+                WHERE UPPER(inv.FULLY_QUALIFIED_NAME) = src.FULL_NAME
                   AND (inv.BUSINESS_UNIT IS NULL OR inv.BUSINESS_UNIT = '')
                 """
             )
@@ -85,7 +85,7 @@ class MigrationService:
                     UPDATE {INV} inv
                     SET BUSINESS_UNIT = COALESCE(inv.BUSINESS_UNIT, map.BUSINESS_UNIT)
                     FROM {DB}.{SCHEMA}.BUSINESS_UNIT_MAP map
-                    WHERE UPPER(inv.FULL_NAME) = UPPER(map.FULL_NAME)
+                    WHERE UPPER(inv.FULLY_QUALIFIED_NAME) = UPPER(map.FULL_NAME)
                       AND (inv.BUSINESS_UNIT IS NULL OR inv.BUSINESS_UNIT = '')
                     """
                 )
@@ -99,13 +99,13 @@ class MigrationService:
                 UPDATE {INV} inv
                 SET BUSINESS_UNIT = COALESCE(inv.BUSINESS_UNIT,
                   CASE
-                    WHEN UPPER(SPLIT_PART(inv.FULL_NAME, '.', 2)) LIKE 'FIN_%' THEN 'Finance'
-                    WHEN UPPER(SPLIT_PART(inv.FULL_NAME, '.', 2)) LIKE 'HR_%' THEN 'HR'
-                    WHEN UPPER(SPLIT_PART(inv.FULL_NAME, '.', 2)) LIKE 'MKT_%' THEN 'Marketing'
-                    WHEN UPPER(SPLIT_PART(inv.FULL_NAME, '.', 2)) LIKE 'SALES_%' THEN 'Sales'
-                    WHEN UPPER(SPLIT_PART(inv.FULL_NAME, '.', 2)) LIKE 'ENG_%' THEN 'Engineering'
-                    WHEN UPPER(SPLIT_PART(inv.FULL_NAME, '.', 2)) LIKE 'IT_%' THEN 'IT'
-                    WHEN UPPER(SPLIT_PART(inv.FULL_NAME, '.', 2)) LIKE 'OPS_%' THEN 'Operations'
+                    WHEN UPPER(SPLIT_PART(inv.FULLY_QUALIFIED_NAME, '.', 2)) LIKE 'FIN_%' THEN 'Finance'
+                    WHEN UPPER(SPLIT_PART(inv.FULLY_QUALIFIED_NAME, '.', 2)) LIKE 'HR_%' THEN 'HR'
+                    WHEN UPPER(SPLIT_PART(inv.FULLY_QUALIFIED_NAME, '.', 2)) LIKE 'MKT_%' THEN 'Marketing'
+                    WHEN UPPER(SPLIT_PART(inv.FULLY_QUALIFIED_NAME, '.', 2)) LIKE 'SALES_%' THEN 'Sales'
+                    WHEN UPPER(SPLIT_PART(inv.FULLY_QUALIFIED_NAME, '.', 2)) LIKE 'ENG_%' THEN 'Engineering'
+                    WHEN UPPER(SPLIT_PART(inv.FULLY_QUALIFIED_NAME, '.', 2)) LIKE 'IT_%' THEN 'IT'
+                    WHEN UPPER(SPLIT_PART(inv.FULLY_QUALIFIED_NAME, '.', 2)) LIKE 'OPS_%' THEN 'Operations'
                     ELSE inv.BUSINESS_UNIT
                   END)
                 WHERE (inv.BUSINESS_UNIT IS NULL OR inv.BUSINESS_UNIT = '')
@@ -132,7 +132,7 @@ class MigrationService:
                   FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
                   GROUP BY 1
                 ) src
-                WHERE UPPER(inv.FULL_NAME) = src.FULL
+                WHERE UPPER(inv.FULLY_QUALIFIED_NAME) = src.FULL
                   AND (inv.REGULATORY IS NULL OR inv.REGULATORY = '')
                 """
             )

@@ -21,17 +21,29 @@ logger = logging.getLogger(__name__)
 
 def _load_allowed_values(connector, value_type: str) -> List[str]:
     """Load allowed values for a specific tag type from the database"""
+    # Resolve active DB from settings; bail out early if invalid to avoid noisy errors
+    active_db = getattr(settings, "SNOWFLAKE_DATABASE", None)
+    if not active_db or str(active_db).strip().upper() in {"", "NONE", "(NONE)", "NULL", "UNKNOWN"}:
+        defaults = {
+            "CLASSIFICATION": ["Public", "Internal", "Restricted", "Confidential"],
+            "CIA_LEVEL": ["0", "1", "2", "3"],
+            "SPECIAL_CATEGORY": ["PII", "PHI", "PCI", "SOX", "Financial", "Auth", "Confidential", "Other"],
+            "COMPLIANCE_CATEGORY": ["GDPR", "CCPA", "HIPAA", "SOX", "PCI DSS", "SOC", "Internal/Other"],
+            "REVIEW_STATUS": ["Pending Reclassification", "Due Soon", "Overdue", "Reviewed"]
+        }
+        return defaults.get(value_type, [])
     try:
+        fqn = f"{active_db}.DATA_CLASSIFICATION_GOVERNANCE.TAG_ALLOWED_VALUES"
         rows = connector.execute_query(
-            """
-            SELECT VALUE 
-            FROM DATA_CLASSIFICATION_GOVERNANCE.TAG_ALLOWED_VALUES
+            f"""
+            SELECT VALUE
+            FROM {fqn}
             WHERE TAG_TYPE = %(type)s
             ORDER BY DISPLAY_ORDER, VALUE
             """,
             {"type": value_type}
         ) or []
-        return [str(r["VALUE"]) for r in rows]
+        return [str(r.get("VALUE")) for r in rows]
     except Exception as e:
         print(f"Warning: Could not load allowed values for {value_type}: {str(e)}")
         # Default fallback values if database is not available
@@ -127,55 +139,96 @@ class TaggingService:
 
     def _load_sensitivity_patterns(self) -> Dict[str, Dict]:
         """Load sensitivity patterns and categories from database"""
+        active_db = getattr(settings, "SNOWFLAKE_DATABASE", None)
+        if not active_db or str(active_db).strip().upper() in {"", "NONE", "(NONE)", "NULL", "UNKNOWN"}:
+            # No valid DB context; return defaults to avoid noisy errors
+            return {
+                'patterns': {
+                    'PII_STRICT': {
+                        'sensitivity_level': 3,
+                        'is_strict': True,
+                        'keywords': ["SSN", "NATIONAL_ID", "PASSPORT", "PAN", "AADHAAR"]
+                    },
+                    'PII': {
+                        'sensitivity_level': 2,
+                        'is_strict': False,
+                        'keywords': ["SSN", "EMAIL", "PHONE", "ADDRESS", "DOB", "PII", "PERSON", "EMPLOYEE", "CUSTOMER"]
+                    },
+                    'FINANCIAL': {
+                        'sensitivity_level': 2,
+                        'is_strict': False,
+                        'keywords': ["GL", "LEDGER", "REVENUE", "EXPENSE", "PAYROLL"]
+                    },
+                    'SOX': {
+                        'sensitivity_level': 3,
+                        'is_strict': True,
+                        'keywords': ["SOX", "FINANCIAL_REPORT", "AUDIT", "IFRS", "GAAP"]
+                    }
+                },
+                'levels': {
+                    1: {'name': 'INTERNAL', 'display': 'Internal'},
+                    2: {'name': 'RESTRICTED', 'display': 'Restricted'},
+                    3: {'name': 'CONFIDENTIAL', 'display': 'Confidential'}
+                }
+            }
         try:
-            # Load patterns from database
-            patterns = {}
-            
-            # Load sensitive patterns
-            rows = self.connector.execute_query("""
+            # Load patterns from database (use active DB prefix)
+            patterns: Dict[str, Dict] = {}
+            fqn_patterns = f"{active_db}.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS"
+            rows = self.connector.execute_query(
+                f"""
                 SELECT 
                     CATEGORY,
                     PATTERN,
                     SENSITIVITY_LEVEL,
-                    IS_STRICT
-                FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS
-                WHERE IS_ACTIVE = TRUE
+                    IS_STRICT,
+                    COALESCE(PRIORITY, 0) AS PRIORITY
+                FROM {fqn_patterns}
+                WHERE COALESCE(IS_ACTIVE, TRUE) = TRUE
                 ORDER BY PRIORITY DESC
-            """) or []
-            
-            # Group patterns by category
+                """
+            ) or []
             for row in rows:
-                category = str(row['CATEGORY'])
-                if category not in patterns:
-                    patterns[category] = {
-                        'sensitivity_level': int(row['SENSITIVITY_LEVEL']),
-                        'is_strict': bool(row['IS_STRICT']),
-                        'keywords': []
-                    }
-                patterns[category]['keywords'].append(str(row['PATTERN']).upper())
-            
-            # Load sensitivity levels
+                try:
+                    category = str(row.get('CATEGORY'))
+                    if not category:
+                        continue
+                    if category not in patterns:
+                        patterns[category] = {
+                            'sensitivity_level': int(row.get('SENSITIVITY_LEVEL', 1) or 1),
+                            'is_strict': bool(row.get('IS_STRICT', False)),
+                            'keywords': []
+                        }
+                    patterns[category]['keywords'].append(str(row.get('PATTERN') or '').upper())
+                except Exception:
+                    continue
+            # Load sensitivity levels (optional table)
             levels = {}
-            rows = self.connector.execute_query("""
-                SELECT 
-                    LEVEL_NAME,
-                    LEVEL_VALUE,
-                    DISPLAY_NAME
-                FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_LEVELS
-                ORDER BY LEVEL_VALUE
-            """) or []
-            
-            for row in rows:
-                levels[int(row['LEVEL_VALUE'])] = {
-                    'name': str(row['LEVEL_NAME']),
-                    'display': str(row['DISPLAY_NAME'])
+            try:
+                fqn_levels = f"{active_db}.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_LEVELS"
+                lvl_rows = self.connector.execute_query(
+                    f"""
+                    SELECT LEVEL_NAME, LEVEL_VALUE, DISPLAY_NAME
+                    FROM {fqn_levels}
+                    ORDER BY LEVEL_VALUE
+                    """
+                ) or []
+                for row in lvl_rows:
+                    try:
+                        levels[int(row.get('LEVEL_VALUE') or 0)] = {
+                            'name': str(row.get('LEVEL_NAME') or ''),
+                            'display': str(row.get('DISPLAY_NAME') or '')
+                        }
+                    except Exception:
+                        continue
+            except Exception:
+                # If SENSITIVITY_LEVELS missing, provide defaults
+                levels = {
+                    1: {'name': 'INTERNAL', 'display': 'Internal'},
+                    2: {'name': 'RESTRICTED', 'display': 'Restricted'},
+                    3: {'name': 'CONFIDENTIAL', 'display': 'Confidential'}
                 }
-            
-            return {
-                'patterns': patterns,
-                'levels': levels
-            }
-            
+            return {'patterns': patterns, 'levels': levels}
         except Exception as e:
             print(f"Warning: Failed to load sensitivity patterns: {str(e)}")
             # Fallback to default patterns
@@ -483,6 +536,95 @@ class TaggingService:
             except Exception as e:
                 logger.error(f"Failed to tag {full}: {e}")
         return count
+
+    def generate_tag_sql_for_object(self, full_name: str, object_type: str, tags: Dict[str, str]) -> str:
+        db, schema, obj = self._split_fqn(full_name)
+        assignments = ", ".join([f"{TAG_DB}.{TAG_SCHEMA}.{k} = '{v}'" for k, v in tags.items()])
+        return f"ALTER {object_type} {self._q(db)}.{self._q(schema)}.{self._q(obj)} SET TAG {assignments}"
+
+    def generate_tag_sql_for_column(self, full_table_name: str, column_name: str, tags: Dict[str, str]) -> str:
+        db, schema, table = self._split_fqn(full_table_name)
+        assignments = ", ".join([f"{TAG_DB}.{TAG_SCHEMA}.{k} = '{v}'" for k, v in tags.items()])
+        return (
+            f"ALTER TABLE {self._q(db)}.{self._q(schema)}.{self._q(table)} "
+            f"MODIFY COLUMN {self._q(column_name)} SET TAG {assignments}"
+        )
+
+    def suggest_tags_from_criteria(self, classification: str, c: int, i: int, a: int) -> Dict[str, str]:
+        classification = (classification or "Internal").title()
+        c = max(0, min(3, int(c)))
+        i = max(0, min(3, int(i)))
+        a = max(0, min(3, int(a)))
+        return {
+            "DATA_CLASSIFICATION": classification,
+            "CONFIDENTIALITY_LEVEL": str(c),
+            "INTEGRITY_LEVEL": str(i),
+            "AVAILABILITY_LEVEL": str(a),
+        }
+
+    def explain_tag(self, tag_name: str, value: Optional[str] = None) -> Dict:
+        tag = str(tag_name or "").upper()
+        allowed = TAG_DEFINITIONS.get(tag, [])
+        info = {
+            "tag": tag,
+            "allowed_values": allowed,
+            "value": value,
+        }
+        desc = {
+            "DATA_CLASSIFICATION": "Overall data sensitivity label",
+            "CONFIDENTIALITY_LEVEL": "C level: 0 Public, 1 Internal, 2 Restricted, 3 Confidential",
+            "INTEGRITY_LEVEL": "I level: 0 Low, 1 Standard, 2 High, 3 Critical",
+            "AVAILABILITY_LEVEL": "A level: 0 Low, 1 Standard, 2 High, 3 Critical",
+            "SPECIAL_CATEGORY": "Sensitive category such as PII/PHI/PCI/SOX",
+            "COMPLIANCE_CATEGORY": "Applicable regulations (e.g., GDPR, HIPAA, PCI DSS)",
+            "LAST_CLASSIFIED_DATE": "YYYY-MM-DD date when last classified",
+            "LAST_REVIEW_DATE": "YYYY-MM-DD date when last reviewed",
+            "REVIEW_STATUS": "Review workflow status",
+            "MASKING_OVERRIDE": "Whether to override masking enforcement",
+            "MASKING_EXEMPT": "Whether object/column is exempt from masking",
+        }
+        info["description"] = desc.get(tag, "")
+        if value is not None and isinstance(allowed, list) and allowed and value not in allowed and allowed != "__DATE__":
+            info["validation"] = f"Invalid value '{value}'. Allowed: {allowed}"
+        return info
+
+    def diagnose(self, full_name: Optional[str], object_type: Optional[str], tags: Optional[Dict[str, str]], error_message: str) -> List[str]:
+        msg = str(error_message or "")
+        suggestions: List[str] = []
+        try:
+            if tags:
+                try:
+                    self.validate_tags(tags)
+                except Exception as e:
+                    suggestions.append(str(e))
+            if full_name and object_type and tags:
+                try:
+                    if object_type.upper() in ("TABLE", "VIEW"):
+                        db, schema, obj = self._split_fqn(full_name)
+                        _ = self.connector.execute_query(
+                            f"SELECT 1 FROM {self._q(db)}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{obj}' LIMIT 1"
+                        )
+                except Exception:
+                    pass
+            m = msg.lower()
+            if "not authorized" in m or "insufficient privileges" in m or "not enough privileges" in m:
+                suggestions.append("Grant OWNERSHIP or ALTER on the object and USAGE on database/schema; use a role with privileges")
+            if "does not exist" in m or "object does not exist" in m:
+                suggestions.append("Verify DB.SCHEMA.OBJECT and case/quoting; ensure object exists in current account")
+            if "tag" in m and "does not exist" in m:
+                if tags:
+                    for k in tags.keys():
+                        if not self._tag_exists(TAG_DB, TAG_SCHEMA, k):
+                            suggestions.append(f"Tag {TAG_DB}.{TAG_SCHEMA}.{k} is missing; initialize tagging or create tag")
+            if "invalid identifier" in m:
+                suggestions.append("Quote identifiers with double quotes if mixed-case or special chars")
+            if "cannot modify" in m and "column" in m:
+                suggestions.append("Ensure column exists and you used ALTER TABLE ... MODIFY COLUMN syntax")
+            if not suggestions:
+                suggestions.append("Check current role, warehouse, and context; confirm tag allowed values and object existence")
+        except Exception:
+            pass
+        return suggestions
 
 
 tagging_service = TaggingService()

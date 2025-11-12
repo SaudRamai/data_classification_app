@@ -13,8 +13,8 @@ from src.config.settings import settings
 logger = logging.getLogger(__name__)
 
 DB = settings.SNOWFLAKE_DATABASE
-SCHEMA = "DATA_GOVERNANCE"
-INVENTORY = "ASSET_INVENTORY"
+SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
+INVENTORY = "ASSETS"
 
 
 class DiscoveryService:
@@ -28,33 +28,16 @@ class DiscoveryService:
             return
         try:
             self.connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {DB}.{SCHEMA}")
-            self.connector.execute_non_query(
-                f"""
-                CREATE TABLE IF NOT EXISTS {DB}.{SCHEMA}.{INVENTORY} (
-                    FULL_NAME STRING,
-                    OBJECT_DOMAIN STRING,
-                    ROW_COUNT NUMBER,
-                    LAST_DDL_TIME TIMESTAMP_NTZ,
-                    FIRST_DISCOVERED TIMESTAMP_NTZ,
-                    LAST_SEEN TIMESTAMP_NTZ,
-                    CLASSIFICATION_LEVEL STRING,
-                    CIA_CONF NUMBER,
-                    CIA_INT NUMBER,
-                    CIA_AVAIL NUMBER,
-                    QUEUE_PRIORITY NUMBER,
-                    CLASSIFIED BOOLEAN,
-                    PRIMARY KEY (FULL_NAME)
-                )
-                """
-            )
+            # ASSETS table should already exist from schema init scripts
+            pass
             # Secondary view for prioritized queue
             self.connector.execute_non_query(
                 f"""
                 CREATE OR REPLACE VIEW {DB}.{SCHEMA}.CLASSIFICATION_QUEUE AS
                 SELECT *
                 FROM {DB}.{SCHEMA}.{INVENTORY}
-                WHERE COALESCE(CLASSIFIED, FALSE) = FALSE
-                ORDER BY QUEUE_PRIORITY DESC, ROW_COUNT DESC, LAST_SEEN DESC
+                WHERE COALESCE(CLASSIFICATION_LABEL, '') = ''
+                ORDER BY CREATED_TIMESTAMP DESC
                 """
             )
             self._ensured = True
@@ -87,14 +70,12 @@ class DiscoveryService:
                     USING (
                         SELECT %(full)s AS FULL_NAME, %(dom)s AS OBJECT_DOMAIN, %(rc)s AS ROW_COUNT, %(ddl)s AS LAST_DDL_TIME
                     ) s
-                    ON t.FULL_NAME = s.FULL_NAME
+                    ON t.FULLY_QUALIFIED_NAME = s.FULL_NAME
                     WHEN MATCHED THEN UPDATE SET 
-                        OBJECT_DOMAIN = s.OBJECT_DOMAIN,
-                        ROW_COUNT = s.ROW_COUNT,
-                        LAST_DDL_TIME = s.LAST_DDL_TIME,
-                        LAST_SEEN = CURRENT_TIMESTAMP
-                    WHEN NOT MATCHED THEN INSERT (FULL_NAME, OBJECT_DOMAIN, ROW_COUNT, LAST_DDL_TIME, FIRST_DISCOVERED, LAST_SEEN, CLASSIFIED)
-                    VALUES (s.FULL_NAME, s.OBJECT_DOMAIN, s.ROW_COUNT, s.LAST_DDL_TIME, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, FALSE)
+                        ASSET_TYPE = s.OBJECT_DOMAIN,
+                        LAST_MODIFIED_TIMESTAMP = CURRENT_TIMESTAMP
+                    WHEN NOT MATCHED THEN INSERT (ASSET_ID, FULLY_QUALIFIED_NAME, ASSET_NAME, ASSET_TYPE, DATABASE_NAME, SCHEMA_NAME, OBJECT_NAME, DATA_OWNER, CREATED_TIMESTAMP, LAST_MODIFIED_TIMESTAMP)
+                    VALUES (UUID_STRING(), s.FULL_NAME, SPLIT_PART(s.FULL_NAME, '.', 3), s.OBJECT_DOMAIN, SPLIT_PART(s.FULL_NAME, '.', 1), SPLIT_PART(s.FULL_NAME, '.', 2), SPLIT_PART(s.FULL_NAME, '.', 3), 'SYSTEM', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     {
                         "full": r["FULL_NAME"],
@@ -111,12 +92,13 @@ class DiscoveryService:
             self.connector.execute_non_query(
                 f"""
                 UPDATE {DB}.{SCHEMA}.{INVENTORY}
-                SET QUEUE_PRIORITY = (
-                    COALESCE(ROW_COUNT,0)/1000 + 
-                    CASE WHEN FULL_NAME ILIKE '%CUSTOMER%' OR FULL_NAME ILIKE '%USER%' OR FULL_NAME ILIKE '%PII%' THEN 50 ELSE 0 END +
-                    CASE WHEN FULL_NAME ILIKE '%FINANCE%' OR FULL_NAME ILIKE '%PAYROLL%' OR FULL_NAME ILIKE '%INVOICE%' THEN 40 ELSE 0 END
+                SET CONTAINS_PII = (
+                    CASE WHEN FULLY_QUALIFIED_NAME ILIKE '%CUSTOMER%' OR FULLY_QUALIFIED_NAME ILIKE '%USER%' OR FULLY_QUALIFIED_NAME ILIKE '%PII%' THEN TRUE ELSE FALSE END
+                ),
+                CONTAINS_FINANCIAL_DATA = (
+                    CASE WHEN FULLY_QUALIFIED_NAME ILIKE '%FINANCE%' OR FULLY_QUALIFIED_NAME ILIKE '%PAYROLL%' OR FULLY_QUALIFIED_NAME ILIKE '%INVOICE%' THEN TRUE ELSE FALSE END
                 )
-                WHERE CLASSIFIED = FALSE
+                WHERE COALESCE(CLASSIFICATION_LABEL, '') = ''
                 """
             )
         except Exception as e:
@@ -140,13 +122,13 @@ class DiscoveryService:
             self.connector.execute_non_query(
                 f"""
                 UPDATE {DB}.{SCHEMA}.{INVENTORY}
-                SET CLASSIFIED = TRUE,
-                    CLASSIFICATION_LEVEL = %(cls)s,
-                    CIA_CONF = %(c)s,
-                    CIA_INT = %(i)s,
-                    CIA_AVAIL = %(a)s,
-                    LAST_SEEN = CURRENT_TIMESTAMP
-                WHERE FULL_NAME = %(full)s
+                SET CLASSIFICATION_LABEL = %(cls)s,
+                    CONFIDENTIALITY_LEVEL = %(c)s,
+                    INTEGRITY_LEVEL = %(i)s,
+                    AVAILABILITY_LEVEL = %(a)s,
+                    CLASSIFICATION_DATE = CURRENT_TIMESTAMP,
+                    LAST_MODIFIED_TIMESTAMP = CURRENT_TIMESTAMP
+                WHERE FULLY_QUALIFIED_NAME = %(full)s
                 """,
                 {"full": full_name, "cls": cls, "c": c, "i": i, "a": a},
             )

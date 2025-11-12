@@ -325,9 +325,9 @@ class ReclassificationService:
         try:
             inv_rows = self.connector.execute_query(
                 f"""
-                SELECT FULL_NAME, FIRST_DISCOVERED, OWNER
-                FROM {db}.{self._schema()}.ASSET_INVENTORY
-                WHERE COALESCE(CLASSIFIED, FALSE) = FALSE
+                SELECT FULLY_QUALIFIED_NAME AS FULL_NAME, CREATED_TIMESTAMP AS FIRST_DISCOVERED, DATA_OWNER_EMAIL AS OWNER
+                FROM {db}.{self._schema()}.ASSETS
+                WHERE COALESCE(CLASSIFICATION_LABEL, '') = ''
                 LIMIT 1000
                 """
             ) or []
@@ -437,9 +437,9 @@ class ReclassificationService:
 
         rows2 = self.connector.execute_query(
             f"""
-            SELECT FULL_NAME
-            FROM {db}.{self._schema()}.ASSET_INVENTORY
-            WHERE LAST_DDL_TIME > DATEADD(day, -1, CURRENT_TIMESTAMP)
+            SELECT FULLY_QUALIFIED_NAME AS FULL_NAME
+            FROM {db}.{self._schema()}.ASSETS
+            WHERE LAST_MODIFIED_TIMESTAMP > DATEADD(day, -1, CURRENT_TIMESTAMP)
             LIMIT 100
             """
         )

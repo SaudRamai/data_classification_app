@@ -73,8 +73,8 @@ class AISensitiveDetectionService:
         self.ai_service = ai_classification_service if use_ai else None
 
         # Config caches loaded from governance views
-        self.weights = {"AI": 0.5, "REGEX": 0.3, "KEYWORD": 0.2}
-        self.thresholds = {"FINAL_MIN_CONF": 0.7, "GRAY_ZONE_LOW": 0.55}
+        self.weights = {"AI": 0.35, "REGEX": 0.30, "KEYWORD": 0.35}
+        self.thresholds = {"FINAL_MIN_CONF": 0.7, "GRAY_ZONE_LOW": 0.5, "AI_CATEGORY_MIN": 0.6}
         self.keyword_rows: List[Dict[str, Any]] = []
         self.pattern_rows: List[Dict[str, Any]] = []
         self.categories: Set[str] = set()
@@ -370,7 +370,9 @@ class AISensitiveDetectionService:
         try:
             # Get semantic matches for column name and table name
             context = f"{table}.{column}"
-            return self.ai_service.get_semantic_matches(context, samples)
+            # Pass valid category list (or None) instead of sample strings
+            categories = list(self.categories) if getattr(self, 'categories', None) else None
+            return self.ai_service.get_semantic_matches(context, categories)
         except Exception as e:
             logger.warning(f"Semantic matching failed: {e}")
             return []
@@ -561,39 +563,81 @@ class AISensitiveDetectionService:
         db = self._gov_db()
         gv = "DATA_CLASSIFICATION_GOVERNANCE"
         gv_fqn = f"{db}.{gv}"
+        # Weights
         try:
-            rows = snowflake_connector.execute_query(f"SELECT SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.VW_SENSITIVITY_WEIGHTS_CANONICAL") or []
-            w = {r.get("SOURCE", ""): float(r.get("WEIGHT", 0)) for r in rows if r.get("IS_ACTIVE", True)}
-            self.weights.update({k.upper(): v for k, v in w.items() if k})
+            rows = snowflake_connector.execute_query(
+                f"SELECT SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.VW_SENSITIVITY_WEIGHTS_CANONICAL"
+            ) or []
+            w = { (r.get("SOURCE") or "").upper(): float(r.get("WEIGHT") or 0) for r in rows if r.get("IS_ACTIVE", True) }
+            for k, v in w.items():
+                if k:
+                    self.weights[k] = v
         except Exception as e:
             logger.warning(f"Weights load failed: {e}")
+        # Thresholds
         try:
-            thr = snowflake_connector.execute_query(f"SELECT NAME, VALUE, IS_ACTIVE FROM {gv_fqn}.VW_SENSITIVITY_THRESHOLDS_CANONICAL") or []
+            thr = snowflake_connector.execute_query(
+                f"SELECT NAME, VALUE, IS_ACTIVE FROM {gv_fqn}.VW_SENSITIVITY_THRESHOLDS_CANONICAL"
+            ) or []
             for r in thr:
                 if r.get("IS_ACTIVE", True) and r.get("NAME"):
                     self.thresholds[str(r["NAME"]).upper()] = float(r.get("VALUE", 0))
         except Exception as e:
             logger.warning(f"Thresholds load failed: {e}")
+        # Keywords
         try:
-            self.keyword_rows = snowflake_connector.execute_query(f"SELECT * FROM {gv_fqn}.VW_SENSITIVE_KEYWORDS_CANONICAL WHERE IS_ACTIVE") or []
+            self.keyword_rows = snowflake_connector.execute_query(
+                f"SELECT * FROM {gv_fqn}.VW_SENSITIVE_KEYWORDS_CANONICAL WHERE IS_ACTIVE"
+            ) or []
         except Exception as e:
             logger.warning(f"Keywords load failed: {e}")
             self.keyword_rows = []
+        if not self.keyword_rows:
+            # Fallback strong signals
+            self.keyword_rows = [
+                {"KEYWORD_ID": 1, "KEYWORD": "SSN", "SENSITIVITY_TYPE": "PII", "SCORE": 0.9, "IS_ACTIVE": True},
+                {"KEYWORD_ID": 2, "KEYWORD": "SOCIAL SECURITY", "SENSITIVITY_TYPE": "PII", "SCORE": 0.9, "IS_ACTIVE": True},
+                {"KEYWORD_ID": 3, "KEYWORD": "CUSTOMER CONTACT", "SENSITIVITY_TYPE": "PII", "SCORE": 0.8, "IS_ACTIVE": True},
+                {"KEYWORD_ID": 4, "KEYWORD": "EMAIL", "SENSITIVITY_TYPE": "PII", "SCORE": 0.75, "IS_ACTIVE": True},
+                {"KEYWORD_ID": 5, "KEYWORD": "PHONE", "SENSITIVITY_TYPE": "PII", "SCORE": 0.75, "IS_ACTIVE": True},
+                {"KEYWORD_ID": 6, "KEYWORD": "ACCOUNT NUMBER", "SENSITIVITY_TYPE": "FINANCIAL", "SCORE": 0.85, "IS_ACTIVE": True},
+                {"KEYWORD_ID": 7, "KEYWORD": "INVOICE", "SENSITIVITY_TYPE": "FINANCIAL", "SCORE": 0.8, "IS_ACTIVE": True},
+                {"KEYWORD_ID": 8, "KEYWORD": "GDPR", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.85, "IS_ACTIVE": True},
+                {"KEYWORD_ID": 9, "KEYWORD": "HIPAA", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.9, "IS_ACTIVE": True},
+                {"KEYWORD_ID": 10, "KEYWORD": "PCI DSS", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.9, "IS_ACTIVE": True},
+            ]
+        # Patterns
         try:
-            self.pattern_rows = snowflake_connector.execute_query(f"SELECT * FROM {gv_fqn}.VW_SENSITIVE_PATTERNS_CANONICAL WHERE IS_ACTIVE") or []
+            self.pattern_rows = snowflake_connector.execute_query(
+                f"SELECT * FROM {gv_fqn}.VW_SENSITIVE_PATTERNS_CANONICAL WHERE IS_ACTIVE"
+            ) or []
         except Exception as e:
             logger.warning(f"Patterns load failed: {e}")
             self.pattern_rows = []
+        if not self.pattern_rows:
+            # Fallback regex patterns
+            self.pattern_rows = [
+                {"PATTERN_ID": "PII_SSN", "PATTERN_REGEX": r"\\b(\d{3}-\d{2}-\d{4})\\b", "SENSITIVITY_TYPE": "PII", "SCORE": 0.9, "IS_ACTIVE": True},
+                {"PATTERN_ID": "PII_EMAIL", "PATTERN_REGEX": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "SENSITIVITY_TYPE": "PII", "SCORE": 0.8, "IS_ACTIVE": True},
+                {"PATTERN_ID": "FIN_ACCOUNT", "PATTERN_REGEX": r"ACCOUNT\s*NUMBER|IBAN|SWIFT", "SENSITIVITY_TYPE": "FINANCIAL", "SCORE": 0.8, "IS_ACTIVE": True},
+                {"PATTERN_ID": "REG_GDPR", "PATTERN_REGEX": r"GDPR|HIPAA|PCI\s*DSS", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.85, "IS_ACTIVE": True},
+            ]
+        # Categories and high-risk list
         try:
-            cats = snowflake_connector.execute_query(f"SELECT CATEGORY_NAME, IS_HIGH_RISK FROM {gv_fqn}.VW_SENSITIVITY_CATEGORIES_CANONICAL WHERE IS_ACTIVE") or []
+            cats = snowflake_connector.execute_query(
+                f"SELECT CATEGORY_NAME, IS_HIGH_RISK FROM {gv_fqn}.VW_SENSITIVITY_CATEGORIES_CANONICAL WHERE IS_ACTIVE"
+            ) or []
             self.categories = set([(r.get("CATEGORY_NAME") or "").upper() for r in cats if r.get("CATEGORY_NAME")])
             high_flags = { (r.get("CATEGORY_NAME") or "").upper(): bool(r.get("IS_HIGH_RISK")) for r in cats if r.get("CATEGORY_NAME") }
-            self.thresholds.setdefault("HIGH_RISK_CATEGORIES", [k for k,v in high_flags.items() if v])
+            self.thresholds.setdefault("HIGH_RISK_CATEGORIES", [k for k, v in high_flags.items() if v])
         except Exception as e:
             logger.warning(f"Categories load failed: {e}")
             self.categories = self.categories or set()
+        # Compliance mapping
         try:
-            cmap = snowflake_connector.execute_query(f"SELECT CATEGORY_NAME, COMPLIANCE_TAG FROM {gv_fqn}.VW_COMPLIANCE_MAPPING_CANONICAL WHERE IS_ACTIVE") or []
+            cmap = snowflake_connector.execute_query(
+                f"SELECT CATEGORY_NAME, COMPLIANCE_TAG FROM {gv_fqn}.VW_COMPLIANCE_MAPPING_CANONICAL WHERE IS_ACTIVE"
+            ) or []
             m: Dict[str, List[str]] = {}
             for r in cmap:
                 cat = (r.get("CATEGORY_NAME") or "").upper()
@@ -605,8 +649,8 @@ class AISensitiveDetectionService:
         except Exception as e:
             logger.warning(f"Compliance mapping load failed: {e}")
             self.compliance_map = {}
-    
-    def detect_sensitive_tables(self, 
+
+    def detect_sensitive_tables(self,
                               database: str,
                               schema_name: Optional[str] = None,
                               table_name: Optional[str] = None) -> List[Dict]:

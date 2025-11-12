@@ -49,10 +49,13 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
     )
     sel_db = "" if sel_db_raw == "All" else sel_db_raw
 
-    # Schemas with 'All'
-    schemas = []
+    # Schemas with 'All' — if no database selected, list account-level schemas
+    schemas: List[str] = []
     if sel_db:
         schemas = [r.get("name") or r.get("NAME") for r in _safe_query(f"SHOW SCHEMAS IN DATABASE {sel_db}") if (r.get("name") or r.get("NAME"))]
+    else:
+        # No database selected: show schemas available in the account (best-effort)
+        schemas = [r.get("name") or r.get("NAME") for r in _safe_query("SHOW SCHEMAS IN ACCOUNT") if (r.get("name") or r.get("NAME"))]
     schema_options = (["All"] + schemas) if schemas else ["All"]
     prev_schema = st.session_state.get(f"{key_prefix}_schema") or "All"
     try:

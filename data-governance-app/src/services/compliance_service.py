@@ -252,9 +252,9 @@ class ComplianceService:
     def _rule_untagged_tables(self) -> List[Dict[str, Any]]:
         sql = f"""
         WITH inv AS (
-          SELECT FULL_NAME FROM {DB}.{SCHEMA}.ASSET_INVENTORY
+          SELECT FULLY_QUALIFIED_NAME FROM {DB}.{SCHEMA}.ASSETS
         )
-        SELECT inv.FULL_NAME
+        SELECT inv.FULLY_QUALIFIED_NAME AS FULL_NAME
         FROM inv
         LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES tr
           ON UPPER(inv.FULL_NAME) = UPPER(tr.OBJECT_DATABASE||'.'||tr.OBJECT_SCHEMA||'.'||tr.OBJECT_NAME)
@@ -340,10 +340,10 @@ class ComplianceService:
         """Assets discovered more than 5 business days ago and not yet classified."""
         # Using a simple >=5 day difference; if a BUSINESS_DAY calendar exists, replace with a proper business day calc
         sql = f"""
-        SELECT FULL_NAME
-        FROM {DB}.{SCHEMA}.ASSET_INVENTORY
-        WHERE COALESCE(CLASSIFIED, FALSE) = FALSE
-          AND FIRST_DISCOVERED < DATEADD(day, -5, CURRENT_TIMESTAMP)
+        SELECT FULLY_QUALIFIED_NAME AS FULL_NAME
+        FROM {DB}.{SCHEMA}.ASSETS
+        WHERE COALESCE(CLASSIFICATION_LABEL, '') = ''
+          AND CREATED_TIMESTAMP < DATEADD(day, -5, CURRENT_TIMESTAMP)
         LIMIT 500
         """
         try:
@@ -363,14 +363,14 @@ class ComplianceService:
         }
         try:
             total_assets = self.connector.execute_query(
-                f"SELECT COUNT(*) AS C FROM {DB}.{SCHEMA}.ASSET_INVENTORY"
+                f"SELECT COUNT(*) AS C FROM {DB}.{SCHEMA}.ASSETS"
             )[0]["C"]
             tagged_assets = self.connector.execute_query(
                 f"""
                 WITH inv AS (
-                  SELECT FULL_NAME FROM {DB}.{SCHEMA}.ASSET_INVENTORY
+                  SELECT FULLY_QUALIFIED_NAME FROM {DB}.{SCHEMA}.ASSETS
                 )
-                SELECT COUNT(DISTINCT inv.FULL_NAME) AS C
+                SELECT COUNT(DISTINCT inv.FULLY_QUALIFIED_NAME) AS C
                 FROM inv
                 JOIN SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES tr
                   ON UPPER(inv.FULL_NAME) = UPPER(tr.OBJECT_DATABASE||'.'||tr.OBJECT_SCHEMA||'.'||tr.OBJECT_NAME)
@@ -383,8 +383,8 @@ class ComplianceService:
             risk_rows = self.connector.execute_query(
                 f"""
                 WITH r AS (
-                  SELECT COALESCE(GREATEST(COALESCE(CIA_CONF,0), COALESCE(CIA_INT,0), COALESCE(CIA_AVAIL,0)),0) AS R
-                  FROM {DB}.{SCHEMA}.ASSET_INVENTORY
+                  SELECT COALESCE(GREATEST(CAST(COALESCE(CONFIDENTIALITY_LEVEL,'0') AS INT), CAST(COALESCE(INTEGRITY_LEVEL,'0') AS INT), CAST(COALESCE(AVAILABILITY_LEVEL,'0') AS INT)),0) AS R
+                  FROM {DB}.{SCHEMA}.ASSETS
                 )
                 SELECT 
                   SUM(CASE WHEN R >= 3 THEN 1 ELSE 0 END) AS HIGH,
@@ -434,9 +434,9 @@ class ComplianceService:
         """
         sql = f"""
             WITH inv AS (
-              SELECT FULL_NAME,
-                     COALESCE(CIA_CONF,0) AS C
-              FROM {DB}.{SCHEMA}.ASSET_INVENTORY
+              SELECT FULLY_QUALIFIED_NAME AS FULL_NAME,
+                     CAST(COALESCE(CONFIDENTIALITY_LEVEL,'0') AS INT) AS C
+              FROM {DB}.{SCHEMA}.ASSETS
             ),
             tr AS (
               SELECT UPPER(OBJECT_DATABASE||'.'||OBJECT_SCHEMA||'.'||OBJECT_NAME) AS FULL,
@@ -767,9 +767,9 @@ class ComplianceService:
         """Flag assets likely containing EU personal data without GDPR regulatory tag."""
         sql = f"""
         WITH inv AS (
-          SELECT FULL_NAME, COALESCE(CLASSIFICATION_LEVEL,'') AS CLASSIFICATION_LEVEL,
-                 COALESCE(CIA_CONF,0) AS C
-          FROM {DB}.{SCHEMA}.ASSET_INVENTORY
+          SELECT FULLY_QUALIFIED_NAME AS FULL_NAME, COALESCE(CLASSIFICATION_LABEL,'') AS CLASSIFICATION_LEVEL,
+                 CAST(COALESCE(CONFIDENTIALITY_LEVEL,'0') AS INT) AS C
+          FROM {DB}.{SCHEMA}.ASSETS
         ),
         tags AS (
           SELECT UPPER(OBJECT_DATABASE||'.'||OBJECT_SCHEMA||'.'||OBJECT_NAME) AS FULL,
@@ -796,9 +796,9 @@ class ComplianceService:
         """Flag assets likely containing PHI without HIPAA tag or masking policy references."""
         sql = f"""
         WITH inv AS (
-          SELECT FULL_NAME, COALESCE(CLASSIFICATION_LEVEL,'') AS CLASSIFICATION_LEVEL,
-                 COALESCE(CIA_CONF,0) AS C
-          FROM {DB}.{SCHEMA}.ASSET_INVENTORY
+          SELECT FULLY_QUALIFIED_NAME AS FULL_NAME, COALESCE(CLASSIFICATION_LABEL,'') AS CLASSIFICATION_LEVEL,
+                 CAST(COALESCE(CONFIDENTIALITY_LEVEL,'0') AS INT) AS C
+          FROM {DB}.{SCHEMA}.ASSETS
         ),
         tags AS (
           SELECT UPPER(OBJECT_DATABASE||'.'||OBJECT_SCHEMA||'.'||OBJECT_NAME) AS FULL,

@@ -2,7 +2,6 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import logging
 from src.connectors.snowflake_connector import snowflake_connector
-from src.services.ai_classification_service import ai_classification_service
 from src.services.decision_matrix_service import validate as dm_validate
 from src.services.tagging_service import tagging_service
 from src.services.audit_service import audit_service
@@ -332,25 +331,40 @@ class ai_assistant_service:
         try:
             # Build enriched semantic context for the asset using metadata, samples, glossary, policy
             try:
-                enriched = ai_classification_service.build_enriched_context(asset['full_name'])
+                from src.services.ai_classification_service import ai_classification_service as _ai_cls  # lazy import to avoid circulars
             except Exception:
-                enriched = ''
+                _ai_cls = None
+
+            enriched = ''
+            if _ai_cls is not None:
+                try:
+                    enriched = _ai_cls.build_enriched_context(asset['full_name'])
+                except Exception:
+                    enriched = ''
+
             # Optionally add a few per-column contexts for stronger signal
             col_ctx_blob = ''
-            try:
-                col_ctx = ai_classification_service.build_column_contexts(asset['full_name'], sample_rows=5) or {}
-                if col_ctx:
-                    top_cols = list(col_ctx.keys())[:3]
-                    col_lines = [col_ctx[c] for c in top_cols if c in col_ctx]
-                    if col_lines:
-                        col_ctx_blob = "\n" + "\n".join(col_lines)
-            except Exception:
-                col_ctx_blob = ''
+            if _ai_cls is not None:
+                try:
+                    col_ctx = _ai_cls.build_column_contexts(asset['full_name'], sample_rows=5) or {}
+                    if col_ctx:
+                        top_cols = list(col_ctx.keys())[:3]
+                        col_lines = [col_ctx[c] for c in top_cols if c in col_ctx]
+                        if col_lines:
+                            col_ctx_blob = "\n" + "\n".join(col_lines)
+                except Exception:
+                    col_ctx_blob = ''
+
             context = "\n".join([s for s in [business_context, enriched] if s]) + col_ctx_blob
 
             # Semantic embedding similarity against governance categories (MiniLM + hybrid)
             # Use enriched context directly with the governance-aware matcher
-            matches = ai_classification_service._get_semantic_matches_gov(context)
+            matches = []
+            if _ai_cls is not None:
+                try:
+                    matches = _ai_cls._get_semantic_matches_gov(context) or []
+                except Exception:
+                    matches = []
             for m in (matches or []):
                 try:
                     src_cat = str(m.get('category') or '')

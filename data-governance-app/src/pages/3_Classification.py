@@ -201,7 +201,8 @@ except Exception as _top_auth_err:
 
 # Ensure AI service is properly initialized
 try:
-    ai_classification_service.set_mode(True)
+    if hasattr(ai_classification_service, "set_mode"):
+        ai_classification_service.set_mode(True)
     _db_init = st.session_state.get("sf_database") or resolve_governance_db()
     if _db_init:
         _sc_fqn_init = f"{_db_init}.DATA_CLASSIFICATION_GOVERNANCE"
@@ -340,7 +341,8 @@ with st.sidebar.expander("🌐 Global Filters", expanded=True):
                 except Exception:
                     pass
             try:
-                ai_classification_service.set_mode(True)
+                if hasattr(ai_classification_service, "set_mode"):
+                    ai_classification_service.set_mode(True)
                 _sc_fqn_sel = f"{_db_sel}.DATA_CLASSIFICATION_GOVERNANCE"
                 ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn_sel)
             except Exception:
@@ -424,7 +426,8 @@ def _set_db_from_filters_if_available() -> None:
 def _apply_snowflake_context() -> None:
     try:
         try:
-            ai_classification_service.set_mode(True)
+            if hasattr(ai_classification_service, "set_mode"):
+                ai_classification_service.set_mode(True)
         except Exception:
             pass
 
@@ -1042,8 +1045,10 @@ with tab_qa:
                     gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
                     sql = f"""
                         select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME,
-                               coalesce(CLASSIFICATION_TAG, CURRENT_CLASSIFICATION, '') as CLASSIFICATION,
-                               coalesce(CIA_C, 0) as C, coalesce(CIA_I, 0) as I, coalesce(CIA_A, 0) as A
+                               coalesce(CLASSIFICATION_LABEL, '') as CLASSIFICATION,
+                               coalesce(try_to_number(regexp_substr(CONFIDENTIALITY_LEVEL, '[0-9]')), 0) as C,
+                               coalesce(try_to_number(regexp_substr(INTEGRITY_LEVEL, '[0-9]')), 0)        as I,
+                               coalesce(try_to_number(regexp_substr(AVAILABILITY_LEVEL, '[0-9]')), 0)     as A
                         from {db}.{gv}.ASSETS
                         qualify row_number() over (order by DATABASE_NAME, SCHEMA_NAME, ASSET_NAME) <= %(lim)s
                     """

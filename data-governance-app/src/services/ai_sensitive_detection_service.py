@@ -17,7 +17,6 @@ import numpy as np
 from collections import defaultdict
 
 from src.connectors.snowflake_connector import snowflake_connector
-from src.services.ai_classification_service import ai_classification_service
 from src.services.sensitive_detection import SensitiveDataDetector
 from src.config.settings import settings
 
@@ -70,7 +69,15 @@ class AISensitiveDetectionService:
         
         # Initialize base detector
         self.detector = SensitiveDataDetector()
-        self.ai_service = ai_classification_service if use_ai else None
+        # Lazy import to avoid circular dependency with ai_classification_service
+        if use_ai:
+            try:
+                from src.services.ai_classification_service import ai_classification_service
+                self.ai_service = ai_classification_service
+            except Exception:
+                self.ai_service = None
+        else:
+            self.ai_service = None
 
         # Config caches loaded from governance views
         self.weights = {"AI": 0.35, "REGEX": 0.30, "KEYWORD": 0.35}
@@ -559,25 +566,34 @@ class AISensitiveDetectionService:
 
     # --- Config loading ---
     def _load_configs_safely(self) -> None:
-        """Load governance configs; tolerate missing objects/privileges."""
+        """Load governance configs; tolerate missing objects/privileges.
+
+        This now uses the base SENSITIVITY_* and SENSITIVE_* tables instead of
+        legacy VW_*_CANONICAL views, and aliases columns to the internal
+        field names expected by the detection logic.
+        """
         db = self._gov_db()
         gv = "DATA_CLASSIFICATION_GOVERNANCE"
         gv_fqn = f"{db}.{gv}"
-        # Weights
+        # Weights (AI / REGEX / KEYWORD, etc.)
         try:
             rows = snowflake_connector.execute_query(
-                f"SELECT SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.VW_SENSITIVITY_WEIGHTS_CANONICAL"
+                f"SELECT CATEGORY AS SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_WEIGHTS"
             ) or []
-            w = { (r.get("SOURCE") or "").upper(): float(r.get("WEIGHT") or 0) for r in rows if r.get("IS_ACTIVE", True) }
+            w = {
+                (r.get("SOURCE") or "").upper(): float(r.get("WEIGHT") or 0)
+                for r in rows
+                if r.get("IS_ACTIVE", True)
+            }
             for k, v in w.items():
                 if k:
                     self.weights[k] = v
         except Exception as e:
             logger.warning(f"Weights load failed: {e}")
-        # Thresholds
+        # Thresholds (generic name/value mapping)
         try:
             thr = snowflake_connector.execute_query(
-                f"SELECT NAME, VALUE, IS_ACTIVE FROM {gv_fqn}.VW_SENSITIVITY_THRESHOLDS_CANONICAL"
+                f"SELECT THRESHOLD_NAME AS NAME, CONFIDENCE_LEVEL AS VALUE, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_THRESHOLDS"
             ) or []
             for r in thr:
                 if r.get("IS_ACTIVE", True) and r.get("NAME"):
@@ -587,7 +603,19 @@ class AISensitiveDetectionService:
         # Keywords
         try:
             self.keyword_rows = snowflake_connector.execute_query(
-                f"SELECT * FROM {gv_fqn}.VW_SENSITIVE_KEYWORDS_CANONICAL WHERE IS_ACTIVE"
+                f"""
+                SELECT 
+                    k.KEYWORD_ID,
+                    k.KEYWORD_STRING AS KEYWORD,
+                    c.CATEGORY_NAME AS SENSITIVITY_TYPE,
+                    k.SENSITIVITY_WEIGHT AS SCORE,
+                    k.IS_ACTIVE
+                FROM {gv_fqn}.SENSITIVE_KEYWORDS k
+                JOIN {gv_fqn}.SENSITIVITY_CATEGORIES c
+                    ON k.CATEGORY_ID = c.CATEGORY_ID
+                WHERE k.IS_ACTIVE = TRUE
+                  AND c.IS_ACTIVE = TRUE
+                """
             ) or []
         except Exception as e:
             logger.warning(f"Keywords load failed: {e}")
@@ -609,7 +637,19 @@ class AISensitiveDetectionService:
         # Patterns
         try:
             self.pattern_rows = snowflake_connector.execute_query(
-                f"SELECT * FROM {gv_fqn}.VW_SENSITIVE_PATTERNS_CANONICAL WHERE IS_ACTIVE"
+                f"""
+                SELECT 
+                    p.PATTERN_ID,
+                    p.PATTERN_STRING AS PATTERN_REGEX,
+                    c.CATEGORY_NAME AS SENSITIVITY_TYPE,
+                    p.SENSITIVITY_WEIGHT AS SCORE,
+                    p.IS_ACTIVE
+                FROM {gv_fqn}.SENSITIVE_PATTERNS p
+                JOIN {gv_fqn}.SENSITIVITY_CATEGORIES c
+                    ON p.CATEGORY_ID = c.CATEGORY_ID
+                WHERE p.IS_ACTIVE = TRUE
+                  AND c.IS_ACTIVE = TRUE
+                """
             ) or []
         except Exception as e:
             logger.warning(f"Patterns load failed: {e}")
@@ -625,29 +665,20 @@ class AISensitiveDetectionService:
         # Categories and high-risk list
         try:
             cats = snowflake_connector.execute_query(
-                f"SELECT CATEGORY_NAME, IS_HIGH_RISK FROM {gv_fqn}.VW_SENSITIVITY_CATEGORIES_CANONICAL WHERE IS_ACTIVE"
+                f"SELECT CATEGORY_NAME, IS_HIGH_RISK, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_CATEGORIES"
             ) or []
+            cats = [r for r in cats if r.get("IS_ACTIVE", True)]
             self.categories = set([(r.get("CATEGORY_NAME") or "").upper() for r in cats if r.get("CATEGORY_NAME")])
             high_flags = { (r.get("CATEGORY_NAME") or "").upper(): bool(r.get("IS_HIGH_RISK")) for r in cats if r.get("CATEGORY_NAME") }
             self.thresholds.setdefault("HIGH_RISK_CATEGORIES", [k for k, v in high_flags.items() if v])
         except Exception as e:
             logger.warning(f"Categories load failed: {e}")
             self.categories = self.categories or set()
-        # Compliance mapping
+        # Compliance mapping (optional) – leave empty if no mapping table
         try:
-            cmap = snowflake_connector.execute_query(
-                f"SELECT CATEGORY_NAME, COMPLIANCE_TAG FROM {gv_fqn}.VW_COMPLIANCE_MAPPING_CANONICAL WHERE IS_ACTIVE"
-            ) or []
-            m: Dict[str, List[str]] = {}
-            for r in cmap:
-                cat = (r.get("CATEGORY_NAME") or "").upper()
-                tag = r.get("COMPLIANCE_TAG")
-                if not cat or not tag:
-                    continue
-                m.setdefault(cat, []).append(str(tag))
-            self.compliance_map = m
-        except Exception as e:
-            logger.warning(f"Compliance mapping load failed: {e}")
+            # If a COMPLIANCE_MAPPING table exists, you can wire it here.
+            self.compliance_map = {}
+        except Exception:
             self.compliance_map = {}
 
     def detect_sensitive_tables(self,

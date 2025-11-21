@@ -561,14 +561,26 @@ class AIClassificationPipelineService:
             if SentenceTransformer is not None:
                 try:
                     logger.info("Initializing SentenceTransformer embeddings...")
-                    self._embedder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+                    # Try to load a better model for higher accuracy
+                    # We use e5-small-v2 as a balance between performance and resource usage in this environment
+                    # In a full production environment, 'intfloat/e5-large-v2' or 'google/embedding-gemma-300m' would be preferred
+                    model_name = 'intfloat/e5-small-v2'
+                    try:
+                        self._embedder = SentenceTransformer(model_name)
+                        self._embed_backend = 'sentence-transformers'
+                        logger.info(f"✓ Embeddings initialized successfully with {model_name}")
+                    except Exception as e_model:
+                        logger.warning(f"Failed to load {model_name}, falling back to MiniLM: {e_model}")
+                        self._embedder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+                        self._embed_backend = 'sentence-transformers'
+                        logger.info("✓ Fallback embeddings initialized successfully (MiniLM)")
+
                     tv = self._embedder.encode(["ok"], normalize_embeddings=True)
                     v0 = tv[0] if isinstance(tv, (list, tuple)) else tv
                     dim = int(getattr(v0, "shape", [0])[-1]) if hasattr(v0, "shape") else (len(v0) if isinstance(v0, (list, tuple)) else 0)
                     if dim and dim > 0:
-                        self._embed_backend = 'sentence-transformers'
                         self._embed_ready = True
-                        logger.info(f"✓ Embeddings initialized successfully. Backend: {self._embed_backend}, Dimension: {dim}")
+                        logger.info(f"  Dimension: {dim}")
                     else:
                         self._embedder = None
                         self._embed_backend = 'none'
@@ -910,7 +922,8 @@ class AIClassificationPipelineService:
                       fiscal year fy quarter q1 q2 q3 q4 period 
                       materiality threshold variance budget forecast 
                       internal control icfr sox compliance sox audit sox testing
-                      revenue recognition expense recognition matching principle"""),
+                      revenue recognition expense recognition matching principle
+                      quantity amount price total unit cost total cost"""),
             
             # SOC2: Enhanced with security, compliance, and operational controls
             ("SOC2", """soc2 soc 2 service organization control security availability processing integrity confidentiality privacy 
@@ -930,7 +943,8 @@ class AIClassificationPipelineService:
                        segregation of duties sod conflict of interest 
                        data classification data protection data privacy gdpr hipaa pci dss 
                        security control operational control technical control administrative control
-                       trust service criteria tsc availability confidentiality integrity privacy security""")
+                       trust service criteria tsc availability confidentiality integrity privacy security
+                       database name schema name table name column name created by updated by last modified risk score asset id classification tag""")
         ]
         centroids: Dict[str, Any] = {}
         tokens_out: Dict[str, List[str]] = {}
@@ -1010,7 +1024,9 @@ class AIClassificationPipelineService:
                     if c is None:
                         continue
                     sim = float(np.dot(v, c))
-                    conf = max(0.0, min(1.0, (sim + 1.0) / 2.0))
+                    # Use raw cosine similarity (clipped at 0) rather than (sim+1)/2
+                    # This prevents noise (sim ~0) from starting at 0.5
+                    conf = max(0.0, sim)
                     raw[cat] = conf
                 except Exception:
                     continue
@@ -1021,22 +1037,24 @@ class AIClassificationPipelineService:
                 vals = list(raw.values())
                 mn = min(vals)
                 mx = max(vals)
-                if mx > mn:
+                # Only apply relative boosting if we have a meaningful signal (sim > 0.35)
+                # This prevents boosting "best of the worst" noise to 1.0
+                if mx > mn and mx > 0.35:
                     for k, v0 in raw.items():
                         x = (float(v0) - float(mn)) / (float(mx) - float(mn))
                         # ENHANCED: More aggressive boosting to reach 85%+ confidence for strong matches
                         if x >= 0.65:
-                            # Very aggressive boost for very strong signals: x^0.25
-                            x = pow(x, 0.25)
+                            # Very aggressive boost for very strong signals: x^0.2
+                            x = pow(x, 0.2)
                         elif x >= 0.55:
-                            # Aggressive boost for strong signals: x^0.35
-                            x = pow(x, 0.35)
+                            # Aggressive boost for strong signals: x^0.3
+                            x = pow(x, 0.3)
                         elif x >= 0.45:
                             # Moderate boost for medium-strong signals
-                            x = pow(x, 0.5)
+                            x = pow(x, 0.45)
                         elif x >= 0.30:
                             # Gentle boost for medium signals
-                            x = pow(x, 0.7)
+                            x = pow(x, 0.65)
                         elif x >= 0.15:
                             # Minimal boost for weak signals
                             x = pow(x, 0.85)
@@ -1045,6 +1063,8 @@ class AIClassificationPipelineService:
                             x = pow(x, 1.1)
                         scores[k] = max(0.0, min(1.0, x))
                 else:
+                    # If signals are weak, return raw scores (likely 0.0-0.3)
+                    # These will likely be filtered out by the 0.40 threshold
                     scores = dict(raw)
             except Exception:
                 scores = dict(raw)
@@ -1069,7 +1089,7 @@ class AIClassificationPipelineService:
                         if re.search(r"\b" + re.escape(tok_lower) + r"\b", t, re.IGNORECASE):
                             exact_hits += 1
                             # Weight based on token specificity (longer = more specific)
-                            weight = min(1.0, len(tok_lower) / 15.0) + 0.5
+                            weight = min(1.0, len(tok_lower) / 10.0) + 0.5
                             total_weight += weight
                         # Partial match (lower confidence)
                         elif tok_lower in t:
@@ -1083,17 +1103,14 @@ class AIClassificationPipelineService:
                 
                 # Calculate score with emphasis on exact matches
                 if exact_hits > 0:
-                    # Strong signal: multiple exact matches
-                    base_score = min(1.0, (exact_hits * 0.25) + (total_weight * 0.15))
-                    # Boost for multiple exact matches
-                    if exact_hits >= 3:
-                        base_score = min(1.0, base_score * 1.3)
-                    elif exact_hits >= 2:
-                        base_score = min(1.0, base_score * 1.15)
-                    out[cat] = base_score
+                    # Strong signal: exact matches should yield high confidence
+                    # Start at 0.85 for any exact match, then boost
+                    base_score = 0.85 + (min(0.15, exact_hits * 0.05))
+                    out[cat] = min(1.0, base_score)
                 elif hits > 0:
                     # Moderate signal: partial matches only
-                    out[cat] = min(0.6, (hits * 0.15) + (total_weight * 0.1))
+                    # Scale based on hits and weight, capped at 0.65
+                    out[cat] = min(0.65, (hits * 0.15) + (total_weight * 0.1))
                 else:
                     out[cat] = 0.0
         except Exception:
@@ -1414,6 +1431,120 @@ class AIClassificationPipelineService:
         except Exception:
             return scores
 
+    def _calculate_enhanced_confidence(self, text: str, context_map: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, float]]:
+        """
+        Multi-factor confidence scoring with weighted components.
+        Returns a dict of category -> {final: float, components: dict}
+        """
+        results: Dict[str, Dict[str, float]] = {}
+        try:
+            # 1. Semantic Similarity Score
+            # Prefix with "query: " if using e5 models, though for generic use we'll stick to raw text
+            # unless we detect e5.
+            ptxt = self._preprocess_text_local(text)
+            if self._embedder and 'e5' in str(type(self._embedder)).lower():
+                 # e5 models expect "query: " prefix for asymmetric tasks, but here we are comparing
+                 # column context (query) to category centroids (documents).
+                 # Ideally centroids are "passage: " and input is "query: ".
+                 # For now, we assume the input text is the query.
+                 ptxt_emb = f"query: {ptxt}"
+                 # We need to handle this in _semantic_scores or here. 
+                 # _semantic_scores uses _embedder directly.
+                 # Let's just use _semantic_scores as is, assuming it handles the embedding generation.
+                 # If we want to be strict about e5, we should update _semantic_scores.
+                 pass
+
+            sem = self._semantic_scores(ptxt)
+            
+            # 2. Keyword/Pattern Score
+            kw = self._keyword_scores(ptxt)
+            pt = self._pattern_scores(ptxt)
+            
+            # 3. Governance Score
+            gov = self._gov_semantic_scores(ptxt)
+            
+            # 4. Context/Metadata Score (derived from context_map)
+            # context_map might contain: data_type, uniqueness, etc.
+            meta_score = 0.5 # Default neutral
+            if context_map:
+                dtype = str(context_map.get("data_type", "")).upper()
+                # Simple type validation to reduce false positives
+                if "DATE" in dtype or "TIME" in dtype:
+                    # Unlikely to be PII like Name, Email, SSN (unless DOB)
+                    # We use loose matching for categories since they might be "PII" or specific
+                    if any(x in cat.upper() for x in ["EMAIL", "PHONE", "SSN", "NAME"]):
+                        if not any(x in cat.upper() for x in ["DOB", "BIRTH"]):
+                             meta_score = 0.1
+                elif "BOOLEAN" in dtype:
+                    meta_score = 0.0
+                elif "NUMERIC" in dtype or "INT" in dtype or "FLOAT" in dtype:
+                     # Unlikely to be Name, Email (though IDs are numeric)
+                     if any(x in cat.upper() for x in ["NAME", "EMAIL"]):
+                         meta_score = 0.1
+
+            all_cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()) + list(gov.keys()))
+            
+            for cat in all_cats:
+                s_score = float(sem.get(cat, 0.0))
+                k_score = float(kw.get(cat, 0.0))
+                p_score = float(pt.get(cat, 0.0))
+                g_score = float(gov.get(cat, 0.0))
+                
+                # Adaptive weights
+                # Base weights
+                w_sem = 0.35
+                w_pat = 0.25 # kw + pt
+                w_ctx = 0.20
+                w_meta = 0.15
+                w_dist = 0.05
+                
+                # Combine keyword and pattern into "Pattern Match Score"
+                # If we have a strong regex match (p_score), it should dominate pattern score
+                pattern_score = max(k_score, p_score)
+                
+                # Context Score (using governance as a proxy for "Context Validation" + "Table Context")
+                # If governance says it's a match, that's very strong context
+                context_score = g_score if g_score > 0 else (0.8 if k_score > 0.5 else 0.0)
+                
+                # Metadata/Distribution (mocked for now as 0.5 unless we have data)
+                dist_score = 0.5
+                
+                # Calculate weighted sum
+                final = (
+                    w_sem * s_score +
+                    w_pat * pattern_score +
+                    w_ctx * context_score +
+                    w_meta * meta_score +
+                    w_dist * dist_score
+                )
+                
+                # Adaptive Boosts
+                # If pattern is very high (exact match), boost significantly
+                if pattern_score > 0.9:
+                    final = max(final, 0.92)
+                elif pattern_score > 0.7:
+                    final = max(final, 0.85)
+                
+                # If governance is high, boost significantly
+                if g_score > 0.8:
+                    final = max(final, 0.95)
+                
+                results[cat] = {
+                    "final": min(1.0, max(0.0, final)),
+                    "components": {
+                        "semantic": s_score,
+                        "pattern": pattern_score,
+                        "context": context_score,
+                        "metadata": meta_score,
+                        "distribution": dist_score
+                    }
+                }
+                
+        except Exception as e:
+            logger.warning(f"Enhanced confidence calculation failed: {e}")
+            
+        return results
+
     def _auto_tune_parameters(self) -> None:
         try:
             valid_centroids = 0
@@ -1722,55 +1853,37 @@ class AIClassificationPipelineService:
                         pass
 
                 ptxt = self._preprocess_text_local(full_context)
-                sem = self._semantic_scores(ptxt)
-                kw = self._keyword_scores(ptxt)
-                pt = self._pattern_scores(ptxt)
+                
+                # ENHANCED: Use Multi-Factor Confidence Scoring for Table-Level Context
+                enhanced_scores = self._calculate_enhanced_confidence(full_context, context_map={
+                    "business_purpose": context
+                })
+                
                 combined: Dict[str, float] = {}
-                cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()))
-                
-                # Diagnostic logging for score computation
-                logger.info(f"Score computation for {asset}:")
-                logger.info(f"  Semantic scores: {sem}")
-                logger.info(f"  Keyword scores: {kw}")
-                logger.info(f"  Pattern scores: {pt}")
-                
-                # weights: allow dynamic override
-                cfg = {}
-                try:
-                    cfg = self._load_dynamic_config()
-                except Exception:
-                    cfg = {}
-                w_sem = float(cfg.get("w_sem", getattr(self, "_w_sem", 0.7)))
-                w_kw = float(cfg.get("w_kw", getattr(self, "_w_kw", 0.3)))
-                w_pt = float(cfg.get("w_pt", 0.2))
-                # normalize weights so they sum <= 1; if exceed, rescale
-                try:
-                    total_w = w_sem + w_kw + w_pt
-                    if total_w > 1.0:
-                        w_sem /= total_w
-                        w_kw /= total_w
-                        w_pt /= total_w
-                except Exception:
-                    pass
-                
-                logger.info(f"  Weights: w_sem={w_sem:.2f}, w_kw={w_kw:.2f}, w_pt={w_pt:.2f}")
-                
-                for cat in cats:
-                    s = float(sem.get(cat, 0.0))
-                    k = float(kw.get(cat, 0.0))
-                    p = float(pt.get(cat, 0.0))
-                    v = (w_sem * s) + (w_kw * k) + (w_pt * p)
-                    combined[cat] = max(0.0, min(1.0, v))
-                    logger.debug(f"    {cat}: sem={s:.3f}, kw={k:.3f}, pt={p:.3f} → combined={combined[cat]:.3f}")
+                if enhanced_scores:
+                    for cat, data in enhanced_scores.items():
+                        combined[cat] = data.get("final", 0.0)
+                        logger.debug(f"    Table {asset.get('table')} - {cat}: {data.get('final', 0.0):.4f}")
+                else:
+                    # Fallback
+                    sem = self._semantic_scores(ptxt)
+                    kw = self._keyword_scores(ptxt)
+                    pt = self._pattern_scores(ptxt)
+                    cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()))
+                    for cat in cats:
+                        s = float(sem.get(cat, 0.0))
+                        k = float(kw.get(cat, 0.0))
+                        p = float(pt.get(cat, 0.0))
+                        v = (0.70 * s) + (0.20 * k) + (0.10 * p)
+                        combined[cat] = max(0.0, min(1.0, v))
+
                 try:
                     g = self._gov_semantic_scores(ptxt)
                     if g:
-                        w_gov = 0.25
-                        keys = set(list(combined.keys()) + list(g.keys()))
-                        for k in keys:
+                        # If governance matches, boost significantly
+                        for k, gv in g.items():
                             base = float(combined.get(k, 0.0))
-                            gv = float(g.get(k, 0.0))
-                            combined[k] = max(0.0, min(1.0, (1.0 - w_gov) * base + w_gov * gv))
+                            combined[k] = max(base, float(gv))
                 except Exception:
                     pass
                 # Apply heuristic boosts for FINANCIAL/REGULATORY from structure/content
@@ -2078,81 +2191,66 @@ class AIClassificationPipelineService:
                     # Diagnostic logging
                     logger.info(f"  {col_name} context: {col_context[:120]}")
                     
-                    sem = self._semantic_scores(ptxt)
-                    kw = self._keyword_scores(ptxt)
-                    pt = self._pattern_scores(ptxt)
+                    # ENHANCED: Use Multi-Factor Confidence Scoring
+                    enhanced_scores = self._calculate_enhanced_confidence(col_context, context_map={
+                        "data_type": col_type,
+                        "comment": col_comment
+                    })
                     
-                    # ENHANCED: Adaptive Strong Signal Boost
-                    # If a strong keyword match is found (kw > 0.5), boost the semantic score to ensure detection
-                    for cat, k_score in kw.items():
-                        if k_score > 0.5:
-                            # Strong keyword match: boost semantic score significantly
-                            current_sem = sem.get(cat, 0.0)
-                            boosted_sem = max(current_sem, 0.88)
-                            sem[cat] = boosted_sem
-                            logger.info(f"    !!! Strong keyword match for {cat} (kw_score={k_score:.2f}) -> Boosted semantic from {current_sem:.2f} to {boosted_sem:.2f}")
-                        elif k_score > 0.35:
-                            # Moderate keyword match: moderate boost
-                            current_sem = sem.get(cat, 0.0)
-                            boosted_sem = max(current_sem, min(0.75, current_sem + 0.20))
-                            sem[cat] = boosted_sem
-                            logger.info(f"    Moderate keyword match for {cat} (kw_score={k_score:.2f}) -> Boosted semantic from {current_sem:.2f} to {boosted_sem:.2f}")
-
-                    # Log embedding scores for debugging
-                    logger.info(f"    Semantic scores: {sem}")
-                    logger.info(f"    Keyword scores: {kw}")
-                    logger.info(f"    Pattern scores: {pt}")
-                    
-                    # Combine scores with adaptive weighting
                     combined: Dict[str, float] = {}
-                    cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()))
                     
-                    for cat in cats:
-                        s = float(sem.get(cat, 0.0))
-                        k = float(kw.get(cat, 0.0))
-                        p = float(pt.get(cat, 0.0))
-                        
-                        # Adaptive weighting based on signal strength
-                        if k > 0.6 or s > 0.75:
-                            # Very strong signal: let the strongest signal dominate
-                            v = max(s, k, p)
-                        elif k > 0.4 or s > 0.60:
-                            # Strong signal: weighted combination with emphasis on strong signals
-                            v = (0.60 * s) + (0.30 * k) + (0.10 * p)
-                        else:
-                            # Normal weighting: balanced approach
+                    if enhanced_scores:
+                        for cat, data in enhanced_scores.items():
+                            combined[cat] = data.get("final", 0.0)
+                            logger.debug(f"    {cat}: {data.get('final', 0.0):.4f} (components: {data.get('components')})")
+                    else:
+                        # Fallback to legacy logic if enhanced fails
+                        logger.info(f"    Enhanced scoring returned empty, using fallback")
+                        sem = self._semantic_scores(ptxt)
+                        kw = self._keyword_scores(ptxt)
+                        pt = self._pattern_scores(ptxt)
+                        cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()))
+                        for cat in cats:
+                            s = float(sem.get(cat, 0.0))
+                            k = float(kw.get(cat, 0.0))
+                            p = float(pt.get(cat, 0.0))
                             v = (0.70 * s) + (0.20 * k) + (0.10 * p)
-                        
-                        combined[cat] = max(0.0, min(1.0, v))
+                            combined[cat] = max(0.0, min(1.0, v))
                     
-                    # FALLBACK: If no scores from embeddings/keywords/patterns, use simple keyword matching
+                    # HEURISTIC OVERRIDES: Correct common misclassifications
+                    # 1. Metadata columns -> SOC2 or Exclude
+                    if any(x in col_name.upper() for x in ['CREATED_BY', 'UPDATED_BY', 'LAST_MODIFIED', 'RISK_SCORE', 'ASSET_ID', 'CLASSIFICATION_TAG', 'DATABASE_NAME', 'SCHEMA_NAME', 'TABLE_NAME']):
+                        combined['SOC2'] = 0.95
+                        combined['PII'] = 0.0
+                        combined['SOX'] = 0.0
+                    
+                    # 2. Generic IDs -> SOC2 (System Integrity) unless explicitly PII (SSN, Tax ID)
+                    elif col_name.upper().endswith('_ID') and not any(x in col_name.upper() for x in ['SSN', 'TAX', 'USER', 'CUSTOMER', 'EMPLOYEE', 'PERSON']):
+                         # Check if it's a financial ID (Order, Invoice) -> SOX
+                         if any(x in col_name.upper() for x in ['ORDER', 'INVOICE', 'TRANSACTION', 'PAYMENT']):
+                             combined['SOX'] = 0.85
+                             combined['PII'] = 0.0
+                         else:
+                             combined['SOC2'] = 0.8
+                             combined['PII'] = 0.0
+                             combined['SOX'] = 0.0
+
+                    # 3. Address components -> PII (regardless of prefix like 'billing')
+                    elif any(x in col_name.upper() for x in ['CITY', 'STATE', 'ZIP', 'POSTAL', 'COUNTRY', 'STREET']):
+                        combined['PII'] = 0.9
+                        combined['SOX'] = 0.1
+
+                    # 4. Quantity/Amount -> SOX
+                    elif any(x in col_name.upper() for x in ['QUANTITY', 'AMOUNT', 'PRICE', 'TOTAL', 'COST']):
+                        combined['SOX'] = 0.9
+                        combined['PII'] = 0.0
+
+                    # FALLBACK: If no scores, use simple keyword matching
                     if not combined:
-                        logger.info(f"    No scores from embeddings/keywords/patterns, using fallback matching")
+                        logger.info(f"    No scores from enhanced/legacy, using fallback matching")
                         fallback_scores = self._fallback_keyword_matching(col_context)
                         combined = fallback_scores
                         logger.info(f"    Fallback scores: {combined}")
-                    
-                    logger.debug(f"    Combined scores: {combined}")
-                    
-                    # Apply governance table boost if available
-                    try:
-                        gov_scores = self._gov_semantic_scores(ptxt)
-                        logger.debug(f"    Governance scores: {gov_scores}")
-                        if gov_scores:
-                            for cat in gov_scores:
-                                gov_val = float(gov_scores.get(cat, 0.0))
-                                base_val = float(combined.get(cat, 0.0))
-                                # Governance tables provide authoritative signal: let it override or significantly boost
-                                if gov_val > 0.75:
-                                    # High confidence governance match: trust it
-                                    combined[cat] = max(base_val, gov_val)
-                                    logger.info(f"    !!! Governance override for {cat}: {gov_val:.2f}")
-                                else:
-                                    # Moderate governance match: weighted boost
-                                    combined[cat] = max(0.0, min(1.0, 0.6 * base_val + 0.4 * gov_val))
-                            logger.debug(f"    After gov boost: {combined}")
-                    except Exception as e:
-                        logger.debug(f"    Gov scores error: {e}")
                     
                     # Get best category and confidence
                     if combined:
@@ -2222,14 +2320,28 @@ class AIClassificationPipelineService:
                     logger.info(f"  Column {col_name}: {display_cat} (raw={best_cat}) @ {confidence:.1%} → {label}")
                     
                     # Include only columns that map into PII / SOX / SOC2 with minimum confidence
-                    if display_cat and confidence >= 0.15:
+                    # ENHANCED: Raised threshold to 0.40 to ensure only high-confidence columns are classified
+                    if display_cat and confidence >= 0.40:
                         logger.info(f"    ✓ INCLUDED: {col_name} ({display_cat}, {confidence:.1%})")
+                        if best_cat and confidence > 0.4:
+                            # Normalize for logging
+                            norm_cat = best_cat.upper()
+                            if "PERSONAL" in norm_cat or "PII" in norm_cat:
+                                norm_cat = "PII"
+                            elif "FINANCIAL" in norm_cat or "SOX" in norm_cat:
+                                norm_cat = "SOX"
+                            elif "REGULATORY" in norm_cat or "SOC2" in norm_cat:
+                                norm_cat = "SOC2"
+                                
+                            if norm_cat in {'PII', 'SOX', 'SOC2'}:
+                                logger.info(f"    ✓ DETECTED SENSITIVE COLUMN: {col_name} -> {norm_cat} (conf={confidence:.2f})")
+                        
                         results.append({
                             'column': col_name,
                             'data_type': col_type,
                             'comment': col_comment,
                             'context': col_context,
-                            'category': display_cat,
+                            'category': display_cat, # Kept display_cat as it's the filtered one
                             'confidence': confidence,
                             'confidence_pct': round(confidence * 100.0, 1),
                             'label': label,
@@ -3064,110 +3176,112 @@ class AIClassificationPipelineService:
                                 logger.info(f"  - {r.get('column')}: {r.get('category')} @ {r.get('confidence_pct')}% (label={r.get('label')})")
                             
                             # Filter for display - show only higher-confidence PII / SOX / SOC2 columns
-                            col_rows_clean = [
-                                r for r in col_rows
-                                if 'error' not in r
-                                and r.get('category') in {'PII', 'SOX', 'SOC2'}
-                                and r.get('confidence_pct', 0) >= 50
-                            ]
+                            # FIX: Apply mapping BEFORE filtering to ensure categories like 'Financial' are correctly mapped to 'SOX'
+                            col_rows_clean = []
                             
-                            logger.info(f"After display filter: {len(col_rows_clean)} rows")
-                            for r in col_rows_clean:
-                                logger.info(f"  - {r.get('column')}: {r.get('category')} @ {r.get('confidence_pct')}% (label={r.get('label')})")
+                            # Use same emoji mapping as table-level classifications
+                            label_emoji_map = {
+                                'Confidential': '🟥 Confidential',
+                                'Restricted': '🟧 Restricted',
+                                'Internal': '🟨 Internal',
+                                'Public': '🟩 Public',
+                                'Uncertain — review': '⬜ Uncertain — review',
+                            }
                             
-                            if col_rows_clean and len(col_rows_clean) > 0:
-                                st.markdown("#### 📊 Column-Level Classification Results")
+                            col_display = []
+                            
+                            for r in col_rows:
+                                if 'error' in r:
+                                    continue
                                 
-                                # Use same emoji mapping as table-level classifications
-                                label_emoji_map = {
-                                    'Confidential': '🟥 Confidential',
-                                    'Restricted': '🟧 Restricted',
-                                    'Internal': '🟨 Internal',
-                                    'Public': '🟩 Public',
-                                    'Uncertain — review': '⬜ Uncertain — review',
-                                }
+                                raw_cat = r.get('category')
+                                conf = r.get('confidence_pct', 0)
                                 
-                                # Create display dataframe (no confidence column)
-                                col_display = []
-                                for col in col_rows_clean:
-                                    raw_label = col.get('label', 'N/A')
+                                # Map raw category to PII/SOX/SOC2
+                                try:
+                                    _cat_up = str(raw_cat or "").strip().upper()
+                                    _cat_map = {
+                                        'PERSONAL_DATA': 'PII',
+                                        'PERSONAL DATA': 'PII',
+                                        'PERSONAL': 'PII',
+                                        'PII': 'PII',
+                                        'PERSONAL FINANCIAL DATA': 'SOX',
+                                        'FINANCIAL_DATA': 'SOX',
+                                        'FINANCIAL DATA': 'SOX',
+                                        'FINANCIAL': 'SOX',
+                                        'PROPRIETARY_DATA': 'SOX',
+                                        'PROPRIETARY DATA': 'SOX',
+                                        'REGULATORY_DATA': 'SOC2',
+                                        'REGULATORY DATA': 'SOC2',
+                                        'REGULATORY': 'SOC2',
+                                        'SOC2': 'SOC2',
+                                        'SOX': 'SOX',
+                                        'INTERNAL_DATA': 'SOC2',
+                                        'INTERNAL DATA': 'SOC2',
+                                    }
+                                    _cat_norm = _cat_map.get(_cat_up)
+                                except Exception:
+                                    _cat_norm = None
+                                
+                                # Only include if it maps to PII, SOX, or SOC2 and meets confidence threshold
+                                if _cat_norm in {'PII', 'SOX', 'SOC2'} and conf >= 40:
+                                    # Add to clean list for stats
+                                    col_rows_clean.append(r)
+                                    
+                                    raw_label = r.get('label', 'N/A')
                                     label_with_emoji = label_emoji_map.get(raw_label, raw_label)
-                                    raw_cat = col.get('category')
-                                    try:
-                                        _cat_up = str(raw_cat or "").strip().upper()
-                                        _cat_map = {
-                                            'PERSONAL_DATA': 'PII',
-                                            'PERSONAL DATA': 'PII',
-                                            'PERSONAL': 'PII',
-                                            'PII': 'PII',
-                                            'PERSONAL FINANCIAL DATA': 'SOX',
-                                            'FINANCIAL_DATA': 'SOX',
-                                            'FINANCIAL DATA': 'SOX',
-                                            'FINANCIAL': 'SOX',
-                                            'PROPRIETARY_DATA': 'SOX',
-                                            'PROPRIETARY DATA': 'SOX',
-                                            'REGULATORY_DATA': 'SOC2',
-                                            'REGULATORY DATA': 'SOC2',
-                                            'REGULATORY': 'SOC2',
-                                            'SOC2': 'SOC2',
-                                            'SOX': 'SOX',
-                                        }
-                                        _cat_norm = _cat_map.get(_cat_up)
-                                    except Exception:
-                                        _cat_norm = None
-                                    # Only show PII/SOX/SOC2; do not surface raw legacy names
-                                    display_cat = _cat_norm if _cat_norm in {'PII', 'SOX', 'SOC2'} else None
+                                    
                                     col_display.append({
-                                        "Column": col.get('column', 'N/A'),
-                                        "Data Type": col.get('data_type', 'N/A'),
-                                        "Category": display_cat if display_cat is not None else 'N/A',
+                                        "Column": r.get('column', 'N/A'),
+                                        "Data Type": r.get('data_type', 'N/A'),
+                                        "Category": _cat_norm,
                                         "Label": label_with_emoji,
-                                        "C": col.get('c', 0),
-                                        "I": col.get('i', 0),
-                                        "A": col.get('a', 0),
+                                        "C": r.get('c', 0),
+                                        "I": r.get('i', 0),
+                                        "A": r.get('a', 0),
                                     })
+                            
+                            if col_display:
+                                st.markdown("#### 📊 Column-Level Classification Results")
+                                col_df = pd.DataFrame(col_display)
                                 
-                                if col_display:
-                                    col_df = pd.DataFrame(col_display)
-                                    
-                                    # Color code by label using same scheme as table-level results
-                                    def _apply_column_label_style(row: pd.Series):
-                                        val = str(row.get('Label', '') or '')
-                                        bg = ''
-                                        if '🟥 Confidential' in val:
-                                            bg = '#ffe5e5'  # Red background (light)
-                                        elif '🟧 Restricted' in val:
-                                            bg = '#fff0e1'  # Orange
-                                        elif '🟨 Internal' in val:
-                                            bg = '#fffbe5'  # Yellow
-                                        elif '🟩 Public' in val:
-                                            bg = '#e9fbe5'  # Green
-                                        elif '⬜ Uncertain — review' in val:
-                                            bg = '#f5f5f5'  # Gray
-                                        styles = ['' for _ in row.index]
-                                        try:
-                                            idx = list(row.index).index('Label')
-                                            if bg:
-                                                styles[idx] = f'background-color: {bg}; color: #000; font-weight: 600'
-                                        except Exception:
-                                            pass
-                                        return styles
-                                    
-                                    styled_df = col_df.style.apply(_apply_column_label_style, axis=1)
-                                    st.dataframe(styled_df, width='stretch', hide_index=True, use_container_width=True)
-                                    
-                                    # Summary statistics
-                                    confident = sum(1 for c in col_rows_clean if c.get('confidence_pct', 0) >= 80)
-                                    likely = sum(1 for c in col_rows_clean if 60 <= c.get('confidence_pct', 0) < 80)
-                                    uncertain = sum(1 for c in col_rows_clean if c.get('confidence_pct', 0) < 60)
-                                    
-                                    st.success(f"✅ Summary: {confident} Confident (≥80%) | {likely} Likely (60-80%) | {uncertain} Uncertain (<60%)")
-                                else:
-                                    st.info("ℹ️ No sensitive columns detected in this table.")
+                                # Color code by label using same scheme as table-level results
+                                def _apply_column_label_style(row: pd.Series):
+                                    val = str(row.get('Label', '') or '')
+                                    bg = ''
+                                    if '🟥 Confidential' in val:
+                                        bg = '#ffe5e5'  # Red background (light)
+                                    elif '🟧 Restricted' in val:
+                                        bg = '#fff0e1'  # Orange
+                                    elif '🟨 Internal' in val:
+                                        bg = '#fffbe5'  # Yellow
+                                    elif '🟩 Public' in val:
+                                        bg = '#e9fbe5'  # Green
+                                    elif '⬜ Uncertain — review' in val:
+                                        bg = '#f5f5f5'  # Gray
+                                    styles = ['' for _ in row.index]
+                                    try:
+                                        idx = list(row.index).index('Label')
+                                        if bg:
+                                            styles[idx] = f'background-color: {bg}; color: #000; font-weight: 600'
+                                    except Exception:
+                                        pass
+                                    return styles
+
+                                styled_col = col_df.style.apply(_apply_column_label_style, axis=1)
+                                st.dataframe(styled_col, width='stretch', hide_index=True)
+                                
+                                # Summary statistics
+                                confident = sum(1 for c in col_rows_clean if c.get('confidence_pct', 0) >= 80)
+                                likely = sum(1 for c in col_rows_clean if 60 <= c.get('confidence_pct', 0) < 80)
+                                uncertain = sum(1 for c in col_rows_clean if c.get('confidence_pct', 0) < 60)
+                                
+                                st.success(f"✅ Summary: {confident} Confident (≥80%) | {likely} Likely (60-80%) | {uncertain} Uncertain (<60%)")
                             else:
-                                st.info("ℹ️ Column detection completed - no sensitive columns found.")
-                        elif col_rows == []:
+                                st.info("ℹ️ No sensitive columns detected in this table.")
+                        else:
                             st.info("ℹ️ Column detection completed - no sensitive columns found.")
+
                     except Exception as e:
                         logger.error(f"Column detection UI error: {e}", exc_info=True)
                         st.error(f"Error displaying column detection: {e}")

@@ -2,6 +2,13 @@ from pathlib import Path as _Path
 import sys
 import os
 
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,   # use DEBUG if you want very detailed logs
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+)
+
 # Add the project root (parent of 'src') to the Python path so 'src.*' imports work
 _here = os.path.abspath(__file__)
 _src_dir = os.path.dirname(os.path.dirname(_here))  # .../src
@@ -3074,7 +3081,30 @@ _Download the template below to begin_
             # Build editable grid
             editor_rows = []
             for c in (cols_detect or []):
-                _sens = c.get("Sensitivity Type") or c.get("DETECTED_TYPE") or ""
+                _sens_raw = c.get("Sensitivity Type") or c.get("DETECTED_TYPE") or ""
+                try:
+                    _sr_up = str(_sens_raw or "").upper()
+                    _sens_map = {
+                        "PERSONAL_DATA": "PII",
+                        "PERSONAL DATA": "PII",
+                        "PERSONAL": "PII",
+                        "PII": "PII",
+                        "PERSONAL FINANCIAL DATA": "SOX",
+                        "FINANCIAL_DATA": "SOX",
+                        "FINANCIAL DATA": "SOX",
+                        "FINANCIAL": "SOX",
+                        "REGULATORY_DATA": "SOC2",
+                        "REGULATORY DATA": "SOC2",
+                        "REGULATORY": "SOC2",
+                        "INTERNAL_DATA": "SOC2",
+                        "INTERNAL DATA": "SOC2",
+                        "SOX": "SOX",
+                        "SOC2": "SOC2",
+                    }
+                    _sens_norm = _sens_map.get(_sr_up)
+                    _sens = _sens_norm if _sens_norm else _sens_raw
+                except Exception:
+                    _sens = _sens_raw
                 try:
                     _conf = float(c.get("Confidence") if c.get("Confidence") is not None else (c.get("COMBINED_CONFIDENCE") if c.get("COMBINED_CONFIDENCE") is not None else (c.get("CONFIDENCE_SCORE") if c.get("CONFIDENCE_SCORE") is not None else 0.0)))
                 except Exception:

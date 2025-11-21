@@ -974,6 +974,57 @@ class AIClassificationPipelineService:
             return {}
         return scores
 
+    def _get_semantic_matches_gov(
+        self,
+        text: str,
+        top_k: int = 5,
+        min_confidence: float = 0.1,
+    ) -> List[Dict[str, Any]]:
+        """Return top governance category matches for the provided context."""
+        try:
+            cleaned = self._preprocess_text_local(text or "")
+            if not cleaned:
+                return []
+
+            # Ensure embeddings and centroids are ready
+            if self._embedder is None or not self._category_centroids:
+                self._init_local_embeddings()
+            if self._embedder is None or not self._category_centroids:
+                return []
+
+            cache_key = f"gov_sem_matches::{hashlib.sha1(cleaned.encode('utf-8')).hexdigest()}::{top_k}::{min_confidence}"
+            try:
+                if hasattr(self, "_cache") and cache_key in self._cache:
+                    cached = self._cache.get(cache_key)
+                    if isinstance(cached, list):
+                        return cached
+            except Exception:
+                pass
+
+            scores = self._semantic_scores(cleaned)
+            if not scores:
+                return []
+
+            ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+            matches: List[Dict[str, Any]] = []
+            for category, score in ordered:
+                if score < min_confidence:
+                    continue
+                matches.append({"category": category, "confidence": float(score)})
+                if len(matches) >= top_k:
+                    break
+
+            try:
+                if hasattr(self, "_cache"):
+                    self._cache[cache_key] = list(matches)
+            except Exception:
+                pass
+
+            return matches
+        except Exception as e:
+            logger.debug(f"_get_semantic_matches_gov failed: {e}", exc_info=True)
+            return []
+
     def _keyword_scores(self, text: str) -> Dict[str, float]:
         """Lightweight keyword/regex fallback scores per category in [0,1]."""
         t = (text or '').lower()
@@ -1356,7 +1407,25 @@ class AIClassificationPipelineService:
             return " ".join(toks)
         except Exception:
             return s
-        
+
+    def _normalize_category_for_cia(self, category: Optional[str]) -> str:
+        """Map a detected category to the canonical Avendra category for CIA mapping.
+
+        Handles internal labels like 'PII', 'Financial', 'Regulatory', 'Internal' by
+        mapping them through ai_assistant_service._SEMANTIC_TO_AVENDRA when possible.
+        """
+        try:
+            raw = (category or '').strip()
+            if not raw:
+                return ''
+            try:
+                sem_map = getattr(self.ai_service, "_SEMANTIC_TO_AVENDRA", {}) or {}
+            except Exception:
+                sem_map = {}
+            mapped = sem_map.get(raw, raw)
+            return mapped
+        except Exception:
+            return str(category or '').strip()
 
     def _context_quality_metrics(self, text: str) -> Dict[str, float]:
         s = str(text or "")
@@ -1421,6 +1490,7 @@ class AIClassificationPipelineService:
                 if sample_txt:
                     ctx_parts.append(sample_txt)
                 ctx = " | ".join([p for p in ctx_parts if p])
+
                 ptxt = self._preprocess_text_local(ctx)
                 sem = self._semantic_scores(ptxt)
                 kw = self._keyword_scores(ptxt)
@@ -1438,8 +1508,10 @@ class AIClassificationPipelineService:
                 else:
                     best = max(comb, key=comb.get)
                     conf = float(comb.get(best, 0.0))
+
                 try:
-                    c_level, i_level, a_level = ai_assistant_service.CIA_MAPPING.get(best or '', (1, 1, 1))
+                    canon_cat = self._normalize_category_for_cia(best)
+                    c_level, i_level, a_level = ai_assistant_service.CIA_MAPPING.get(canon_cat or '', (1, 1, 1))
                 except Exception:
                     c_level, i_level, a_level = (1, 1, 1)
                 try:
@@ -1499,13 +1571,13 @@ class AIClassificationPipelineService:
                 pt = self._pattern_scores(ptxt)
                 combined: Dict[str, float] = {}
                 cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()))
-                
+
                 # Diagnostic logging for score computation
                 logger.info(f"Score computation for {asset}:")
                 logger.info(f"  Semantic scores: {sem}")
                 logger.info(f"  Keyword scores: {kw}")
                 logger.info(f"  Pattern scores: {pt}")
-                
+
                 # weights: allow dynamic override
                 cfg = {}
                 try:
@@ -1524,9 +1596,9 @@ class AIClassificationPipelineService:
                         w_pt /= total_w
                 except Exception:
                     pass
-                
+
                 logger.info(f"  Weights: w_sem={w_sem:.2f}, w_kw={w_kw:.2f}, w_pt={w_pt:.2f}")
-                
+
                 for cat in cats:
                     s = float(sem.get(cat, 0.0))
                     k = float(kw.get(cat, 0.0))
@@ -1580,7 +1652,8 @@ class AIClassificationPipelineService:
 
                 # CIA mapping and label
                 try:
-                    c, i, a = self.ai_service.CIA_MAPPING.get(best_cat, (1, 1, 1))  # type: ignore
+                    canon_cat = self._normalize_category_for_cia(best_cat)
+                    c, i, a = self.ai_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))  # type: ignore
                 except Exception:
                     c, i, a = (1, 1, 1)
                 try:
@@ -1689,7 +1762,7 @@ class AIClassificationPipelineService:
                 logger.info("Initializing embeddings for column classification...")
                 self._init_local_embeddings()
                 logger.info(f"Embeddings initialized: {len(self._category_centroids)} centroids")
-            
+
             # Fetch columns from information_schema
             cols = snowflake_connector.execute_query(
                 f"""
@@ -1701,27 +1774,27 @@ class AIClassificationPipelineService:
                 """,
                 {"s": schema, "t": table},
             ) or []
-            
+
             logger.info(f"Column-level classification: {db}.{schema}.{table} with {len(cols)} columns")
-            
+
             if not cols:
                 logger.warning(f"No columns found for {db}.{schema}.{table}")
                 return results
-            
+
             for col in cols:
                 try:
                     col_name = str(col.get('COLUMN_NAME') or '')
                     col_type = str(col.get('DATA_TYPE') or '')
                     col_comment = str(col.get('COMMENT') or '')
-                    
+
                     if not col_name:
                         continue
-                    
+
                     # Build column context: name + type + comment + sample values
                     col_context_parts = [col_name, col_type]
                     if col_comment:
                         col_context_parts.append(col_comment)
-                    
+
                     # Sample column values for context
                     try:
                         samples = self._sample_column_values(db, schema, table, col_name, sample_rows=20) or []
@@ -1730,51 +1803,51 @@ class AIClassificationPipelineService:
                             col_context_parts.append(f"Examples: {sample_str}")
                     except Exception:
                         pass
-                    
+
                     col_context = " | ".join(col_context_parts)
-                    
+
                     # Compute scores using embeddings + keywords + patterns
                     ptxt = self._preprocess_text_local(col_context)
-                    
+
                     # Diagnostic logging
                     logger.info(f"  {col_name} context: {col_context[:80]}")
                     logger.info(f"    Preprocessed: {ptxt[:80]}")
                     logger.info(f"    Embedder ready: {self._embedder is not None}, Centroids: {len(self._category_centroids) if self._category_centroids else 0}")
-                    
+
                     sem = self._semantic_scores(ptxt)
                     kw = self._keyword_scores(ptxt)
                     pt = self._pattern_scores(ptxt)
-                    
+
                     # Log embedding scores for debugging
                     logger.info(f"    Semantic scores: {sem}")
                     logger.info(f"    Keyword scores: {kw}")
                     logger.info(f"    Pattern scores: {pt}")
-                    
+
                     # Combine scores with governance-aware weights
                     combined: Dict[str, float] = {}
                     cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()))
-                    
+
                     # Use higher semantic weight for column-level detection (embeddings are more accurate for short text)
                     w_sem = 0.75
                     w_kw = 0.20
                     w_pt = 0.15
-                    
+
                     for cat in cats:
                         s = float(sem.get(cat, 0.0))
                         k = float(kw.get(cat, 0.0))
                         p = float(pt.get(cat, 0.0))
                         v = (w_sem * s) + (w_kw * k) + (w_pt * p)
                         combined[cat] = max(0.0, min(1.0, v))
-                    
+
                     # FALLBACK: If no scores from embeddings/keywords/patterns, use simple keyword matching
                     if not combined:
                         logger.info(f"    No scores from embeddings/keywords/patterns, using fallback matching")
                         fallback_scores = self._fallback_keyword_matching(col_context)
                         combined = fallback_scores
                         logger.info(f"    Fallback scores: {combined}")
-                    
+
                     logger.debug(f"    Combined scores: {combined}")
-                    
+
                     # Apply governance table boost if available
                     try:
                         gov_scores = self._gov_semantic_scores(ptxt)
@@ -1788,7 +1861,7 @@ class AIClassificationPipelineService:
                             logger.debug(f"    After gov boost: {combined}")
                     except Exception as e:
                         logger.debug(f"    Gov scores error: {e}")
-                    
+
                     # Get best category and confidence
                     if combined:
                         best_cat = max(combined, key=combined.get)
@@ -1796,9 +1869,9 @@ class AIClassificationPipelineService:
                     else:
                         best_cat = None
                         confidence = 0.0
-                    
+
                     logger.debug(f"    Before calibration - best_cat: {best_cat}, confidence: {confidence:.3f}")
-                    
+
                     # Apply quality calibration
                     q = self._context_quality_metrics(col_context)
                     logger.debug(f"    Quality metrics: {q}")
@@ -1808,12 +1881,43 @@ class AIClassificationPipelineService:
                             best_cat = max(combined, key=combined.get)
                             confidence = float(combined.get(best_cat, 0.0))
                             logger.debug(f"    After calibration - best_cat: {best_cat}, confidence: {confidence:.3f}")
-                    
+
                     # Determine label based on confidence
                     try:
-                        c, i, a = self.ai_service.CIA_MAPPING.get(best_cat, (1, 1, 1))  # type: ignore
+                        canon_cat = self._normalize_category_for_cia(best_cat)
+                        c, i, a = self.ai_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))  # type: ignore
                     except Exception:
                         c, i, a = (1, 1, 1)
+
+                    # Derive a display category strictly limited to PII, SOX, SOC2
+                    display_cat = None
+                    try:
+                        legacy_map = {
+                            'PERSONAL_DATA': 'PII',
+                            'PERSONAL DATA': 'PII',
+                            'PERSONAL': 'PII',
+                            'PII': 'PII',
+                            'PERSONAL FINANCIAL DATA': 'SOX',
+                            'FINANCIAL_DATA': 'SOX',
+                            'FINANCIAL DATA': 'SOX',
+                            'FINANCIAL': 'SOX',
+                            'PROPRIETARY_DATA': 'SOX',
+                            'PROPRIETARY DATA': 'SOX',
+                            'REGULATORY_DATA': 'SOC2',
+                            'REGULATORY DATA': 'SOC2',
+                            'REGULATORY': 'SOC2',
+                            'INTERNAL_DATA': 'SOC2',
+                            'INTERNAL DATA': 'SOC2',
+                            'SOC2': 'SOC2',
+                            'SOX': 'SOX',
+                        }
+                        if best_cat:
+                            key = str(best_cat).strip().upper()
+                            normalized = legacy_map.get(key)
+                            if normalized in {'PII', 'SOX', 'SOC2'}:
+                                display_cat = normalized
+                    except Exception:
+                        display_cat = None
                     
                     # Assign label based on confidence and CIA levels
                     # Lower threshold to 0.20 to catch more sensitive columns
@@ -1825,18 +1929,18 @@ class AIClassificationPipelineService:
                     else:
                         label = 'Uncertain'
                     
-                    logger.info(f"  Column {col_name}: {best_cat} @ {confidence:.1%} → {label}")
+                    logger.info(f"  Column {col_name}: {display_cat or best_cat} (raw={best_cat}) @ {confidence:.1%} → {label}")
                     
                     # Include ALL columns with a detected category and minimum confidence
                     # Don't filter out 'Uncertain' here - let display layer decide what to show
                     if best_cat and confidence >= 0.15:
-                        logger.info(f"    ✓ INCLUDED: {col_name} ({best_cat}, {confidence:.1%})")
+                        logger.info(f"    ✓ INCLUDED: {col_name} ({display_cat or best_cat}, {confidence:.1%})")
                         results.append({
                             'column': col_name,
                             'data_type': col_type,
                             'comment': col_comment,
                             'context': col_context,
-                            'category': best_cat,
+                            'category': display_cat if display_cat else best_cat,
                             'confidence': confidence,
                             'confidence_pct': round(confidence * 100.0, 1),
                             'label': label,

@@ -65,6 +65,8 @@ class AIClassificationPipelineService:
         self._cache: Dict[str, Any] = {}
         self._embed_cache: Dict[str, Any] = {}
         self._embed_ready: bool = False
+        # Track whether we had to fall back to built-in categories instead of governance-driven ones
+        self._using_fallback_categories: bool = False
 
     def render_classification_pipeline(self) -> None:
         """Render the Automatic AI Classification Pipeline sub-tab."""
@@ -454,6 +456,14 @@ class AIClassificationPipelineService:
                     "Detection mode: "
                     + ("MiniLM embeddings + keyword fallback" if self._embed_backend == 'sentence-transformers' else "keyword/regex fallback only")
                 )
+                # Single message to indicate whether semantic search is using governance-driven categories or fallback
+                try:
+                    if getattr(self, "_using_fallback_categories", False):
+                        st.warning("Semantic categories: using built-in fallback (PII / SOX / SOC2). Verify governance tables for full coverage.")
+                    else:
+                        st.info("Semantic categories: loaded from governance tables (SENSITIVITY_CATEGORIES / SENSITIVE_KEYWORDS / SENSITIVE_PATTERNS).")
+                except Exception:
+                    pass
                 try:
                     cat_cnt = len(getattr(self, "_category_centroids", {}) or {})
                     tok_cnt = sum(len(v) for v in (getattr(self, "_category_tokens", {}) or {}).values())
@@ -626,6 +636,7 @@ class AIClassificationPipelineService:
                 ) or []
             except Exception:
                 rows = []
+        # Use governance categories directly from SENSITIVITY_CATEGORIES
         cats = []
         for r in rows:
             try:
@@ -865,13 +876,12 @@ class AIClassificationPipelineService:
         return out
 
     def _create_fallback_categories(self) -> None:
+        # Fallback categories when governance configuration or embeddings are unavailable.
+        # Aligns with the primary policy dimensions: PII, SOX, and SOC2.
         cats = [
-            ("PERSONAL_DATA", "personal data pii name email phone address ssn passport dob identifier customer individual"),
-            ("FINANCIAL_DATA", "financial salary payroll account bank credit debit transaction ledger revenue expense invoice payment"),
-            ("REGULATORY_DATA", "regulatory compliance gdpr ccpa hipaa pci law regulation consent data subject rights"),
-            ("PROPRIETARY_DATA", "proprietary trade secret intellectual property confidential design source code roadmap pricing"),
-            ("INTERNAL_DATA", "internal business operational non sensitive standard general reference lookup config"),
-            ("PUBLIC_DATA", "public open shared non confidential non sensitive"),
+            ("PII", "personally identifiable information customer email phone address ssn passport dob name identifier"),
+            ("SOX", "sox financial reporting general ledger journal entry trial balance revenue expense accounting controls"),
+            ("SOC2", "soc2 security availability confidentiality integrity privacy access log audit trail control policy"),
         ]
         centroids: Dict[str, Any] = {}
         tokens_out: Dict[str, List[str]] = {}
@@ -1022,15 +1032,72 @@ class AIClassificationPipelineService:
         scores: Dict[str, float] = {}
         t = (text or '').lower()
         
-        # Hardcoded fallback keywords for common sensitive categories
-        fallback_keywords = {
-            'PII': ['customer', 'email', 'phone', 'mobile', 'ssn', 'passport', 'dob', 'date of birth', 
-                   'first name', 'last name', 'address', 'contact', 'person', 'individual', 'name'],
-            'Financial': ['account', 'bank', 'credit', 'debit', 'payment', 'invoice', 'salary', 'payroll',
-                         'transaction', 'ledger', 'revenue', 'expense', 'balance', 'card number'],
-            'Regulatory': ['gdpr', 'ccpa', 'hipaa', 'pci', 'compliance', 'regulation', 'consent', 'audit'],
-            'Internal': ['internal', 'operational', 'config', 'setting', 'reference', 'lookup', 'status'],
-        }
+        # Prefer governance-driven keywords from SENSITIVITY_CATEGORIES / SENSITIVE_KEYWORDS.
+        # This allows dynamic categories such as PII, SOC2, SOX to be fully managed in Snowflake.
+        fallback_keywords: Dict[str, List[str]] = {}
+        schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
+        gov_db = None
+        try:
+            gov_db = resolve_governance_db()
+        except Exception:
+            gov_db = None
+        if gov_db:
+            try:
+                snowflake_connector.execute_non_query(f"USE DATABASE {gov_db}")
+            except Exception:
+                pass
+            schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+
+        # Attempt to load active keywords grouped by CATEGORY_NAME from governance tables.
+        try:
+            rows = snowflake_connector.execute_query(
+                f"""
+                SELECT 
+                    COALESCE(c.CATEGORY_NAME, c.CATEGORY, c.NAME) AS CATEGORY_NAME,
+                    k.KEYWORD_STRING
+                FROM {schema_fqn}.SENSITIVE_KEYWORDS k
+                JOIN {schema_fqn}.SENSITIVITY_CATEGORIES c
+                  ON k.CATEGORY_ID = c.CATEGORY_ID
+                WHERE COALESCE(k.IS_ACTIVE, true)
+                  AND COALESCE(c.IS_ACTIVE, true)
+                """
+            ) or []
+        except Exception:
+            rows = []
+
+        try:
+            for r in rows:
+                try:
+                    cname = str(r.get("CATEGORY_NAME") or "").strip()
+                    kw = str(r.get("KEYWORD_STRING") or "").strip()
+                except Exception:
+                    continue
+                if not cname or not kw:
+                    continue
+                cl = cname
+                if cl not in fallback_keywords:
+                    fallback_keywords[cl] = []
+                fallback_keywords[cl].append(kw)
+        except Exception:
+            fallback_keywords = {}
+
+        # If governance tables are unavailable or empty, fall back to a small built-in dictionary
+        # focused on the primary policy categories: PII, SOX, and SOC2.
+        if not fallback_keywords:
+            fallback_keywords = {
+                'PII': [
+                    'customer', 'email', 'phone', 'mobile', 'ssn', 'passport', 'dob', 'date of birth',
+                    'first name', 'last name', 'address', 'contact', 'person', 'individual', 'name'
+                ],
+                'SOX': [
+                    'general ledger', 'journal entry', 'trial balance', 'financial statement', 'sox',
+                    'revenue', 'expense', 'balance', 'accounting', 'financial reporting'
+                ],
+                'SOC2': [
+                    'access log', 'audit trail', 'change management', 'user provisioning', 'security incident',
+                    'monitoring', 'control', 'policy', 'encryption', 'key management'
+                ],
+            }
         
         for category, keywords in fallback_keywords.items():
             hits = 0
@@ -1355,6 +1422,28 @@ class AIClassificationPipelineService:
             return s
         
 
+    def _normalize_category_for_cia(self, category: Optional[str]) -> str:
+        try:
+            raw = (category or "").strip()
+            if not raw:
+                return ""
+            # Prefer normalization from ai_classification_service when available
+            try:
+                from src.services.ai_classification_service import ai_classification_service as _svc
+                if _svc is not None and hasattr(_svc, "_normalize_category_for_cia"):
+                    return _svc._normalize_category_for_cia(raw)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            # Fallback: use semantic-to-Avendra mapping from ai_assistant_service
+            try:
+                sem_map = getattr(ai_assistant_service, "_SEMANTIC_TO_AVENDRA", {}) or {}
+            except Exception:
+                sem_map = {}
+            mapped = sem_map.get(raw, raw)
+            return mapped
+        except Exception:
+            return str(category or "").strip()
+
     def _context_quality_metrics(self, text: str) -> Dict[str, float]:
         s = str(text or "")
         n = len(s)
@@ -1435,6 +1524,8 @@ class AIClassificationPipelineService:
                 else:
                     best = max(comb, key=comb.get)
                     conf = float(comb.get(best, 0.0))
+
+                # CIA mapping and label
                 try:
                     c_level, i_level, a_level = ai_assistant_service.CIA_MAPPING.get(best or '', (1, 1, 1))
                 except Exception:
@@ -1577,21 +1668,100 @@ class AIClassificationPipelineService:
 
                 # CIA mapping and label
                 try:
-                    c, i, a = self.ai_service.CIA_MAPPING.get(best_cat, (1, 1, 1))  # type: ignore
+                    canon_cat = self._normalize_category_for_cia(best_cat)
+                    c, i, a = ai_assistant_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))  # type: ignore
                 except Exception:
                     c, i, a = (1, 1, 1)
+
+                # -------------------------------------------------------------------------
+                # ENHANCED: Column-Level High Water Mark Aggregation
+                # -------------------------------------------------------------------------
+                # "Table-level labels vs Column-level CIA"
+                # We run column classification to find the most sensitive elements.
+                # The table's CIA should be the MAXIMUM of its columns' CIA (High Water Mark).
+                column_reasoning = []
                 try:
-                    score = int(max(int(c), int(i), int(a)))
+                    # Perform column-level classification
+                    col_results = self._classify_columns_local(
+                        db=db,
+                        schema=str(asset.get('schema')),
+                        table=str(asset.get('table')),
+                        max_cols=50  # Analyze up to 50 columns
+                    )
+
+                    if col_results:
+                        # Calculate High Water Mark from columns
+                        max_col_c = 1
+                        max_col_i = 1
+                        max_col_a = 1
+                        max_col_conf = 0.0
+                        sensitive_cols = []
+
+                        for cr in col_results:
+                            cc = int(cr.get('c', 1))
+                            ci = int(cr.get('i', 1))
+                            ca = int(cr.get('a', 1) )
+                            c_conf = float(cr.get('confidence', 0.0))
+                            
+                            # Track max CIA
+                            max_col_c = max(max_col_c, cc)
+                            max_col_i = max(max_col_i, ci)
+                            max_col_a = max(max_col_a, ca)
+                            
+                            # Track confidence of the drivers of sensitivity
+                            if max(cc, ci, ca) >= 2:
+                                sensitive_cols.append(f"{cr.get('column')} ({cr.get('label')})")
+                                max_col_conf = max(max_col_conf, c_conf)
+
+                        # Apply High Water Mark: Table CIA is max of Table-Context CIA and Column-Max CIA
+                        old_score = max(c, i, a)
+                        new_score = max(max_col_c, max_col_i, max_col_a)
+                        
+                        if new_score > old_score:
+                            logger.info(f"Table {asset.get('table')} upgraded from C={c}/I={i}/A={a} to {max_col_c}/{max_col_i}/{max_col_a} based on columns")
+                            c = max(c, max_col_c)
+                            i = max(i, max_col_i)
+                            a = max(a, max_col_a)
+                            
+                            # If we upgraded based on columns, use the column confidence if it's higher
+                            if max_col_conf > confidence:
+                                confidence = max_col_conf
+                                # Update best_cat to the most frequent category from sensitive columns
+                                if sensitive_cols:
+                                    # Extract categories from sensitive columns (format: "column_name (CATEGORY)")
+                                    categories = [col.split('(')[-1].rstrip(')') for col in sensitive_cols]
+                                    # Count category occurrences
+                                    from collections import Counter
+                                    category_counter = Counter(categories)
+                                    most_common = category_counter.most_common(1)
+                                    if most_common:
+                                        best_cat = most_common[0][0]  # Get the most frequent category
+                                        logger.info(f"Table {asset.get('table')} category set to {best_cat} based on {len(sensitive_cols)} sensitive columns")
+                                    
+                                    column_reasoning = sensitive_cols[:3]
+                                    if len(sensitive_cols) > 3:
+                                        column_reasoning.append(f"+{len(sensitive_cols)-3} more")
+
+                except Exception as e:
+                    logger.warning(f"Failed to aggregate column CIA for {asset.get('table')}: {e}")
+                # -------------------------------------------------------------------------
+
+                try:
+                    base_label = self.ai_service._map_cia_to_label(c, i, a)  # type: ignore
                 except Exception:
-                    score = 1
-                if score <= 0:
-                    base_label = 'Public'
-                elif score == 1:
-                    base_label = 'Internal'
-                elif score == 2:
-                    base_label = 'Confidential'
-                else:
-                    base_label = 'Restricted'
+                    # Fallback: derive from max CIA level using the same 0-3 scale
+                    try:
+                        score = int(max(int(c), int(i), int(a)))
+                    except Exception:
+                        score = 1
+                    if score <= 0:
+                        base_label = 'Public'
+                    elif score == 1:
+                        base_label = 'Internal'
+                    elif score == 2:
+                        base_label = 'Restricted'
+                    else:
+                        base_label = 'Confidential'
                 lbl_thr = float(getattr(self, "_conf_label_threshold", 0.45))
                 final_label = base_label if confidence >= lbl_thr else "Uncertain — review"
 
@@ -1672,6 +1842,7 @@ class AIClassificationPipelineService:
                     'failure_reason': None,
                     'sql_preview': sql_preview,
                     'compliance': compliance,
+                    'reasoning': column_reasoning,
                 })
             except Exception as e:
                 results.append({'asset': asset, 'error': str(e)})
@@ -1805,14 +1976,45 @@ class AIClassificationPipelineService:
                             best_cat = max(combined, key=combined.get)
                             confidence = float(combined.get(best_cat, 0.0))
                             logger.debug(f"    After calibration - best_cat: {best_cat}, confidence: {confidence:.3f}")
+
+                    # Derive a display category strictly limited to PII, SOX, SOC2
+                    display_cat = None
+                    try:
+                        legacy_map = {
+                            'PERSONAL_DATA': 'PII',
+                            'PERSONAL DATA': 'PII',
+                            'PERSONAL': 'PII',
+                            'PII': 'PII',
+                            'PERSONAL FINANCIAL DATA': 'SOX',
+                            'FINANCIAL_DATA': 'SOX',
+                            'FINANCIAL DATA': 'SOX',
+                            'FINANCIAL': 'SOX',
+                            'PROPRIETARY_DATA': 'SOX',
+                            'PROPRIETARY DATA': 'SOX',
+                            'REGULATORY_DATA': 'SOC2',
+                            'REGULATORY DATA': 'SOC2',
+                            'REGULATORY': 'SOC2',
+                            'INTERNAL_DATA': 'SOC2',
+                            'INTERNAL DATA': 'SOC2',
+                            'SOC2': 'SOC2',
+                            'SOX': 'SOX',
+                        }
+                        if best_cat:
+                            key = str(best_cat).strip().upper()
+                            normalized = legacy_map.get(key)
+                            if normalized in {'PII', 'SOX', 'SOC2'}:
+                                display_cat = normalized
+                    except Exception:
+                        display_cat = None
                     
                     # Determine label based on confidence
                     try:
-                        c, i, a = self.ai_service.CIA_MAPPING.get(best_cat, (1, 1, 1))  # type: ignore
+                        canon_cat = self._normalize_category_for_cia(best_cat)
+                        c, i, a = self.ai_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))  # type: ignore
                     except Exception:
                         c, i, a = (1, 1, 1)
                     
-                    # Assign label based on confidence and CIA levels
+                    # Assign label based on CIA levels and confidence using the same 0-3 policy scale
                     # Lower threshold to 0.20 to catch more sensitive columns
                     if confidence >= 0.20:
                         if c >= 2 or i >= 2 or a >= 2:
@@ -1822,18 +2024,17 @@ class AIClassificationPipelineService:
                     else:
                         label = 'Uncertain'
                     
-                    logger.info(f"  Column {col_name}: {best_cat} @ {confidence:.1%} → {label}")
+                    logger.info(f"  Column {col_name}: {display_cat} (raw={best_cat}) @ {confidence:.1%} → {label}")
                     
-                    # Include ALL columns with a detected category and minimum confidence
-                    # Don't filter out 'Uncertain' here - let display layer decide what to show
-                    if best_cat and confidence >= 0.15:
-                        logger.info(f"    ✓ INCLUDED: {col_name} ({best_cat}, {confidence:.1%})")
+                    # Include only columns that map into PII / SOX / SOC2 with minimum confidence
+                    if display_cat and confidence >= 0.15:
+                        logger.info(f"    ✓ INCLUDED: {col_name} ({display_cat}, {confidence:.1%})")
                         results.append({
                             'column': col_name,
                             'data_type': col_type,
                             'comment': col_comment,
                             'context': col_context,
-                            'category': best_cat,
+                            'category': display_cat,
                             'confidence': confidence,
                             'confidence_pct': round(confidence * 100.0, 1),
                             'label': label,
@@ -2568,6 +2769,14 @@ class AIClassificationPipelineService:
                             st.write(f"**Confidence:** 🔴 {confidence_pct:.1f}% ({confidence_tier})")
                         
                         st.write(f"**Classification:** {result.get('label_emoji', result.get('label', 'N/A'))}")
+                        
+                        # Display reasoning if available (e.g. column-level drivers)
+                        reasoning = result.get('reasoning', [])
+                        if reasoning:
+                            st.write("**Reasoning:**")
+                            for r in reasoning:
+                                st.caption(f"• {r}")
+                                
                         st.write(f"**Route:** {result.get('route', 'N/A')}")
                         
                         # Display most relevant compliance frameworks
@@ -2684,10 +2893,37 @@ class AIClassificationPipelineService:
                                 for col in col_rows_clean:
                                     raw_label = col.get('label', 'N/A')
                                     label_with_emoji = label_emoji_map.get(raw_label, raw_label)
+                                    raw_cat = col.get('category')
+                                    try:
+                                        _cat_up = str(raw_cat or "").strip().upper()
+                                        _cat_map = {
+                                            'PERSONAL_DATA': 'PII',
+                                            'PERSONAL DATA': 'PII',
+                                            'PERSONAL': 'PII',
+                                            'PII': 'PII',
+                                            'PERSONAL FINANCIAL DATA': 'SOX',
+                                            'FINANCIAL_DATA': 'SOX',
+                                            'FINANCIAL DATA': 'SOX',
+                                            'FINANCIAL': 'SOX',
+                                            'PROPRIETARY_DATA': 'SOX',
+                                            'PROPRIETARY DATA': 'SOX',
+                                            'REGULATORY_DATA': 'SOC2',
+                                            'REGULATORY DATA': 'SOC2',
+                                            'REGULATORY': 'SOC2',
+                                            'INTERNAL_DATA': 'SOC2',
+                                            'INTERNAL DATA': 'SOC2',
+                                            'SOC2': 'SOC2',
+                                            'SOX': 'SOX',
+                                        }
+                                        _cat_norm = _cat_map.get(_cat_up)
+                                    except Exception:
+                                        _cat_norm = None
+                                    # Only show PII/SOX/SOC2; do not surface raw legacy names
+                                    display_cat = _cat_norm if _cat_norm in {'PII', 'SOX', 'SOC2'} else None
                                     col_display.append({
                                         "Column": col.get('column', 'N/A'),
                                         "Data Type": col.get('data_type', 'N/A'),
-                                        "Category": col.get('category', 'N/A'),
+                                        "Category": display_cat if display_cat is not None else 'N/A',
                                         "Label": label_with_emoji,
                                         "C": col.get('c', 0),
                                         "I": col.get('i', 0),

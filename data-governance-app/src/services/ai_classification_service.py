@@ -22,7 +22,7 @@ except Exception:
 from src.connectors.snowflake_connector import snowflake_connector
 from src.services.ai_assistant_service import ai_assistant_service
 from src.services.discovery_service import DiscoveryService
-from src.services.ai_sensitive_detection_service import AISensitiveDetectionService
+# AISensitiveDetectionService import moved to __init__ to avoid circular dependency
 from src.services.governance_db_resolver import resolve_governance_db
 from src.services.tagging_service import tagging_service
 try:
@@ -41,6 +41,7 @@ class AIClassificationPipelineService:
         self.discovery = DiscoveryService()
         # Sensitive detection service is optional and initialized without AI linkage to avoid circular imports
         try:
+            from src.services.ai_sensitive_detection_service import AISensitiveDetectionService
             self.sensitive_service = AISensitiveDetectionService(sample_size=200, min_confidence=0.3, use_ai=False)
         except Exception:
             self.sensitive_service = None

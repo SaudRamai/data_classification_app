@@ -23,7 +23,7 @@ from src.connectors.snowflake_connector import snowflake_connector
 from src.services.ai_assistant_service import ai_assistant_service
 from src.services.ai_classification_service import ai_classification_service
 from src.services.discovery_service import DiscoveryService
-from src.services.ai_sensitive_detection_service import AISensitiveDetectionService
+# AISensitiveDetectionService import moved to __init__
 from src.services.governance_db_resolver import resolve_governance_db
 from src.services.tagging_service import tagging_service
 try:
@@ -41,6 +41,7 @@ class AIClassificationPipelineService:
         self.ai_service = ai_assistant_service
         self.discovery = DiscoveryService()
         try:
+            from src.services.ai_sensitive_detection_service import AISensitiveDetectionService
             self.sensitive_service = AISensitiveDetectionService(sample_size=200, min_confidence=0.3, use_ai=True)
         except Exception:
             self.sensitive_service = None
@@ -879,9 +880,57 @@ class AIClassificationPipelineService:
         # Fallback categories when governance configuration or embeddings are unavailable.
         # Aligns with the primary policy dimensions: PII, SOX, and SOC2.
         cats = [
-            ("PII", "personally identifiable information customer email phone address ssn passport dob name identifier"),
-            ("SOX", "sox financial reporting general ledger journal entry trial balance revenue expense accounting controls"),
-            ("SOC2", "soc2 security availability confidentiality integrity privacy access log audit trail control policy"),
+            # PII: Enhanced with identity, contact, demographic, and biometric indicators
+            ("PII", """personally identifiable information pii customer client user person individual employee 
+                      email mail address phone mobile telephone contact fax 
+                      ssn social security number passport driver license tax id tin ein 
+                      credit card debit card cvv cvc iban swift routing account number 
+                      birth date dob date of birth age birthday 
+                      first name last name full name surname given name middle name maiden name 
+                      gender sex nationality citizenship ethnicity race religion 
+                      biometric fingerprint retina iris facial recognition voice print 
+                      medical health patient diagnosis treatment prescription 
+                      ip address mac address device id user id login username password 
+                      home address residential address mailing address street city state zip postal code country
+                      personal phone personal email personal data sensitive data confidential data"""),
+            
+            # SOX: Enhanced with financial, accounting, and audit terminology
+            ("SOX", """sox sarbanes oxley financial reporting accounting audit controls 
+                      general ledger gl journal entry je trial balance tb 
+                      revenue income sales expense cost expenditure 
+                      balance sheet bs income statement is profit loss p&l cash flow statement cfs 
+                      assets liabilities equity capital retained earnings 
+                      accounts receivable ar accounts payable ap 
+                      payroll salary wage bonus compensation commission 
+                      bank statement reconciliation transaction 
+                      invoice bill receipt purchase order po sales order so 
+                      accrual deferral depreciation amortization 
+                      financial statement financial data financial record 
+                      chart of accounts coa account code account number 
+                      fiscal year fy quarter q1 q2 q3 q4 period 
+                      materiality threshold variance budget forecast 
+                      internal control icfr sox compliance sox audit sox testing
+                      revenue recognition expense recognition matching principle"""),
+            
+            # SOC2: Enhanced with security, compliance, and operational controls
+            ("SOC2", """soc2 soc 2 service organization control security availability processing integrity confidentiality privacy 
+                       access control access log access right permission privilege role 
+                       authentication authorization mfa multi factor two factor 2fa 
+                       audit trail audit log change log activity log event log 
+                       encryption decrypt encrypt cipher key management certificate ssl tls 
+                       firewall network security intrusion detection ids ips 
+                       vulnerability scan penetration test security assessment risk assessment 
+                       incident response incident management security incident data breach 
+                       disaster recovery dr business continuity bcp backup restore 
+                       compliance policy security policy access policy password policy 
+                       monitoring alert notification siem security information event management 
+                       system configuration baseline hardening patch management 
+                       user provisioning deprovisioning access review access certification 
+                       change management change control change request change approval 
+                       segregation of duties sod conflict of interest 
+                       data classification data protection data privacy gdpr hipaa pci dss 
+                       security control operational control technical control administrative control
+                       trust service criteria tsc availability confidentiality integrity privacy security""")
         ]
         centroids: Dict[str, Any] = {}
         tokens_out: Dict[str, List[str]] = {}
@@ -909,6 +958,23 @@ class AIClassificationPipelineService:
                 centroids[name] = None
         self._category_centroids = centroids
         self._category_tokens = tokens_out
+        
+        # Add default patterns for fallback to ensure pattern scoring works
+        patterns_out: Dict[str, List[str]] = {}
+        patterns_out['PII'] = [
+            r'\b\d{3}-\d{2}-\d{4}\b', # SSN
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', # Email
+            r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b' # Phone
+        ]
+        patterns_out['SOX'] = [
+            r'\b(revenue|expense|profit|loss|margin|budget)\b',
+            r'\b(gl|ledger|balance|asset|liability)\b'
+        ]
+        patterns_out['SOC2'] = [
+            r'\b(password|secret|key|token|credential)\b',
+            r'\b(audit|log|access|permission|role)\b'
+        ]
+        self._category_patterns = patterns_out
         try:
             st.session_state["_pipe_cat_count"] = len({k: v for k, v in centroids.items() if v is not None})
             st.session_state["_pipe_tok_count"] = sum(len(v) for v in tokens_out.values())
@@ -958,20 +1024,25 @@ class AIClassificationPipelineService:
                 if mx > mn:
                     for k, v0 in raw.items():
                         x = (float(v0) - float(mn)) / (float(mx) - float(mn))
-                        # ENHANCED: Boost high-confidence scores to reach 80%+ confidence
-                        # Remove artificial cap at 0.7; allow scores to reach 0.95+
-                        if x >= 0.7:
-                            # Very aggressive boost for very strong signals: x^0.3
-                            x = pow(x, 0.3)
-                        elif x >= 0.6:
-                            # Aggressive boost for strong signals: x^0.4 amplifies separation
-                            x = pow(x, 0.4)
-                        elif x >= 0.4:
-                            # Moderate boost for medium signals
-                            x = pow(x, 0.6)
-                        elif x >= 0.2:
-                            # Gentle boost for weak signals
-                            x = pow(x, 0.8)
+                        # ENHANCED: More aggressive boosting to reach 85%+ confidence for strong matches
+                        if x >= 0.65:
+                            # Very aggressive boost for very strong signals: x^0.25
+                            x = pow(x, 0.25)
+                        elif x >= 0.55:
+                            # Aggressive boost for strong signals: x^0.35
+                            x = pow(x, 0.35)
+                        elif x >= 0.45:
+                            # Moderate boost for medium-strong signals
+                            x = pow(x, 0.5)
+                        elif x >= 0.30:
+                            # Gentle boost for medium signals
+                            x = pow(x, 0.7)
+                        elif x >= 0.15:
+                            # Minimal boost for weak signals
+                            x = pow(x, 0.85)
+                        else:
+                            # Suppress very weak signals
+                            x = pow(x, 1.1)
                         scores[k] = max(0.0, min(1.0, x))
                 else:
                     scores = dict(raw)
@@ -982,20 +1053,49 @@ class AIClassificationPipelineService:
         return scores
 
     def _keyword_scores(self, text: str) -> Dict[str, float]:
-        """Lightweight keyword/regex fallback scores per category in [0,1]."""
+        """Enhanced keyword scoring with weighted matching and exact match bonuses."""
         t = (text or '').lower()
         out: Dict[str, float] = {}
         try:
             for cat, toks in self._category_tokens.items():
                 hits = 0
+                exact_hits = 0
+                total_weight = 0.0
+                
                 for tok in toks:
                     try:
-                        if re.search(r"\b" + re.escape(tok.lower()) + r"\b", t, re.IGNORECASE):
+                        tok_lower = tok.lower()
+                        # Exact word boundary match (highest confidence)
+                        if re.search(r"\b" + re.escape(tok_lower) + r"\b", t, re.IGNORECASE):
+                            exact_hits += 1
+                            # Weight based on token specificity (longer = more specific)
+                            weight = min(1.0, len(tok_lower) / 15.0) + 0.5
+                            total_weight += weight
+                        # Partial match (lower confidence)
+                        elif tok_lower in t:
                             hits += 1
+                            weight = min(0.5, len(tok_lower) / 20.0) + 0.2
+                            total_weight += weight
                     except Exception:
                         if tok.lower() in t:
                             hits += 1
-                out[cat] = max(0.0, min(1.0, math.log1p(hits) / math.log1p(10)))
+                            total_weight += 0.3
+                
+                # Calculate score with emphasis on exact matches
+                if exact_hits > 0:
+                    # Strong signal: multiple exact matches
+                    base_score = min(1.0, (exact_hits * 0.25) + (total_weight * 0.15))
+                    # Boost for multiple exact matches
+                    if exact_hits >= 3:
+                        base_score = min(1.0, base_score * 1.3)
+                    elif exact_hits >= 2:
+                        base_score = min(1.0, base_score * 1.15)
+                    out[cat] = base_score
+                elif hits > 0:
+                    # Moderate signal: partial matches only
+                    out[cat] = min(0.6, (hits * 0.15) + (total_weight * 0.1))
+                else:
+                    out[cat] = 0.0
         except Exception:
             return {}
         return out
@@ -1086,17 +1186,57 @@ class AIClassificationPipelineService:
         if not fallback_keywords:
             fallback_keywords = {
                 'PII': [
-                    'customer', 'email', 'phone', 'mobile', 'ssn', 'passport', 'dob', 'date of birth',
-                    'first name', 'last name', 'address', 'contact', 'person', 'individual', 'name'
+                    'personally identifiable information', 'pii', 'customer', 'client', 'user', 'person', 'individual', 'employee',
+                    'email', 'mail', 'address', 'phone', 'mobile', 'telephone', 'contact', 'fax',
+                    'ssn', 'social security number', 'passport', 'driver license', 'tax id', 'tin', 'ein',
+                    'credit card', 'debit card', 'cvv', 'cvc', 'iban', 'swift', 'routing', 'account number',
+                    'birth date', 'dob', 'date of birth', 'age', 'birthday',
+                    'first name', 'last name', 'full name', 'surname', 'given name', 'middle name', 'maiden name',
+                    'gender', 'sex', 'nationality', 'citizenship', 'ethnicity', 'race', 'religion',
+                    'biometric', 'fingerprint', 'retina', 'iris', 'facial recognition', 'voice print',
+                    'medical', 'health', 'patient', 'diagnosis', 'treatment', 'prescription',
+                    'ip address', 'mac address', 'device id', 'user id', 'login', 'username', 'password',
+                    'home address', 'residential address', 'mailing address', 'street', 'city', 'state', 'zip', 'postal code', 'country',
+                    'personal phone', 'personal email', 'personal data', 'sensitive data', 'confidential data'
                 ],
                 'SOX': [
-                    'general ledger', 'journal entry', 'trial balance', 'financial statement', 'sox',
-                    'revenue', 'expense', 'balance', 'accounting', 'financial reporting'
+                    'sox', 'sarbanes oxley', 'financial reporting', 'accounting', 'audit', 'controls',
+                    'general ledger', 'gl', 'journal entry', 'je', 'trial balance', 'tb',
+                    'revenue', 'income', 'sales', 'expense', 'cost', 'expenditure',
+                    'balance sheet', 'bs', 'income statement', 'is', 'profit', 'loss', 'p&l', 'cash flow statement', 'cfs',
+                    'assets', 'liabilities', 'equity', 'capital', 'retained earnings',
+                    'accounts receivable', 'ar', 'accounts payable', 'ap',
+                    'payroll', 'salary', 'wage', 'bonus', 'compensation', 'commission',
+                    'bank statement', 'reconciliation', 'transaction',
+                    'invoice', 'bill', 'receipt', 'purchase order', 'po', 'sales order', 'so',
+                    'accrual', 'deferral', 'depreciation', 'amortization',
+                    'financial statement', 'financial data', 'financial record',
+                    'chart of accounts', 'coa', 'account code', 'account number',
+                    'fiscal year', 'fy', 'quarter', 'q1', 'q2', 'q3', 'q4', 'period',
+                    'materiality', 'threshold', 'variance', 'budget', 'forecast',
+                    'internal control', 'icfr', 'sox compliance', 'sox audit', 'sox testing',
+                    'revenue recognition', 'expense recognition', 'matching principle'
                 ],
                 'SOC2': [
-                    'access log', 'audit trail', 'change management', 'user provisioning', 'security incident',
-                    'monitoring', 'control', 'policy', 'encryption', 'key management'
-                ],
+                    'soc2', 'soc 2', 'service organization control', 'security', 'availability', 'processing integrity', 'confidentiality', 'privacy',
+                    'access control', 'access log', 'access right', 'permission', 'privilege', 'role',
+                    'authentication', 'authorization', 'mfa', 'multi factor', 'two factor', '2fa',
+                    'audit trail', 'audit log', 'change log', 'activity log', 'event log',
+                    'encryption', 'decrypt', 'encrypt', 'cipher', 'key management', 'certificate', 'ssl', 'tls',
+                    'firewall', 'network security', 'intrusion detection', 'ids', 'ips',
+                    'vulnerability scan', 'penetration test', 'security assessment', 'risk assessment',
+                    'incident response', 'incident management', 'security incident', 'data breach',
+                    'disaster recovery', 'dr', 'business continuity', 'bcp', 'backup', 'restore',
+                    'compliance policy', 'security policy', 'access policy', 'password policy',
+                    'monitoring', 'alert', 'notification', 'siem', 'security information', 'event management',
+                    'system configuration', 'baseline', 'hardening', 'patch management',
+                    'user provisioning', 'deprovisioning', 'access review', 'access certification',
+                    'change management', 'change control', 'change request', 'change approval',
+                    'segregation of duties', 'sod', 'conflict of interest',
+                    'data classification', 'data protection', 'data privacy', 'gdpr', 'hipaa', 'pci dss',
+                    'security control', 'operational control', 'technical control', 'administrative control',
+                    'trust service criteria', 'tsc'
+                ]
             }
         
         for category, keywords in fallback_keywords.items():
@@ -1822,30 +1962,59 @@ class AIClassificationPipelineService:
                 else:
                     confidence_tier = "Confident"
 
-                results.append({
-                    'asset': asset,
-                    'business_context': full_context,
-                    'category': best_cat,
-                    'confidence': confidence,
-                    'confidence_pct': confidence_pct,
-                    'confidence_tier': confidence_tier,
-                    'c': c,
-                    'i': i,
-                    'a': a,
-                    'label': final_label,
-                    'label_emoji': label_emoji,
-                    'color': color_map.get(final_label, ''),
-                    'validation_status': validation_status,
-                    'issues': issues,
-                    'route': route,
-                    'application_status': 'QUEUED_FOR_REVIEW',
-                    'failure_reason': None,
-                    'sql_preview': sql_preview,
-                    'compliance': compliance,
-                    'reasoning': column_reasoning,
-                })
+                # Filter: Only include PII, SOX, SOC2
+                legacy_map = {
+                    'PERSONAL_DATA': 'PII',
+                    'PERSONAL DATA': 'PII',
+                    'PERSONAL': 'PII',
+                    'PII': 'PII',
+                    'PERSONAL FINANCIAL DATA': 'SOX',
+                    'FINANCIAL_DATA': 'SOX',
+                    'FINANCIAL DATA': 'SOX',
+                    'FINANCIAL': 'SOX',
+                    'PROPRIETARY_DATA': 'SOX',
+                    'PROPRIETARY DATA': 'SOX',
+                    'REGULATORY_DATA': 'SOC2',
+                    'REGULATORY DATA': 'SOC2',
+                    'REGULATORY': 'SOC2',
+                    'INTERNAL_DATA': 'SOC2',
+                    'INTERNAL DATA': 'SOC2',
+                    'SOC2': 'SOC2',
+                    'SOX': 'SOX',
+                }
+                
+                display_cat = None
+                if best_cat:
+                    key = str(best_cat).strip().upper()
+                    normalized = legacy_map.get(key)
+                    if normalized in {'PII', 'SOX', 'SOC2'}:
+                        display_cat = normalized
+
+                if display_cat:
+                    results.append({
+                        'asset': asset,
+                        'business_context': full_context,
+                        'category': display_cat,
+                        'confidence': confidence,
+                        'confidence_pct': confidence_pct,
+                        'confidence_tier': confidence_tier,
+                        'c': c,
+                        'i': i,
+                        'a': a,
+                        'label': final_label,
+                        'label_emoji': label_emoji,
+                        'color': color_map.get(final_label, ''),
+                        'validation_status': validation_status,
+                        'issues': issues,
+                        'route': route,
+                        'application_status': 'QUEUED_FOR_REVIEW',
+                        'failure_reason': None,
+                        'sql_preview': sql_preview,
+                        'compliance': compliance,
+                        'reasoning': column_reasoning,
+                    })
             except Exception as e:
-                results.append({'asset': asset, 'error': str(e)})
+                logger.error(f"Error classifying {asset.get('full_name')}: {e}")
         return results
 
     def _classify_columns_local(self, db: str, schema: str, table: str, max_cols: int = 50) -> List[Dict[str, Any]]:
@@ -1885,17 +2054,19 @@ class AIClassificationPipelineService:
                     if not col_name:
                         continue
                     
-                    # Build column context: name + type + comment + sample values
-                    col_context_parts = [col_name, col_type]
+                    # Build column context: table + name + type + comment + sample values
+                    # ENHANCED: Include table name to disambiguate context (e.g. "EMPLOYEE" table vs "PRODUCT" table)
+                    col_context_parts = [f"Table: {table}", f"Column: {col_name}", f"Type: {col_type}"]
                     if col_comment:
-                        col_context_parts.append(col_comment)
+                        col_context_parts.append(f"Comment: {col_comment}")
                     
-                    # Sample column values for context
+                    # Sample column values for richer context (increased from 20 to 50 for better accuracy)
                     try:
-                        samples = self._sample_column_values(db, schema, table, col_name, sample_rows=20) or []
+                        samples = self._sample_column_values(db, schema, table, col_name, sample_rows=50) or []
                         if samples:
-                            sample_str = ", ".join([str(s)[:32] for s in samples[:5]])
-                            col_context_parts.append(f"Examples: {sample_str}")
+                            # Include more samples (up to 8) for better pattern detection
+                            sample_str = ", ".join([str(s)[:40] for s in samples[:8]])
+                            col_context_parts.append(f"Values: {sample_str}")
                     except Exception:
                         pass
                     
@@ -1905,33 +2076,53 @@ class AIClassificationPipelineService:
                     ptxt = self._preprocess_text_local(col_context)
                     
                     # Diagnostic logging
-                    logger.info(f"  {col_name} context: {col_context[:80]}")
-                    logger.info(f"    Preprocessed: {ptxt[:80]}")
-                    logger.info(f"    Embedder ready: {self._embedder is not None}, Centroids: {len(self._category_centroids) if self._category_centroids else 0}")
+                    logger.info(f"  {col_name} context: {col_context[:120]}")
                     
                     sem = self._semantic_scores(ptxt)
                     kw = self._keyword_scores(ptxt)
                     pt = self._pattern_scores(ptxt)
                     
+                    # ENHANCED: Adaptive Strong Signal Boost
+                    # If a strong keyword match is found (kw > 0.5), boost the semantic score to ensure detection
+                    for cat, k_score in kw.items():
+                        if k_score > 0.5:
+                            # Strong keyword match: boost semantic score significantly
+                            current_sem = sem.get(cat, 0.0)
+                            boosted_sem = max(current_sem, 0.88)
+                            sem[cat] = boosted_sem
+                            logger.info(f"    !!! Strong keyword match for {cat} (kw_score={k_score:.2f}) -> Boosted semantic from {current_sem:.2f} to {boosted_sem:.2f}")
+                        elif k_score > 0.35:
+                            # Moderate keyword match: moderate boost
+                            current_sem = sem.get(cat, 0.0)
+                            boosted_sem = max(current_sem, min(0.75, current_sem + 0.20))
+                            sem[cat] = boosted_sem
+                            logger.info(f"    Moderate keyword match for {cat} (kw_score={k_score:.2f}) -> Boosted semantic from {current_sem:.2f} to {boosted_sem:.2f}")
+
                     # Log embedding scores for debugging
                     logger.info(f"    Semantic scores: {sem}")
                     logger.info(f"    Keyword scores: {kw}")
                     logger.info(f"    Pattern scores: {pt}")
                     
-                    # Combine scores with governance-aware weights
+                    # Combine scores with adaptive weighting
                     combined: Dict[str, float] = {}
                     cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()))
-                    
-                    # Use higher semantic weight for column-level detection (embeddings are more accurate for short text)
-                    w_sem = 0.75
-                    w_kw = 0.20
-                    w_pt = 0.15
                     
                     for cat in cats:
                         s = float(sem.get(cat, 0.0))
                         k = float(kw.get(cat, 0.0))
                         p = float(pt.get(cat, 0.0))
-                        v = (w_sem * s) + (w_kw * k) + (w_pt * p)
+                        
+                        # Adaptive weighting based on signal strength
+                        if k > 0.6 or s > 0.75:
+                            # Very strong signal: let the strongest signal dominate
+                            v = max(s, k, p)
+                        elif k > 0.4 or s > 0.60:
+                            # Strong signal: weighted combination with emphasis on strong signals
+                            v = (0.60 * s) + (0.30 * k) + (0.10 * p)
+                        else:
+                            # Normal weighting: balanced approach
+                            v = (0.70 * s) + (0.20 * k) + (0.10 * p)
+                        
                         combined[cat] = max(0.0, min(1.0, v))
                     
                     # FALLBACK: If no scores from embeddings/keywords/patterns, use simple keyword matching
@@ -1951,8 +2142,14 @@ class AIClassificationPipelineService:
                             for cat in gov_scores:
                                 gov_val = float(gov_scores.get(cat, 0.0))
                                 base_val = float(combined.get(cat, 0.0))
-                                # Governance tables provide strong signal: 30% weight
-                                combined[cat] = max(0.0, min(1.0, 0.7 * base_val + 0.3 * gov_val))
+                                # Governance tables provide authoritative signal: let it override or significantly boost
+                                if gov_val > 0.75:
+                                    # High confidence governance match: trust it
+                                    combined[cat] = max(base_val, gov_val)
+                                    logger.info(f"    !!! Governance override for {cat}: {gov_val:.2f}")
+                                else:
+                                    # Moderate governance match: weighted boost
+                                    combined[cat] = max(0.0, min(1.0, 0.6 * base_val + 0.4 * gov_val))
                             logger.debug(f"    After gov boost: {combined}")
                     except Exception as e:
                         logger.debug(f"    Gov scores error: {e}")
@@ -1994,8 +2191,6 @@ class AIClassificationPipelineService:
                             'REGULATORY_DATA': 'SOC2',
                             'REGULATORY DATA': 'SOC2',
                             'REGULATORY': 'SOC2',
-                            'INTERNAL_DATA': 'SOC2',
-                            'INTERNAL DATA': 'SOC2',
                             'SOC2': 'SOC2',
                             'SOX': 'SOX',
                         }
@@ -2868,9 +3063,13 @@ class AIClassificationPipelineService:
                             for r in col_rows:
                                 logger.info(f"  - {r.get('column')}: {r.get('category')} @ {r.get('confidence_pct')}% (label={r.get('label')})")
                             
-                            # Filter for display - show rows with valid category and meaningful confidence
-                            # Include Internal, Confidential, Restricted labels (exclude only very low confidence)
-                            col_rows_clean = [r for r in col_rows if 'error' not in r and r.get('category') and r.get('confidence_pct', 0) >= 15]
+                            # Filter for display - show only higher-confidence PII / SOX / SOC2 columns
+                            col_rows_clean = [
+                                r for r in col_rows
+                                if 'error' not in r
+                                and r.get('category') in {'PII', 'SOX', 'SOC2'}
+                                and r.get('confidence_pct', 0) >= 50
+                            ]
                             
                             logger.info(f"After display filter: {len(col_rows_clean)} rows")
                             for r in col_rows_clean:
@@ -2910,8 +3109,6 @@ class AIClassificationPipelineService:
                                             'REGULATORY_DATA': 'SOC2',
                                             'REGULATORY DATA': 'SOC2',
                                             'REGULATORY': 'SOC2',
-                                            'INTERNAL_DATA': 'SOC2',
-                                            'INTERNAL DATA': 'SOC2',
                                             'SOC2': 'SOC2',
                                             'SOX': 'SOX',
                                         }

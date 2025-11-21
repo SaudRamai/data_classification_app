@@ -91,6 +91,8 @@ class ai_assistant_service:
         'TradeSecret': 'PROPRIETARY_DATA',
         'Internal': 'INTERNAL',
         'Public': 'PUBLIC_DATA',
+        'SOX': 'FINANCIAL_DATA',
+        'SOC2': 'REGULATORY_DATA',
     }
 
     # Compliance hints per Avendra category

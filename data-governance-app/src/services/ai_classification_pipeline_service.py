@@ -13,6 +13,13 @@ from typing import List, Dict, Any, Optional
 import pandas as pd
 import numpy as np  # type: ignore
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except ImportError:
+    # Fallback for older Streamlit versions or if internal API changes
+    from streamlit.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 try:
     from sentence_transformers import SentenceTransformer  # type: ignore
@@ -21,11 +28,15 @@ except Exception:
 
 from src.connectors.snowflake_connector import snowflake_connector
 from src.services.ai_assistant_service import ai_assistant_service
-from src.services.ai_classification_service import ai_classification_service
+try:
+    from src.services.ai_classification_service import ai_classification_service
+except ImportError:
+    ai_classification_service = None  # type: ignore
 from src.services.discovery_service import DiscoveryService
 # AISensitiveDetectionService import moved to __init__
 from src.services.governance_db_resolver import resolve_governance_db
 from src.services.tagging_service import tagging_service
+from src.services.llm_classification_service import llm_classification_service
 try:
     from src.config import settings
 except Exception:
@@ -349,9 +360,23 @@ class AIClassificationPipelineService:
                 except Exception as _de:
                     st.caption(f"Discovery preview error: {_de}")
 
-        # Run pipeline button
-        if st.button("Run AI Classification Pipeline", type="primary", key="run_ai_pipeline"):
-            self._run_classification_pipeline(db, gov_db)
+        # Run pipeline button with configurable limit
+        col_run1, col_run2 = st.columns([2, 1])
+        with col_run1:
+            run_btn = st.button("Run AI Classification Pipeline", type="primary", key="run_ai_pipeline")
+        with col_run2:
+            max_tables = st.number_input(
+                "Max tables to classify", 
+                min_value=1, 
+                max_value=1000, 
+                value=50, 
+                step=10,
+                key="max_tables_to_classify",
+                help="Number of tables to classify in this run (more tables = longer processing time)"
+            )
+        
+        if run_btn:
+            self._run_classification_pipeline(db, gov_db, max_tables=int(max_tables))
 
     def _get_active_database(self) -> Optional[str]:
         """Get the active database from global filters."""
@@ -416,8 +441,14 @@ class AIClassificationPipelineService:
         except Exception:
             return db
 
-    def _run_classification_pipeline(self, db: str, gov_db: str) -> None:
-        """Execute the full AI classification pipeline."""
+    def _run_classification_pipeline(self, db: str, gov_db: str, max_tables: int = 50) -> None:
+        """Execute the full AI classification pipeline.
+        
+        Args:
+            db: Database to classify
+            gov_db: Governance database
+            max_tables: Maximum number of tables to classify (default: 50)
+        """
         # Validate database
         if not db or db.upper() in ('NONE', '(NONE)', 'NULL', 'UNKNOWN', ''):
             st.error("Invalid database selected. Please choose a valid database from Global Filters.")
@@ -449,7 +480,8 @@ class AIClassificationPipelineService:
                     st.warning("No tables found in the selected database.")
                     return
 
-                st.info(f"Discovered {len(assets)} tables for classification.")
+                st.info(f"Discovered {len(assets)} tables. Will classify up to {max_tables} tables.")
+
 
                 # Show backend status
                 st.caption(f"Embedding backend: {self._embed_backend}")
@@ -474,8 +506,17 @@ class AIClassificationPipelineService:
                 except Exception:
                     pass
 
-                # Step 2-8: Run local classification pipeline (no governance tables)
-                results = self._classify_assets_local(db=db, assets=assets[:50])
+                # Step 2-8: Run classification pipeline
+                # STRICT LLM CHECK as requested by user
+                if not llm_classification_service.check_connection():
+                    st.error(f"LLM Service not reachable at {llm_classification_service.base_url}. Please ensure Ollama is running (e.g., 'ollama run phi3.5'). Cannot proceed with LLM classification.")
+                    return
+
+                st.success(f"Using LLM-based classification (Model: {llm_classification_service.model})")
+                
+                # Process assets up to max_tables limit
+                results = self._classify_assets_llm(db=db, assets=assets[:max_tables])
+
 
                 try:
                     conf_list = [float(r.get('confidence', 0.0) or 0.0) for r in results if isinstance(r, dict) and 'error' not in r]
@@ -534,14 +575,16 @@ class AIClassificationPipelineService:
                     st.warning("No assets were successfully classified.")
                     return
 
-                # Display results (table-level only)
+                # Display results (table-level and column-level details)
                 self._display_classification_results(results)
 
                 # Summary
                 successful = len([r for r in results if 'error' not in r])
                 failed = len([r for r in results if 'error' in r])
 
-                st.success(f"Pipeline completed! Successfully classified {successful} assets. Failed: {failed}")
+                st.success(f"✅ Pipeline completed! Successfully classified {successful} assets. Failed: {failed}")
+                st.info(f"👆 **Scroll up to review detailed classification results for each table, including column-level PII, SOX, and SOC2 classifications.**")
+
 
                 if failed > 0:
                     with st.expander("View Errors", expanded=False):
@@ -1342,10 +1385,14 @@ class AIClassificationPipelineService:
                 val = self._cache.get(cache_key) or {}
                 if isinstance(val, dict):
                     return val
-            svc = ai_classification_service
+            
+            # Add None check before using ai_classification_service
+            svc = ai_classification_service if 'ai_classification_service' in globals() and ai_classification_service else None
+            
             # If governance match function or connector isn't available, skip
-            if not hasattr(svc, "_get_semantic_matches_gov"):
+            if not svc or not hasattr(svc, "_get_semantic_matches_gov"):
                 return out
+            
             try:
                 # Some environments may not have Snowflake or proper tables; trap and continue
                 matches = svc._get_semantic_matches_gov(text) or []
@@ -2361,6 +2408,239 @@ class AIClassificationPipelineService:
         logger.info(f"✓ Column classification complete: {len(results)} columns included in results")
         return results
 
+    def _classify_assets_llm(self, db: str, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Classify assets using the LLM service with parallel execution."""
+        import time
+        results: List[Dict[str, Any]] = []
+        
+        # Progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        total_assets = len(assets)
+        completed_count = 0
+        
+        # ENHANCED: Track timing for performance monitoring
+        pipeline_start = time.time()
+        logger.info(f"=" * 80)
+        logger.info(f"Starting LLM classification pipeline for {total_assets} tables")
+        logger.info(f"=" * 80)
+        
+        # Capture the current Streamlit context to pass to worker threads
+        try:
+            ctx = get_script_run_ctx()
+        except Exception:
+            ctx = None
+
+        def process_single_asset(asset):
+            # Attach the Streamlit context to this thread so st.session_state works
+            if ctx:
+                add_script_run_ctx(threading.current_thread(), ctx)
+            
+            # ENHANCED: Track timing per table
+            table_start = time.time()
+            
+            try:
+                table_name = asset.get('table')
+                schema_name = asset.get('schema')
+                full_name = asset.get('full_name')
+                
+                logger.info(f"▶ Starting classification: {full_name}")
+                
+                # Fetch columns (limit to 50 to prevent excessive processing time)
+                fetch_start = time.time()
+                try:
+                    cols_data = snowflake_connector.execute_query(
+                        f"SELECT COLUMN_NAME, DATA_TYPE, COMMENT FROM {db}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s LIMIT 50",
+                        {"s": schema_name, "t": table_name}
+                    ) or []
+                    fetch_time = time.time() - fetch_start
+                    logger.info(f"  ├─ Fetched {len(cols_data)} columns in {fetch_time:.2f}s")
+                except Exception as e:
+                    logger.error(f"  └─ ❌ Failed to fetch columns: {e}")
+                    cols_data = []
+                
+                if not cols_data:
+                    logger.warning(f"  └─ ⚠️  No columns found for {full_name}")
+                    return None
+                    
+                columns_meta = []
+                for c in cols_data:
+                    columns_meta.append({
+                        "name": c.get('COLUMN_NAME'),
+                        "data_type": c.get('DATA_TYPE'),
+                        "comment": c.get('COMMENT')
+                    })
+                
+                # Call LLM
+                logger.info(f"  ├─ Calling LLM for {len(columns_meta)} columns...")
+                llm_start = time.time()
+                llm_result = llm_classification_service.classify_table(table_name, columns_meta)
+                llm_time = time.time() - llm_start
+                
+                if "error" in llm_result:
+                    logger.error(f"  └─ ❌ LLM Error for {full_name}: {llm_result['error']}")
+                    return None
+                
+                logger.info(f"  ├─ LLM completed in {llm_time:.2f}s")
+                
+                # Process LLM results
+                llm_cols = llm_result.get("columns", [])
+                logger.info(f"  ├─ Processing {len(llm_cols)} classified columns...")
+                
+                # Aggregation variables
+                max_c, max_i, max_a = 1, 1, 1
+                table_tags = set()
+                sensitive_cols_reasoning = []
+                max_confidence = 0.0
+                
+                # Map LLM tags to CIA and Categories
+                for col in llm_cols:
+                    classifications = col.get("classifications", [])
+                    col_conf_str = col.get("confidence", "Medium")
+                    col_name = col.get("col_name", col.get("column_name", "unknown"))
+                    
+                    # Map confidence string to float
+                    col_conf = 0.5
+                    if col_conf_str == "High": col_conf = 0.9
+                    elif col_conf_str == "Medium": col_conf = 0.6
+                    elif col_conf_str == "Low": col_conf = 0.3
+                    
+                    max_confidence = max(max_confidence, col_conf)
+                    
+                    # Determine CIA impact based on tags
+                    c, i, a = 1, 1, 1
+                    if "PII" in classifications:
+                        c = 3 if col.get("pii_type") == "Sensitive" else 2
+                        table_tags.add("PII")
+                    if "SOC2" in classifications:
+                        c = max(c, 2)
+                        table_tags.add("SOC2")
+                    if "SOX" in classifications:
+                        i = max(i, 2) # Financial data integrity is key
+                        table_tags.add("SOX")
+                        
+                    # Update High Water Mark
+                    max_c = max(max_c, c)
+                    max_i = max(max_i, i)
+                    max_a = max(max_a, a)
+                    
+                    # Add reasoning for sensitive columns
+                    if classifications:
+                        tags_str = ", ".join(classifications)
+                        sensitive_cols_reasoning.append(f"{col_name} ({tags_str})")
+
+                # Determine primary category
+                primary_category = "SOC2" # Default if nothing else
+                if "PII" in table_tags:
+                    primary_category = "PII"
+                elif "SOX" in table_tags:
+                    primary_category = "SOX"
+                elif "SOC2" in table_tags:
+                    primary_category = "SOC2"
+                
+                # Determine Label
+                label = "Internal"
+                if max_c >= 3: label = "Confidential"
+                elif max_c == 2: label = "Restricted"
+                elif max_c == 1: label = "Internal"
+                else: label = "Public"
+                
+                # Format for display
+                label_emoji_map = {
+                    'Confidential': '🟥 Confidential',
+                    'Restricted': '🟧 Restricted',
+                    'Internal': '🟨 Internal',
+                    'Public': '🟩 Public',
+                }
+                color_map = {
+                    'Confidential': 'Red',
+                    'Restricted': 'Orange',
+                    'Internal': 'Yellow',
+                    'Public': 'Green',
+                }
+                
+                # ENHANCED: Log completion with timing
+                table_time = time.time() - table_start
+                logger.info(f"  └─ ✅ Classification complete for {full_name}")
+                logger.info(f"     Total time: {table_time:.2f}s | Category: {primary_category} | Label: {label} | Confidence: {max_confidence:.0%}")
+                logger.info(f"     Tags: {list(table_tags)} | Sensitive columns: {len(sensitive_cols_reasoning)}")
+                
+                return {
+                    'asset': asset,
+                    'business_context': f"Classified by AI Model: {llm_classification_service.model}",
+                    'category': primary_category,
+                    'confidence': max_confidence,
+                    'confidence_pct': round(max_confidence * 100, 1),
+                    'confidence_tier': "Confident" if max_confidence > 0.8 else "Likely",
+                    'c': max_c,
+                    'i': max_i,
+                    'a': max_a,
+                    'label': label,
+                    'label_emoji': label_emoji_map.get(label, label),
+                    'color': color_map.get(label, 'Gray'),
+                    'validation_status': 'REVIEW_REQUIRED',
+                    'issues': [],
+                    'route': 'STANDARD_REVIEW',
+                    'application_status': 'QUEUED_FOR_REVIEW',
+                    'failure_reason': None,
+                    'sql_preview': None,
+                    'compliance': list(table_tags),
+                    'reasoning': sensitive_cols_reasoning[:5], # Top 5 columns
+                }
+            except Exception as e:
+                table_time = time.time() - table_start
+                logger.error(f"  └─ ❌ Error processing asset {asset.get('full_name')} after {table_time:.2f}s: {e}", exc_info=True)
+                return None
+
+        # ENHANCED: Container for incremental detailed results
+        results_container = st.container()
+        
+        # Use ThreadPoolExecutor for parallel execution
+        # OPTIMIZED: Increased from max_workers=1 to max_workers=2
+        # Testing shows Ollama can handle 2 parallel requests with acceptable performance
+        # Monitor resource usage and reduce back to 1 if instability occurs
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_to_asset = {executor.submit(process_single_asset, asset): asset for asset in assets}
+            
+            for future in as_completed(future_to_asset):
+                completed_count += 1
+                asset = future_to_asset[future]
+                
+                # Update progress
+                progress_pct = completed_count / total_assets
+                progress_bar.progress(progress_pct)
+                status_text.text(f"✓ Classified {completed_count}/{total_assets} tables ({progress_pct:.0%})")
+                
+                try:
+                    res = future.result()
+                    if res:
+                        results.append(res)
+                        
+                        # ENHANCED: Show completion message for this table
+                        # This gives instant feedback to the user
+                        logger.info(f"📊 Completed {asset.get('full_name')} ({len(results)} results so far)")
+                        
+                        # Display detailed results immediately for this completed table
+                        with results_container:
+                            self._display_single_table_result(res, completed_count, total_assets)
+                    else:
+                        logger.warning(f"⚠️  No result returned for {asset.get('full_name')}")
+                except Exception as exc:
+                    logger.error(f"❌ Asset processing exception for {asset.get('full_name')}: {exc}", exc_info=True)
+        
+        # ENHANCED: Final summary with timing
+        pipeline_time = time.time() - pipeline_start
+        avg_time = pipeline_time / total_assets if total_assets > 0 else 0
+        logger.info(f"=" * 80)
+        logger.info(f"Pipeline complete: {len(results)}/{total_assets} tables classified")
+        logger.info(f"Total time: {pipeline_time:.2f}s | Average per table: {avg_time:.2f}s")
+        logger.info(f"=" * 80)
+        
+        status_text.empty()
+        progress_bar.empty()
+        return results
+
     def _build_richer_context(self, asset: Dict[str, Any], max_cols: int = 120, max_vals: int = 10, business_purpose: Optional[str] = None) -> str:
         """Aggregate business purpose, column names, and example values in a single contextual string."""
         table_name = str(asset.get('table') or '')
@@ -2414,7 +2694,8 @@ class AIClassificationPipelineService:
         try:
             # Load dynamic patterns from sensitivity config
             try:
-                cfg = ai_classification_service.load_sensitivity_config() or {}
+                cfg = ai_classification_service.load_sensitivity_config() if ai_classification_service else {}
+                cfg = cfg or {}
             except Exception:
                 cfg = {}
             pats = cfg.get("patterns") or {}
@@ -2674,13 +2955,14 @@ class AIClassificationPipelineService:
         ])
         # Load sensitivity configuration
         try:
-            cfg = ai_classification_service.load_sensitivity_config() or {}
+            cfg = ai_classification_service.load_sensitivity_config() if ai_classification_service else {}
+            cfg = cfg or {}
         except Exception:
             cfg = {}
         patterns = cfg.get('patterns') or {}
         # Detect configured pattern/keyword hits using the service helper
         try:
-            if hasattr(ai_classification_service, "_detect_patterns_in_context"):
+            if ai_classification_service and hasattr(ai_classification_service, "_detect_patterns_in_context"):
                 raw = ai_classification_service._detect_patterns_in_context(eval_text, patterns)
             else:
                 raw = {}
@@ -2712,6 +2994,11 @@ class AIClassificationPipelineService:
     def _discover_assets(self, db: str) -> List[Dict[str, Any]]:
         """Discover tables and extract metadata for classification."""
         try:
+            # Validate db
+            if not db or str(db).strip().upper() in ('NONE', '(NONE)', 'NULL', 'UNKNOWN', ''):
+                logger.warning(f"Invalid database for discovery: {db}")
+                return []
+
             # Cache lookup
             try:
                 schema_filter = self._get_schema_filter()
@@ -2779,6 +3066,10 @@ class AIClassificationPipelineService:
 
     def _collect_metadata(self, db: str, schema_filter: Optional[str], table_filter: Optional[str], gov_db: str):
         """Collect tables, columns and governance glossary/compliance info."""
+        # Validate db
+        if not db or str(db).strip().upper() in ('NONE', '(NONE)', 'NULL', 'UNKNOWN', ''):
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
         # Tables
         try:
             ck_t = f"meta_tables::{db}::{schema_filter or ''}::{table_filter or ''}"
@@ -2978,7 +3269,205 @@ class AIClassificationPipelineService:
             logger.error(f"Column detection failed for {database}.{schema}.{table}: {e}", exc_info=True)
             return []
 
+
+    def _display_single_table_result(self, result: Dict[str, Any], completed_count: int, total_count: int) -> None:
+        """Display detailed classification results for a single completed table.
+        
+        Args:
+            result: Classification result for a single table
+            completed_count: Number of tables completed so far
+            total_count: Total number of tables being classified
+        """
+        if 'error' in result:
+            return
+            
+        asset = result['asset']
+        full_name = asset['full_name']
+        
+        # Create an expander for this table's results
+        with st.expander(f"✅ {completed_count}/{total_count}: {full_name} → {result.get('label_emoji', result.get('label', 'N/A'))}", expanded=True):
+            # Create two-column layout for basic info
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                st.markdown(f"**Table:** {full_name}")
+                st.write(f"**Category:** {result.get('category', 'N/A')}")
+                
+                # Display confidence with visualization
+                confidence_pct = result.get('confidence', 0) * 100
+                confidence_tier = result.get('confidence_tier', 'Uncertain')
+                if confidence_pct >= 80:
+                    st.write(f"**Confidence:** 🟢 {confidence_pct:.1f}% ({confidence_tier})")
+                elif confidence_pct >= 60:
+                    st.write(f"**Confidence:** 🟡 {confidence_pct:.1f}% ({confidence_tier})")
+                else:
+                    st.write(f"**Confidence:** 🔴 {confidence_pct:.1f}% ({confidence_tier})")
+                
+                st.write(f"**Classification:** {result.get('label_emoji', result.get('label', 'N/A'))}")
+                
+                # CIA Values
+                c_val = int(result.get('c', 0) or 0)
+                i_val = int(result.get('i', 0) or 0)
+                a_val = int(result.get('a', 0) or 0)
+                st.write(f"**CIA Levels:** C={c_val}, I={i_val}, A={a_val}")
+                
+                st.write(f"**Route:** {result.get('route', 'N/A')}")
+                st.write(f"**Status:** {result.get('application_status', 'N/A')}")
+                
+                # Display reasoning if available
+                reasoning = result.get('reasoning', [])
+                if reasoning:
+                    st.write("**Key Sensitive Columns:**")
+                    for r in reasoning[:5]:  # Top 5
+                        st.caption(f"• {r}")
+            
+            with col2:
+                # Business context
+                business_context = result.get('business_context', '')
+                if business_context:
+                    st.write("**Business Context:**")
+                    st.text_area("", value=business_context, height=100, disabled=True, key=f"bc_{full_name}_{completed_count}", label_visibility="collapsed")
+                
+                # Display most relevant compliance frameworks
+                compliance_list = result.get('compliance', [])
+                if compliance_list:
+                    comp_display = []
+                    for comp in compliance_list[:3]:
+                        comp_icon = '📋'
+                        if 'GDPR' in comp.upper():
+                            comp_icon = '🇪🇺'
+                        elif 'CCPA' in comp.upper():
+                            comp_icon = '🇺🇸'
+                        elif 'HIPAA' in comp.upper():
+                            comp_icon = '🏥'
+                        elif 'PCI' in comp.upper():
+                            comp_icon = '💳'
+                        elif 'SOX' in comp.upper():
+                            comp_icon = '📊'
+                        elif 'SOC2' in comp.upper():
+                            comp_icon = '🔒'
+                        elif 'PII' in comp.upper():
+                            comp_icon = '👤'
+                        comp_display.append(f"{comp_icon} {comp}")
+                    st.write(f"**Compliance Tags:** {', '.join(comp_display)}")
+            
+            # Column-level classification details
+            st.markdown("---")
+            st.markdown("#### 📊 Column-Level Classification")
+            
+            try:
+                dbn, scn, tbn = full_name.split('.')
+                
+                with st.spinner("🔄 Analyzing columns for sensitive data..."):
+                    col_rows = self.get_column_detection_results(dbn, scn, tbn)
+                    
+                    if col_rows and len(col_rows) > 0:
+                        # Use same emoji mapping as table-level classifications
+                        label_emoji_map = {
+                            'Confidential': '🟥 Confidential',
+                            'Restricted': '🟧 Restricted',
+                            'Internal': '🟨 Internal',
+                            'Public': '🟩 Public',
+                            'Uncertain — review': '⬜ Uncertain — review',
+                        }
+                        
+                        col_display = []
+                        
+                        for r in col_rows:
+                            if 'error' in r:
+                                continue
+                            
+                            raw_cat = r.get('category')
+                            conf = r.get('confidence_pct', 0)
+                            
+                            # Map raw category to PII/SOX/SOC2
+                            try:
+                                _cat_up = str(raw_cat or "").strip().upper()
+                                _cat_map = {
+                                    'PERSONAL_DATA': 'PII',
+                                    'PERSONAL DATA': 'PII',
+                                    'PERSONAL': 'PII',
+                                    'PII': 'PII',
+                                    'PERSONAL FINANCIAL DATA': 'SOX',
+                                    'FINANCIAL_DATA': 'SOX',
+                                    'FINANCIAL DATA': 'SOX',
+                                    'FINANCIAL': 'SOX',
+                                    'PROPRIETARY_DATA': 'SOX',
+                                    'PROPRIETARY DATA': 'SOX',
+                                    'REGULATORY_DATA': 'SOC2',
+                                    'REGULATORY DATA': 'SOC2',
+                                    'REGULATORY': 'SOC2',
+                                    'SOC2': 'SOC2',
+                                    'SOX': 'SOX',
+                                    'INTERNAL_DATA': 'SOC2',
+                                    'INTERNAL DATA': 'SOC2',
+                                }
+                                _cat_norm = _cat_map.get(_cat_up)
+                            except Exception:
+                                _cat_norm = None
+                            
+                            # Only include if it maps to PII, SOX, or SOC2 and meets confidence threshold
+                            if _cat_norm in {'PII', 'SOX', 'SOC2'} and conf >= 40:
+                                raw_label = r.get('label', 'N/A')
+                                label_with_emoji = label_emoji_map.get(raw_label, raw_label)
+                                
+                                col_display.append({
+                                    "Column": r.get('column', 'N/A'),
+                                    "Data Type": r.get('data_type', 'N/A'),
+                                    "Category": _cat_norm,
+                                    "Label": label_with_emoji,
+                                    "Confidence": f"{conf:.0f}%",
+                                    "C": r.get('c', 0),
+                                    "I": r.get('i', 0),
+                                    "A": r.get('a', 0),
+                                })
+                        
+                        if col_display:
+                            col_df = pd.DataFrame(col_display)
+                            
+                            # Color code by label
+                            def _apply_column_label_style(row: pd.Series):
+                                val = str(row.get('Label', '') or '')
+                                bg = ''
+                                if '🟥 Confidential' in val:
+                                    bg = '#ffe5e5'  # Red background (light)
+                                elif '🟧 Restricted' in val:
+                                    bg = '#fff0e1'  # Orange
+                                elif '🟨 Internal' in val:
+                                    bg = '#fffbe5'  # Yellow
+                                elif '🟩 Public' in val:
+                                    bg = '#e9fbe5'  # Green
+                                elif '⬜ Uncertain — review' in val:
+                                    bg = '#f5f5f5'  # Gray
+                                styles = ['' for _ in row.index]
+                                try:
+                                    idx = list(row.index).index('Label')
+                                    if bg:
+                                        styles[idx] = f'background-color: {bg}; color: #000; font-weight: 600'
+                                except Exception:
+                                    pass
+                                return styles
+
+                            styled_col = col_df.style.apply(_apply_column_label_style, axis=1)
+                            st.dataframe(styled_col, width='stretch', hide_index=True)
+                            
+                            # Summary statistics
+                            high_conf = sum(1 for c in col_display if float(c.get('Confidence', '0%').rstrip('%')) >= 80)
+                            med_conf = sum(1 for c in col_display if 60 <= float(c.get('Confidence', '0%').rstrip('%')) < 80)
+                            low_conf = sum(1 for c in col_display if float(c.get('Confidence', '0%').rstrip('%')) < 60)
+                            
+                            st.info(f"📊 **{len(col_display)} sensitive columns detected** | 🟢 High confidence: {high_conf} | 🟡 Medium: {med_conf} | 🔴 Low: {low_conf}")
+                        else:
+                            st.info("ℹ️ No sensitive columns detected in this table (all columns below threshold).")
+                    else:
+                        st.info("ℹ️ Column detection completed - no sensitive columns found.")
+                        
+            except Exception as e:
+                logger.error(f"Column detection error for {full_name}: {e}", exc_info=True)
+                st.warning(f"⚠️ Could not load column-level details: {e}")
+
     def _display_classification_results(self, results: List[Dict[str, Any]]) -> None:
+
         """Display the classification results in a structured format."""
         st.markdown("#### Classification Results")
 
@@ -3011,6 +3500,9 @@ class AIClassificationPipelineService:
             })
 
         results_df = pd.DataFrame(display_data)
+        
+        # ALWAYS show the main results table prominently (not in an expander)
+        st.markdown(f"**📋 Classified Tables: {len(successful_results)}**")
         try:
             try:
                 theme_base = st.get_option("theme.base")
@@ -3054,9 +3546,16 @@ class AIClassificationPipelineService:
         except Exception:
             st.dataframe(results_df, width='stretch', hide_index=True)
 
-        # Show detailed results in expandable sections
-        with st.expander("Detailed Results", expanded=False):
-            for result in successful_results[:10]:  # Limit for performance
+
+        # Show detailed results with column-level classification - COLLAPSED since already shown above
+        with st.expander(f"📊 All Detailed Results (Consolidated View - {len(successful_results)} tables)", expanded=False):
+            st.caption("ℹ️ **Note:** Detailed results for each table were displayed above as they completed. This section provides a consolidated reference view.")
+
+            # Add a note if there are many results
+            if len(successful_results) > 20:
+                st.caption(f"⚠️ Showing all {len(successful_results)} results. This may take a moment to render.")
+            
+            for idx, result in enumerate(successful_results, 1):  # Show all results
                 asset = result['asset']
                 with st.container():
                     col1, col2 = st.columns([1, 2])

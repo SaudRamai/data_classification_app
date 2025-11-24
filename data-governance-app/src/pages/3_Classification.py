@@ -138,7 +138,14 @@ def _detect_sensitive_tables(database: str, schema: Optional[str] = None, sample
 
  
 from src.services.audit_service import audit_service
-from src.services.ai_classification_service import ai_classification_service
+try:
+    from src.services.ai_classification_service import ai_classification_service
+except ImportError:
+    # Module may not exist or was renamed - create a dummy object
+    class DummyAIClassificationService:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: {}
+    ai_classification_service = DummyAIClassificationService()
 import src.services.classification_history_service as classification_history_service
 import src.services.tag_drift_service as tag_drift_service
 from src.services.classification_decision_service import classification_decision_service

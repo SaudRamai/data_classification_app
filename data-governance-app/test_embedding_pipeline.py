@@ -183,42 +183,24 @@ class TestAIClassificationPipeline:
         for cat, c in self._category_centroids.items():
             if c is None: continue
             sim = float(np.dot(v, c))
-            # Use raw cosine similarity (clipped at 0) rather than (sim+1)/2
-            conf = max(0.0, sim)
+            conf = max(0.0, min(1.0, (sim + 1.0) / 2.0))
             raw[cat] = conf
             logger.info(f"  Similarity to {cat}: {sim:.4f} (normalized: {conf:.4f})")
 
         if not raw: return {}
 
-        vals = list(raw.values())
-        mn = min(vals)
-        mx = max(vals)
-        # Only apply relative boosting if we have a meaningful signal (sim > 0.35)
-        if mx > mn and mx > 0.35:
-            for k, v0 in raw.items():
-                x = (float(v0) - float(mn)) / (float(mx) - float(mn))
-                # ENHANCED: More aggressive boosting to reach 85%+ confidence for strong matches
-                if x >= 0.65:
-                    # Very aggressive boost for very strong signals: x^0.2
-                    x = pow(x, 0.2)
-                elif x >= 0.55:
-                    # Aggressive boost for strong signals: x^0.3
-                    x = pow(x, 0.3)
-                elif x >= 0.45:
-                    # Moderate boost for medium-strong signals
-                    x = pow(x, 0.45)
-                elif x >= 0.30:
-                    # Gentle boost for medium signals
-                    x = pow(x, 0.65)
-                elif x >= 0.15:
-                    # Minimal boost for weak signals
-                    x = pow(x, 0.85)
-                else:
-                    # Suppress very weak signals
-                    x = pow(x, 1.1)
-                scores[k] = max(0.0, min(1.0, x))
-        else:
-            scores = dict(raw)
+        # Refined scoring logic: Use absolute similarity thresholds to avoid boosting noise.
+        threshold = 0.575 
+        
+        for k, conf in raw.items():
+            if conf < threshold:
+                score = 0.0
+            else:
+                # Normalize the range [threshold, 1.0] to [0.0, 1.0]
+                score = (conf - threshold) / (1.0 - threshold)
+                score = pow(score, 1.2)
+            
+            scores[k] = max(0.0, min(1.0, score))
             
         return scores
 
@@ -227,40 +209,10 @@ class TestAIClassificationPipeline:
         out: Dict[str, float] = {}
         for cat, toks in self._category_tokens.items():
             hits = 0
-            exact_hits = 0
-            total_weight = 0.0
-            
             for tok in toks:
-                try:
-                    tok_lower = tok.lower()
-                    # Exact word boundary match (highest confidence)
-                    if re.search(r"\b" + re.escape(tok_lower) + r"\b", t, re.IGNORECASE):
-                        exact_hits += 1
-                        # Weight based on token specificity (longer = more specific)
-                        weight = min(1.0, len(tok_lower) / 10.0) + 0.5
-                        total_weight += weight
-                    # Partial match (lower confidence)
-                    elif tok_lower in t:
-                        hits += 1
-                        weight = min(0.5, len(tok_lower) / 20.0) + 0.2
-                        total_weight += weight
-                except Exception:
-                    if tok.lower() in t:
-                        hits += 1
-                        total_weight += 0.3
-            
-            # Calculate score with emphasis on exact matches
-            if exact_hits > 0:
-                # Strong signal: exact matches should yield high confidence
-                # Start at 0.85 for any exact match, then boost
-                base_score = 0.85 + (min(0.15, exact_hits * 0.05))
-                out[cat] = min(1.0, base_score)
-            elif hits > 0:
-                # Moderate signal: partial matches only
-                # Scale based on hits and weight, capped at 0.65
-                out[cat] = min(0.65, (hits * 0.15) + (total_weight * 0.1))
-            else:
-                out[cat] = 0.0
+                if tok.lower() in t:
+                    hits += 1
+            out[cat] = max(0.0, min(1.0, math.log1p(hits) / math.log1p(10)))
         return out
 
     def test_classification(self, text: str):
@@ -275,27 +227,6 @@ class TestAIClassificationPipeline:
         kw = self._keyword_scores(ptxt)
         logger.info(f"Keyword Scores: {kw}")
         
-        # Adaptive Strong Signal Boost
-        for cat, k_score in kw.items():
-            if k_score > 0.75:
-                # Exact/Strong keyword match: force high semantic score
-                current_sem = sem.get(cat, 0.0)
-                boosted_sem = max(current_sem, 0.95)
-                sem[cat] = boosted_sem
-                logger.info(f"    !!! Exact/Strong keyword match for {cat} (kw_score={k_score:.2f}) -> Boosted semantic from {current_sem:.2f} to {boosted_sem:.2f}")
-            elif k_score > 0.5:
-                # Good keyword match: significant boost
-                current_sem = sem.get(cat, 0.0)
-                boosted_sem = max(current_sem, 0.85)
-                sem[cat] = boosted_sem
-                logger.info(f"    Strong keyword match for {cat} (kw_score={k_score:.2f}) -> Boosted semantic from {current_sem:.2f} to {boosted_sem:.2f}")
-            elif k_score > 0.35:
-                # Moderate keyword match: moderate boost
-                current_sem = sem.get(cat, 0.0)
-                boosted_sem = max(current_sem, min(0.80, current_sem + 0.25))
-                sem[cat] = boosted_sem
-                logger.info(f"    Moderate keyword match for {cat} (kw_score={k_score:.2f}) -> Boosted semantic from {current_sem:.2f} to {boosted_sem:.2f}")
-
         combined = {}
         cats = set(list(sem.keys()) + list(kw.keys()))
         

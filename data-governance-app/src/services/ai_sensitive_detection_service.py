@@ -17,7 +17,7 @@ import numpy as np
 from collections import defaultdict
 
 from src.connectors.snowflake_connector import snowflake_connector
-from src.services.sensitive_detection import SensitiveDataDetector
+# from src.services.sensitive_detection import SensitiveDataDetector
 from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -67,8 +67,8 @@ class AISensitiveDetectionService:
         self.min_confidence = min_confidence
         self.use_ai = use_ai
         
-        # Initialize base detector
-        self.detector = SensitiveDataDetector()
+        # Initialize base detector - REMOVED (Legacy)
+        # self.detector = SensitiveDataDetector()
         # Lazy import to avoid circular dependency with ai_classification_service
         if use_ai:
             try:
@@ -790,4 +790,14 @@ class AISensitiveDetectionService:
         return final_results
 
 # Singleton instance
-ai_sensitive_detection_service = AISensitiveDetectionService()
+try:
+    ai_sensitive_detection_service = AISensitiveDetectionService()
+except Exception as e:
+    logger.error(f"Failed to initialize ai_sensitive_detection_service: {e}")
+    # Create a minimal instance without AI to allow imports to succeed
+    try:
+        ai_sensitive_detection_service = AISensitiveDetectionService(use_ai=False)
+    except Exception as e2:
+        logger.error(f"Failed to create fallback instance: {e2}")
+        ai_sensitive_detection_service = None  # type: ignore
+

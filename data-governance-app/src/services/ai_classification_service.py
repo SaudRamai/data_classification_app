@@ -50,8 +50,9 @@ class AIClassificationPipelineService:
             setattr(self.ai_service, "use_governance_glossary", False)
         except Exception:
             pass
-        # Local embedding backend (MiniLM) for governance-free detection
+        # Local embedding backend (MiniLM/E5) for governance-free detection
         self._embed_backend: str = 'none'
+        self._model_name: str = 'none'
         self._embedder: Any = None
         self._category_centroids: Dict[str, Any] = {}
         self._category_tokens: Dict[str, List[str]] = {}
@@ -456,14 +457,16 @@ class AIClassificationPipelineService:
                 st.caption(f"Embedding backend: {self._embed_backend}")
                 st.caption(
                     "Detection mode: "
-                    + ("MiniLM embeddings + keyword fallback" if self._embed_backend == 'sentence-transformers' else "keyword/regex fallback only")
+                    + ("E5-Large-v2 embeddings + keyword fallback" if self._embed_backend == 'sentence-transformers' else "keyword/regex fallback only")
                 )
                 try:
                     cat_cnt = len(getattr(self, "_category_centroids", {}) or {})
                     tok_cnt = sum(len(v) for v in (getattr(self, "_category_tokens", {}) or {}).values())
                     st.caption(f"Categories loaded: {cat_cnt} | Tokens configured: {tok_cnt}")
                     if self._embed_backend == 'sentence-transformers' and cat_cnt == 0:
-                        st.warning("MiniLM is active but no category centroids are available. Falling back to keywords only. Verify governance config and embeddings initialization.")
+                        st.error("CRITICAL: E5-Large-v2 is active but NO category centroids were created.")
+                        st.error("  → Check SENSITIVITY_CATEGORIES table: Ensure 'DESCRIPTION' column is populated.")
+                        st.error("  → Falling back to keywords only (reduced accuracy).")
                 except Exception:
                     pass
 
@@ -553,8 +556,9 @@ class AIClassificationPipelineService:
             self._embed_ready = False
             if SentenceTransformer is not None:
                 try:
-                    logger.info("Initializing SentenceTransformer embeddings...")
-                    self._embedder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+                    logger.info("Initializing SentenceTransformer embeddings (E5-Large-v2)...")
+                    self._model_name = 'intfloat/e5-large-v2'
+                    self._embedder = SentenceTransformer(self._model_name)
                     tv = self._embedder.encode(["ok"], normalize_embeddings=True)
                     v0 = tv[0] if isinstance(tv, (list, tuple)) else tv
                     dim = int(getattr(v0, "shape", [0])[-1]) if hasattr(v0, "shape") else (len(v0) if isinstance(v0, (list, tuple)) else 0)
@@ -565,6 +569,7 @@ class AIClassificationPipelineService:
                     else:
                         self._embedder = None
                         self._embed_backend = 'none'
+                        self._model_name = 'none'
                         logger.warning(f"✗ Embedding dimension validation failed: {dim}")
                 except Exception as _e:
                     try:
@@ -573,9 +578,11 @@ class AIClassificationPipelineService:
                         pass
                     self._embedder = None
                     self._embed_backend = 'none'
+                    self._model_name = 'none'
             else:
                 self._embedder = None
                 self._embed_backend = 'none'
+                self._model_name = 'none'
                 logger.warning("✗ SentenceTransformer not available")
         except Exception as _e2:
             try:
@@ -584,6 +591,7 @@ class AIClassificationPipelineService:
                 pass
             self._embedder = None
             self._embed_backend = 'none'
+            self._model_name = 'none'
             try:
                 self._embed_ready = False
             except Exception:
@@ -606,18 +614,20 @@ class AIClassificationPipelineService:
             schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
         rows = []
         try:
+            # FIXED: Explicitly select correct columns to avoid COALESCE issues
             rows = snowflake_connector.execute_query(
                 f"""
                 SELECT 
-                    COALESCE(category_name, category, name) AS CATEGORY_NAME,
-                    COALESCE(description, desc, details) AS DESCRIPTION,
-                    COALESCE(is_active, true) AS IS_ACTIVE
+                    CATEGORY_NAME,
+                    DESCRIPTION,
+                    IS_ACTIVE
                 FROM {schema_fqn}.SENSITIVITY_CATEGORIES
-                WHERE COALESCE(is_active, true)
+                WHERE IS_ACTIVE = TRUE
                 """
             ) or []
         except Exception:
             try:
+                # Fallback for older schema versions
                 rows = snowflake_connector.execute_query(
                     f"""
                     SELECT 
@@ -635,8 +645,15 @@ class AIClassificationPipelineService:
             try:
                 n = str(r.get("CATEGORY_NAME") or "").strip()
                 d = str(r.get("DESCRIPTION") or "").strip()
-                if n:
-                    cats.append((n, d))
+                
+                # CRITICAL: Validate description
+                if not n: 
+                    continue
+                if not d:
+                    logger.warning(f"Category '{n}' has EMPTY DESCRIPTION. Centroid cannot be built.")
+                    continue
+                    
+                cats.append((n, d))
             except Exception:
                 continue
         if not cats and self._embed_backend == 'sentence-transformers':
@@ -669,13 +686,18 @@ class AIClassificationPipelineService:
                         for a in add:
                             al = a.lower()
                             if al not in base_seen:
-                                ex.append(a)
-                                base_seen.add(al)
+                                 ex.append(a)
+                                 base_seen.add(al)
                 except Exception:
                     pass
             try:
                 # preprocess examples to reduce noise and expand abbreviations
                 ex2 = [self._preprocess_text_local(s, remove_stopwords=True) for s in ex]
+                
+                # E5 requires "passage: " prefix for documents/centroids
+                if 'e5' in str(self._model_name or '').lower():
+                     ex2 = [f"passage: {s}" for s in ex2]
+                     
                 vecs = self._embedder.encode(ex2, normalize_embeddings=True)
                 mat = np.stack(vecs, axis=0)
                 c = np.mean(mat, axis=0)
@@ -821,43 +843,20 @@ class AIClassificationPipelineService:
     def _load_additional_tokens_from_keywords(self, schema_fqn: str, category_name: str) -> List[str]:
         rows = []
         try:
+            # Corrected query matching schema: SENSITIVE_KEYWORDS table, KEYWORD_STRING column
             rows = snowflake_connector.execute_query(
                 f"""
-                SELECT COALESCE(keyword, KEYWORD, KEYWORD_STRING) AS KW
+                SELECT KEYWORD_STRING AS KW
                 FROM {schema_fqn}.SENSITIVE_KEYWORDS
-                WHERE COALESCE(is_active, true) AND (
-                    LOWER(category) = LOWER(%(n)s) OR LOWER(category_name) = LOWER(%(n)s)
+                WHERE COALESCE(is_active, true) AND category_id IN (
+                    SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
                 )
                 """,
                 {"n": category_name},
             ) or []
         except Exception:
-            try:
-                # CATEGORY_ID-based lookup using SENSITIVITY_CATEGORIES
-                rows = snowflake_connector.execute_query(
-                    f"""
-                    SELECT COALESCE(keyword, KEYWORD, KEYWORD_STRING) AS KW
-                    FROM {schema_fqn}.SENSITIVE_KEYWORDS
-                    WHERE COALESCE(is_active, true) AND category_id IN (
-                        SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
-                    )
-                    """,
-                    {"n": category_name},
-                ) or []
-            except Exception:
-                try:
-                    rows = snowflake_connector.execute_query(
-                        f"""
-                        SELECT COALESCE(keyword, KEYWORD, KEYWORD_STRING) AS KW
-                        FROM {schema_fqn}.SENSITIVITY_KEYWORDS
-                        WHERE COALESCE(is_active, true) AND category_id IN (
-                            SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
-                        )
-                        """,
-                        {"n": category_name},
-                    ) or []
-                except Exception:
-                    rows = []
+            rows = []
+            
         out: List[str] = []
         for r in rows:
             try:
@@ -877,37 +876,20 @@ class AIClassificationPipelineService:
             ("INTERNAL_DATA", "internal business operational non sensitive standard general reference lookup config"),
             ("PUBLIC_DATA", "public open shared non confidential non sensitive"),
         ]
-        centroids: Dict[str, Any] = {}
-        tokens_out: Dict[str, List[str]] = {}
-        for name, desc in cats:
-            try:
-                toks = self._generate_category_tokens(name, desc)
-            except Exception:
-                toks = []
-            if toks:
-                tokens_out[name] = toks
-            try:
-                if self._embedder is not None and np is not None and self._embed_backend == 'sentence-transformers':
-                    ex = self._generate_category_examples(name, desc)
-                    ex2 = [self._preprocess_text_local(s, remove_stopwords=True) for s in ex]
-                    vecs = self._embedder.encode(ex2, normalize_embeddings=True)
-                    mat = np.stack(vecs, axis=0)
-                    c = np.mean(mat, axis=0)
-                    n = float(np.linalg.norm(c) or 0.0)
-                    if n > 0:
-                        c = c / n
-                    centroids[name] = c
-                else:
-                    centroids[name] = None
-            except Exception:
-                centroids[name] = None
-        self._category_centroids = centroids
-        self._category_tokens = tokens_out
-        try:
-            st.session_state["_pipe_cat_count"] = len({k: v for k, v in centroids.items() if v is not None})
-            st.session_state["_pipe_tok_count"] = sum(len(v) for v in tokens_out.values())
-        except Exception:
-            pass
+        
+        self._category_centroids = {}
+        self._category_tokens = {}
+        
+        for name, text in cats:
+            self._category_tokens[name] = text.split()
+            if self._embedder:
+                try:
+                    # E5 requires "passage: " prefix
+                    txt_enc = f"passage: {text}" if 'e5' in str(self._model_name or '').lower() else text
+                    vec = self._embedder.encode([txt_enc], normalize_embeddings=True)[0]
+                    self._category_centroids[name] = vec
+                except Exception:
+                    pass
 
     def _semantic_scores(self, text: str) -> Dict[str, float]:
         """Compute semantic similarity scores per category in [0,1] using local centroids."""
@@ -921,7 +903,11 @@ class AIClassificationPipelineService:
             key = f"emb::pp1::{t}"
             v = self._embed_cache.get(key) if hasattr(self, "_embed_cache") else None
             if v is None:
-                v_raw = self._embedder.encode([t], normalize_embeddings=True)
+                # E5 requires "query: " prefix for search queries/columns
+                t_enc = t
+                if 'e5' in str(getattr(self, '_model_name', '') or '').lower():
+                    t_enc = f"query: {t}"
+                v_raw = self._embedder.encode([t_enc], normalize_embeddings=True)
                 v = np.asarray(v_raw[0], dtype=float)
                 try:
                     if hasattr(self, "_embed_cache"):
@@ -1108,43 +1094,20 @@ class AIClassificationPipelineService:
     def _load_patterns_from_governance(self, schema_fqn: str, category_name: str) -> List[str]:
         rows = []
         try:
+            # Corrected query matching schema: SENSITIVE_PATTERNS table, PATTERN_STRING column
             rows = snowflake_connector.execute_query(
                 f"""
-                SELECT COALESCE(pattern, PATTERN, PATTERN_STRING) AS PTN
+                SELECT PATTERN_STRING AS PTN
                 FROM {schema_fqn}.SENSITIVE_PATTERNS
-                WHERE COALESCE(is_active, true) AND (
-                    LOWER(category) = LOWER(%(n)s) OR LOWER(category_name) = LOWER(%(n)s)
+                WHERE COALESCE(is_active, true) AND category_id IN (
+                    SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
                 )
                 """,
                 {"n": category_name},
             ) or []
         except Exception:
-            try:
-                # CATEGORY_ID-based lookup using SENSITIVITY_CATEGORIES
-                rows = snowflake_connector.execute_query(
-                    f"""
-                    SELECT COALESCE(pattern, PATTERN, PATTERN_STRING) AS PTN
-                    FROM {schema_fqn}.SENSITIVE_PATTERNS
-                    WHERE COALESCE(is_active, true) AND category_id IN (
-                        SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
-                    )
-                    """,
-                    {"n": category_name},
-                ) or []
-            except Exception:
-                try:
-                    rows = snowflake_connector.execute_query(
-                        f"""
-                        SELECT COALESCE(pattern, PATTERN, PATTERN_STRING) AS PTN
-                        FROM {schema_fqn}.SENSITIVITY_PATTERNS
-                        WHERE COALESCE(is_active, true) AND category_id IN (
-                            SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
-                        )
-                        """,
-                        {"n": category_name},
-                    ) or []
-                except Exception:
-                    rows = []
+            rows = []
+            
         out: List[str] = []
         for r in rows:
             try:

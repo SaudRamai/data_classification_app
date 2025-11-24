@@ -102,7 +102,8 @@ class AISensitiveDetectionService:
 
     def _gov_db(self) -> str:
         try:
-            return self._normalize_db(getattr(settings, "SNOWFLAKE_DATABASE", None))
+            db = getattr(settings, "SNOWFLAKE_DATABASE", None)
+            return self._normalize_db(db)
         except Exception:
             return "DATA_CLASSIFICATION_DB"
         
@@ -577,9 +578,16 @@ class AISensitiveDetectionService:
         gv_fqn = f"{db}.{gv}"
         # Weights (AI / REGEX / KEYWORD, etc.)
         try:
-            rows = snowflake_connector.execute_query(
-                f"SELECT CATEGORY AS SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_WEIGHTS"
-            ) or []
+            # Try SOURCE column first, fallback to CATEGORY if needed
+            try:
+                rows = snowflake_connector.execute_query(
+                    f"SELECT SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_WEIGHTS"
+                ) or []
+            except Exception:
+                rows = snowflake_connector.execute_query(
+                    f"SELECT CATEGORY AS SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_WEIGHTS"
+                ) or []
+            
             w = {
                 (r.get("SOURCE") or "").upper(): float(r.get("WEIGHT") or 0)
                 for r in rows
@@ -664,9 +672,22 @@ class AISensitiveDetectionService:
             ]
         # Categories and high-risk list
         try:
-            cats = snowflake_connector.execute_query(
-                f"SELECT CATEGORY_NAME, IS_HIGH_RISK, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_CATEGORIES"
-            ) or []
+            # Try querying with IS_HIGH_RISK first, fallback to just CATEGORY_NAME
+            try:
+                cats = snowflake_connector.execute_query(
+                    f"SELECT CATEGORY_NAME, IS_HIGH_RISK, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_CATEGORIES"
+                ) or []
+            except Exception:
+                # Fallback: try HIGH_RISK or just ignore risk flag
+                try:
+                    cats = snowflake_connector.execute_query(
+                        f"SELECT CATEGORY_NAME, HIGH_RISK AS IS_HIGH_RISK, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_CATEGORIES"
+                    ) or []
+                except Exception:
+                     cats = snowflake_connector.execute_query(
+                        f"SELECT CATEGORY_NAME, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_CATEGORIES"
+                    ) or []
+
             cats = [r for r in cats if r.get("IS_ACTIVE", True)]
             self.categories = set([(r.get("CATEGORY_NAME") or "").upper() for r in cats if r.get("CATEGORY_NAME")])
             high_flags = { (r.get("CATEGORY_NAME") or "").upper(): bool(r.get("IS_HIGH_RISK")) for r in cats if r.get("CATEGORY_NAME") }

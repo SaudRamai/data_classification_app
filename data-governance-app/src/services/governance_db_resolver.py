@@ -138,7 +138,12 @@ def resolve_governance_db(force_refresh: bool = False) -> Optional[str]:
         logger.info(f"governance_db_resolver: resolved governance DB: {db} via {_LAST_INFO.get('method')}")
         return db
 
-    return None
+    # Fallback to default if resolution fails completely
+    default_db = "DATA_CLASSIFICATION_DB"
+    logger.warning(f"governance_db_resolver: resolution failed, falling back to default: {default_db}")
+    _CACHED_DB = default_db
+    _LAST_INFO.update({"method": "FALLBACK_DEFAULT", "db": default_db})
+    return default_db
 
 
 def get_last_resolution_info() -> dict:

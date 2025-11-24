@@ -110,7 +110,7 @@ class MetricsService:
             query = f"""
                 SELECT
                   DATE(COALESCE(CREATED_AT, CURRENT_DATE())) AS DAY,
-                  COALESCE(STATUS, ACTION, 'UNKNOWN') AS CLASSIFICATION_STATUS,
+                  COALESCE(ACTION, 'UNKNOWN') AS CLASSIFICATION_STATUS,
                   COUNT(*) AS DECISIONS
                 FROM {decisions_fqn}
                 WHERE COALESCE(CREATED_AT, CURRENT_DATE()) >= DATEADD(day, -%(d)s, CURRENT_DATE())

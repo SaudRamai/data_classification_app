@@ -149,7 +149,8 @@ This document describes the comprehensive multi-layered sensitive data detection
 **Location**: `ai_classification_service.py::get_column_metadata()`, `get_sample_data()`
 
 **Existing Implementation**:
-- Queries `INFORMATION_SCHEMA.COLUMNS` for metadata
+- Queries `
+ATION_SCHEMA.COLUMNS` for metadata
 - Fetches sample data using `SAMPLE` clause
 - Supports dynamic sampling strategies
 

@@ -85,10 +85,6 @@ ipython_config.py
 .python-version
 
 # pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   repect your setup, thus including it can be problematic and is left to your discretion.
 #Pipfile.lock
 
 # PDM
@@ -138,3 +134,6 @@ node_modules/
 # SQL temporary files
 *.sqlite3
 *.db
+
+# Markdown files
+*.md

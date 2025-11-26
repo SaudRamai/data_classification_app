@@ -1,3 +1,4 @@
+
 """
 Snowflake connector module with improved security and connection management.
 """

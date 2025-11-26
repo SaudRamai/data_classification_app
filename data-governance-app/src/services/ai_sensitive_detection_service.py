@@ -17,7 +17,7 @@ import numpy as np
 from collections import defaultdict
 
 from src.connectors.snowflake_connector import snowflake_connector
-# from src.services.sensitive_detection import SensitiveDataDetector
+from src.services.sensitive_detection import SensitiveDataDetector
 from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -67,10 +67,17 @@ class AISensitiveDetectionService:
         self.min_confidence = min_confidence
         self.use_ai = use_ai
         
-        # Initialize base detector - REMOVED (Legacy)
-        # self.detector = SensitiveDataDetector()
+        # Initialize base detector
+        self.detector = SensitiveDataDetector()
         # Lazy import to avoid circular dependency with ai_classification_service
-        self._ai_service = None
+        if use_ai:
+            try:
+                from src.services.ai_classification_service import ai_classification_service
+                self.ai_service = ai_classification_service
+            except Exception:
+                self.ai_service = None
+        else:
+            self.ai_service = None
 
         # Config caches loaded from governance views
         self.weights = {"AI": 0.35, "REGEX": 0.30, "KEYWORD": 0.35}
@@ -84,25 +91,6 @@ class AISensitiveDetectionService:
         # Cache for table metadata to avoid repeated queries
         self._metadata_cache: Dict[str, Dict] = {}
 
-    @property
-    def ai_service(self):
-        if not self.use_ai:
-            return None
-        if self._ai_service is None:
-            try:
-                from src.services.ai_classification_service import ai_classification_service
-                self._ai_service = ai_classification_service
-            except ImportError:
-                # Fallback to pipeline service if main service name not found
-                try:
-                    from src.services.ai_classification_service import ai_classification_pipeline_service
-                    self._ai_service = ai_classification_pipeline_service
-                except Exception:
-                    self._ai_service = None
-            except Exception:
-                self._ai_service = None
-        return self._ai_service
-
     def _normalize_db(self, db: Optional[str]) -> str:
         try:
             s = (db or "").strip()
@@ -114,8 +102,7 @@ class AISensitiveDetectionService:
 
     def _gov_db(self) -> str:
         try:
-            db = getattr(settings, "SNOWFLAKE_DATABASE", None)
-            return self._normalize_db(db)
+            return self._normalize_db(getattr(settings, "SNOWFLAKE_DATABASE", None))
         except Exception:
             return "DATA_CLASSIFICATION_DB"
         
@@ -344,7 +331,7 @@ class AISensitiveDetectionService:
         try:
             compiled: List[Tuple[str, str, re.Pattern]] = []
             for p in self.pattern_rows:
-                pat = p.get("PATTERN_REGEX") or p.get("PATTERN_STRING")
+                pat = p.get("PATTERN_STRING")
                 if not pat or not p.get("IS_ACTIVE", True):
                     continue
                 try:
@@ -579,41 +566,25 @@ class AISensitiveDetectionService:
 
     # --- Config loading ---
     def _load_configs_safely(self) -> None:
-        """Load governance configs; tolerate missing objects/privileges.
-
-        This now uses the base SENSITIVITY_* and SENSITIVE_* tables instead of
-        legacy VW_*_CANONICAL views, and aliases columns to the internal
-        field names expected by the detection logic.
-        """
+        """Load governance configs; tolerate missing objects/privileges."""
         db = self._gov_db()
         gv = "DATA_CLASSIFICATION_GOVERNANCE"
         gv_fqn = f"{db}.{gv}"
-        # Weights (AI / REGEX / KEYWORD, etc.)
+        # Weights
         try:
-            # Try SOURCE column first, fallback to CATEGORY if needed
-            try:
-                rows = snowflake_connector.execute_query(
-                    f"SELECT SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_WEIGHTS"
-                ) or []
-            except Exception:
-                rows = snowflake_connector.execute_query(
-                    f"SELECT CATEGORY AS SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_WEIGHTS"
-                ) or []
-            
-            w = {
-                (r.get("SOURCE") or "").upper(): float(r.get("WEIGHT") or 0)
-                for r in rows
-                if r.get("IS_ACTIVE", True)
-            }
+            rows = snowflake_connector.execute_query(
+                f"SELECT SOURCE, WEIGHT, IS_ACTIVE FROM {gv_fqn}.VW_SENSITIVITY_WEIGHTS_CANONICAL"
+            ) or []
+            w = { (r.get("SOURCE") or "").upper(): float(r.get("WEIGHT") or 0) for r in rows if r.get("IS_ACTIVE", True) }
             for k, v in w.items():
                 if k:
                     self.weights[k] = v
         except Exception as e:
             logger.warning(f"Weights load failed: {e}")
-        # Thresholds (generic name/value mapping)
+        # Thresholds
         try:
             thr = snowflake_connector.execute_query(
-                f"SELECT THRESHOLD_NAME AS NAME, CONFIDENCE_LEVEL AS VALUE, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_THRESHOLDS"
+                f"SELECT NAME, VALUE, IS_ACTIVE FROM {gv_fqn}.VW_SENSITIVITY_THRESHOLDS_CANONICAL"
             ) or []
             for r in thr:
                 if r.get("IS_ACTIVE", True) and r.get("NAME"):
@@ -623,19 +594,7 @@ class AISensitiveDetectionService:
         # Keywords
         try:
             self.keyword_rows = snowflake_connector.execute_query(
-                f"""
-                SELECT 
-                    k.KEYWORD_ID,
-                    k.KEYWORD_STRING AS KEYWORD,
-                    c.CATEGORY_NAME AS SENSITIVITY_TYPE,
-                    k.SENSITIVITY_WEIGHT AS SCORE,
-                    k.IS_ACTIVE
-                FROM {gv_fqn}.SENSITIVE_KEYWORDS k
-                JOIN {gv_fqn}.SENSITIVITY_CATEGORIES c
-                    ON k.CATEGORY_ID = c.CATEGORY_ID
-                WHERE k.IS_ACTIVE = TRUE
-                  AND c.IS_ACTIVE = TRUE
-                """
+                f"SELECT * FROM {gv_fqn}.VW_SENSITIVE_KEYWORDS_CANONICAL WHERE IS_ACTIVE"
             ) or []
         except Exception as e:
             logger.warning(f"Keywords load failed: {e}")
@@ -657,19 +616,7 @@ class AISensitiveDetectionService:
         # Patterns
         try:
             self.pattern_rows = snowflake_connector.execute_query(
-                f"""
-                SELECT 
-                    p.PATTERN_ID,
-                    p.PATTERN_STRING AS PATTERN_REGEX,
-                    c.CATEGORY_NAME AS SENSITIVITY_TYPE,
-                    p.SENSITIVITY_WEIGHT AS SCORE,
-                    p.IS_ACTIVE
-                FROM {gv_fqn}.SENSITIVE_PATTERNS p
-                JOIN {gv_fqn}.SENSITIVITY_CATEGORIES c
-                    ON p.CATEGORY_ID = c.CATEGORY_ID
-                WHERE p.IS_ACTIVE = TRUE
-                  AND c.IS_ACTIVE = TRUE
-                """
+                f"SELECT * FROM {gv_fqn}.VW_SENSITIVE_PATTERNS_CANONICAL WHERE IS_ACTIVE"
             ) or []
         except Exception as e:
             logger.warning(f"Patterns load failed: {e}")
@@ -684,34 +631,30 @@ class AISensitiveDetectionService:
             ]
         # Categories and high-risk list
         try:
-            # Try querying with IS_HIGH_RISK first, fallback to just CATEGORY_NAME
-            try:
-                cats = snowflake_connector.execute_query(
-                    f"SELECT CATEGORY_NAME, IS_HIGH_RISK, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_CATEGORIES"
-                ) or []
-            except Exception:
-                # Fallback: try HIGH_RISK or just ignore risk flag
-                try:
-                    cats = snowflake_connector.execute_query(
-                        f"SELECT CATEGORY_NAME, HIGH_RISK AS IS_HIGH_RISK, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_CATEGORIES"
-                    ) or []
-                except Exception:
-                     cats = snowflake_connector.execute_query(
-                        f"SELECT CATEGORY_NAME, IS_ACTIVE FROM {gv_fqn}.SENSITIVITY_CATEGORIES"
-                    ) or []
-
-            cats = [r for r in cats if r.get("IS_ACTIVE", True)]
+            cats = snowflake_connector.execute_query(
+                f"SELECT CATEGORY_NAME, IS_HIGH_RISK FROM {gv_fqn}.VW_SENSITIVITY_CATEGORIES_CANONICAL WHERE IS_ACTIVE"
+            ) or []
             self.categories = set([(r.get("CATEGORY_NAME") or "").upper() for r in cats if r.get("CATEGORY_NAME")])
             high_flags = { (r.get("CATEGORY_NAME") or "").upper(): bool(r.get("IS_HIGH_RISK")) for r in cats if r.get("CATEGORY_NAME") }
             self.thresholds.setdefault("HIGH_RISK_CATEGORIES", [k for k, v in high_flags.items() if v])
         except Exception as e:
             logger.warning(f"Categories load failed: {e}")
             self.categories = self.categories or set()
-        # Compliance mapping (optional) – leave empty if no mapping table
+        # Compliance mapping
         try:
-            # If a COMPLIANCE_MAPPING table exists, you can wire it here.
-            self.compliance_map = {}
-        except Exception:
+            cmap = snowflake_connector.execute_query(
+                f"SELECT CATEGORY_NAME, COMPLIANCE_TAG FROM {gv_fqn}.VW_COMPLIANCE_MAPPING_CANONICAL WHERE IS_ACTIVE"
+            ) or []
+            m: Dict[str, List[str]] = {}
+            for r in cmap:
+                cat = (r.get("CATEGORY_NAME") or "").upper()
+                tag = r.get("COMPLIANCE_TAG")
+                if not cat or not tag:
+                    continue
+                m.setdefault(cat, []).append(str(tag))
+            self.compliance_map = m
+        except Exception as e:
+            logger.warning(f"Compliance mapping load failed: {e}")
             self.compliance_map = {}
 
     def detect_sensitive_tables(self,
@@ -801,35 +744,5 @@ class AISensitiveDetectionService:
         
         return final_results
 
-class _LazyAISensitiveDetectionService:
-    """
-    Lazily instantiate the real service on first attribute access.
-    This avoids executing Snowflake queries at import time, which can
-    raise and cause `ImportError: cannot import name 'ai_sensitive_detection_service'`.
-    """
-    def __init__(self):
-        self._instance = None
-        self._init_error = None
-
-    def _ensure_instance(self):
-        if self._instance is None and self._init_error is None:
-            try:
-                self._instance = AISensitiveDetectionService()
-            except Exception as e:
-                # Try fallback without AI
-                try:
-                    logger.warning(f"Failed to initialize AISensitiveDetectionService with AI: {e}, trying without AI...")
-                    self._instance = AISensitiveDetectionService(use_ai=False)
-                except Exception as e2:
-                    self._init_error = e2
-                    logger.error(f"Failed to initialize AISensitiveDetectionService even without AI: {e2}")
-                    raise
-
-    def __getattr__(self, item):
-        self._ensure_instance()
-        return getattr(self._instance, item)
-
-
 # Singleton instance
-ai_sensitive_detection_service = _LazyAISensitiveDetectionService()
-
+ai_sensitive_detection_service = AISensitiveDetectionService()

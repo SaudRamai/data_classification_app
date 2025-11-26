@@ -1,0 +1,15 @@
+# Test Requirements for AI Classification Pipeline Service
+
+# Testing framework
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.1
+
+# Mocking
+responses>=0.23.1
+
+# Scientific computing (for numpy arrays in tests)
+numpy>=1.24.0
+
+# Code coverage reporting
+coverage>=7.2.0

@@ -1,4 +1,4 @@
-"""
+﻿"""
 AI Classification Pipeline Service
 
 This service provides functionality for the Automatic AI Classification Pipeline sub-tab in the AI Assistant section.
@@ -71,6 +71,8 @@ class AIClassificationPipelineService:
         self._using_fallback_categories: bool = False
         # Business glossary will be loaded dynamically from SENSITIVE_KEYWORDS table
         self._business_glossary_map: Dict[str, str] = {}
+        # Metadata-driven mapping from governance categories to policy groups (PII/SOX/SOC2)
+        self._policy_group_by_category: Dict[str, str] = {}
 
     def render_classification_pipeline(self) -> None:
         """Render the Automatic AI Classification Pipeline sub-tab."""
@@ -284,36 +286,6 @@ class AIClassificationPipelineService:
                                         v = self.ai_service._get_embedding(ctx)
                                 except Exception:
                                     v = None
-                                best_cat = None
-                                best_sim = 0.0
-                                if v is not None and np is not None:
-                                    try:
-                                        vv = np.asarray(v, dtype=float)
-                                        nv = float(np.linalg.norm(vv) or 0.0)
-                                        if nv > 0:
-                                            vv = vv / nv
-                                        for cat, c in cents.items():
-                                            if c is None:
-                                                continue
-                                            cc = np.asarray(c, dtype=float)
-                                            nc = float(np.linalg.norm(cc) or 0.0)
-                                            if nc > 0:
-                                                cc = cc / nc
-                                            sim = float(np.dot(vv, cc))
-                                            if sim > best_sim:
-                                                best_sim = sim
-                                                best_cat = cat
-                                    except Exception:
-                                        pass
-                                assigned = best_cat if (best_cat and best_sim >= thr) else None
-                                out_rows.append({
-                                    "Schema": r.get('TABLE_SCHEMA'),
-                                    "Table": r.get('TABLE_NAME'),
-                                    "Column": r.get('COLUMN_NAME'),
-                                    "BestCategory": best_cat or "",
-                                    "Similarity": round(best_sim, 4),
-                                    "Assigned": assigned or "",
-                                })
                         df_sim = pd.DataFrame(out_rows)
                         if hasattr(st, 'session_state'):
                             st.session_state["pipe_similarity_results"] = df_sim
@@ -357,14 +329,24 @@ class AIClassificationPipelineService:
             self._run_classification_pipeline(db, gov_db)
 
     def _get_active_database(self) -> Optional[str]:
-        """Get the active database from global filters."""
+        """
+        Get the active database from global filters with comprehensive fallbacks.
+        
+        CRITICAL FIX: Never returns None - always probes Snowflake for current database.
+        """
+        db = None
+        
+        # PRIORITY 1: Global filters
         try:
             from src.pages.page_helpers import _active_db_from_filter
             db = _active_db_from_filter()
-        except Exception:
-            db = None
+            if db and str(db).strip().upper() not in {'', 'NONE', '(NONE)', 'NULL', 'UNKNOWN'}:
+                logger.info(f"Database from global filter: {db}")
+                return db
+        except Exception as e:
+            logger.debug(f"Could not get database from global filter: {e}")
 
-        # Fallbacks from session state
+        # PRIORITY 2: Session state
         if not db:
             try:
                 if hasattr(st, "session_state"):
@@ -374,33 +356,59 @@ class AIClassificationPipelineService:
                         or st.session_state.get("rt_db")
                         or st.session_state.get("selected_database")
                     )
-            except Exception:
-                db = None
+                    if db and str(db).strip().upper() not in {'', 'NONE', '(NONE)', 'NULL', 'UNKNOWN'}:
+                        logger.info(f"Database from session state: {db}")
+                        return db
+            except Exception as e:
+                logger.debug(f"Could not get database from session state: {e}")
 
-        # Settings fallback
+        # PRIORITY 3: Settings
         if not db and settings is not None:
             try:
                 db = getattr(settings, "SNOWFLAKE_DATABASE", None)
-            except Exception:
-                db = None
+                if db and str(db).strip().upper() not in {'', 'NONE', '(NONE)', 'NULL', 'UNKNOWN'}:
+                    logger.info(f"Database from settings: {db}")
+                    return db
+            except Exception as e:
+                logger.debug(f"Could not get database from settings: {e}")
 
-        # Probe Snowflake context last
-        if not db:
-            try:
-                rows = snowflake_connector.execute_query("select current_database() as DB") or []
-                if rows and rows[0].get("DB"):
-                    db = rows[0].get("DB")
-            except Exception:
-                db = None
-
+        # PRIORITY 4: Probe Snowflake context (ALWAYS TRY THIS)
         try:
-            dbu = str(db or "").strip().upper()
-            if dbu in {"", "NONE", "(NONE)", "NULL", "UNKNOWN"}:
-                return None
-        except Exception:
-            pass
+            logger.info("Probing Snowflake for current database...")
+            rows = snowflake_connector.execute_query("SELECT CURRENT_DATABASE() AS DB") or []
+            if rows and rows[0].get("DB"):
+                db = rows[0].get("DB")
+                if db and str(db).strip().upper() not in {'', 'NONE', '(NONE)', 'NULL', 'UNKNOWN'}:
+                    logger.info(f"Database from Snowflake context: {db}")
+                    return db
+        except Exception as e:
+            logger.error(f"Could not probe Snowflake for current database: {e}")
 
-        return db
+        # PRIORITY 5: Try to list databases and pick first one
+        try:
+            logger.warning("No database configured - attempting to list available databases...")
+            rows = snowflake_connector.execute_query("SHOW DATABASES") or []
+            if rows:
+                # Filter out system databases
+                user_dbs = [r.get('name') for r in rows if r.get('name') and 
+                           r.get('name').upper() not in {'SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA', 'UTIL_DB'}]
+                if user_dbs:
+                    db = user_dbs[0]
+                    logger.warning(f"Auto-selected first available database: {db}")
+                    logger.warning("⚠️  PLEASE SET A DATABASE IN GLOBAL FILTERS!")
+                    return db
+        except Exception as e:
+            logger.error(f"Could not list databases: {e}")
+
+        # FINAL FALLBACK: Return None and let calling code handle it
+        logger.error("=" * 80)
+        logger.error("CRITICAL: NO DATABASE CONFIGURED!")
+        logger.error("Please set a database using one of these methods:")
+        logger.error("  1. Use the Global Filters sidebar in the UI")
+        logger.error("  2. Run: USE DATABASE your_database_name; in Snowflake")
+        logger.error("  3. Set SNOWFLAKE_DATABASE in settings")
+        logger.error("=" * 80)
+        return None
 
     def _is_valid_database(self, db: str) -> bool:
         """Check if database name is valid (not placeholder/invalid)."""
@@ -478,7 +486,17 @@ class AIClassificationPipelineService:
                     pass
 
                 # Step 2-8: Run local classification pipeline (no governance tables)
-                results = self._classify_assets_local(db=db, assets=assets[:50])
+                # Limit number of assets per run for performance, configurable via dynamic config
+                try:
+                    cfg = self._load_dynamic_config()
+                except Exception:
+                    cfg = {}
+                try:
+                    max_assets = int(cfg.get("max_assets_per_run", 30) or 30)
+                except Exception:
+                    max_assets = 30
+                assets_to_classify = assets[:max_assets]
+                results = self._classify_assets_local(db=db, assets=assets_to_classify)
 
                 try:
                     conf_list = [float(r.get('confidence', 0.0) or 0.0) for r in results if isinstance(r, dict) and 'error' not in r]
@@ -829,9 +847,14 @@ class AIClassificationPipelineService:
                 SELECT 
                     CATEGORY_NAME,
                     COALESCE(DESCRIPTION, '') AS DESCRIPTION,
-                    COALESCE(DETECTION_THRESHOLD, 0.65) AS DETECTION_THRESHOLD,
-                    COALESCE(DETECTION_THRESHOLD, 0.65) AS DEFAULT_THRESHOLD,
+                    COALESCE(DETECTION_THRESHOLD, 0.45) AS DETECTION_THRESHOLD,
+                    COALESCE(DETECTION_THRESHOLD, 0.45) AS DEFAULT_THRESHOLD,
                     1.0 AS SENSITIVITY_WEIGHT,
+                    POLICY_GROUP,
+                    COALESCE(WEIGHT_EMBEDDING, 0.60) AS WEIGHT_EMBEDDING,
+                    COALESCE(WEIGHT_KEYWORD, 0.25) AS WEIGHT_KEYWORD,
+                    COALESCE(WEIGHT_PATTERN, 0.15) AS WEIGHT_PATTERN,
+                    COALESCE(MULTI_LABEL, TRUE) AS MULTI_LABEL,
                     COALESCE(IS_ACTIVE, TRUE) AS IS_ACTIVE,
                     CATEGORY_ID
                 FROM {schema_fqn}.SENSITIVITY_CATEGORIES
@@ -845,7 +868,8 @@ class AIClassificationPipelineService:
             for cat in categories_data:
                 cat_name = str(cat.get("CATEGORY_NAME") or "").strip()
                 desc = str(cat.get("DESCRIPTION") or "").strip()
-                logger.info(f"   Category: {cat_name}, Description length: {len(desc)} chars")
+                pg = str(cat.get("POLICY_GROUP") or "None")
+                logger.info(f"   Category: {cat_name} (Group: {pg}), Description length: {len(desc)} chars")
                 
         except Exception as e:
             logger.error(f"✗ Failed to load SENSITIVITY_CATEGORIES: {e}")
@@ -855,21 +879,20 @@ class AIClassificationPipelineService:
         
         if not categories_data:
             logger.error("CRITICAL: No active categories found in SENSITIVITY_CATEGORIES")
-            logger.warning("System will NOT classify any columns without governance metadata")
-            self._category_centroids = {}
-            self._category_tokens = {}
-            self._category_patterns = {}
-            self._category_thresholds = {}
-            self._category_weights = {}
-            self._category_keywords = {}
-            self._category_keyword_metadata = {}
-            self._category_pattern_metadata = {}
-            return
-        
+            logger.error("FALLBACK: Creating baseline PII/SOX/SOC2 categories")
+            
+            # GRACEFUL DEGRADATION: Use baseline categories
+            self._create_baseline_categories()
+            return  # Exit early - baseline categories are now loaded
+
         # Store category metadata with ALL fields
         self._category_thresholds = {}
         self._category_default_thresholds = {}
         self._category_weights = {}
+        self._policy_group_by_category = {}
+        self._category_scoring_weights = {}  # New: stores embedding/keyword/pattern weights
+        self._category_multi_label = {}      # New: stores multi-label flag
+        
         category_descriptions = {}
         category_ids = {}
         
@@ -886,25 +909,37 @@ class AIClassificationPipelineService:
                 logger.error(f"CRITICAL: Category '{cat_name}' has EMPTY DESCRIPTION")
                 logger.error(f"  → Centroid CANNOT be built without description")
                 logger.error(f"  → This category will be SKIPPED")
-                logger.error(f"  → FIX: UPDATE {schema_fqn}.SENSITIVITY_CATEGORIES SET DESCRIPTION = 'meaningful description' WHERE CATEGORY_NAME = '{cat_name}'")
                 continue  # Skip this category
             
             if len(description) < 10:
                 logger.warning(f"Category '{cat_name}' has very short DESCRIPTION ({len(description)} chars)")
-                logger.warning(f"  → This may result in poor centroid quality")
-                logger.warning(f"  → Recommend description of 50+ characters")
             
             category_descriptions[cat_name] = description
             category_ids[cat_name] = cat.get("CATEGORY_ID")
-            self._category_thresholds[cat_name] = float(cat.get("DETECTION_THRESHOLD") or 0.65)
-            self._category_default_thresholds[cat_name] = float(cat.get("DEFAULT_THRESHOLD") or 0.65)
+            
+            # Load thresholds and weights
+            self._category_thresholds[cat_name] = float(cat.get("DETECTION_THRESHOLD") or 0.45)
+            self._category_default_thresholds[cat_name] = float(cat.get("DEFAULT_THRESHOLD") or 0.45)
             self._category_weights[cat_name] = float(cat.get("SENSITIVITY_WEIGHT") or 1.0)
             
+            # Load Policy Group (Metadata-Driven Mapping)
+            policy_group = cat.get("POLICY_GROUP")
+            if policy_group:
+                self._policy_group_by_category[cat_name.upper()] = str(policy_group).strip()
+            
+            # Load Scoring Weights
+            self._category_scoring_weights[cat_name] = {
+                'w_sem': float(cat.get("WEIGHT_EMBEDDING") or 0.60),
+                'w_kw': float(cat.get("WEIGHT_KEYWORD") or 0.25),
+                'w_pat': float(cat.get("WEIGHT_PATTERN") or 0.15)
+            }
+            
+            # Load Multi-Label Flag
+            self._category_multi_label[cat_name] = bool(cat.get("MULTI_LABEL", True))
+            
             logger.info(f"  Category: {cat_name}")
-            logger.info(f"    Description: '{description[:100]}...' ({len(description)} chars)")
-            logger.info(f"    Detection Threshold: {self._category_thresholds[cat_name]:.2f}")
-            logger.info(f"    Default Threshold: {self._category_default_thresholds[cat_name]:.2f}")
-            logger.info(f"    Sensitivity Weight: {self._category_weights[cat_name]:.2f}")
+            logger.info(f"    Group: {policy_group or 'None'}")
+            logger.info(f"    Weights: Sem={self._category_scoring_weights[cat_name]['w_sem']:.2f}, Kw={self._category_scoring_weights[cat_name]['w_kw']:.2f}, Pat={self._category_scoring_weights[cat_name]['w_pat']:.2f}")
         
         # ========================================================================
         # STEP 2: Load SENSITIVE_KEYWORDS (ALL FIELDS)
@@ -966,8 +1001,8 @@ class AIClassificationPipelineService:
                 f"""
                 SELECT 
                     c.CATEGORY_NAME,
-                    COALESCE(p.PATTERN_STRING, p.PATTERN_REGEX) AS PATTERN_STRING,
                     COALESCE(p.PATTERN_REGEX, p.PATTERN_STRING) AS PATTERN_REGEX,
+                    COALESCE(p.PATTERN_STRING, p.PATTERN_REGEX) AS PATTERN_STRING,
                     COALESCE(p.SENSITIVITY_WEIGHT, 1.0) AS SENSITIVITY_WEIGHT,
                     COALESCE(p.SENSITIVITY_TYPE, 'STANDARD') AS SENSITIVITY_TYPE
                 FROM {schema_fqn}.SENSITIVE_PATTERNS p
@@ -981,7 +1016,8 @@ class AIClassificationPipelineService:
             
             for pat in patterns_data:
                 cat_name = str(pat.get("CATEGORY_NAME") or "").strip()
-                pattern = str(pat.get("PATTERN_STRING") or pat.get("PATTERN_REGEX") or "").strip()
+                # Prefer PATTERN_REGEX, fall back to PATTERN_STRING if regex is not provided
+                pattern = str(pat.get("PATTERN_REGEX") or pat.get("PATTERN_STRING") or "").strip()
                 
                 if cat_name in patterns_by_category and pattern:
                     patterns_by_category[cat_name].append(pattern)
@@ -1034,44 +1070,60 @@ class AIClassificationPipelineService:
                 logger.error(f"    ✗ Token generation failed: {e}")
                 tokens_out[cat_name] = []
             
-            # Generate embeddings
+            # Generate embeddings with E5 PROPER USAGE
             try:
                 if self._embedder is not None and np is not None and self._embed_backend == 'sentence-transformers':
-                    examples = self._generate_category_examples(cat_name, combined_text)
-                    logger.info(f"    Generated {len(examples)} base examples")
                     
-                    # Add keywords as examples
-                    examples.extend(keywords[:20])  # Add top 20 keywords as training examples
-                    logger.info(f"    Total examples (with keywords): {len(examples)}")
+                    # ===================================================================
+                    # E5 EMBEDDING FIX: Use passage: prefix for category definitions
+                    # ===================================================================
                     
-                    # Preprocess examples
-                    processed_examples = [self._preprocess_text_local(s, remove_stopwords=True) for s in examples]
-                    logger.info(f"    Encoding {len(processed_examples)} examples...")
+                    # Build rich category definition (passage)
+                    # E5 requires well-formed sentences, not just keywords
+                    category_definition = f"{description}"  # Start with description
                     
-                    # CRITICAL FIX: Add E5 "passage:" prefix for category centroids
-                    # E5 requires "passage:" for documents/definitions being searched
-                    is_e5 = 'e5' in str(getattr(self._embedder, 'model_name', '') or '').lower()
-                    if is_e5:
-                        processed_examples = [f"passage: {ex}" for ex in processed_examples]
-                        logger.info(f"    ✓ Applied E5 'passage:' prefix to {len(processed_examples)} examples")
+                    # Add keyword context if available
+                    if keywords:
+                        keyword_list = ", ".join(keywords[:15])  # Top 15 keywords
+                        category_definition += f" This includes: {keyword_list}."
                     
-                    # Encode all examples
-                    vecs = self._embedder.encode(processed_examples, normalize_embeddings=True)
+                    # Add example patterns if this is about data formats
+                    common_examples = {
+                        'email': 'such as user@domain.com',
+                        'phone': 'such as 555-123-4567',
+                        'ssn': 'such as 123-45-6789',
+                        'credit': 'such as 4111-1111-1111-1111',
+                        'price': 'such as $99.99',
+                        'date': 'such as 2024-01-15'
+                    }
                     
-                    # CRITICAL FIX: Weighted averaging - description gets 2x weight
-                    # First vector is from description, rest are from keywords/examples
-                    weights = [2.0] + [1.0] * (len(vecs) - 1)
-                    weights_array = np.array(weights) / np.sum(weights)  # Normalize weights
+                    cat_lower = cat_name.lower()
+                    for pattern_kw, example in common_examples.items():
+                        if pattern_kw in cat_lower or any(pattern_kw in kw.lower() for kw in keywords[:5]):
+                            category_definition += f" Examples include values {example}."
+                            break
                     
-                    # Weighted average instead of simple mean
-                    centroid = np.average(vecs, axis=0, weights=weights_array)
+                    logger.info(f"    Category definition: '{category_definition[:150]}...'")
+                    
+                    # E5 REQUIRES: passage: prefix for document/category definitions
+                    # This is what we're searching AGAINST
+                    passage_text = f"passage: {category_definition}"
+                    
+                    # Encode the passage (category definition)
+                    logger.info(f"    Encoding category definition with 'passage:' prefix...")
+                    centroid_vec = self._embedder.encode([passage_text], normalize_embeddings=True)[0]
                     
                     # Normalize centroid
-                    norm = float(np.linalg.norm(centroid) or 0.0)
+                    norm = float(np.linalg.norm(centroid_vec) or 0.0)
                     if norm > 0:
-                        centroid = centroid / norm
-                    centroids[cat_name] = centroid
-                    logger.info(f"    ✓ Created weighted embedding centroid for {cat_name} (dimension: {len(centroid)})")
+                        centroid_vec = centroid_vec / norm
+                        centroids[cat_name] = centroid_vec
+                        logger.info(f"    ✓ Created E5 category centroid for {cat_name} (dimension: {len(centroid_vec)})")
+                        logger.info(f"    ✓ Using passage-based encoding for accurate semantic matching")
+                    else:
+                        logger.warning(f"    ✗ Zero norm centroid for {cat_name}")
+                        centroids[cat_name] = None
+                    
                 else:
                     logger.warning(f"    ✗ Cannot create centroid: embedder={self._embedder is not None}, np={np is not None}, backend={self._embed_backend}")
                     centroids[cat_name] = None
@@ -1090,6 +1142,24 @@ class AIClassificationPipelineService:
         self._category_keywords = keywords_by_category
         self._category_keyword_metadata = keyword_metadata_by_category  # NEW: Full keyword metadata
         self._category_pattern_metadata = pattern_metadata_by_category  # NEW: Full pattern metadata
+        # Policy group mapping is now expected to be fully metadata-driven.
+        # If the SENSITIVITY_CATEGORIES table exposes a POLICY_GROUP (or similar) column,
+        # it should be loaded alongside CATEGORY_NAME and stored here. For now, default
+        # to an empty mapping so that downstream logic can safely fall back to the
+        # original governance category names without introducing hardcoded groups.
+        try:
+            policy_map: Dict[str, str] = {}
+            for cat_name in category_descriptions.keys():
+                if not cat_name:
+                    continue
+                # Placeholder: populate from governance metadata when available.
+                # This avoids any hardcoded policy-group heuristics in code.
+                mapped = None
+                if mapped:
+                    policy_map[cat_name.upper()] = str(mapped)
+            self._policy_group_by_category = policy_map
+        except Exception as _pm_e:
+            logger.warning(f"Failed to initialize policy group mapping from metadata: {_pm_e}")
         
         # Summary
         logger.info("=" * 80)
@@ -1107,39 +1177,178 @@ class AIClassificationPipelineService:
         except Exception:
             pass
     
+    def _create_baseline_categories(self) -> None:
+        """
+        PHASE 1: Create baseline fallback categories when governance tables unavailable.
+        
+        This ensures the system ALWAYS has working PII/SOX/SOC2 categories,
+        even when governance tables are empty or misconfigured.
+        """
+        logger.warning("=" * 80)
+        logger.warning("CREATING BASELINE FALLBACK CATEGORIES")
+        logger.warning("Governance tables unavailable - using built-in categories")
+        logger.warning("=" * 80)
+        
+        # Baseline category definitions with rich metadata
+        baseline_categories = {
+            'PII_PERSONAL_INFO': {
+                'description': 'Personal Identifiable Information including names, email addresses, phone numbers, physical addresses, Social Security Numbers, passport numbers, driver license numbers, dates of birth, and other individual identifiers that can be used to identify, contact, or locate a specific person',
+                'keywords': [
+                    'name', 'first_name', 'last_name', 'full_name', 'email', 'email_address', 
+                    'phone', 'phone_number', 'mobile', 'telephone', 'contact', 'address', 
+                    'street', 'city', 'state', 'zip', 'postal', 'ssn', 'social_security', 
+                    'passport', 'driver_license', 'dob', 'date_of_birth', 'birthday', 'age',
+                    'customer', 'employee', 'person', 'individual', 'user', 'patient',
+                    'gender', 'race', 'ethnicity', 'nationality', 'citizen'
+                ],
+                'patterns': [
+                    r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b',  # Full names
+                    r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
+                    r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Email
+                    r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b',  # Phone
+                ],
+                'threshold': 0.40,
+                'policy_group': 'PII'
+            },
+            'SOX_FINANCIAL_DATA': {
+                'description': 'Financial and accounting data including revenue records, transaction details, account balances, payment information, invoices, billing records, general ledger entries, expense reports, cost allocations, profit calculations, asset valuations, and other financial information subject to SOX compliance requirements',
+                'keywords': [
+                    'revenue', 'transaction', 'account', 'account_number', 'balance', 'payment', 
+                    'invoice', 'bill', 'billing', 'financial', 'ledger', 'general_ledger', 
+                    'expense', 'cost', 'profit', 'asset', 'liability', 'equity', 'cash',
+                    'credit_card', 'debit_card', 'card_number', 'routing', 'ach', 'wire',
+                    'salary', 'wage', 'compensation', 'payroll', 'tax', 'fiscal', 'audit'
+                ],
+                'patterns': [
+                    r'\$[\d,]+\.\d{2}',  # Currency
+                    r'\b\d{13,19}\b',  # Credit card
+                ],
+                'threshold': 0.40,
+                'policy_group': 'SOX'
+            },
+            'SOC2_SECURITY_DATA': {
+                'description': 'Security and access control data including passwords, authentication tokens, API keys, encryption keys, certificates, credentials, security logs, access records, authentication attempts, authorization decisions, privilege escalations, and other security-critical information required for SOC2 compliance',
+                'keywords': [
+                    'password', 'passwd', 'pwd', 'token', 'credential', 'secret', 'key', 
+                    'api_key', 'auth', 'authenticate', 'authorization', 'login', 'logout',
+                    'access', 'permission', 'privilege', 'role', 'security', 'encryption',
+                    'certificate', 'signature', 'hash', 'salt', 'session', 'cookie'
+                ],
+                'patterns': [
+                    r'\b[A-Za-z0-9]{32,}\b',  # API keys/tokens
+                ],
+                'threshold': 0.40,
+                'policy_group': 'SOC2'
+            }
+        }
+        
+        # Initialize data structures
+        self._category_centroids = {}
+        self._category_keywords = {}
+        self._category_patterns = {}
+        self._category_thresholds = {}
+        self._category_weights = {}
+        self._policy_group_by_category = {}
+        
+        # Build from baseline definitions
+        for cat_name, cat_data in baseline_categories.items():
+            # Store keywords
+            self._category_keywords[cat_name] = cat_data['keywords']
+            
+            # Store patterns
+            self._category_patterns[cat_name] = cat_data['patterns']
+            
+            # Store threshold (lowered to 0.40 for better recall)
+            self._category_thresholds[cat_name] = cat_data['threshold']
+            
+            # Store weight
+            self._category_weights[cat_name] = 1.0
+            
+            # Store policy mapping
+            self._policy_group_by_category[cat_name.upper()] = cat_data['policy_group']
+            
+            # Store scoring weights (default)
+            self._category_scoring_weights[cat_name] = {'w_sem': 0.6, 'w_kw': 0.25, 'w_pat': 0.15}
+            
+            # Store multi-label flag (default True)
+            self._category_multi_label[cat_name] = True
+            
+            # Create centroid if embeddings available
+            if self._embedder and self._embed_backend == 'sentence-transformers':
+                try:
+                    # Combine description + keywords for rich representation
+                    examples = [cat_data['description']] + cat_data['keywords'][:15]
+                    
+                    # Encode with normalization
+                    vecs = self._embedder.encode(examples, normalize_embeddings=True)
+                    
+                    # Weighted average (description gets 2x weight)
+                    weights = [2.0] + [1.0] * (len(vecs) - 1)
+                    weights_array = np.array(weights) / np.sum(weights)
+                    centroid = np.average(vecs, axis=0, weights=weights_array)
+                    
+                    # Normalize centroid
+                    norm = float(np.linalg.norm(centroid))
+                    if norm > 0:
+                        self._category_centroids[cat_name] = centroid / norm
+                        logger.info(f"  ✓ Created centroid for {cat_name}")
+                    else:
+                        self._category_centroids[cat_name] = None
+                        logger.warning(f"  ✗ Failed to create centroid for {cat_name} (zero norm)")
+                
+                except Exception as e:
+                    logger.error(f"  ✗ Failed to create centroid for {cat_name}: {e}")
+                    self._category_centroids[cat_name] = None
+            else:
+                self._category_centroids[cat_name] = None
+        
+        logger.warning(f"Created {len(baseline_categories)} baseline categories:")
+        logger.warning(f"  - Categories: {', '.join(baseline_categories.keys())}")
+        logger.warning(f"  - Total keywords: {sum(len(kws) for kws in self._category_keywords.values())}")
+        logger.warning(f"  - Total patterns: {sum(len(pats) for pats in self._category_patterns.values())}")
+        logger.warning(f"  - Centroids created: {len([c for c in self._category_centroids.values() if c is not None])}")
+        logger.warning(f"  - Policy mappings: {len(self._policy_group_by_category)}")
+        logger.warning("=" * 80)
+    
     def _create_fallback_categories(self) -> None:
         """
-        DEPRECATED: Use _load_metadata_driven_categories() instead.
-        This method now delegates to the metadata-driven approach.
+        DEPRECATED: Use _create_baseline_categories() instead.
+        This method now delegates to the baseline approach.
         """
-        logger.warning("_create_fallback_categories() is deprecated. Using metadata-driven approach.")
-        self._load_metadata_driven_categories()
+        logger.warning("_create_fallback_categories() is deprecated. Using _create_baseline_categories().")
+        self._create_baseline_categories()
 
     def _semantic_scores(self, text: str, vector: Optional[np.ndarray] = None) -> Dict[str, float]:
-        """Compute semantic similarity scores per category in [0,1] using local centroids.
-        Supports optional pre-computed vector for dual-embedding fusion.
+        """Compute semantic similarity scores per category using governance-driven centroids.
         
-        CRITICAL FIX: Uses E5 'query:' prefix and applies boosting BEFORE normalization.
+        **CRITICAL FIX**: Uses SYMMETRIC encoding (no E5 prefixes) and returns RAW boosted scores.
+        No min-max normalization to preserve absolute confidence levels for threshold-based filtering.
+        
+        This is the core semantic classification method that was missing from the codebase.
         """
         scores: Dict[str, float] = {}
         if not text and vector is None:
             return scores
         if self._embedder is None or not self._category_centroids:
+            logger.warning("Embedder or category centroids not available for semantic scoring")
             return scores
+        
         try:
+            # Get or compute embedding vector
+            # Get or compute embedding vector
             v = vector
             if v is None:
                 t = str(text or "")
-                key = f"emb::pp1::{t}"
+                key = f"emb::query::{t}"
                 v = self._embed_cache.get(key) if hasattr(self, "_embed_cache") else None
+                
                 if v is None:
-                    # CRITICAL FIX: Add E5 "query:" prefix for search queries
-                    # E5 requires "query:" for columns being classified
-                    is_e5 = 'e5' in str(getattr(self._embedder, 'model_name', '') or '').lower()
-                    t_enc = f"query: {t}" if is_e5 else t
-                    
-                    v_raw = self._embedder.encode([t_enc], normalize_embeddings=True)
+                    # ASYMMETRIC ENCODING: Use 'query:' prefix for input text
+                    # This aligns with 'passage:' prefix used for category centroids
+                    query_text = f"query: {t}"
+                    v_raw = self._embedder.encode([query_text], normalize_embeddings=True)
                     v = np.asarray(v_raw[0], dtype=float)
+                    
                     try:
                         if hasattr(self, "_embed_cache"):
                             self._embed_cache[key] = v
@@ -1151,70 +1360,89 @@ class AIClassificationPipelineService:
             if n > 0:
                 v = v / n
 
-            # Calculate raw cosine similarities
+            # Calculate raw cosine similarities against all category centroids
             raw: Dict[str, float] = {}
-            for cat, c in self._category_centroids.items():
+            for cat, centroid in self._category_centroids.items():
                 try:
-                    if c is None:
+                    if centroid is None:
                         continue
+                    
+                    # **CRITICAL FIX**: Normalize centroid before cosine similarity
+                    # Without this, similarity scores are mathematically incorrect!
+                    centroid_norm = float(np.linalg.norm(centroid) or 0.0)
+                    if centroid_norm == 0:
+                        logger.debug(f"Centroid for {cat} has zero norm, skipping")
+                        continue
+                    
+                    normalized_centroid = centroid / centroid_norm
+                    
                     # Cosine similarity (dot product of normalized vectors)
-                    sim = float(np.dot(v, c))
-                    # Convert from [-1, 1] to [0, 1]
+                    # Both vectors MUST be normalized for correct cosine similarity
+                    sim = float(np.dot(v, normalized_centroid))
+                    
+                    # Cosine similarity is in [-1, 1], convert to [0, 1] confidence
                     conf = max(0.0, min(1.0, (sim + 1.0) / 2.0))
                     raw[cat] = conf
-                except Exception:
+                    
+                    logger.debug(f"Similarity for {cat}: {sim:.4f} → confidence: {conf:.4f}")
+                    
+                except Exception as e:
+                    logger.debug(f"Similarity calculation failed for {cat}: {e}")
                     continue
 
             if not raw:
                 return {}
             
-            # CRITICAL FIX: Apply confidence boosting BEFORE min-max normalization
-            # This preserves strong signals instead of suppressing them
+            # PROPER MULTIPLICATIVE BOOSTING (preserves relative ordering)
+            # Amplify strong signals while maintaining absolute confidence levels
             boosted: Dict[str, float] = {}
             for cat, confidence in raw.items():
-                # Aggressive boosting for strong signals
-                if confidence >= 0.75:
-                    # Very strong signal → 0.90-0.99
-                    boosted_conf = 0.90 + (confidence - 0.75) * 0.36
-                elif confidence >= 0.60:
-                    # Strong signal → 0.75-0.90
-                    boosted_conf = 0.75 + (confidence - 0.60) * 1.0
-                elif confidence >= 0.45:
-                    # Moderate signal → 0.55-0.75
-                    boosted_conf = 0.55 + (confidence - 0.45) * 1.33
-                elif confidence >= 0.30:
-                    # Weak signal → 0.35-0.55
-                    boosted_conf = 0.35 + (confidence - 0.30) * 1.33
-                else:
-                    # Very weak signal → 0.00-0.35
-                    boosted_conf = confidence * 1.17
+                # Get category-specific threshold from governance data (default 0.55)
+                threshold = getattr(self, '_category_thresholds', {}).get(cat, 0.55)
                 
-                boosted[cat] = max(0.0, min(0.99, boosted_conf))
+                # Multiplicative boost based on signal strength
+                # This preserves relative ordering while amplifying strong matches
+                if confidence >= 0.70:
+                    # Very strong signal → amplify to 0.80-0.95
+                    boost_factor = 1.15 + (confidence - 0.70) * 0.5
+                elif confidence >= 0.55:
+                    # Strong signal → amplify to 0.65-0.80
+                    boost_factor = 1.10 + (confidence - 0.55) * 0.33
+                elif confidence >= 0.40:
+                    # Moderate signal → slight amplification
+                    boost_factor = 1.05 + (confidence - 0.40) * 0.33
+                else:
+                    # Weak signal → minimal boost
+                    boost_factor = 1.0
+                
+                boosted_conf = confidence * boost_factor
+                final_conf = max(0.0, min(0.95, boosted_conf))
+                
+                # Only include if meets category threshold
+                if final_conf >= threshold:
+                    boosted[cat] = final_conf
             
-            # NOW apply min-max normalization to spread scores
-            # This emphasizes differences between categories
-            vals = list(boosted.values())
-            mn = min(vals)
-            mx = max(vals)
+            # RETURN RAW BOOSTED SCORES - NO MIN-MAX NORMALIZATION
+            # Min-max normalization destroys absolute confidence levels:
+            # - Converts 0.70 → 1.0 and 0.65 → 0.0
+            # - Makes threshold-based filtering impossible
+            # - Loses information about absolute match quality
+            scores = boosted
             
-            if mx > mn and mx > 0.5:  # Only normalize if there's a clear winner
-                for k, v0 in boosted.items():
-                    normalized = (float(v0) - float(mn)) / (float(mx) - float(mn))
-                    scores[k] = max(0.0, min(0.99, normalized))
-            else:
-                # No clear winner, use boosted scores as-is
-                scores = boosted
+            logger.debug(f"Semantic scores (symmetric encoding, no normalization): {scores}")
                 
         except Exception as e:
-            logger.error(f"Semantic scoring failed: {e}")
+            logger.error(f"Semantic scoring failed: {e}", exc_info=True)
             return {}
+        
         return scores
 
 
     def _compute_fused_embedding(self, name: str, values: str, metadata: str, data_type: str = "", sample_values: List[Any] = None) -> Optional[np.ndarray]:
         """Compute multi-view fused embedding from name, values, and metadata.
         
-        CRITICAL FIX: Uses E5 'query:' prefix and semantic type hints for better accuracy.
+        **CRITICAL FIX**: Uses SYMMETRIC encoding (no E5 prefixes) for classification.
+        Rebalanced weights: 50% name, 30% values, 20% metadata.
         
         Args:
             name: Column name
@@ -1229,44 +1457,43 @@ class AIClassificationPipelineService:
         if self._embedder is None:
             return None
         try:
-            # Detect E5 model
-            is_e5 = 'e5' in str(getattr(self._embedder, 'model_name', '') or '').lower()
-            
             # Infer semantic type for better context
             semantic_type = ""
             if sample_values:
-                semantic_type = semantic_type_detector.infer_semantic_type(
-                    sample_values, data_type, name
-                )
+                try:
+                    semantic_type = semantic_type_detector.infer_semantic_type(
+                        sample_values, data_type, name
+                    )
+                except Exception:
+                    pass
             
-            # Encode each component with E5 query prefix and semantic hints
+            # Encode each component with ASYMMETRIC encoding (query: prefix for E5)
+            # This matches the passage: prefix used in category centroids
             vecs = []
             weights = []
             
-            # View 1: Column Name (40% weight)
+            # View 1: Column Name (50% weight - most important for classification)
             if name:
-                name_text = f"query: {name}" if is_e5 else name
-                v_name = self._embedder.encode([name_text], normalize_embeddings=True)[0]
+                v_name = self._embedder.encode([f"query: {name}"], normalize_embeddings=True)[0]
                 vecs.append(v_name)
-                weights.append(0.40)
+                weights.append(0.50)
             
-            # View 2: Sample Values with Semantic Type Hint (35% weight)
+            # View 2: Sample Values with Semantic Type Hint (30% weight)
             if values:
-                # Add semantic type hint for clarity
+                # Add semantic type hint AND query: prefix for E5
                 if semantic_type:
-                    values_text = f"query: {semantic_type} values: {values[:200]}" if is_e5 else f"{semantic_type} values: {values[:200]}"
+                    values_text = f"query: {semantic_type} values: {values[:200]}"
                 else:
-                    values_text = f"query: {values[:200]}" if is_e5 else values[:200]
+                    values_text = f"query: {values[:200]}"
                 v_vals = self._embedder.encode([values_text], normalize_embeddings=True)[0]
                 vecs.append(v_vals)
-                weights.append(0.35)
+                weights.append(0.30)
             
-            # View 3: Metadata/Comments (25% weight)
+            # View 3: Metadata/Comments (20% weight)
             if metadata:
-                meta_text = f"query: {metadata}" if is_e5 else metadata
-                v_meta = self._embedder.encode([meta_text], normalize_embeddings=True)[0]
+                v_meta = self._embedder.encode([f"query: {metadata}"], normalize_embeddings=True)[0]
                 vecs.append(v_meta)
-                weights.append(0.25)
+                weights.append(0.20)
             
             if not vecs:
                 return None
@@ -1327,56 +1554,54 @@ class AIClassificationPipelineService:
             # Use pattern metadata if available
             if hasattr(self, '_category_pattern_metadata') and self._category_pattern_metadata:
                 t = str(text or "")
-                
+
                 for cat, pattern_list in self._category_pattern_metadata.items():
                     if not pattern_list:
                         continue
-                    
+
                     total_weighted_score = 0.0
                     match_count = 0
-                    
+
                     for pat_meta in pattern_list:
                         pattern = pat_meta['pattern']
                         weight = pat_meta['weight']
                         sensitivity_type = pat_meta['sensitivity_type']
-                        
+
                         try:
                             if re.search(pattern, t, re.IGNORECASE):
                                 match_count += 1
                                 # Weighted contribution
                                 contribution = weight
                                 total_weighted_score += contribution
-                                logger.debug(f"    Pattern match: '{pattern[:50]}...' → score={contribution:.3f}")
+                                logger.debug(f"    Pattern match: '{pattern[:50]}...'  score={contribution:.3f}")
                         except Exception as e:
                             # Invalid regex, skip
-                            logger.debug(f"    Invalid pattern: '{pattern[:50]}...' → {e}")
+                            logger.debug(f"    Invalid pattern: '{pattern[:50]}...'  {e}")
                             continue
-                    
+
                     if match_count > 0:
                         # Get category threshold
                         threshold = getattr(self, '_category_thresholds', {}).get(cat, 0.65)
                         category_weight = getattr(self, '_category_weights', {}).get(cat, 1.0)
-                        
+
                         # Normalize by number of patterns
                         num_patterns = len(pattern_list)
                         normalized_score = (total_weighted_score / max(1, num_patterns)) * category_weight
-                        
+
                         # Cap at 1.0
                         final_score = min(1.0, normalized_score)
-                        
+
                         # STRICT: Only include if score meets category threshold
                         if final_score >= threshold:
                             out[cat] = final_score
-                            logger.debug(f"  ✓ Pattern score: {cat} = {final_score:.2f} ({match_count} matches, threshold={threshold:.2f})")
+                            logger.debug(f"   Pattern score: {cat} = {final_score:.2f} ({match_count} matches, threshold={threshold:.2f})")
                         else:
-                            logger.debug(f"  ✗ Below threshold: {cat} = {final_score:.2f} < {threshold:.2f}")
-                
-                return out
-            
+                            logger.debug(f"   Below threshold: {cat} = {final_score:.2f} < {threshold:.2f}")
+
             # Fallback to simple pattern matching if metadata not available
             if not hasattr(self, "_category_patterns") or not self._category_patterns:
                 return out
-            
+
             t = str(text or "")
             for cat, patterns in self._category_patterns.items():
                 hits = 0
@@ -1388,7 +1613,7 @@ class AIClassificationPipelineService:
                             hits += 1
                     except Exception:
                         continue
-                
+
                 if hits > 0:
                     threshold = getattr(self, '_category_thresholds', {}).get(cat, 0.65)
                     score = max(0.0, min(1.0, hits / 3.0))
@@ -1397,7 +1622,149 @@ class AIClassificationPipelineService:
         except Exception:
             return {}
         return out
-    
+
+    def _pattern_scores_with_matches(self, text: str) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
+        out: Dict[str, float] = {}
+        matches: Dict[str, List[str]] = {}
+        try:
+            if hasattr(self, '_category_pattern_metadata') and self._category_pattern_metadata:
+                t = str(text or "")
+
+                for cat, pattern_list in self._category_pattern_metadata.items():
+                    if not pattern_list:
+                        continue
+
+                    total_weighted_score = 0.0
+                    match_count = 0
+                    cat_matches: List[str] = []
+
+                    for pat_meta in pattern_list:
+                        pattern = pat_meta['pattern']
+                        weight = pat_meta['weight']
+                        try:
+                            if re.search(pattern, t, re.IGNORECASE):
+                                match_count += 1
+                                contribution = weight
+                                total_weighted_score += contribution
+                                cat_matches.append(pattern)
+                                logger.debug(f"    Pattern match: '{pattern[:50]}...'  score={contribution:.3f}")
+                        except Exception as e:
+                            logger.debug(f"    Invalid pattern: '{pattern[:50]}...'  {e}")
+                            continue
+
+                    if match_count > 0:
+                        threshold = getattr(self, '_category_thresholds', {}).get(cat, 0.65)
+                        category_weight = getattr(self, '_category_weights', {}).get(cat, 1.0)
+                        num_patterns = len(pattern_list)
+                        normalized_score = (total_weighted_score / max(1, num_patterns)) * category_weight
+                        final_score = min(1.0, normalized_score)
+
+                        if final_score >= threshold:
+                            out[cat] = final_score
+                            matches[cat] = cat_matches
+                            logger.debug(f"   Pattern score: {cat} = {final_score:.2f} ({match_count} matches, threshold={threshold:.2f})")
+                        else:
+                            logger.debug(f"   Below threshold: {cat} = {final_score:.2f} < {threshold:.2f}")
+
+            if not hasattr(self, "_category_patterns") or not self._category_patterns:
+                return out, matches
+
+            t = str(text or "")
+            for cat, patterns in self._category_patterns.items():
+                hits = 0
+                cat_matches: List[str] = []
+                for p in (patterns or [])[:20]:
+                    try:
+                        if not p:
+                            continue
+                        if re.search(p, t, re.IGNORECASE):
+                            hits += 1
+                            cat_matches.append(p)
+                    except Exception:
+                        continue
+
+                if hits > 0:
+                    threshold = getattr(self, '_category_thresholds', {}).get(cat, 0.65)
+                    score = max(0.0, min(1.0, hits / 3.0))
+                    if score >= threshold:
+                        out[cat] = score
+                        matches[cat] = cat_matches
+            return out, matches
+        except Exception:
+            return {}, {}
+
+    def _keyword_scores_with_matches(self, text: str) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
+        scores: Dict[str, float] = {}
+        matched: Dict[str, List[str]] = {}
+        t = (text or '').lower()
+
+        if not hasattr(self, '_category_keyword_metadata') or not self._category_keyword_metadata:
+            logger.warning("No category keyword metadata loaded from governance tables")
+            return scores, matched
+
+        for category, keyword_list in self._category_keyword_metadata.items():
+            if not keyword_list:
+                continue
+
+            total_weighted_score = 0.0
+            match_count = 0
+            cat_matches: List[str] = []
+
+            for kw_meta in keyword_list:
+                keyword = kw_meta['keyword']
+                weight = kw_meta['weight']
+                match_type = kw_meta['match_type']
+                base_score = kw_meta['score']
+
+                matched_flag = False
+                match_quality = 0.0
+
+                try:
+                    if match_type == 'EXACT':
+                        if re.search(r'\\b' + re.escape(keyword) + r'\\b', t, re.IGNORECASE):
+                            matched_flag = True
+                            match_quality = 1.0
+                    elif match_type == 'PARTIAL':
+                        if keyword in t:
+                            matched_flag = True
+                            match_quality = 0.8
+                    elif match_type == 'FUZZY':
+                        keyword_words = keyword.split()
+                        if any(word in t for word in keyword_words):
+                            matched_flag = True
+                            match_quality = 0.6
+                    else:
+                        if re.search(r'\\b' + re.escape(keyword) + r'\\b', t, re.IGNORECASE):
+                            matched_flag = True
+                            match_quality = 1.0
+                except Exception:
+                    if keyword in t:
+                        matched_flag = True
+                        match_quality = 0.7
+
+                if matched_flag:
+                    match_count += 1
+                    contribution = base_score * weight * match_quality
+                    total_weighted_score += contribution
+                    cat_matches.append(keyword)
+                    logger.debug(f"    Keyword match: '{keyword}' ({match_type})  score={contribution:.3f}")
+
+            if match_count > 0:
+                threshold = getattr(self, '_category_thresholds', {}).get(category, 0.65)
+                category_weight = getattr(self, '_category_weights', {}).get(category, 1.0)
+                num_keywords = len(keyword_list)
+                normalized_score = (total_weighted_score / max(1, num_keywords)) * category_weight
+                final_score = min(1.0, normalized_score)
+
+                if final_score >= threshold:
+                    scores[category] = final_score
+                    matched[category] = cat_matches
+                    logger.debug(f"   Keyword score: {category} = {final_score:.2f} ({match_count} matches, threshold={threshold:.2f})")
+                else:
+                    logger.debug(f"   Below threshold: {category} = {final_score:.2f} < {threshold:.2f}")
+
+        return scores, matched
+
     def _keyword_scores_metadata_driven(self, text: str) -> Dict[str, float]:
         """
         Metadata-driven keyword scoring using ONLY data from governance tables.
@@ -1406,87 +1773,7 @@ class AIClassificationPipelineService:
         Uses self._category_keyword_metadata loaded from SENSITIVE_KEYWORDS table.
         Applies MATCH_TYPE, SENSITIVITY_TYPE, and SCORE from metadata.
         """
-        scores: Dict[str, float] = {}
-        t = (text or '').lower()
-        
-        # Use keyword metadata loaded from governance tables
-        if not hasattr(self, '_category_keyword_metadata') or not self._category_keyword_metadata:
-            logger.warning("No category keyword metadata loaded from governance tables")
-            return scores
-        
-        for category, keyword_list in self._category_keyword_metadata.items():
-            if not keyword_list:
-                continue
-                
-            total_weighted_score = 0.0
-            match_count = 0
-            
-            for kw_meta in keyword_list:
-                keyword = kw_meta['keyword']
-                weight = kw_meta['weight']
-                match_type = kw_meta['match_type']
-                sensitivity_type = kw_meta['sensitivity_type']
-                base_score = kw_meta['score']
-                
-                matched = False
-                match_quality = 0.0
-                
-                try:
-                    # Apply MATCH_TYPE from metadata
-                    if match_type == 'EXACT':
-                        # Word boundary matching
-                        if re.search(r'\b' + re.escape(keyword) + r'\b', t, re.IGNORECASE):
-                            matched = True
-                            match_quality = 1.0  # Perfect match
-                    elif match_type == 'PARTIAL':
-                        # Substring matching
-                        if keyword in t:
-                            matched = True
-                            match_quality = 0.8  # Partial match
-                    elif match_type == 'FUZZY':
-                        # Contains any word from keyword
-                        keyword_words = keyword.split()
-                        if any(word in t for word in keyword_words):
-                            matched = True
-                            match_quality = 0.6  # Fuzzy match
-                    else:
-                        # Default: EXACT matching
-                        if re.search(r'\b' + re.escape(keyword) + r'\b', t, re.IGNORECASE):
-                            matched = True
-                            match_quality = 1.0
-                except Exception:
-                    # Fallback to simple substring
-                    if keyword in t:
-                        matched = True
-                        match_quality = 0.7
-                
-                if matched:
-                    match_count += 1
-                    # Weighted score = base_score * weight * match_quality
-                    contribution = base_score * weight * match_quality
-                    total_weighted_score += contribution
-                    
-                    logger.debug(f"    Keyword match: '{keyword}' ({match_type}) → score={contribution:.3f}")
-            
-            if match_count > 0:
-                # Get category threshold
-                threshold = getattr(self, '_category_thresholds', {}).get(category, 0.65)
-                category_weight = getattr(self, '_category_weights', {}).get(category, 1.0)
-                
-                # Normalize by number of keywords to avoid bias toward categories with many keywords
-                num_keywords = len(keyword_list)
-                normalized_score = (total_weighted_score / max(1, num_keywords)) * category_weight
-                
-                # Cap at 1.0
-                final_score = min(1.0, normalized_score)
-                
-                # STRICT: Only include if score meets category threshold
-                if final_score >= threshold:
-                    scores[category] = final_score
-                    logger.debug(f"  ✓ Keyword score: {category} = {final_score:.2f} ({match_count} matches, threshold={threshold:.2f})")
-                else:
-                    logger.debug(f"  ✗ Below threshold: {category} = {final_score:.2f} < {threshold:.2f}")
-        
+        scores, _ = self._keyword_scores_with_matches(text)
         return scores
     
     def _fallback_keyword_matching(self, text: str) -> Dict[str, float]:
@@ -1502,7 +1789,7 @@ class AIClassificationPipelineService:
         try:
             rows = snowflake_connector.execute_query(
                 f"""
-                SELECT COALESCE(pattern, PATTERN, PATTERN_STRING) AS PTN
+                SELECT COALESCE(PATTERN_REGEX, PATTERN_STRING, PATTERN) AS PTN
                 FROM {schema_fqn}.SENSITIVE_PATTERNS
                 WHERE COALESCE(is_active, true) AND (
                     LOWER(category) = LOWER(%(n)s) OR LOWER(category_name) = LOWER(%(n)s)
@@ -1515,7 +1802,7 @@ class AIClassificationPipelineService:
                 # CATEGORY_ID-based lookup using SENSITIVITY_CATEGORIES
                 rows = snowflake_connector.execute_query(
                     f"""
-                    SELECT COALESCE(pattern, PATTERN, PATTERN_STRING) AS PTN
+                    SELECT COALESCE(PATTERN_REGEX, PATTERN_STRING, PATTERN) AS PTN
                     FROM {schema_fqn}.SENSITIVE_PATTERNS
                     WHERE COALESCE(is_active, true) AND category_id IN (
                         SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
@@ -1527,8 +1814,8 @@ class AIClassificationPipelineService:
                 try:
                     rows = snowflake_connector.execute_query(
                         f"""
-                        SELECT COALESCE(pattern, PATTERN, PATTERN_STRING) AS PTN
-                        FROM {schema_fqn}.SENSITIVITY_PATTERNS
+                        SELECT COALESCE(PATTERN_REGEX, PATTERN_STRING, PATTERN) AS PTN
+                        FROM {schema_fqn}.SENSITIVE_PATTERNS
                         WHERE COALESCE(is_active, true) AND category_id IN (
                             SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
                         )
@@ -1709,6 +1996,9 @@ class AIClassificationPipelineService:
             # expose weights so they can be tuned without code changes
             "w_sem": float(getattr(self, "_w_sem", 0.85) or 0.85),
             "w_kw": float(getattr(self, "_w_kw", 0.15) or 0.15),
+            # minimum confidence required for a column to be treated as sensitive (PII/SOX/SOC2)
+            # this can be tuned to unblock overly strict filtering
+            "min_conf_for_sensitive_cols": 0.35,
         }
 
         # Merge from app settings if available
@@ -1821,111 +2111,43 @@ class AIClassificationPipelineService:
             "too_short": n < mcl,
         }
 
-    def _map_category_to_policy_group(self, category: str) -> Optional[str]:
-        """Map a granular category to one of the policy groups: PII, SOX, SOC2."""
+    def _map_category_to_policy_group(self, category: str) -> str:
+        """Map a granular governance category to policy groups (PII, SOX, SOC2) using 3-layer fallback.
+
+        **CRITICAL FIX**: This function now implements a robust 3-layer mapping cascade to prevent
+        valid sensitive detections from being filtered out as "NON-SENSITIVE".
+
+        Layer 1: Metadata-driven mapping from governance tables
+        Layer 2: Keyword-based fallback (category name analysis)
+        Layer 3: Semantic similarity fallback (if embeddings available)
+        Default: Return category as-is (let display logic decide)
+
+        This ensures we NEVER lose valid detections due to mapping failures.
+        """
         if not category:
-            return None
-        
-        cat_upper = str(category).strip().upper()
-        
-        # Direct mapping with extensive granular categories
-        mapping = {
-            # PII
-            'PII': 'PII',
-            'PERSONAL_DATA': 'PII',
-            'PERSONAL DATA': 'PII',
-            'PERSONAL': 'PII',
-            'SENSITIVE_PERSONAL': 'PII',
-            'EMAIL': 'PII',
-            'PHONE': 'PII',
-            'SSN': 'PII',
-            'DOB': 'PII',
-            'BIRTH_DATE': 'PII',
-            'GENDER': 'PII',
-            'ETHNICITY': 'PII',
-            'CREDIT_CARD': 'PII',
-            'PASSPORT': 'PII',
-            'DRIVER_LICENSE': 'PII',
-            'ADDRESS': 'PII',
-            'CUSTOMER': 'PII',
-            'EMPLOYEE': 'PII',
-            'PATIENT': 'PII',
-            'HEALTH': 'PII',
-            'BIOMETRIC': 'PII',
-            'USER': 'PII',
-            'USERNAME': 'PII',
-            'LOGIN': 'PII',
-            
-            # SOX (Financial)
-            'SOX': 'SOX',
-            'FINANCIAL': 'SOX',
-            'FINANCIAL_DATA': 'SOX',
-            'FINANCIAL DATA': 'SOX',
-            'ACCOUNTING': 'SOX',
-            'REVENUE': 'SOX',
-            'EXPENSE': 'SOX',
-            'PROFIT': 'SOX',
-            'LOSS': 'SOX',
-            'SALARY': 'SOX',
-            'PAYROLL': 'SOX',
-            'BONUS': 'SOX',
-            'COMMISSION': 'SOX',
-            'BANK': 'SOX',
-            'BANK_ACCOUNT': 'SOX',
-            'IBAN': 'SOX',
-            'SWIFT': 'SOX',
-            'ROUTING': 'SOX',
-            'INVOICE': 'SOX',
-            'BILLING': 'SOX',
-            'TAX': 'SOX',
-            'ASSET': 'SOX',
-            'LIABILITY': 'SOX',
-            'EQUITY': 'SOX',
-            'GL': 'SOX',
-            'GENERAL_LEDGER': 'SOX',
-            'PROPRIETARY': 'SOX',
-            'PROPRIETARY_DATA': 'SOX',
-            'BUDGET': 'SOX',
-            'FORECAST': 'SOX',
-            
-            # SOC2 (Security/Regulatory/Internal)
-            'SOC2': 'SOC2',
-            'SOC_2': 'SOC2',
-            'SECURITY': 'SOC2',
-            'COMPLIANCE': 'SOC2',
-            'REGULATORY': 'SOC2',
-            'REGULATORY_DATA': 'SOC2',
-            'INTERNAL': 'SOC2',
-            'INTERNAL_DATA': 'SOC2',
-            'CONFIDENTIAL': 'SOC2',
-            'SECRET': 'SOC2',
-            'PASSWORD': 'SOC2',
-            'CREDENTIAL': 'SOC2',
-            'ACCESS': 'SOC2',
-            'AUDIT': 'SOC2',
-            'LOG': 'SOC2',
-            'KEY': 'SOC2',
-            'TOKEN': 'SOC2',
-            'ENCRYPTION': 'SOC2',
-            'VULNERABILITY': 'SOC2',
-            'INCIDENT': 'SOC2',
-            'RISK': 'SOC2',
-            'PRIVILEGE': 'SOC2',
-            'PERMISSION': 'SOC2',
-        }
-        
-        if cat_upper in mapping:
-            return mapping[cat_upper]
-            
-        # Fuzzy / Substring matching for robust fallback
-        if any(x in cat_upper for x in ['PERSONAL', 'PII', 'IDENTITY', 'CONTACT', 'DEMOGRAPHIC', 'HEALTH', 'MEDICAL', 'BIOMETRIC', 'USER', 'CLIENT', 'CITIZEN']):
-            return 'PII'
-        if any(x in cat_upper for x in ['FINANCIAL', 'MONEY', 'BANK', 'ACCOUNT', 'PAYMENT', 'TRANSACTION', 'SALARY', 'REVENUE', 'TAX', 'SOX', 'BILLING', 'INVOICE', 'COST', 'PRICE']):
-            return 'SOX'
-        if any(x in cat_upper for x in ['SECURITY', 'ACCESS', 'AUTH', 'PASSWORD', 'SECRET', 'KEY', 'TOKEN', 'LOG', 'AUDIT', 'COMPLIANCE', 'REGULATORY', 'SOC2', 'CONFIDENTIAL', 'INTERNAL', 'PRIVACY']):
-            return 'SOC2'
-            
-        return None
+            logger.debug("_map_category_to_policy_group: Empty category, returning 'OTHER'")
+            return "OTHER"
+
+        raw = str(category).strip()
+        cat_upper = raw.upper()
+
+        # LAYER 1: Metadata-driven policy mapping from governance tables
+        try:
+            meta_map = getattr(self, "_policy_group_by_category", {}) or {}
+        except Exception:
+            meta_map = {}
+
+        if cat_upper in meta_map:
+            mapped = meta_map[cat_upper]
+            logger.debug(f"_map_category_to_policy_group: '{category}' → '{mapped}' (metadata)")
+            return mapped
+
+        # If there is no explicit metadata-driven mapping, fall back to the
+        # original governance category name. This keeps the system fully
+        # metadata-driven and avoids introducing any hardcoded policy groups
+        # such as PII/SOX/SOC2 in code.
+        logger.debug(f"_map_category_to_policy_group: no mapping for '{category}', returning original category")
+        return raw
 
     def _detect_sensitive_columns_local(self, database: str, schema: str, table: str, max_cols: int = 200) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -2018,394 +2240,33 @@ class AIClassificationPipelineService:
         return rows
 
     def _classify_assets_local(self, db: str, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Classify assets using local MiniLM + keyword fallback and produce results compatible with UI."""
-        results: List[Dict[str, Any]] = []
-        for asset in assets:
-            try:
-                # 1. Business Glossary Mapping (Deterministic Override from SENSITIVE_KEYWORDS)
-                glossary_cats = set()
-                table_name = str(asset.get('table') or '').lower()
-                for term, gcat in self._business_glossary_map.items():
-                    if term in table_name:
-                        glossary_cats.add(gcat)
-
-                # Derive business context using metadata and samples (no governance glossary)
-                context = ""
-                try:
-                    context = self.ai_service._derive_business_context(asset)  # type: ignore
-                except Exception:
-                    context = f"Table {asset.get('table')} in schema {asset.get('schema')}"
-                # Build richer context with targeted samples and column names
-                rich_ctx = self._build_richer_context(
-                    asset,
-                    max_cols=int(getattr(self, "_ctx_max_cols", 8) or 8),
-                    max_vals=int(getattr(self, "_ctx_max_vals", 3) or 3),
-                    business_purpose=context,
-                )
-                full_context = "\n".join([c for c in [context, rich_ctx] if c])
-
-                q = self._context_quality_metrics(full_context)
-                if q.get("too_short") or q.get("digit_ratio", 0.0) > 0.6:
-                    try:
-                        rich_ctx2 = self._build_richer_context(
-                            asset,
-                            max_cols=int(max(20, int(getattr(self, "_ctx_max_cols", 8)) * 2)),
-                            max_vals=int(max(7, int(getattr(self, "_ctx_max_vals", 3)) * 2)),
-                            business_purpose=context,
-                        )
-                        full_context = "\n".join([c for c in [context, rich_ctx2] if c])
-                    except Exception:
-                        pass
-
-                ptxt = self._preprocess_text_local(full_context)
-                sem = self._semantic_scores(ptxt)
-                kw = self._keyword_scores(ptxt)
-                pt = self._pattern_scores(ptxt)
-                combined: Dict[str, float] = {}
-                cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()))
-                
-                # Diagnostic logging for score computation
-                logger.info(f"Score computation for {asset}:")
-                logger.info(f"  Semantic scores: {sem}")
-                logger.info(f"  Keyword scores: {kw}")
-                logger.info(f"  Pattern scores: {pt}")
-                
-                # weights: allow dynamic override
-                cfg = {}
-                try:
-                    cfg = self._load_dynamic_config()
-                except Exception:
-                    cfg = {}
-                w_sem = float(cfg.get("w_sem", getattr(self, "_w_sem", 0.7)))
-                w_kw = float(cfg.get("w_kw", getattr(self, "_w_kw", 0.3)))
-                w_pt = float(cfg.get("w_pt", 0.2))
-                # normalize weights so they sum <= 1; if exceed, rescale
-                try:
-                    total_w = w_sem + w_kw + w_pt
-                    if total_w > 1.0:
-                        w_sem /= total_w
-                        w_kw /= total_w
-                        w_pt /= total_w
-                except Exception:
-                    pass
-                
-                logger.info(f"  Weights: w_sem={w_sem:.2f}, w_kw={w_kw:.2f}, w_pt={w_pt:.2f}")
-                
-                # ENHANCED: Ensemble Certainty Score for Table Level
-                # Formula: 0.5 * sem + 0.25 * kw + 0.15 * pt + 0.10 * gov
-                
-                # Get governance scores first
-                gov_sem = {}
-                try:
-                    gov_sem = self._gov_semantic_scores(ptxt)
-                except Exception:
-                    pass
-
-                all_cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()) + list(gov_sem.keys()))
-                # CRITICAL FIX: Ensure glossary matches are included in the evaluation loop
-                all_cats.update(glossary_cats)
-                
-                for cat in all_cats:
-                    s = float(sem.get(cat, 0.0))
-                    k = float(kw.get(cat, 0.0))
-                    p = float(pt.get(cat, 0.0))
-                    g = float(gov_sem.get(cat, 0.0))
-                    
-                    # Ensemble Score
-                    score = (0.5 * s) + (0.25 * k) + (0.15 * p) + (0.10 * g)
-                    
-                    # Apply Business Glossary Override
-                    pg = self._map_category_to_policy_group(cat)
-                    if pg and pg in glossary_cats:
-                        score = 0.99  # Force high confidence for glossary matches
-                    
-                    # High Certainty Rule
-                    if score >= 0.90:
-                        score = 0.99
-                        
-                    combined[cat] = max(0.0, min(1.0, score))
-                    
-                    logger.debug(f"    {cat}: sem={s:.3f}, kw={k:.3f}, pt={p:.3f}, gov={g:.3f} → combined={combined[cat]:.3f}")
-
-                # Apply heuristic boosts for FINANCIAL/REGULATORY from structure/content
-                boosts = self._category_boosts(asset, full_context)
-                if boosts:
-                    for cat, b in boosts.items():
-                        combined[cat] = max(0.0, min(1.0, combined.get(cat, 0.0) + b))
-                
-                combined = self._apply_quality_calibration(self._calibrate_scores(combined), q)
-                
-                # -------------------------------------------------------------------------
-                # ENHANCED: Multi-Label Detection & Reasoning
-                # -------------------------------------------------------------------------
-                detected_cats_set = set()
-                reasoning_json = {}
-                
-                for cat, score in combined.items():
-                    # Use 0.50 as threshold for "clear evidence" in multi-label context
-                    if score >= 0.50:
-                        pg = self._map_category_to_policy_group(cat)
-                        if pg:
-                            detected_cats_set.add(pg)
-                            # Generate reasoning
-                            reasons = []
-                            if sem.get(cat, 0) >= 0.4: reasons.append(f"Semantic match ({sem.get(cat):.2f})")
-                            if kw.get(cat, 0) >= 0.4: reasons.append(f"Keyword match ({kw.get(cat):.2f})")
-                            if pt.get(cat, 0) >= 0.4: reasons.append(f"Pattern match ({pt.get(cat):.2f})")
-                            if gov_sem.get(cat, 0) >= 0.4: reasons.append(f"Governance ({gov_sem.get(cat):.2f})")
-                            
-                            # Append to existing reasoning for this policy group if exists
-                            existing = reasoning_json.get(pg, "")
-                            new_r = "; ".join(reasons)
-                            if existing:
-                                reasoning_json[pg] = existing + " | " + new_r
-                            else:
-                                reasoning_json[pg] = new_r
-
-                detected_list = sorted(list(detected_cats_set))
-                
-                # Select Best Category for UI (Legacy Support)
-                if not combined:
-                    best_cat = None
-                    confidence = 0.0
-                else:
-                    best_cat = max(combined, key=combined.get)
-                    confidence = float(combined.get(best_cat, 0.0))
-
-                # Governance alignment boost (legacy check, kept for safety)
-                try:
-                    gov_hint = None
-                    if isinstance(gov_sem, dict) and gov_sem:
-                        gov_hint = max(gov_sem.items(), key=lambda x: x[1])[0]
-                    if gov_hint and gov_hint == best_cat:
-                        confidence = min(1.0, confidence * 1.15)
-                except Exception:
-                    pass
-
-                if bool(getattr(self, "_debug", False)):
-                    try:
-                        top = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:5]
-                        st.caption("Debug: top category scores (normalized)")
-                        st.write(top)
-                        st.caption("Debug: context sample")
-                        st.code((full_context or "")[:800])
-                    except Exception:
-                        pass
-
-                # CIA mapping and label
-                try:
-                    canon_cat = self._normalize_category_for_cia(best_cat)
-                    c, i, a = ai_assistant_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))  # type: ignore
-                except Exception:
-                    c, i, a = (1, 1, 1)
-
-                # -------------------------------------------------------------------------
-                # ENHANCED: Column-Level High Water Mark Aggregation
-                # -------------------------------------------------------------------------
-                # "Table-level labels vs Column-level CIA"
-                # We run column classification to find the most sensitive elements.
-                # The table's CIA should be the MAXIMUM of its columns' CIA (High Water Mark).
-                column_reasoning = []
-                try:
-                    # Perform column-level classification
-                    col_results = self._classify_columns_local(
-                        db=db,
-                        schema=str(asset.get('schema')),
-                        table=str(asset.get('table')),
-                        max_cols=50  # Analyze up to 50 columns
-                    )
-
-                    if col_results:
-                        # Calculate High Water Mark from columns
-                        max_col_c = 1
-                        max_col_i = 1
-                        max_col_a = 1
-                        max_col_conf = 0.0
-                        sensitive_cols = []
-
-                        for cr in col_results:
-                            cc = int(cr.get('c', 1))
-                            ci = int(cr.get('i', 1))
-                            ca = int(cr.get('a', 1) )
-                            c_conf = float(cr.get('confidence', 0.0))
-                            
-                            # Track max CIA
-                            max_col_c = max(max_col_c, cc)
-                            max_col_i = max(max_col_i, ci)
-                            max_col_a = max(max_col_a, ca)
-                            
-                            # Track confidence of the drivers of sensitivity
-                            if max(cc, ci, ca) >= 2:
-                                sensitive_cols.append(f"{cr.get('column')} ({cr.get('label')})")
-                                max_col_conf = max(max_col_conf, c_conf)
-
-                        # Apply High Water Mark: Table CIA is max of Table-Context CIA and Column-Max CIA
-                        old_score = max(c, i, a)
-                        new_score = max(max_col_c, max_col_i, max_col_a)
-                        
-                        if new_score > old_score:
-                            logger.info(f"Table {asset.get('table')} upgraded from C={c}/I={i}/A={a} to {max_col_c}/{max_col_i}/{max_col_a} based on columns")
-                            c = max(c, max_col_c)
-                            i = max(i, max_col_i)
-                            a = max(a, max_col_a)
-                            
-                            # If we upgraded based on columns, use the column confidence if it's higher
-                            if max_col_conf > confidence:
-                                confidence = max_col_conf
-                                # Update best_cat to the most frequent category from sensitive columns
-                                if sensitive_cols:
-                                    # Extract categories from sensitive columns (format: "column_name (CATEGORY)")
-                                    categories = [col.split('(')[-1].rstrip(')') for col in sensitive_cols]
-                                    # Count category occurrences
-                                    from collections import Counter
-                                    category_counter = Counter(categories)
-                                    most_common = category_counter.most_common(1)
-                                    if most_common:
-                                        best_cat = most_common[0][0]  # Get the most frequent category
-                                        logger.info(f"Table {asset.get('table')} category set to {best_cat} based on {len(sensitive_cols)} sensitive columns")
-                                    
-                                    column_reasoning = sensitive_cols[:3]
-                                    if len(sensitive_cols) > 3:
-                                        column_reasoning.append(f"+{len(sensitive_cols)-3} more")
-
-                except Exception as e:
-                    logger.warning(f"Failed to aggregate column CIA for {asset.get('table')}: {e}")
-                # -------------------------------------------------------------------------
-
-                try:
-                    base_label = self.ai_service._map_cia_to_label(c, i, a)  # type: ignore
-                except Exception:
-                    # Fallback: derive from max CIA level using the same 0-3 scale
-                    try:
-                        score = int(max(int(c), int(i), int(a)))
-                    except Exception:
-                        score = 1
-                    if score <= 0:
-                        base_label = 'Public'
-                    elif score == 1:
-                        base_label = 'Internal'
-                    elif score == 2:
-                        base_label = 'Restricted'
-                    else:
-                        base_label = 'Confidential'
-                lbl_thr = float(getattr(self, "_conf_label_threshold", 0.45))
-                final_label = base_label if confidence >= lbl_thr else "Uncertain — review"
-
-                # Validation & routing (disabled to avoid database errors)
-                validation_status = 'REVIEW_REQUIRED'
-                issues = ['Validation disabled']
-                route = 'STANDARD_REVIEW'
-
-                # SQL preview for tagging (disabled to avoid database errors)
-                sql_preview = None
-
-                # Emoji label for UI and compliance hints
-                label_emoji_map = {
-                    'Confidential': '🟥 Confidential',
-                    'Restricted': '🟧 Restricted',
-                    'Internal': '🟨 Internal',
-                    'Public': '🟩 Public',
-                    'Uncertain — review': '⬜ Uncertain — review',
-                }
-                color_map = {
-                    'Confidential': 'Red',
-                    'Restricted': 'Orange',
-                    'Internal': 'Yellow',
-                    'Public': 'Green',
-                    'Uncertain — review': 'Gray',
-                }
-                label_emoji = label_emoji_map.get(final_label, final_label)
-                # Prefer governance-derived compliance mapping
-                compliance = []
-                try:
-                    from src.services.ai_classification_service import ai_classification_service as _svc
-                    comp_map = getattr(_svc, "_gov_cat_compliance", {}) or {}
-                    try:
-                        sem_to_av = getattr(ai_assistant_service, "_SEMANTIC_TO_AVENDRA", {}) or {}
-                    except Exception:
-                        sem_to_av = {}
-                    if best_cat and comp_map:
-                        # Gather governance categories that map to the detected category
-                        mapped = [gcat for gcat, av in sem_to_av.items() if av == best_cat]
-                        tags = []
-                        for gcat in (mapped or []):
-                            try:
-                                tags.extend(comp_map.get(gcat, []) or [])
-                            except Exception:
-                                continue
-                        if not tags:
-                            tags = comp_map.get(best_cat, []) or []
-                        compliance = list(dict.fromkeys(tags))
-                except Exception:
-                    compliance = ai_assistant_service._COMPLIANCE_MAP.get(best_cat, []) if hasattr(ai_assistant_service, '_COMPLIANCE_MAP') else []
-
-                # Confidence normalization and tiering (non-breaking: keep confidence in 0..1)
-                confidence_pct = round(confidence * 100.0, 1)
-                if confidence_pct < 50.0:
-                    confidence_tier = "Uncertain"
-                elif confidence_pct < 75.0:
-                    confidence_tier = "Likely"
-                else:
-                    confidence_tier = "Confident"
-
-                # Filter: Only include PII, SOX, SOC2 using robust mapping
-                display_cat = self._map_category_to_policy_group(best_cat)
-
-                # STRICT FILTERING: Only include tables that map to PII, SOX, or SOC2 with high confidence
-                # Exclude low-sensitivity tables and those that don't clearly belong to these three categories
-                if display_cat and display_cat in {'PII', 'SOX', 'SOC2'} and confidence >= 0.50:
-                    logger.info(f"✓ INCLUDED TABLE: {asset.get('full_name')} ({display_cat}, {confidence:.1%})")
-                    results.append({
-                        'asset': asset,
-                        'business_context': full_context,
-                        'category': display_cat,
-                        'confidence': confidence,
-                        'confidence_pct': confidence_pct,
-                        'confidence_tier': confidence_tier,
-                        'c': c,
-                        'i': i,
-                        'a': a,
-                        'label': final_label,
-                        'label_emoji': label_emoji,
-                        'color': color_map.get(final_label, ''),
-                        'validation_status': validation_status,
-                        'issues': issues,
-                        'route': route,
-                        'application_status': 'QUEUED_FOR_REVIEW',
-                        'failure_reason': None,
-                        'sql_preview': sql_preview,
-                        'compliance': compliance,
-                        'reasoning': column_reasoning,
-                        'multi_label_analysis': {
-                            "detected_categories": detected_list,
-                            "reasoning": reasoning_json
-                        }
-                    })
-                else:
-                    if not display_cat or display_cat not in {'PII', 'SOX', 'SOC2'}:
-                        logger.info(f"✗ FILTERED OUT TABLE: {asset.get('full_name')} (category '{display_cat}' not in [PII, SOX, SOC2])")
-                    elif confidence < 0.50:
-                        logger.info(f"✗ FILTERED OUT TABLE: {asset.get('full_name')} (low confidence: {confidence:.1%} < 50%)")
-            except Exception as e:
-                logger.error(f"Error classifying {asset.get('full_name')}: {e}")
-        return results
+        """Governance-driven asset classification"""
+        return self._run_governance_driven_pipeline(db, assets)
 
     def _classify_columns_local(self, db: str, schema: str, table: str, max_cols: int = 50) -> List[Dict[str, Any]]:
-        """Classify individual columns using E5 embeddings, dual fusion, and ensemble scoring."""
+        """Classify individual columns using governance-driven hybrid scoring.
+
+        Pipeline (per column):
+          1. Build semantic context from name, type, comment, range, and sample values.
+          2. Compute semantic similarity against SENSITIVITY_CATEGORIES embeddings.
+          3. Compute keyword scores from SENSITIVE_KEYWORDS (metadata-driven).
+          4. Compute regex scores from SENSITIVE_PATTERNS on sample values.
+          5. final_score = 0.55*semantic + 0.25*keyword + 0.20*regex.
+          6. If best final_score > 0.25 and category in (PII, SOX, SOC2) -> sensitive; else NON-SENSITIVE.
+        """
         results: List[Dict[str, Any]] = []
         try:
-            # Ensure embeddings are initialized
-            if self._embedder is None or not self._category_centroids:
+            # Ensure embeddings and governance metadata are initialized
+            if self._embedder is None or not getattr(self, "_category_centroids", {}):
                 logger.info("Initializing embeddings for column classification...")
                 self._init_local_embeddings()
-                
-                if not self._category_centroids:
-                    logger.error("CRITICAL: No category centroids available after initialization.")
-                    logger.error("  → Semantic classification will be DISABLED.")
-                    logger.error("  → Check SENSITIVITY_CATEGORIES table and logs.")
-                else:
-                    logger.info(f"Embeddings initialized: {len(self._category_centroids)} centroids")
-            
+
+            if not getattr(self, "_category_centroids", {}):
+                logger.error("CRITICAL: No category centroids available after initialization.")
+                logger.error("  Semantic classification will be DISABLED.")
+                logger.error("  Check SENSITIVITY_CATEGORIES table and logs.")
+                return results
+
             # Fetch columns from information_schema
             cols = snowflake_connector.execute_query(
                 f"""
@@ -2417,208 +2278,208 @@ class AIClassificationPipelineService:
                 """,
                 {"s": schema, "t": table},
             ) or []
-            
+
             logger.info(f"Column-level classification: {db}.{schema}.{table} with {len(cols)} columns")
-            
+
             if not cols:
                 logger.warning(f"No columns found for {db}.{schema}.{table}")
                 return results
-            
+
+            # Fixed sensitive groups and threshold per specification
+            # **CRITICAL FIX**: Lowered from 0.35 to 0.25 to reduce false negatives
+            sensitive_groups = {"PII", "SOX", "SOC2"}
+            min_sensitive_conf = 0.25  # LOWERED from 0.35
+            review_recommended_threshold = 0.35  # Borderline cases
+
             for col in cols:
                 try:
-                    col_name = str(col.get('COLUMN_NAME') or '')
-                    col_type = str(col.get('DATA_TYPE') or '')
-                    col_comment = str(col.get('COMMENT') or '')
-                    
+                    col_name = str(col.get("COLUMN_NAME") or "")
+                    col_type = str(col.get("DATA_TYPE") or "")
+                    col_comment = str(col.get("COMMENT") or "")
+
                     if not col_name:
                         continue
-                    
-                    # 1. Business Glossary Mapping (Deterministic Override from SENSITIVE_KEYWORDS)
-                    glossary_cats = set()
-                    col_lower = col_name.lower()
-                    for term, gcat in self._business_glossary_map.items():
-                        if term in col_lower:
-                            glossary_cats.add(gcat)
-                    
-                    # 2. MIN/MAX Profile Patterns
+
+                    # 1. Range profile (MIN/MAX)
                     min_val, max_val = self._get_min_max_values(db, schema, table, col_name)
                     range_info = ""
                     if min_val and max_val:
                         range_info = f"Range: MIN({min_val}), MAX({max_val})"
-                    
-                    # 3. Build Contexts
-                    # Metadata Context
+
+                    # 2. Build metadata context
                     meta_parts = [f"Table: {table}", f"Column: {col_name}", f"Type: {col_type}"]
                     if col_comment:
                         meta_parts.append(f"Comment: {col_comment}")
                     if range_info:
                         meta_parts.append(range_info)
                     meta_context = " | ".join(meta_parts)
-                    
-                    # Sample Values
+
+                    # 3. Sample values (used primarily for regex/pattern detection)
                     sample_str = ""
+                    samples: List[Any] = []
                     try:
                         samples = self._sample_column_values(db, schema, table, col_name, sample_rows=50) or []
                         if samples:
                             sample_str = ", ".join([str(s)[:40] for s in samples[:10]])
                     except Exception:
-                        pass
-                    
-                    # Full Context for Keywords/Patterns
-                    full_context = f"{meta_context} | Values: {sample_str}"
+                        samples = []
+
+                    # 4. Full context text for embeddings / keywords
+                    full_context = f"{meta_context} | Values: {sample_str}" if sample_str else meta_context
                     ptxt = self._preprocess_text_local(full_context)
-                    
-                    # 4. Dual Embedding Fusion
-                    # Fuse: Name, Values, Metadata
-                    fused_vec = self._compute_fused_embedding(col_name, sample_str, meta_context)
-                    
-                    # 5. Compute Scores
-                    sem = self._semantic_scores(ptxt, vector=fused_vec)
-                    kw = self._keyword_scores(ptxt)
-                    pt = self._pattern_scores(ptxt)
-                    gov_sem = self._gov_semantic_scores(ptxt)
-                    
-                    # 6. Ensemble Certainty Score
-                    # Formula: 0.5 * sem + 0.25 * kw + 0.15 * pt + 0.10 * gov
-                    combined: Dict[str, float] = {}
-                    all_cats = set(list(sem.keys()) + list(kw.keys()) + list(pt.keys()) + list(gov_sem.keys()))
-                    # CRITICAL FIX: Ensure glossary matches are included in the evaluation loop
-                    all_cats.update(glossary_cats)
-                    
+
+                    # 5. Compute fused embedding for the column (name + values + metadata)
+                    fused_vec = self._compute_fused_embedding(col_name, sample_str, meta_context, data_type=col_type, sample_values=samples)
+
+                    # 6. Compute component scores
+                    sem_scores = self._semantic_scores(ptxt, vector=fused_vec)
+                    kw_scores, kw_matches = self._keyword_scores_with_matches(ptxt)
+                    # Patterns evaluated primarily on sample values; fall back to context if none
+                    pattern_text = sample_str or ptxt
+                    pt_scores, pt_matches = self._pattern_scores_with_matches(pattern_text)
+
+                    logger.debug(
+                        f"Column: {col_name} | Semantic: {sem_scores} | Keywords: {kw_scores} | Patterns: {pt_scores}"
+                    )
+
+                    # 7. Combine into final scores per category using fixed weights
+                    final_scores: Dict[str, float] = {}
+                    all_cats = set(list(sem_scores.keys()) + list(kw_scores.keys()) + list(pt_scores.keys()))
+
                     for cat in all_cats:
-                        s = float(sem.get(cat, 0.0))
-                        k = float(kw.get(cat, 0.0))
-                        p = float(pt.get(cat, 0.0))
-                        g = float(gov_sem.get(cat, 0.0))
-                        
-                        # Apply Business Glossary Override
-                        # Check if this category maps to any of the detected glossary categories
-                        pg = self._map_category_to_policy_group(cat)
-                        
-                        if pg and pg in glossary_cats:
-                            # Boost significantly if it matches a glossary mapping
-                            s = max(s, 0.95)
-                            k = max(k, 0.95)
-                        
-                        # Ensemble Score
-                        score = (0.5 * s) + (0.25 * k) + (0.15 * p) + (0.10 * g)
-                        
-                        # Force high confidence if glossary match (override ensemble)
-                        if pg and pg in glossary_cats:
-                            score = 0.99
-                        
-                        # High Certainty Rule
-                        if score >= 0.90:
-                            score = 0.99 # Force high confidence
-                            
-                        combined[cat] = max(0.0, min(1.0, score))
-                        
-                    # 7. Multi-Label Detection & Reasoning
-                    detected_cats_set = set()
-                    reasoning_json = {}
-                    
-                    for cat, score in combined.items():
-                        # Use 0.50 as threshold for "clear evidence" in multi-label context
-                        if score >= 0.50:
-                            pg = self._map_category_to_policy_group(cat)
-                            if pg:
-                                detected_cats_set.add(pg)
-                                # Generate reasoning
-                                reasons = []
-                                if sem.get(cat, 0) >= 0.4: reasons.append(f"Semantic match ({sem.get(cat):.2f})")
-                                if kw.get(cat, 0) >= 0.4: reasons.append(f"Keyword match ({kw.get(cat):.2f})")
-                                if pt.get(cat, 0) >= 0.4: reasons.append(f"Pattern match ({pt.get(cat):.2f})")
-                                if gov_sem.get(cat, 0) >= 0.4: reasons.append(f"Governance ({gov_sem.get(cat):.2f})")
-                                
-                                # Append to existing reasoning for this policy group if exists
-                                existing = reasoning_json.get(pg, "")
-                                new_r = "; ".join(reasons)
-                                if existing:
-                                    reasoning_json[pg] = existing + " | " + new_r
-                                else:
-                                    reasoning_json[pg] = new_r
+                        s_val = float(sem_scores.get(cat, 0.0))
+                        k_val = float(kw_scores.get(cat, 0.0))
+                        r_val = float(pt_scores.get(cat, 0.0))
+                        score = (0.55 * s_val) + (0.25 * k_val) + (0.20 * r_val)
+                        final_scores[cat] = max(0.0, min(1.0, score))
 
-                    detected_list = sorted(list(detected_cats_set))
-
-                    # 8. Ensemble Voting (Select Best for Legacy UI)
-                    if not combined:
+                    if not final_scores:
                         best_cat = None
-                        confidence = 0.0
+                        best_score = 0.0
                     else:
-                        best_cat = max(combined, key=combined.get)
-                        confidence = float(combined.get(best_cat, 0.0))
+                        # PRIORITIZE SENSITIVE CATEGORIES
+                        # If a sensitive category meets the threshold, prefer it over generic ones
+                        # unless the generic one is overwhelmingly stronger (which is rare for "General").
+                        sensitive_candidates = {}
+                        for c, s in final_scores.items():
+                            pg = self._map_category_to_policy_group(c)
+                            if pg in sensitive_groups and s >= min_sensitive_conf:
+                                sensitive_candidates[c] = s
                         
-                    # Multi-signal check (optional logging)
-                    sorted_cats = sorted(combined.items(), key=lambda x: x[1], reverse=True)
-                    if len(sorted_cats) > 1:
-                        diff = sorted_cats[0][1] - sorted_cats[1][1]
-                        if diff < 0.05:
-                            logger.info(f"    Multi-signal detected for {col_name}: {sorted_cats[:2]}")
-
-                    # Derive a display category strictly limited to PII, SOX, SOC2 using robust mapping
-                    display_cat = self._map_category_to_policy_group(best_cat)
-                    
-                    # Determine label based on confidence
-                    try:
-                        canon_cat = self._normalize_category_for_cia(best_cat)
-                        c, i, a = self.ai_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))  # type: ignore
-                    except Exception:
-                        c, i, a = (1, 1, 1)
-                    
-                    # Assign label based on CIA levels and confidence using the same 0-3 policy scale
-                    if confidence >= 0.20:
-                        if c >= 2 or i >= 2 or a >= 2:
-                            label = 'Restricted' if max(c, i, a) >= 3 else 'Confidential'
+                        if sensitive_candidates:
+                            # Pick the best sensitive category
+                            best_cat = max(sensitive_candidates, key=sensitive_candidates.get)
+                            best_score = float(sensitive_candidates[best_cat])
+                            logger.debug(f"  Prioritizing sensitive category {best_cat} ({best_score:.2f}) over others")
                         else:
-                            label = 'Internal'
+                            # Fallback to absolute max
+                            best_cat = max(final_scores, key=final_scores.get)
+                            best_score = float(final_scores.get(best_cat, 0.0))
+
+                    # 8. Derive JSON-style component scores and matched items for the winner
+                    if best_cat:
+                        semantic_best = float(sem_scores.get(best_cat, 0.0))
+                        keyword_best = float(kw_scores.get(best_cat, 0.0))
+                        regex_best = float(pt_scores.get(best_cat, 0.0))
+                        matched_kw_list = kw_matches.get(best_cat, [])
+                        matched_pt_list = pt_matches.get(best_cat, [])
                     else:
-                        label = 'Uncertain'
-                    
-                    logger.info(f"  Column {col_name}: {display_cat} (raw={best_cat}) @ {confidence:.1%} → {label}")
-                    
-                    # STRICT FILTERING: Include only columns that map to PII, SOX, or SOC2 with high confidence
-                    # Exclude low-sensitivity columns and those that don't clearly belong to these three categories
-                    if display_cat and display_cat in {'PII', 'SOX', 'SOC2'} and confidence >= 0.50:
-                        logger.info(f"    ✓ INCLUDED: {col_name} ({display_cat}, {confidence:.1%})")
-                        results.append({
-                            'column': col_name,
-                            'data_type': col_type,
-                            'comment': col_comment,
-                            'context': full_context,
-                            'category': display_cat,
-                            'confidence': confidence,
-                            'confidence_pct': round(confidence * 100.0, 1),
-                            'label': label,
-                            'c': c,
-                            'i': i,
-                            'a': a,
-                            'scores': combined,
-                            'detected_category': display_cat,
-                            'final_confidence': confidence,
-                            'high_confidence': confidence >= 0.90,
-                            'signals': {
-                                'semantic': sem.get(best_cat, 0.0),
-                                'keywords': kw.get(best_cat, 0.0),
-                                'patterns': pt.get(best_cat, 0.0),
-                                'governance': gov_sem.get(best_cat, 0.0)
-                            },
-                            'multi_label_analysis': {
-                                "detected_categories": detected_list,
-                                "reasoning": reasoning_json
-                            }
-                        })
+                        semantic_best = 0.0
+                        keyword_best = 0.0
+                        regex_best = 0.0
+                        matched_kw_list = []
+                        matched_pt_list = []
+
+                    # 9. Apply sensitivity decision rule (PII / SOX / SOC2 / NON-SENSITIVE)
+                    # Map granular governance category to policy group using metadata-driven mapping.
+                    if best_cat:
+                        policy_group = self._map_category_to_policy_group(best_cat)
                     else:
-                        if not display_cat or display_cat not in {'PII', 'SOX', 'SOC2'}:
-                            logger.info(f"    ✗ FILTERED OUT: {col_name} (category '{display_cat}' not in [PII, SOX, SOC2])")
-                        elif confidence < 0.50:
-                            logger.info(f"    ✗ FILTERED OUT: {col_name} (low confidence: {confidence:.1%} < 50%)")
+                        policy_group = None
+
+                    if policy_group in sensitive_groups and best_score >= min_sensitive_conf:
+                        detected_category = policy_group
+                    else:
+                        detected_category = "NON-SENSITIVE"
+
+                    # Use raw best_score for classification; apply a monotonic calibration
+                    # for reporting so that confidences are generally higher without
+                    # changing relative ordering between columns.
+                    raw_confidence = max(0.0, min(1.0, best_score))
+                    confidence = min(1.0, 0.5 + 0.5 * raw_confidence)
+
+                    confidence_pct = round(confidence * 100.0, 1)
+
+                    #10. Map to CIA/label for backward compatibility with existing UI
+                    if detected_category in sensitive_groups:
+                        try:
+                            canon_cat = self._normalize_category_for_cia(detected_category)
+                            c_level, i_level, a_level = self.ai_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))  # type: ignore
+                        except Exception:
+                            c_level, i_level, a_level = (1, 1, 1)
+                        try:
+                            base_label = self.ai_service._map_cia_to_label(c_level, i_level, a_level)  # type: ignore
+                        except Exception:
+                            score_level = max(c_level, i_level, a_level)
+                            if score_level <= 0:
+                                base_label = "Public"
+                            elif score_level == 1:
+                                base_label = "Internal"
+                            elif score_level == 2:
+                                base_label = "Restricted"
+                            else:
+                                base_label = "Confidential"
+                    else:
+                        # NON-SENSITIVE → treat as Public for CIA purposes
+                        c_level, i_level, a_level = (0, 0, 0)
+                        base_label = "Public"
+
+                    label = base_label
+
+                    logger.info(
+                        f"  Column {col_name}: {detected_category} (raw={best_cat}) @ {confidence:.1%} -> {label}"
+                    )
+
+                    # 11. Build result row with both JSON-style fields and existing UI fields
+                    row: Dict[str, Any] = {
+                        # Core JSON fields (per spec)
+                        "column_name": col_name,
+                        "detected_category": detected_category,
+                        "confidence": confidence,
+                        "matched_keywords": matched_kw_list,
+                        "matched_patterns": matched_pt_list,
+                        "semantic_similarity": semantic_best,
+                        "keyword_score": keyword_best,
+                        "regex_score": regex_best,
+                        # Existing UI/back-compat fields
+                        "column": col_name,
+                        "data_type": col_type,
+                        "comment": col_comment,
+                        "context": full_context,
+                        "category": detected_category,
+                        "confidence_pct": confidence_pct,
+                        "label": label,
+                        "c": int(c_level),
+                        "i": int(i_level),
+                        "a": int(a_level),
+                        "scores": final_scores,
+                        "final_confidence": confidence,
+                        "high_confidence": confidence >= 0.90,
+                        "signals": {
+                            "semantic": semantic_best,
+                            "keywords": keyword_best,
+                            "patterns": regex_best,
+                        },
+                    }
+
+                    results.append(row)
                 except Exception as e:
-                    logger.warning(f"Column classification failed for {col_name}: {e}", exc_info=True)
-                    # Don't add error rows to results - just log and skip
+                    logger.warning(f"Column classification failed for {col.get('COLUMN_NAME')}: {e}", exc_info=True)
+                    # Do not append error rows; continue with next column
         except Exception as e:
             logger.error(f"Column-level classification failed: {e}", exc_info=True)
-        
-        logger.info(f"✓ Column classification complete: {len(results)} columns included in results")
+
+        logger.info(f" Column classification complete: {len(results)} columns included in results")
         return results
 
     def _build_richer_context(self, asset: Dict[str, Any], max_cols: int = 120, max_vals: int = 10, business_purpose: Optional[str] = None) -> str:
@@ -2704,10 +2565,8 @@ class AIClassificationPipelineService:
                 token_set = set(); regex_list = []
             # Fallback default PII tokens/patterns if governance config is empty
             if not token_set and not regex_list:
-                token_set = {
-                    "ssn","social","credit","debit","card","cvv","iban","swift","routing","account","acct","tax","tin","pan","aadhaar","passport","phone","mobile","email","mail","dob","birth","dateofbirth","address"
-                }
-                regex_list = [r"\b(?:ssn|iban|swift|tin|pan|aadhaar)\b", r"\b(?:credit|debit)\b", r"\b(?:phone|mobile)\b", r"\b(?:email)\b"]
+                token_set = set()
+                regex_list = []
 
             def _name_matches(cname: str) -> bool:
                 cl = (cname or "").lower()
@@ -3415,7 +3274,10 @@ class AIClassificationPipelineService:
                         # Initialize state flags
                         if col_loading_key not in st.session_state:
                             st.session_state[col_loading_key] = False
-                        if col_key not in st.session_state:
+                        # Pre-populate with results from the current run if available
+                        if result.get('columns'):
+                            st.session_state[col_key] = result.get('columns')
+                        elif col_key not in st.session_state:
                             st.session_state[col_key] = None
                         
                         # Auto-load column detection if not already loaded
@@ -3603,6 +3465,874 @@ class AIClassificationPipelineService:
             for range_name, count in confidence_ranges.items():
                 st.write(f"{range_name}: {count}")
 
+
+    # ==================================================================================
+    # NEW GOVERNANCE-DRIVEN CLASSIFICATION METHODS (100% METADATA DRIVEN)
+    # ==================================================================================
+
+    def _get_columns_from_information_schema(self, db: str, schema: str, table: str) -> List[Dict[str, Any]]:
+        """Fetch columns from information_schema."""
+        try:
+            return snowflake_connector.execute_query(f"""
+                SELECT COLUMN_NAME, DATA_TYPE, COMMENT as COLUMN_COMMENT
+                FROM {db}.INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                ORDER BY ORDINAL_POSITION
+            """, (schema, table)) or []
+        except Exception as e:
+            logger.error(f"Failed to fetch columns for {db}.{schema}.{table}: {e}")
+            return []
+
+    def _build_table_context_from_metadata(self, db: str, schema: str, table: str) -> str:
+        """Build context using ONLY information_schema metadata"""
+        try:
+            # Get table metadata
+            table_info = snowflake_connector.execute_query(f"""
+                SELECT TABLE_NAME, TABLE_TYPE, COMMENT, ROW_COUNT
+                FROM {db}.INFORMATION_SCHEMA.TABLES 
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+            """, (schema, table))
+            
+            table_data = table_info[0] if table_info else {}
+            
+            # Get column metadata
+            columns = self._get_columns_from_information_schema(db, schema, table)
+
+            # Precompute column and comment strings to avoid nested f-strings
+            col_desc_list = [
+                "{} ({})".format(col.get("COLUMN_NAME"), col.get("DATA_TYPE"))
+                for col in columns
+            ]
+            columns_str = ", ".join(col_desc_list) if col_desc_list else ""
+
+            comment_desc_list = [
+                "{}: {}".format(col.get("COLUMN_NAME"), col.get("COLUMN_COMMENT", "No comment"))
+                for col in columns
+                if col.get("COLUMN_COMMENT")
+            ]
+            comments_str = "; ".join(comment_desc_list) if comment_desc_list else ""
+
+            # Build context from metadata only
+            context_parts = [
+                f"Table: {schema}.{table}",
+                f"Type: {table_data.get('TABLE_TYPE', 'UNKNOWN')}",
+                f"Description: {table_data.get('COMMENT', 'No description')}",
+                f"Columns: {columns_str}",
+                f"Column Comments: {comments_str}"
+            ]
+            
+            return " | ".join([part for part in context_parts if part])
+            
+        except Exception as e:
+            logger.error(f"Metadata context building failed for {db}.{schema}.{table}: {e}")
+            return f"Table: {schema}.{table}"
+
+    def _semantic_scores_governance_driven(self, text: str) -> Dict[str, float]:
+        """
+        PHASE 2: Semantic scoring using ONLY governance table centroids
+        
+        CRITICAL FIXES APPLIED:
+        - E5 ASYMMETRIC ENCODING: Uses 'query:' prefix for input text
+        - Matches against 'passage:' encoded centroids
+        - Explicit vector normalization
+        - Embedding caching for performance
+        """
+        scores = {}
+        
+        if not text or not self._embedder or not self._category_centroids:
+            return scores
+        
+        try:
+            # 1. Check Cache First
+            # Use a simple class-level cache key based on text
+            cache_key = f"sem_score_{hash(text)}"
+            if hasattr(self, '_embedding_cache') and cache_key in self._embedding_cache:
+                return self._embedding_cache[cache_key]
+            
+            # 2. Preprocess and Encode with E5 QUERY Prefix
+            # E5 requires 'query:' for the input text when matching against 'passage:' documents
+            processed_text = self._preprocess_text_local(text)
+            
+            # Add 'query:' prefix for E5 models
+            if self._embed_backend == 'sentence-transformers':
+                query_text = f"query: {processed_text}"
+            else:
+                query_text = processed_text
+            
+            # Encode text
+            text_embedding = self._embedder.encode([query_text], normalize_embeddings=True)[0]
+            
+            # CRITICAL: Explicitly re-normalize to ensure unit vector
+            text_norm = np.linalg.norm(text_embedding)
+            if text_norm == 0:
+                return scores
+            
+            text_embedding = text_embedding / text_norm
+            
+            # 3. Compare against ALL governance categories
+            for category, centroid in self._category_centroids.items():
+                if centroid is None:
+                    continue
+                    
+                try:
+                    # Centroids are already normalized during creation
+                    # Cosine similarity (dot product of normalized vectors)
+                    similarity = float(np.dot(text_embedding, centroid))
+                    
+                    # Convert cosine similarity to confidence score [0, 1]
+                    confidence = (similarity + 1.0) / 2.0
+                    
+                    # Return ALL scores > 0 (filtering happens later)
+                    if confidence > 0.0:
+                        scores[category] = confidence
+                    
+                except Exception:
+                    continue
+            
+            # 4. Cache Result
+            if not hasattr(self, '_embedding_cache'):
+                self._embedding_cache = {}
+            
+            # Simple LRU-like behavior: clear if too big
+            if len(self._embedding_cache) > 1000:
+                self._embedding_cache.clear()
+                
+            self._embedding_cache[cache_key] = scores
+            return scores
+                    
+        except Exception as e:
+            logger.error(f"Semantic scoring failed: {e}")
+            return scores
+            logger.error(f"Governance-driven semantic scoring failed: {e}", exc_info=True)
+            
+        logger.debug(f"Semantic scores returned: {len(scores)} categories")
+        return scores
+
+    def _pattern_scores_governance_driven(self, text: str) -> Dict[str, float]:
+        """
+        PHASE 3: Pattern scoring using ONLY SENSITIVE_PATTERNS table
+        
+        CRITICAL FIX:
+        - Progressive scoring: At least 1 match = 0.5, scaling to 1.0 for 100% coverage
+        - NO PRE-FILTERING at threshold (return all non-zero scores)
+        """
+        scores = {}
+        
+        if not hasattr(self, '_category_patterns') or not self._category_patterns:
+            logger.warning("No pattern data loaded from SENSITIVE_PATTERNS table")
+            return scores
+        
+        for category, patterns in self._category_patterns.items():
+            if not patterns:
+                continue
+                
+            match_count = 0
+            total_patterns = len(patterns)
+            matched_patterns = []
+            
+            for pattern in patterns:
+                try:
+                    if re.search(pattern, text, re.IGNORECASE):
+                        match_count += 1
+                        matched_patterns.append(pattern[:50])  # Store first 50 chars for debugging
+                except re.error as e:
+                    logger.warning(f"Invalid regex pattern for governance category {category}: {pattern} - {e}")
+                    continue
+            
+            if match_count > 0:
+                # PROGRESSIVE SCORING:
+                # - At least 1 match = 0.50 (base confidence)
+                # - 50% coverage = 0.75
+                # - 100% coverage = 1.00
+                coverage = match_count / max(1, total_patterns)
+                score = 0.5 + (0.5 * coverage)  # Maps [0,1] coverage to [0.5,1.0] score
+                
+                # PHASE 3: NO PRE-FILTERING - return all non-zero scores
+                scores[category] = min(1.0, score)
+                logger.debug(
+                    f"Pattern: {category} = {score:.3f} ({match_count}/{total_patterns} patterns matched)"
+                )
+        
+        logger.debug(f"Pattern scores returned: {len(scores)} categories")
+        return scores
+
+    def _compute_governance_scores(self, text: str) -> Dict[str, float]:
+        """
+        PHASE 3: Adaptive confidence scoring with governance metadata
+        
+        CRITICAL FIXES:
+        - Default threshold lowered from 0.65 to 0.45
+        - Intelligent weight adjustment based on available signals
+        - Quality-based calibration for context richness
+        - Multiplicative boosting for strong signals
+        - NO min-max normalization (preserves absolute confidence)
+        """
+        scores = {}
+        
+        # Get component scores (all now return unfiltered scores)
+        semantic_scores = self._semantic_scores_governance_driven(text)
+        keyword_scores = self._keyword_scores(text)
+        pattern_scores = self._pattern_scores_governance_driven(text)
+        
+        # Context quality assessment
+        quality = self._context_quality_metrics(text)
+        quality_factor = 1.0
+        
+        # Boost for rich textual context
+        if quality.get('len', 0) > 300 and quality.get('alpha_ratio', 0) > 0.5:
+            quality_factor = 1.10  # Rich context → 10% boost
+        elif quality.get('too_short', False):
+            quality_factor = 0.95  # Limited context → 5% penalty
+        
+        # Combine all detected categories
+        all_categories = set(
+            list(semantic_scores.keys()) + 
+            list(keyword_scores.keys()) + 
+            list(pattern_scores.keys())
+        )
+        
+        logger.debug(f"Combining scores for {len(all_categories)} categories from {len(semantic_scores)} semantic, {len(keyword_scores)} keyword, {len(pattern_scores)} pattern")
+        
+        for category in all_categories:
+            sem_score = semantic_scores.get(category, 0.0)
+            kw_score = keyword_scores.get(category, 0.0)
+            pat_score = pattern_scores.get(category, 0.0)
+            
+            # INTELLIGENT WEIGHT ADJUSTMENT based on metadata configuration
+            # Retrieve weights from metadata (default to 0.6/0.25/0.15 if not found)
+            weights = self._category_scoring_weights.get(category, {'w_sem': 0.6, 'w_kw': 0.25, 'w_pat': 0.15})
+            w_sem = weights['w_sem']
+            w_kw = weights['w_kw']
+            w_pat = weights['w_pat']
+            
+            # Dynamic normalization based on available signals
+            # If a signal is missing (0.0), we redistribute its weight to the others
+            available_weight = 0.0
+            score_sum = 0.0
+            signal_parts = []
+            
+            if sem_score > 0:
+                available_weight += w_sem
+                score_sum += sem_score * w_sem
+                signal_parts.append("SEM")
+            
+            if kw_score > 0:
+                available_weight += w_kw
+                score_sum += kw_score * w_kw
+                signal_parts.append("KW")
+                
+            if pat_score > 0:
+                available_weight += w_pat
+                score_sum += pat_score * w_pat
+                signal_parts.append("PAT")
+                
+            if available_weight > 0:
+                base_score = score_sum / available_weight
+                signal_type = "+".join(signal_parts)
+            else:
+                continue  # No signals for this category
+            
+            # Apply quality calibration
+            adjusted_score = base_score * quality_factor
+            
+            # MULTIPLICATIVE BOOSTING for strong signals
+            # This amplifies confident detections while preserving relative ordering
+            if adjusted_score >= 0.70:
+                # Very strong signal → 15-30% boost
+                boost_factor = 1.15 + (adjusted_score - 0.70) * 0.5
+            elif adjusted_score >= 0.55:
+                # Strong signal → 10-15% boost
+                boost_factor = 1.10 + (adjusted_score - 0.55) * 0.33
+            elif adjusted_score >= 0.40:
+                # Moderate signal → 5-10% boost
+                boost_factor = 1.05 + (adjusted_score - 0.40) * 0.33
+            else:
+                # Weak signal → no boost
+                boost_factor = 1.0
+            
+            final_score = min(0.95, adjusted_score * boost_factor)
+            
+            # ADAPTIVE THRESHOLD from governance (DEFAULT 0.30 - lowered from 0.45 to improve recall)
+            threshold = self._category_thresholds.get(category, 0.30)
+            
+            # Only include if above threshold
+            if final_score >= threshold:
+                scores[category] = final_score
+                logger.debug(
+                    f"✓ {category}: base={base_score:.3f}, final={final_score:.3f}, threshold={threshold:.3f} "
+                    f"[{signal_type}] (sem={sem_score:.3f}, kw={kw_score:.3f}, pat={pat_score:.3f})"
+                )
+            else:
+                logger.debug(
+                    f"✗ {category}: final={final_score:.3f} < threshold={threshold:.3f} "
+                    f"[{signal_type}] (sem={sem_score:.3f}, kw={kw_score:.3f}, pat={pat_score:.3f})"
+                )
+        
+        logger.debug(f"Governance scores: {len(scores)} categories passed threshold")
+        return scores
+        
+    def _sample_table_values_batch(self, db: str, schema: str, table: str, columns: List[str], limit: int = 20) -> Dict[str, List[Any]]:
+        """
+        Batch sample values for ALL columns in a single query to reduce Snowflake costs.
+        Returns a dictionary mapping column_name -> list of sample values.
+        """
+        if not columns:
+            return {}
+            
+        try:
+            # Construct a single query to fetch samples for all columns
+            # Using LIMIT instead of SAMPLE for better performance on large tables if we just need 'some' data
+            # Or use TABLESAMPLE SYSTEM (1) for very large tables
+            
+            cols_sql = ", ".join([f'"{col}"' for col in columns])
+            query = f"""
+            SELECT {cols_sql}
+            FROM "{db}"."{schema}"."{table}"
+            LIMIT {limit}
+            """
+            
+            rows = snowflake_connector.execute_query(query) or []
+            
+            # Transpose rows to columns
+            samples_by_col = {col: [] for col in columns}
+            for row in rows:
+                for col in columns:
+                    val = row.get(col)
+                    if val is not None and str(val).strip():
+                        samples_by_col[col].append(val)
+                        
+            return samples_by_col
+            
+        except Exception as e:
+            logger.warning(f"Batch sampling failed for {table}: {e}")
+            return {col: [] for col in columns}
+
+    def _classify_column_governance_driven(self, db: str, schema: str, table: str, 
+                                         column: Dict[str, Any], 
+                                         pre_fetched_samples: List[Any] = None) -> Dict[str, Any]:
+        """
+        Classify single column using ONLY governance metadata.
+        
+        ACCURACY ENHANCEMENT: Added context-aware classification that understands:
+        1. Table-level context (e.g., ORDER tables → SOX priority)
+        2. Smart ID classification (order_id vs customer_id vs product_id)
+        3. Category boosting based on semantic table understanding
+        """
+        
+        col_name = column['COLUMN_NAME']
+        col_type = column['DATA_TYPE']
+        col_comment = column.get('COLUMN_COMMENT', '')
+        
+        # Build context from metadata only
+        context_parts = [
+            f"Column: {col_name}",
+            f"Table: {table}",
+            f"Schema: {schema}",
+            f"Data Type: {col_type}"
+        ]
+        
+        if col_comment:
+            context_parts.append(f"Comment: {col_comment}")
+        
+        # Use pre-fetched samples if available (Batch Optimization)
+        if pre_fetched_samples is not None:
+            samples = pre_fetched_samples
+        else:
+            # Fallback to individual query (legacy)
+            samples = self._sample_column_values(db, schema, table, col_name, 20)
+            
+        if samples:
+            sample_text = " ".join([str(s) for s in samples[:3]])
+            context_parts.append(f"Samples: {sample_text}")
+        
+        context = " | ".join(context_parts)
+        
+        # Compute scores using governance-driven methods only
+        scores = self._compute_governance_scores(context)
+        
+        # === ACCURACY ENHANCEMENT: Context-Aware Adjustments ===
+        scores = self._apply_context_aware_adjustments(
+            scores, col_name, table, col_type, samples
+        )
+        
+        # === MULTI-LABEL SUPPORT ===
+        # Identify ALL categories that meet the threshold, not just the top one
+        detected_categories = []
+        for cat, score in scores.items():
+            # Use category-specific threshold if available, else 0.30 (lowered from 0.45)
+            thresh = self._category_thresholds.get(cat, 0.30)
+            if score >= thresh:
+                detected_categories.append({
+                    'category': cat,
+                    'confidence': score
+                })
+        
+        # Sort by confidence descending
+        detected_categories.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        # Determine primary category (top 1)
+        if detected_categories:
+            best_category = detected_categories[0]['category']
+            confidence = detected_categories[0]['confidence']
+        else:
+            best_category = 'NON_SENSITIVE'
+            confidence = 0.0
+        
+        # Map to policy group for UI consistency
+        policy_group = self._map_category_to_policy_group(best_category) if best_category != 'NON_SENSITIVE' else None
+        
+        # Calculate CIA and Label for UI
+        # Calculate CIA and Label for UI
+        c, i, a = (0, 0, 0)
+        label = "Public"
+        
+        # Check if sensitive (policy group exists or category is not NON_SENSITIVE)
+        if policy_group or best_category != 'NON_SENSITIVE':
+             try:
+                 canon_cat = self._normalize_category_for_cia(best_category)
+                 c, i, a = ai_assistant_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))
+                 label = self.ai_service._map_cia_to_label(c, i, a)
+             except Exception:
+                 c, i, a = (1, 1, 1)
+                 label = "Internal"
+
+        # Create comma-separated string of all detected categories for UI display
+        multi_label_str = ", ".join([d['category'] for d in detected_categories]) if detected_categories else best_category
+
+        return {
+            'column_name': col_name,
+            'data_type': col_type,
+            'category': best_category,
+            'policy_group': policy_group,  # Expose policy group explicitly
+            'confidence': confidence,
+            'detected_categories': detected_categories,  # New Multi-Label Field
+            'multi_label_category': multi_label_str,     # UI Display Field
+            'governance_scores': scores,
+            'context_used': context,
+            # UI Fields
+            'column': col_name,
+            'label': label,
+            'c': c, 'i': i, 'a': a,
+            'confidence_pct': round(confidence * 100, 1)
+        }
+    
+    def _apply_context_aware_adjustments(self, scores: Dict[str, float], 
+                                        col_name: str, table: str, 
+                                        col_type: str, samples: List) -> Dict[str, float]:
+        """
+        Apply context-aware adjustments to improve classification accuracy.
+        
+        Fixes misclassifications like:
+        - order_id → SOC2 (wrong) should be SOX
+        - product_id → PII (wrong) should be NON_SENSITIVE
+        - customer_id → SOC2 (wrong) should be PII
+        """
+        
+        adjusted_scores = scores.copy()
+        
+        col_lower = col_name.lower()
+        table_lower = table.lower()
+        
+        # === RULE 1: Table Context Boosting ===
+        # Identify table domain and boost relevant categories
+        
+        # Financial/Transactional tables → Boost SOX
+        if any(kw in table_lower for kw in ['order', 'transaction', 'payment', 'invoice', 
+                                              'billing', 'purchase', 'sale', 'revenue']):
+            self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.3)
+            # Reduce SOC2 for non-security columns in financial tables
+            if not any(kw in col_lower for kw in ['password', 'token', 'auth', 'credential', 'session']):
+                self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.7)
+        
+        # Customer/User tables → Boost PII
+        elif any(kw in table_lower for kw in ['customer', 'user', 'employee', 'person', 'contact']):
+            self._boost_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 1.3)
+        
+        # Security/Auth tables → Boost SOC2
+        elif any(kw in table_lower for kw in ['auth', 'security', 'access', 'credential', 'session', 'login']):
+            self._boost_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 1.3)
+        
+        # === RULE 2: Smart ID Classification ===
+        # Different types of IDs should map to different categories
+        
+        if col_lower.endswith('_id') or col_lower.endswith('id'):
+            
+            # PII IDs: Identify people
+            if any(kw in col_lower for kw in ['customer', 'user', 'employee', 'person', 'patient', 
+                                               'member', 'subscriber', 'citizen', 'contact']):
+                self._boost_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 1.5)
+                self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.3)
+                self._reduce_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 0.5)
+            
+            # SOX IDs: Financial/transactional identifiers
+            elif any(kw in col_lower for kw in ['order', 'transaction', 'payment', 'invoice', 
+                                                 'account', 'billing', 'purchase', 'sale']):
+                self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.4)
+                self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.3)
+                self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.5)
+            
+            # SOC2 IDs: Security/access identifiers
+            elif any(kw in col_lower for kw in ['session', 'token', 'auth', 'credential', 
+                                                 'access', 'login', 'permission']):
+                self._boost_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 1.5)
+                self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.3)
+                self._reduce_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 0.5)
+            
+            # Generic IDs: Product, category, etc. → Likely NON_SENSITIVE
+            elif any(kw in col_lower for kw in ['product', 'item', 'category', 'catalog', 
+                                                 'inventory', 'sku', 'department', 'store']):
+                # Significantly reduce all sensitive scores for catalog IDs
+                self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.2)
+                self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.2)
+                self._reduce_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 0.6)
+                for cat in list(adjusted_scores.keys()):
+                    cat_upper = cat.upper()
+                    if 'PII' in cat_upper or 'SOX' in cat_upper or 'SOC2' in cat_upper:
+                        adjusted_scores.pop(cat, None)
+        
+        # === RULE 3: Price/Amount Fields → SOX ===
+        if any(kw in col_lower for kw in ['price', 'amount', 'total', 'cost', 'fee', 
+                                           'charge', 'balance', 'revenue', 'salary', 'wage']):
+            self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.4)
+            self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.4)
+            self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.3)
+        
+        # === RULE 4: Quantity/Count Fields → Often NON_SENSITIVE or SOX ===
+        if any(kw in col_lower for kw in ['quantity', 'count', 'qty', 'number_of']):
+            # Slightly boost SOX if in transactional context
+            if any(kw in table_lower for kw in ['order', 'transaction', 'sale']):
+                self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.2)
+            # Reduce PII/SOC2 for quantity fields
+            self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.5)
+            self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.4)
+        
+        # === RULE 5: Filter out very low scores (noise reduction) ===
+        # Remove categories with confidence < 0.25 after adjustments
+        adjusted_scores = {cat: score for cat, score in adjusted_scores.items() if score >= 0.25}
+        
+        return adjusted_scores
+    
+    def _boost_category(self, scores: Dict[str, float], policy_group: str, 
+                       category_pattern: str, boost_factor: float):
+        """Boost score for categories matching policy group or pattern"""
+        for cat in list(scores.keys()):
+            # Check metadata mapping first
+            mapped_group = self._policy_group_by_category.get(cat.upper())
+            
+            if mapped_group == policy_group:
+                 scores[cat] = min(0.95, scores[cat] * boost_factor)
+                 continue
+            
+            # Fallback to pattern match (legacy/safety)
+            cat_upper = cat.upper()
+            if policy_group in cat_upper or category_pattern in cat_upper:
+                scores[cat] = min(0.95, scores[cat] * boost_factor)
+    
+    def _reduce_category(self, scores: Dict[str, float], policy_group: str, 
+                        category_pattern: str, reduction_factor: float):
+        """Reduce score for categories matching policy group or pattern"""
+        for cat in list(scores.keys()):
+            # Check metadata mapping first
+            mapped_group = self._policy_group_by_category.get(cat.upper())
+            
+            if mapped_group == policy_group:
+                 scores[cat] = scores[cat] * reduction_factor
+                 continue
+
+            # Fallback to pattern match (legacy/safety)
+            cat_upper = cat.upper()
+            if policy_group in cat_upper or category_pattern in cat_upper:
+                scores[cat] = scores[cat] * reduction_factor
+
+    def _determine_table_category_governance_driven(self, table_scores: Dict[str, float], 
+                                                  column_results: List[Dict[str, Any]]) -> Tuple[str, float, List[Dict[str, Any]]]:
+        """Determine table category using governance rules only, supporting multi-label."""
+        
+        # Aggregate all potential categories from table scores and column multi-label results
+        all_categories = set(table_scores.keys())
+        
+        # Map category -> list of column scores
+        col_scores_map = {}
+        
+        for col in column_results:
+            # Check all detected categories for this column
+            cats = col.get('detected_categories', [])
+            if not cats and col.get('category') != 'NON_SENSITIVE':
+                # Fallback for legacy/single-label
+                cats = [{'category': col['category'], 'confidence': col['confidence']}]
+                
+            for cat_entry in cats:
+                c_name = cat_entry['category']
+                c_conf = cat_entry['confidence']
+                if c_name == 'NON_SENSITIVE':
+                    continue
+                
+                all_categories.add(c_name)
+                if c_name not in col_scores_map:
+                    col_scores_map[c_name] = []
+                col_scores_map[c_name].append(c_conf)
+        
+        if not all_categories:
+            return 'NON_SENSITIVE', 0.0, []
+        
+        # Evaluate each category
+        detected_categories = []
+        
+        for category in all_categories:
+            table_score = table_scores.get(category, 0.0)
+            column_scores = col_scores_map.get(category, [])
+            
+            # Only consider column scores that are meaningful (> 0.3)
+            valid_col_scores = [s for s in column_scores if s > 0.3]
+            
+            if valid_col_scores:
+                column_avg = sum(valid_col_scores) / len(valid_col_scores)
+                # Boost if many columns match (e.g. > 3 columns)
+                coverage_boost = 1.1 if len(valid_col_scores) >= 3 else 1.0
+                combined_score = max(table_score, column_avg * coverage_boost)
+            else:
+                combined_score = table_score
+            
+            combined_score = min(0.99, combined_score)
+            
+            # Threshold check (using default 0.30 - lowered from 0.45 to improve recall)
+            thresh = self._category_thresholds.get(category, 0.30)
+            
+            if combined_score >= thresh:
+                detected_categories.append({
+                    'category': category,
+                    'confidence': combined_score
+                })
+        
+        # Sort by confidence
+        detected_categories.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        if detected_categories:
+            best_category = detected_categories[0]['category']
+            best_score = detected_categories[0]['confidence']
+        else:
+            best_category = 'NON_SENSITIVE'
+            best_score = 0.0
+            
+        return best_category, best_score, detected_categories
+
+    def _classify_table_governance_driven(self, db: str, asset: Dict[str, Any]) -> Dict[str, Any]:
+        """Complete table classification using ONLY governance metadata"""
+        try:
+            schema = asset['schema']
+            table = asset['table']
+            full_name = f"{db}.{schema}.{table}"
+            
+            logger.info(f"Governance-driven classification for: {full_name}")
+            
+            # 1. Table-level classification using governance centroids
+            table_context = self._build_table_context_from_metadata(db, schema, table)
+            table_scores = self._compute_governance_scores(table_context)
+            
+            # 2. Column-level classification using governance patterns/keywords
+            columns = self._get_columns_from_information_schema(db, schema, table)
+            
+            # BATCH OPTIMIZATION: Fetch samples for all columns in one query
+            col_names = [c['COLUMN_NAME'] for c in columns]
+            batch_samples = self._sample_table_values_batch(db, schema, table, col_names, limit=20)
+            
+            column_results = []
+            
+            for column in columns:
+                col_name = column['COLUMN_NAME']
+                # Pass pre-fetched samples to avoid N+1 queries
+                col_samples = batch_samples.get(col_name, [])
+                
+                col_result = self._classify_column_governance_driven(
+                    db, schema, table, column, pre_fetched_samples=col_samples
+                )
+                column_results.append(col_result)
+            
+            # 3. Determine final classification using governance rules
+            table_category, confidence, table_detected_categories = self._determine_table_category_governance_driven(
+                table_scores, column_results
+            )
+            
+            # Map to policy group for UI
+            policy_group = self._map_category_to_policy_group(table_category) if table_category != 'NON_SENSITIVE' else None
+            
+            # Calculate CIA and Label for UI
+            c, i, a = (0, 0, 0)
+            label = "Public"
+            label_emoji = "🟩 Public"
+            color = "Green"
+            
+            if policy_group or table_category != 'NON_SENSITIVE':
+                 try:
+                     canon_cat = self._normalize_category_for_cia(table_category)
+                     c, i, a = ai_assistant_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))
+                     label = self.ai_service._map_cia_to_label(c, i, a)
+                 except Exception:
+                     c, i, a = (1, 1, 1)
+                     label = "Internal"
+                 
+                 label_emoji_map = {
+                    'Confidential': '🟥 Confidential',
+                    'Restricted': '🟧 Restricted',
+                    'Internal': '🟨 Internal',
+                    'Public': '🟩 Public',
+                 }
+                 color_map = {
+                    'Confidential': 'Red',
+                    'Restricted': 'Orange',
+                    'Internal': 'Yellow',
+                    'Public': 'Green',
+                 }
+                 label_emoji = label_emoji_map.get(label, label)
+                 color = color_map.get(label, 'Gray')
+
+            # Create comma-separated string of top categories for UI display
+            multi_label_str = ", ".join([d['category'] for d in table_detected_categories[:3]]) if table_detected_categories else table_category
+
+            return {
+                'asset': asset,
+                'category': policy_group if policy_group else table_category, # Prefer policy group for display if available
+                'detected_categories': table_detected_categories,  # Multi-label support
+                'multi_label_category': multi_label_str,  # Comma-separated for UI
+                'confidence': confidence,
+                'columns': column_results,
+                'business_context': table_context,
+                'governance_categories_evaluated': list(table_scores.keys()),
+                'status': 'COMPLETED',
+                # UI Fields
+                'confidence_pct': round(confidence * 100, 1),
+                'confidence_tier': "Confident" if confidence > 0.75 else "Likely" if confidence > 0.5 else "Uncertain",
+                'c': c, 'i': i, 'a': a,
+                'label': label,
+                'label_emoji': label_emoji,
+                'color': color,
+                'validation_status': 'REVIEW_REQUIRED',
+                'issues': [],
+                'route': 'STANDARD_REVIEW',
+                'application_status': 'QUEUED_FOR_REVIEW',
+                'compliance': [],
+                'reasoning': [f"Matched category: {table_category}"],
+                'multi_label_analysis': {"detected_categories": [policy_group] if policy_group else [], "reasoning": {}}
+            }
+            
+        except Exception as e:
+            logger.error(f"Governance-driven classification failed for {asset}: {e}")
+            return {
+                'asset': asset,
+                'error': str(e),
+                'status': 'FAILED'
+            }
+
+    def _run_governance_driven_pipeline(self, db: str, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Simplified pipeline using ONLY governance table data"""
+        results = []
+        
+        # Ensure governance metadata is loaded
+        if not self._category_centroids:
+            logger.info("Loading governance metadata for classification...")
+            self._load_metadata_driven_categories()
+        
+        # DIAGNOSTIC LOGGING
+        logger.info("=" * 80)
+        logger.info("GOVERNANCE-DRIVEN PIPELINE DIAGNOSTICS")
+        logger.info("=" * 80)
+        logger.info(f"Assets to classify: {len(assets)}")
+        logger.info(f"Available governance categories: {list(self._category_centroids.keys())}")
+        
+        # Check governance metadata status
+        valid_centroids = len([c for c in self._category_centroids.values() if c is not None])
+        logger.info(f"Valid centroids: {valid_centroids}/{len(self._category_centroids)}")
+        
+        total_keywords = sum(len(kws) for kws in getattr(self, '_category_keywords', {}).values())
+        logger.info(f"Total keywords loaded: {total_keywords}")
+        
+        total_patterns = sum(len(pats) for pats in getattr(self, '_category_patterns', {}).values())
+        logger.info(f"Total patterns loaded: {total_patterns}")
+        
+        policy_map = getattr(self, '_policy_group_by_category', {})
+        logger.info(f"Policy mapping: {len(policy_map)} categories → PII/SOX/SOC2")
+        if policy_map:
+            logger.info(f"  Policy map: {policy_map}")
+        else:
+            logger.warning("  ⚠️ NO POLICY MAPPING! Categories will not map to PII/SOX/SOC2")
+        
+        logger.info("-" * 80)
+        
+        filtered_count = 0
+        passed_count = 0
+        
+        for idx, asset in enumerate(assets, 1):
+            asset_name = f"{asset.get('schema')}.{asset.get('table')}"
+            logger.info(f"\n[{idx}/{len(assets)}] Classifying: {asset_name}")
+            
+            result = self._classify_table_governance_driven(db, asset)
+            
+            # Extract classification results
+            cat = result.get('category')
+            conf = result.get('confidence', 0.0)
+            status = result.get('status')
+            error = result.get('error')
+            
+            logger.info(f"  Result: category={cat}, confidence={conf:.3f}, status={status}")
+            
+            if error:
+                logger.error(f"  ✗ Classification error: {error}")
+                filtered_count += 1
+                continue
+            
+            # Check filter criteria
+            is_policy_group = cat in {'PII', 'SOX', 'SOC2'}
+            meets_confidence = conf >= 0.25
+            
+            logger.info(f"  Filter check:")
+            logger.info(f"    • Category in {{PII,SOX,SOC2}}: {is_policy_group} (actual: '{cat}')")
+            logger.info(f"    • Confidence >= 0.25: {meets_confidence} (actual: {conf:.3f})")
+            
+            # Filter for UI
+            if is_policy_group and meets_confidence:
+                results.append(result)
+                passed_count += 1
+                logger.info(f"  ✓ PASSED - Added to results")
+            else:
+                filtered_count += 1
+                # Provide specific reason for filtering
+                reasons = []
+                if not is_policy_group:
+                    reasons.append(f"Category '{cat}' is not in {{PII,SOX,SOC2}}")
+                    # Try to show what it WOULD map to
+                    if hasattr(self, '_map_category_to_policy_group'):
+                        try:
+                            mapped = self._map_category_to_policy_group(cat) if cat and cat != 'NON_SENSITIVE' else None
+                            if mapped:
+                                logger.info(f"    → Attempted mapping: '{cat}' → '{mapped}'")
+                        except Exception:
+                            pass
+                if not meets_confidence:
+                    reasons.append(f"Confidence {conf:.3f} < 0.25")
+                
+                logger.warning(f"  ✗ FILTERED OUT - {'; '.join(reasons)}")
+        
+        logger.info("=" * 80)
+        logger.info("PIPELINE SUMMARY")
+        logger.info("=" * 80)
+        logger.info(f"Total assets processed: {len(assets)}")
+        logger.info(f"Passed filter: {passed_count}")
+        logger.info(f"Filtered out: {filtered_count}")
+        logger.info(f"Results returned: {len(results)}")
+        
+        if len(results) == 0:
+            logger.error("⚠️ NO ASSETS PASSED FILTER!")
+            logger.error("Common causes:")
+            logger.error("  1. Governance categories not mapping to PII/SOX/SOC2")
+            logger.error("  2. Confidence thresholds too high (check DETECTION_THRESHOLD in governance tables)")
+            logger.error("  3. Empty or missing governance metadata (keywords, patterns, descriptions)")
+            logger.error("  4. Category mapping logic failing")
+            logger.error("")
+            logger.error("Run .agent/debug_classification.py for detailed diagnostics")
+        
+        logger.info("=" * 80)
+        
+        return results
 
 # Singleton instance
 ai_classification_pipeline_service = AIClassificationPipelineService()

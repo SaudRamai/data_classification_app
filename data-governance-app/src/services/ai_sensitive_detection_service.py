@@ -70,14 +70,7 @@ class AISensitiveDetectionService:
         # Initialize base detector - REMOVED (Legacy)
         # self.detector = SensitiveDataDetector()
         # Lazy import to avoid circular dependency with ai_classification_service
-        if use_ai:
-            try:
-                from src.services.ai_classification_service import ai_classification_service
-                self.ai_service = ai_classification_service
-            except Exception:
-                self.ai_service = None
-        else:
-            self.ai_service = None
+        self._ai_service = None
 
         # Config caches loaded from governance views
         self.weights = {"AI": 0.35, "REGEX": 0.30, "KEYWORD": 0.35}
@@ -90,6 +83,25 @@ class AISensitiveDetectionService:
         
         # Cache for table metadata to avoid repeated queries
         self._metadata_cache: Dict[str, Dict] = {}
+
+    @property
+    def ai_service(self):
+        if not self.use_ai:
+            return None
+        if self._ai_service is None:
+            try:
+                from src.services.ai_classification_service import ai_classification_service
+                self._ai_service = ai_classification_service
+            except ImportError:
+                # Fallback to pipeline service if main service name not found
+                try:
+                    from src.services.ai_classification_service import ai_classification_pipeline_service
+                    self._ai_service = ai_classification_pipeline_service
+                except Exception:
+                    self._ai_service = None
+            except Exception:
+                self._ai_service = None
+        return self._ai_service
 
     def _normalize_db(self, db: Optional[str]) -> str:
         try:
@@ -789,15 +801,35 @@ class AISensitiveDetectionService:
         
         return final_results
 
+class _LazyAISensitiveDetectionService:
+    """
+    Lazily instantiate the real service on first attribute access.
+    This avoids executing Snowflake queries at import time, which can
+    raise and cause `ImportError: cannot import name 'ai_sensitive_detection_service'`.
+    """
+    def __init__(self):
+        self._instance = None
+        self._init_error = None
+
+    def _ensure_instance(self):
+        if self._instance is None and self._init_error is None:
+            try:
+                self._instance = AISensitiveDetectionService()
+            except Exception as e:
+                # Try fallback without AI
+                try:
+                    logger.warning(f"Failed to initialize AISensitiveDetectionService with AI: {e}, trying without AI...")
+                    self._instance = AISensitiveDetectionService(use_ai=False)
+                except Exception as e2:
+                    self._init_error = e2
+                    logger.error(f"Failed to initialize AISensitiveDetectionService even without AI: {e2}")
+                    raise
+
+    def __getattr__(self, item):
+        self._ensure_instance()
+        return getattr(self._instance, item)
+
+
 # Singleton instance
-try:
-    ai_sensitive_detection_service = AISensitiveDetectionService()
-except Exception as e:
-    logger.error(f"Failed to initialize ai_sensitive_detection_service: {e}")
-    # Create a minimal instance without AI to allow imports to succeed
-    try:
-        ai_sensitive_detection_service = AISensitiveDetectionService(use_ai=False)
-    except Exception as e2:
-        logger.error(f"Failed to create fallback instance: {e2}")
-        ai_sensitive_detection_service = None  # type: ignore
+ai_sensitive_detection_service = _LazyAISensitiveDetectionService()
 

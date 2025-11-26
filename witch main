@@ -1,0 +1,108 @@
+[33mcommit d872de9153fd04b4d8fea71a390f018407583d9d[m[33m ([m[1;36mHEAD[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m, [m[1;32mmain[m[33m)[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Mon Nov 24 19:17:45 2025 +0530
+
+    updated
+
+[33mcommit 604f84e419ea32ccbb85b1a2644cd4129c0f2d6f[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Mon Nov 24 13:05:15 2025 +0530
+
+    updated
+
+[33mcommit 89f03512eaf96a9e0be5157767d6c4cad7a56b58[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Fri Nov 21 18:24:25 2025 +0530
+
+    updated
+
+[33mcommit e8fc0eba34a5bacf88bde9a9e98121e6a058f09a[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Fri Nov 21 15:52:48 2025 +0530
+
+    updated
+
+[33mcommit aa84979c399b51ae822082cc552614b2fa9ee0d8[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Wed Nov 19 15:37:31 2025 +0530
+
+    updated
+
+[33mcommit 4a39bba04f413e409d98989f6bbc707c8de8bb5c[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Wed Nov 19 15:35:10 2025 +0530
+
+    updated
+
+[33mcommit 911b2025d0dfe46caddf9c6f7379f737a08896e4[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Wed Nov 12 19:13:31 2025 +0530
+
+    update
+
+[33mcommit 9f78583091bc15e284075d0c78540bc7f77fe66c[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Wed Nov 5 20:27:16 2025 +0530
+
+    updated
+
+[33mcommit f72399546e542b831a89dcf6c6d1bc2cfbed0671[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Tue Nov 4 20:02:45 2025 +0530
+
+    updated
+
+[33mcommit 4f7c93bc8c4e2718f720a9ae00a73e7cc4d543cc[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Tue Nov 4 16:22:49 2025 +0530
+
+    updated
+
+[33mcommit dd3e3e472ae85e1c4902b65020b0abc320419f08[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Tue Nov 4 14:04:33 2025 +0530
+
+    updated
+
+[33mcommit bcc0a2b781b6d6ffb45952c913e9f008ce088568[m[33m ([m[1;32mrestore-10hours-ago[m[33m)[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Fri Oct 31 14:54:45 2025 +0530
+
+    update
+
+[33mcommit 19344d78a2b3988e3e90af131fa2f0507ef65f64[m
+Merge: 53ec1d0 2a21850
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Fri Oct 31 14:43:14 2025 +0530
+
+    Resolved merge conflict in 011_seed_sensitivity_config.sql
+
+[33mcommit 53ec1d0acd1b3846fd5288d20568f9c9d3ea1879[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Fri Oct 31 14:27:34 2025 +0530
+
+    Update
+
+[33mcommit 2a218507ec3e3a516f9f8a1458fa9d2ff5865128[m
+Author: SaudRamai <136465879+SaudRamai@users.noreply.github.com>
+Date:   Thu Oct 30 14:20:50 2025 +0530
+
+    updated
+
+[33mcommit 79f13fdba5e4acfec56f32436324df27c16e5d52[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Thu Oct 30 13:01:16 2025 +0530
+
+    Add data governance application with classification and sensitive data detection features
+
+[33mcommit 19583e175b5b59ea36a3b0f693d8b1b993c4ef6c[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Mon Oct 13 14:42:46 2025 +0530
+
+    feat: update Classification module (AI Assistant, QA, tasks, services); remove deprecated pages; add tests/docs/sql
+
+[33mcommit 4ea834a2fd1a9a9be2bac39c361e4407558558e6[m
+Author: Ramai Saud <ramai.saud@impressico.local>
+Date:   Thu Oct 2 22:13:46 2025 +0530
+
+    first commit

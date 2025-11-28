@@ -92,19 +92,57 @@ class AISensitiveDetectionService:
         self._metadata_cache: Dict[str, Dict] = {}
 
     def _normalize_db(self, db: Optional[str]) -> str:
+        """Normalize database name and prevent 'NONE' errors."""
         try:
             s = (db or "").strip()
-            if not s or s.upper() in ("NONE", "NULL"):
+            if not s or s.upper() in ("NONE", "NULL", "(NONE)", "UNKNOWN"):
+                # Try to get from governance resolver
+                try:
+                    from src.services.governance_db_resolver import resolve_governance_db
+                    resolved = resolve_governance_db()
+                    if resolved and str(resolved).strip().upper() not in ("NONE", "NULL", "(NONE)", "UNKNOWN"):
+                        return str(resolved).strip()
+                except Exception:
+                    pass
+                
+                # Try to get from Snowflake context
+                try:
+                    rows = snowflake_connector.execute_query("SELECT CURRENT_DATABASE() AS DB") or []
+                    if rows and rows[0].get("DB"):
+                        current_db = str(rows[0].get("DB")).strip()
+                        if current_db.upper() not in ("NONE", "NULL", "(NONE)", "UNKNOWN"):
+                            return current_db
+                except Exception:
+                    pass
+                
+                # Fallback to settings
+                try:
+                    settings_db = getattr(settings, "SNOWFLAKE_DATABASE", None)
+                    if settings_db and str(settings_db).strip().upper() not in ("NONE", "NULL", "(NONE)", "UNKNOWN"):
+                        return str(settings_db).strip()
+                except Exception:
+                    pass
+                
+                # Last resort fallback
                 return "DATA_CLASSIFICATION_DB"
             return s
         except Exception:
             return "DATA_CLASSIFICATION_DB"
 
     def _gov_db(self) -> str:
+        """Get governance database with comprehensive fallback."""
         try:
-            return self._normalize_db(getattr(settings, "SNOWFLAKE_DATABASE", None))
+            # Try settings first
+            settings_db = getattr(settings, "SNOWFLAKE_DATABASE", None)
+            if settings_db:
+                normalized = self._normalize_db(settings_db)
+                if normalized and normalized.upper() not in ("NONE", "NULL", "(NONE)", "UNKNOWN"):
+                    return normalized
         except Exception:
-            return "DATA_CLASSIFICATION_DB"
+            pass
+        
+        # Fallback to normalization logic
+        return self._normalize_db(None)
         
     def discover_metadata(self, database: str, 
                          schema_filter: Optional[str] = None,
@@ -331,7 +369,8 @@ class AISensitiveDetectionService:
         try:
             compiled: List[Tuple[str, str, re.Pattern]] = []
             for p in self.pattern_rows:
-                pat = p.get("PATTERN_STRING")
+                # Try PATTERN_REGEX first (new schema), fall back to PATTERN_STRING (legacy)
+                pat = p.get("PATTERN_REGEX") or p.get("PATTERN_STRING")
                 if not pat or not p.get("IS_ACTIVE", True):
                     continue
                 try:
@@ -743,6 +782,65 @@ class AISensitiveDetectionService:
             final_results.append(table_info)
         
         return final_results
+    
+    def ensure_governance_tables(self) -> None:
+        """Ensure governance tables exist with proper schema (idempotent)."""
+        try:
+            db = self._gov_db()
+            gv = "DATA_CLASSIFICATION_GOVERNANCE"
+            
+            # Create schema
+            try:
+                snowflake_connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {db}.{gv}")
+            except Exception as e:
+                logger.warning(f"Schema creation skipped: {e}")
+            
+            # Create AI_ASSISTANT_SENSITIVE_ASSETS table
+            try:
+                snowflake_connector.execute_non_query(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {db}.{gv}.AI_ASSISTANT_SENSITIVE_ASSETS (
+                        RUN_ID STRING,
+                        DATABASE_NAME STRING,
+                        SCHEMA_NAME STRING,
+                        TABLE_NAME STRING,
+                        COLUMN_NAME STRING,
+                        DETECTED_CATEGORY STRING,
+                        DETECTED_TYPE STRING,
+                        COMBINED_CONFIDENCE FLOAT,
+                        METHODS_USED VARIANT,
+                        COMPLIANCE_TAGS VARIANT,
+                        SAMPLE_METADATA VARIANT,
+                        DETECTION_REASON STRING,
+                        LAST_SCAN_TS TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                        CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+                    )
+                    """
+                )
+            except Exception as e:
+                logger.warning(f"Table creation skipped: {e}")
+            
+            # Add columns if they don't exist (handle "already exists" errors gracefully)
+            try:
+                snowflake_connector.execute_non_query(
+                    f"ALTER TABLE {db}.{gv}.AI_ASSISTANT_SENSITIVE_ASSETS ADD COLUMN IF NOT EXISTS PREV_SHA256_HEX STRING"
+                )
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    logger.warning(f"Column PREV_SHA256_HEX add failed: {e}")
+            
+            try:
+                snowflake_connector.execute_non_query(
+                    f"ALTER TABLE {db}.{gv}.AI_ASSISTANT_SENSITIVE_ASSETS ADD COLUMN IF NOT EXISTS CHAIN_SHA256_HEX STRING"
+                )
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    logger.warning(f"Column CHAIN_SHA256_HEX add failed: {e}")
+            
+            logger.info("Governance tables verified/created successfully")
+            
+        except Exception as e:
+            logger.warning(f"Governance table setup failed: {e}")
 
 # Singleton instance
 ai_sensitive_detection_service = AISensitiveDetectionService()

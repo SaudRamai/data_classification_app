@@ -1,0 +1,390 @@
+# Governance Tagging Engine
+
+## Overview
+
+The Governance Tagging Engine automatically generates Snowflake governance tags based on sensitivity classifications (PII, SOX, SOC2, or NONE) and supports manual tag overrides.
+
+## Implementation
+
+### Location
+- **File**: `src/services/ai_classification_pipeline_service.py`
+- **Method**: `_generate_governance_tags(category, policy_group, manual_overrides)`
+
+### Integration Points
+1. **Column-level classification**: `_classify_column_governance_driven()` - Line ~4418
+2. **Table-level classification**: `_classify_table_governance_driven()` - Line ~4691
+
+---
+
+## Auto-Tagging Rules
+
+### 1. PII (Personal Identifiable Information)
+```python
+{
+    'DATA_CLASSIFICATION': 'Confidential',
+    'DATA_CATEGORY': 'Personal_Data',
+    'REGULATORY_FRAMEWORK': 'GDPR',
+    'CONFIDENTIALITY_LEVEL': 'C3',
+    'INTEGRITY_LEVEL': 'I2',
+    'AVAILABILITY_LEVEL': 'A1'
+}
+```
+
+**Reasoning**: PII requires maximum confidentiality (C3) to protect personal data under GDPR. Moderate integrity (I2) ensures data accuracy, while low availability (A1) reflects that personal data doesn't require high uptime.
+
+---
+
+### 2. SOX (Sarbanes-Oxley)
+```python
+{
+    'DATA_CLASSIFICATION': 'Confidential',
+    'DATA_CATEGORY': 'Financial_Data',
+    'REGULATORY_FRAMEWORK': 'SOX',
+    'CONFIDENTIALITY_LEVEL': 'C3',
+    'INTEGRITY_LEVEL': 'I3',
+    'AVAILABILITY_LEVEL': 'A2'
+}
+```
+
+**Reasoning**: Financial data requires maximum integrity (I3) for audit accuracy and high confidentiality (C3). Moderate availability (A2) ensures financial systems remain accessible for reporting.
+
+---
+
+### 3. SOC2 (Service Organization Control 2)
+
+SOC2 tags are determined by **Trust Service Principles**:
+
+#### Security (Default)
+```python
+{
+    'CONFIDENTIALITY_LEVEL': 'C2',
+    'INTEGRITY_LEVEL': 'I2',
+    'AVAILABILITY_LEVEL': 'A2'
+}
+```
+
+#### Availability
+```python
+{
+    'CONFIDENTIALITY_LEVEL': 'C1',
+    'INTEGRITY_LEVEL': 'I1',
+    'AVAILABILITY_LEVEL': 'A3'
+}
+```
+
+#### Confidentiality
+```python
+{
+    'CONFIDENTIALITY_LEVEL': 'C3',
+    'INTEGRITY_LEVEL': 'I2',
+    'AVAILABILITY_LEVEL': 'A2'
+}
+```
+
+#### Processing Integrity
+```python
+{
+    'CONFIDENTIALITY_LEVEL': 'C1',
+    'INTEGRITY_LEVEL': 'I3',
+    'AVAILABILITY_LEVEL': 'A2'
+}
+```
+
+#### Privacy
+```python
+{
+    'CONFIDENTIALITY_LEVEL': 'C3',
+    'INTEGRITY_LEVEL': 'I2',
+    'AVAILABILITY_LEVEL': 'A2'
+}
+```
+
+**Detection Logic**: The engine examines the category name (e.g., `SOC2_AVAILABILITY_DATA`) to determine the trust principle.
+
+---
+
+### 4. NONE (Non-Sensitive)
+- **No tags generated** unless manual overrides are provided.
+
+---
+
+## Manual Tag Overrides
+
+### How It Works
+Manual tags **override** auto-generated tags for specified fields only. All other fields follow auto-tagging rules.
+
+### Example 1: Override Confidentiality Level
+```python
+# Auto-generated for PII
+auto_tags = {
+    'DATA_CLASSIFICATION': 'Confidential',
+    'CONFIDENTIALITY_LEVEL': 'C3',  # Auto
+    'INTEGRITY_LEVEL': 'I2',
+    'AVAILABILITY_LEVEL': 'A1'
+}
+
+# User provides override
+manual_overrides = {'CONFIDENTIALITY_LEVEL': 'C2'}
+
+# Final output
+final_tags = {
+    'DATA_CLASSIFICATION': 'Confidential',
+    'CONFIDENTIALITY_LEVEL': 'C2',  # ← OVERRIDDEN
+    'INTEGRITY_LEVEL': 'I2',        # Auto
+    'AVAILABILITY_LEVEL': 'A1'      # Auto
+}
+```
+
+### Example 2: Add Custom Tags
+```python
+manual_overrides = {
+    'CONFIDENTIALITY_LEVEL': 'C1',
+    'CUSTOM_TAG': 'SpecialValue',
+    'DEPARTMENT': 'Finance'
+}
+
+# All manual tags are merged into final output
+final_tags = {
+    'DATA_CLASSIFICATION': 'Confidential',
+    'CONFIDENTIALITY_LEVEL': 'C1',  # Override
+    'INTEGRITY_LEVEL': 'I2',        # Auto
+    'AVAILABILITY_LEVEL': 'A1',     # Auto
+    'CUSTOM_TAG': 'SpecialValue',   # Manual
+    'DEPARTMENT': 'Finance'         # Manual
+}
+```
+
+---
+
+## Tag Validation
+
+### Valid Ranges
+The engine validates CIA levels to ensure compliance:
+
+| Tag Field | Valid Values | Description |
+|-----------|--------------|-------------|
+| `CONFIDENTIALITY_LEVEL` | C0, C1, C2, C3 | 0=Public, 3=Highly Confidential |
+| `INTEGRITY_LEVEL` | I0, I1, I2, I3 | 0=No integrity req, 3=Critical |
+| `AVAILABILITY_LEVEL` | A0, A1, A2, A3 | 0=No uptime req, 3=24/7 critical |
+
+### Invalid Tag Handling
+If a manual override provides an invalid value (e.g., `C9`, `I5`), the engine:
+1. Logs a warning
+2. **Removes the invalid tag** from the final output
+3. Continues with valid tags
+
+**Example**:
+```python
+manual_overrides = {'CONFIDENTIALITY_LEVEL': 'C9'}  # Invalid!
+
+# Result: CONFIDENTIALITY_LEVEL is removed
+final_tags = {
+    'DATA_CLASSIFICATION': 'Confidential',
+    # CONFIDENTIALITY_LEVEL removed due to invalid value
+    'INTEGRITY_LEVEL': 'I2',
+    'AVAILABILITY_LEVEL': 'A1'
+}
+```
+
+---
+
+## Output Format
+
+### Return Value
+```python
+(tags: Dict[str, str], reasoning: List[str])
+```
+
+### Example Output
+```python
+tags = {
+    'DATA_CLASSIFICATION': 'Confidential',
+    'DATA_CATEGORY': 'Personal_Data',
+    'REGULATORY_FRAMEWORK': 'GDPR',
+    'CONFIDENTIALITY_LEVEL': 'C3',
+    'INTEGRITY_LEVEL': 'I2',
+    'AVAILABILITY_LEVEL': 'A1'
+}
+
+reasoning = [
+    "Auto-tags generated for PII (GDPR/Confidential)."
+]
+```
+
+### With Manual Overrides
+```python
+tags = {
+    'DATA_CLASSIFICATION': 'Confidential',
+    'DATA_CATEGORY': 'Personal_Data',
+    'REGULATORY_FRAMEWORK': 'GDPR',
+    'CONFIDENTIALITY_LEVEL': 'C2',  # Overridden
+    'INTEGRITY_LEVEL': 'I2',
+    'AVAILABILITY_LEVEL': 'A1'
+}
+
+reasoning = [
+    "Auto-tags generated for PII (GDPR/Confidential).",
+    "Manual overrides applied for: CONFIDENTIALITY_LEVEL."
+]
+```
+
+---
+
+## Integration with Classification Results
+
+### Column-Level Results
+```python
+{
+    'column_name': 'email',
+    'category': 'PII_PERSONAL_INFO',
+    'policy_group': 'PII',
+    'confidence': 0.92,
+    'governance_tags': {
+        'DATA_CLASSIFICATION': 'Confidential',
+        'CONFIDENTIALITY_LEVEL': 'C3',
+        ...
+    },
+    'tag_reasoning': [
+        "Auto-tags generated for PII (GDPR/Confidential)."
+    ],
+    ...
+}
+```
+
+### Table-Level Results
+```python
+{
+    'asset': {...},
+    'category': 'PII',
+    'confidence': 0.88,
+    'governance_tags': {
+        'DATA_CLASSIFICATION': 'Confidential',
+        'DATA_CATEGORY': 'Personal_Data',
+        ...
+    },
+    'tag_reasoning': [
+        "Auto-tags generated for PII (GDPR/Confidential)."
+    ],
+    'columns': [...]
+}
+```
+
+---
+
+## Usage Examples
+
+### Basic Usage (Auto-Tagging)
+```python
+from src.services.ai_classification_pipeline_service import ai_classification_pipeline_service
+
+service = ai_classification_pipeline_service
+
+# Generate tags for PII
+tags, reasoning = service._generate_governance_tags(
+    category='PII_PERSONAL_INFO',
+    policy_group='PII'
+)
+
+print(tags)
+# {'DATA_CLASSIFICATION': 'Confidential', 'CONFIDENTIALITY_LEVEL': 'C3', ...}
+```
+
+### With Manual Overrides
+```python
+# Override confidentiality level
+overrides = {'CONFIDENTIALITY_LEVEL': 'C2'}
+
+tags, reasoning = service._generate_governance_tags(
+    category='PII_PERSONAL_INFO',
+    policy_group='PII',
+    manual_overrides=overrides
+)
+
+print(tags['CONFIDENTIALITY_LEVEL'])  # 'C2' (overridden)
+print(reasoning)
+# ['Auto-tags generated for PII...', 'Manual overrides applied for: CONFIDENTIALITY_LEVEL.']
+```
+
+### SOC2 Trust Principle Detection
+```python
+# Security (default)
+tags, _ = service._generate_governance_tags('SOC2_SECURITY_DATA', 'SOC2')
+# C2, I2, A2
+
+# Availability
+tags, _ = service._generate_governance_tags('SOC2_AVAILABILITY_DATA', 'SOC2')
+# C1, I1, A3
+
+# Privacy
+tags, _ = service._generate_governance_tags('SOC2_PRIVACY_DATA', 'SOC2')
+# C3, I2, A2
+```
+
+---
+
+## Testing
+
+### Test Script
+Run `test_governance_tagging.py` to validate all tagging rules:
+
+```bash
+python test_governance_tagging.py
+```
+
+### Test Coverage
+- ✅ PII auto-tagging
+- ✅ SOX auto-tagging
+- ✅ SOC2 trust principle detection (Security, Availability, Confidentiality, Processing Integrity, Privacy)
+- ✅ Manual overrides
+- ✅ Invalid tag validation
+- ✅ NONE sensitivity handling
+
+---
+
+## Best Practices
+
+### 1. Always Provide Policy Group
+The `policy_group` parameter (PII/SOX/SOC2) is critical for correct tag generation.
+
+### 2. Validate Manual Overrides
+Ensure manual overrides use valid CIA levels (C0-C3, I0-I3, A0-A3).
+
+### 3. Document Override Rationale
+When using manual overrides, document why the auto-tags were insufficient.
+
+### 4. Review Tag Reasoning
+The `tag_reasoning` output explains how tags were generated and which fields were overridden.
+
+---
+
+## Troubleshooting
+
+### Issue: No Tags Generated
+**Cause**: `policy_group` is `NONE` or `category` is `NON_SENSITIVE`  
+**Solution**: Ensure the asset is classified as PII/SOX/SOC2
+
+### Issue: Manual Override Ignored
+**Cause**: Invalid tag value (e.g., `C9`)  
+**Solution**: Check logs for validation warnings and use valid ranges
+
+### Issue: Wrong Trust Principle for SOC2
+**Cause**: Category name doesn't contain trust principle keywords  
+**Solution**: Ensure category names include keywords like `AVAILABILITY`, `CONFIDENTIALITY`, `PRIVACY`, etc.
+
+---
+
+## Future Enhancements
+
+1. **Dynamic Tag Schemas**: Load tag schemas from Snowflake governance tables
+2. **Tag Templates**: Pre-defined tag templates for common use cases
+3. **Bulk Tagging**: Apply tags to multiple assets in a single operation
+4. **Tag Versioning**: Track tag changes over time with audit logs
+5. **Compliance Validation**: Validate tags against regulatory requirements (GDPR, SOX, SOC2)
+
+---
+
+## Related Documentation
+
+- **Classification Pipeline**: `GOVERNANCE_DRIVEN_CLASSIFICATION.md`
+- **CIA Mapping**: `AI_CLASSIFICATION_ENHANCEMENTS.md`
+- **Snowflake Tagging**: `docs/snowflake_tagging.md`

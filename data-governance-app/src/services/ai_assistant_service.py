@@ -72,10 +72,10 @@ class ai_assistant_service:
 
     # CIA mappings per category
     CIA_MAPPING = {
-        'PERSONAL_DATA': (2, 3, 2),  # C2+, I3, A2
-        'FINANCIAL_DATA': (3, 3, 3),  # C3, I3, A3
+        'PERSONAL_DATA': (3, 2, 2),  # PII: C3 (Very High), I2 (High), A2 (Medium)
+        'FINANCIAL_DATA': (3, 3, 2),  # SOX: C3 (High), I3 (Critical), A2 (Medium)
         'PROPRIETARY_DATA': (2, 2, 1),  # C2, I2, A1
-        'REGULATORY_DATA': (3, 3, 2),  # C3, I3, A2
+        'REGULATORY_DATA': (3, 3, 2),  # SOC2/HIPAA: C3, I3, A2 (Safe default)
         'INTERNAL': (1, 1, 1),  # C1, I1, A1
         'PUBLIC_DATA': (0, 0, 0),  # C0, I0, A0
     }
@@ -441,14 +441,20 @@ class ai_assistant_service:
         # Additional logic for sensitive categories
         detected_cats = set(category_scores.keys())
 
-        # Regulatory minimums
-        if {'GDPR', 'CCPA', 'REGULATORY_DATA', 'HIPAA', 'PCI'} & detected_cats:
-            c = max(c, 3)
-        if {'PERSONAL_DATA', 'PII'} & detected_cats:
-            c = max(c, 2)
-        if {'FINANCIAL_DATA', 'SOX'} & detected_cats:
+        # PII Rule: Confidentiality must ALWAYS be C3 (Very High)
+        if category == 'PERSONAL_DATA' or 'PERSONAL_DATA' in detected_cats:
+            c = 3
+        
+        # SOX Rule: Integrity must ALWAYS be I3 (Critical)
+        if category == 'FINANCIAL_DATA' or 'FINANCIAL_DATA' in detected_cats:
+            i = 3
+            # SOX also implies High Confidentiality (C2/C3)
             c = max(c, 2)
 
+        # SOC2 Rule: Depends on trust principle (mapped to REGULATORY_DATA)
+        # Default for REGULATORY_DATA is (3, 3, 2) which is safe.
+        # If we could detect specific principles, we would adjust here.
+        
         return c, i, a
 
     def _map_cia_to_label(self, c: int, i: int, a: int) -> str:

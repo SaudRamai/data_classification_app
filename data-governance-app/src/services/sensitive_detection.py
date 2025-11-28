@@ -110,7 +110,7 @@ def _load_patterns_from_db() -> None:
             """
             SELECT 
                 p.PATTERN_NAME as name,
-                p.PATTERN_STRING as pattern,
+                p.PATTERN_REGEX as pattern,
                 c.CATEGORY_NAME as category,
                 p.SENSITIVITY_WEIGHT as weight
             FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS p

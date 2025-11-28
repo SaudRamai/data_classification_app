@@ -46,6 +46,7 @@ except Exception:
     ai_assistant_service = None
 from src.services.ai_sensitive_tables_service import ai_sensitive_tables_service
 from src.services.ai_classification_pipeline_service import ai_classification_pipeline_service
+from src.services.decision_matrix_service import validate as dm_validate
 
 def _detect_sensitive_tables(database: str, schema: Optional[str] = None, sample_size: int = 1000) -> List[Dict[str, Any]]:
     """Detect sensitive tables in the specified database using metadata, patterns, and AI.
@@ -6085,7 +6086,8 @@ with tab_tasks:
 
         def _fetch_audit_trail(_db: str, _gv: str, lookback_days: int) -> pd.DataFrame:
             try:
-                cols = _get_object_columns(_db, _gv, "CLASSIFICATION_AUDIT_VW")
+                cols = _get_object_columns(_db, _gv, "VW_CLASSIFICATION_AUDIT")
+
                 ts_col = _first_existing(["CREATED_AT","UPDATED_AT","EVENT_AT","TS","TIMESTAMP"], cols)
                 where = []
                 params = {}
@@ -6105,11 +6107,12 @@ with tab_tasks:
                         params[f"ac{i}"] = a
                 sql = f"""
                     select *
-                    from {_db}.{_gv}.CLASSIFICATION_AUDIT_VW
+                    from {_db}.{_gv}.VW_CLASSIFICATION_AUDIT
                     {('WHERE ' + ' AND '.join(where)) if where else ''}
                     {('ORDER BY ' + ts_col + ' DESC') if ts_col else ''}
                     limit 1000
                 """
+
                 rows = snowflake_connector.execute_query(sql, params) or []
                 return pd.DataFrame(rows)
             except Exception as e:

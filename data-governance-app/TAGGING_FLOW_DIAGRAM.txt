@@ -1,0 +1,201 @@
+================================================================================
+GOVERNANCE TAGGING ENGINE - FLOW DIAGRAM
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     DATA CLASSIFICATION PIPELINE                        │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Column/Table Classification                                            │
+│  • Semantic scoring                                                     │
+│  • Keyword matching                                                     │
+│  • Pattern detection                                                    │
+│  ────────────────────────────────────────────────────────────────────  │
+│  Result: category = "PII_PERSONAL_INFO", policy_group = "PII"          │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    _generate_governance_tags()                          │
+│                                                                         │
+│  Input:                                                                 │
+│  • category: "PII_PERSONAL_INFO"                                        │
+│  • policy_group: "PII"                                                  │
+│  • manual_overrides: {"CONFIDENTIALITY_LEVEL": "C2"} (optional)        │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    ▼                               ▼
+        ┌───────────────────────┐       ┌──────────────────────┐
+        │   AUTO-TAGGING        │       │  MANUAL OVERRIDES    │
+        │   RULES ENGINE        │       │  (Optional)          │
+        └───────────────────────┘       └──────────────────────┘
+                    │                               │
+        ┌───────────┴───────────┐                   │
+        ▼           ▼           ▼                   │
+    ┌─────┐   ┌─────┐   ┌──────────┐               │
+    │ PII │   │ SOX │   │  SOC2    │               │
+    └─────┘   └─────┘   └──────────┘               │
+        │         │            │                    │
+        │         │            │                    │
+        │         │     ┌──────┴──────┐             │
+        │         │     ▼             ▼             │
+        │         │  Security    Availability       │
+        │         │  Privacy     Confidentiality    │
+        │         │  Processing Integrity           │
+        │         │                                 │
+        ▼         ▼            ▼                    │
+    ┌─────────────────────────────────────────┐    │
+    │  AUTO-GENERATED TAGS                    │    │
+    │  {                                      │    │
+    │    DATA_CLASSIFICATION: "Confidential", │    │
+    │    DATA_CATEGORY: "Personal_Data",      │    │
+    │    REGULATORY_FRAMEWORK: "GDPR",        │    │
+    │    CONFIDENTIALITY_LEVEL: "C3",         │    │
+    │    INTEGRITY_LEVEL: "I2",               │    │
+    │    AVAILABILITY_LEVEL: "A1"             │    │
+    │  }                                      │    │
+    └─────────────────────────────────────────┘    │
+                    │                              │
+                    └──────────┬───────────────────┘
+                               ▼
+                    ┌──────────────────────┐
+                    │   MERGE LOGIC        │
+                    │                      │
+                    │  final_tags =        │
+                    │    manual_overrides  │
+                    │    OR auto_tags      │
+                    └──────────────────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │   TAG VALIDATION     │
+                    │                      │
+                    │  • C0-C3 ✓           │
+                    │  • I0-I3 ✓           │
+                    │  • A0-A3 ✓           │
+                    │  • Invalid → Remove  │
+                    └──────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  FINAL OUTPUT                                                           │
+│                                                                         │
+│  tags = {                                                               │
+│    DATA_CLASSIFICATION: "Confidential",                                 │
+│    DATA_CATEGORY: "Personal_Data",                                      │
+│    REGULATORY_FRAMEWORK: "GDPR",                                        │
+│    CONFIDENTIALITY_LEVEL: "C2",  ← OVERRIDDEN                          │
+│    INTEGRITY_LEVEL: "I2",        ← AUTO                                │
+│    AVAILABILITY_LEVEL: "A1"      ← AUTO                                │
+│  }                                                                      │
+│                                                                         │
+│  reasoning = [                                                          │
+│    "Auto-tags generated for PII (GDPR/Confidential).",                 │
+│    "Manual overrides applied for: CONFIDENTIALITY_LEVEL."              │
+│  ]                                                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  CLASSIFICATION RESULT (with tags)                                      │
+│                                                                         │
+│  {                                                                      │
+│    column_name: "email",                                                │
+│    category: "PII_PERSONAL_INFO",                                       │
+│    policy_group: "PII",                                                 │
+│    confidence: 0.92,                                                    │
+│    governance_tags: { ... },      ← TAGS ADDED HERE                    │
+│    tag_reasoning: [ ... ],        ← REASONING ADDED HERE               │
+│    ...                                                                  │
+│  }                                                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+AUTO-TAGGING DECISION TREE
+================================================================================
+
+                        policy_group?
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+      PII                   SOX                  SOC2
+        │                     │                     │
+        ▼                     ▼                     │
+   ┌─────────┐          ┌─────────┐                │
+   │ GDPR    │          │ SOX     │                │
+   │ C3/I2/A1│          │ C3/I3/A2│                │
+   └─────────┘          └─────────┘                │
+                                                   │
+                                    ┌──────────────┴──────────────┐
+                                    │  Examine category name      │
+                                    └──────────────┬──────────────┘
+                                                   │
+        ┌──────────────┬──────────────┬────────────┼────────────┬──────────────┐
+        ▼              ▼              ▼            ▼            ▼              ▼
+   SECURITY      AVAILABILITY  CONFIDENTIALITY  PROCESSING  PRIVACY       (default)
+   C2/I2/A2       C1/I1/A3       C3/I2/A2       C1/I3/A2   C3/I2/A2      C2/I2/A2
+
+================================================================================
+MANUAL OVERRIDE FLOW
+================================================================================
+
+User provides:
+  manual_overrides = {
+    "CONFIDENTIALITY_LEVEL": "C2",
+    "CUSTOM_TAG": "Finance"
+  }
+
+Step 1: Generate auto-tags
+  auto_tags = {
+    "DATA_CLASSIFICATION": "Confidential",
+    "CONFIDENTIALITY_LEVEL": "C3",  ← Will be overridden
+    "INTEGRITY_LEVEL": "I2",
+    "AVAILABILITY_LEVEL": "A1"
+  }
+
+Step 2: Apply overrides
+  for key, value in manual_overrides:
+    if auto_tags[key] != value:
+      track as overridden
+    auto_tags[key] = value
+
+Step 3: Result
+  final_tags = {
+    "DATA_CLASSIFICATION": "Confidential",
+    "CONFIDENTIALITY_LEVEL": "C2",     ← OVERRIDDEN
+    "INTEGRITY_LEVEL": "I2",           ← AUTO
+    "AVAILABILITY_LEVEL": "A1",        ← AUTO
+    "CUSTOM_TAG": "Finance"            ← MANUAL (new)
+  }
+
+  reasoning = [
+    "Auto-tags generated for PII (GDPR/Confidential).",
+    "Manual overrides applied for: CONFIDENTIALITY_LEVEL."
+  ]
+
+================================================================================
+VALIDATION FLOW
+================================================================================
+
+For each tag in final_tags:
+  │
+  ├─ Is it CONFIDENTIALITY_LEVEL?
+  │  └─ Value matches C[0-3]? ✓ Keep : ✗ Remove + Log Warning
+  │
+  ├─ Is it INTEGRITY_LEVEL?
+  │  └─ Value matches I[0-3]? ✓ Keep : ✗ Remove + Log Warning
+  │
+  ├─ Is it AVAILABILITY_LEVEL?
+  │  └─ Value matches A[0-3]? ✓ Keep : ✗ Remove + Log Warning
+  │
+  └─ Other tags → Keep (no validation)
+
+Example:
+  Input:  {"CONFIDENTIALITY_LEVEL": "C9"}  ← Invalid!
+  Output: {}  ← Removed
+  Log:    "WARNING: Invalid tag value for CONFIDENTIALITY_LEVEL: C9. Removing."
+
+================================================================================

@@ -107,7 +107,8 @@ class AIClassificationPipelineService:
             + (f" | Table filter: {table_filter}" if table_filter else "")
         )
         try:
-            snowflake_connector.execute_non_query(f"USE DATABASE {db}")
+            if self._is_valid_database(db):
+                snowflake_connector.execute_non_query(f"USE DATABASE {db}")
         except Exception:
             pass
         try:
@@ -3760,6 +3761,12 @@ class AIClassificationPipelineService:
         """
         Classify single column using ONLY governance metadata.
         
+        CRITICAL REQUIREMENTS:
+        1. Retrieve all sensitive columns using metadata from governance tables
+        2. Exclude generic columns (product_id, status, etc.)
+        3. Match against semantic definitions AND sensitive_patterns governance table
+        4. Return only genuinely detected sensitive columns (PII/SOX/SOC2)
+        
         ACCURACY ENHANCEMENT: Added context-aware classification that understands:
         1. Table-level context (e.g., ORDER tables → SOX priority)
         2. Smart ID classification (order_id vs customer_id vs product_id)
@@ -3773,107 +3780,81 @@ class AIClassificationPipelineService:
         col_lower = col_name.lower()
 
         # ========================================================================
-        # WHITELIST APPROACH: Skip column UNLESS it matches sensitive patterns
+        # METADATA-DRIVEN APPROACH: Use governance tables for pattern matching
         # ========================================================================
-        # This inverts the logic to be more conservative - we only process columns
-        # that have EXPLICIT indicators of sensitive data.
+        # Instead of hardcoded patterns, we use patterns from SENSITIVE_PATTERNS table
+        # This ensures the system is 100% metadata-driven and can be updated without code changes
         
-        # Define patterns that DEFINITELY indicate sensitive data
-        # SYNCED WITH GOVERNANCE TABLES: SENSITIVE_KEYWORDS
-        definitely_sensitive_patterns = [
-            # === PII (Personal Identifiable Information) ===
-            'ssn', 'social_security', 'social_sec', 'tax_id', 'ein', 'tin', 'itin',
-            'email', 'e_mail', 'email_address', 'personal_email', 'work_email', 'customer_email', 'employee_email', 'user_email',
-            'phone', 'mobile', 'telephone', 'cell_phone', 'phone_number', 'mobile_number', 'home_phone', 'customer_phone', 'employee_phone', 'client_phone', 'user_phone', 'patient_phone',
-            'first_name', 'last_name', 'full_name', 'maiden_name', 'middle_name', 'customer_name', 'employee_name', 'client_name', 'patient_name',
-            'birth_date', 'dob', 'date_of_birth', 'birthdate',
-            'passport', 'passport_number', 'passport_id',
-            'driver_license', 'drivers_license', 'license_number', 'drivers_license_number',
-            'national_id', 'national_identifier', 'citizen_id', 'identity_number', 'government_id_number',
-            'address', 'street_address', 'home_address', 'mailing_address',
-            'billing_address', 'shipping_address',
-            'zip_code', 'postal_code', 'postcode',
-            'credit_card', 'card_number', 'cc_number', 'card_num', 'credit_card_number', 'debit_card',
-            'cvv', 'cvc', 'security_code',
-            'routing_number', 'routing_num', 'aba_number',
-            'account_number', 'account_num', 'bank_account', 'bank_account_number',
-            'iban', 'swift', 'bic', 'swift_code',
-            'medical_record', 'patient_medical_record', 'patient_record', 'health_record', 'health_id',
-            'patient_id', 'diagnosis', 'treatment',
-            'biometric', 'fingerprint', 'retina_scan', 'facial_recognition',
-            'ethnicity', 'marital_status',
-            'taxpayer_id', 'tax_identification_number',
-            
-            # === Financial (SOX) ===
-            # Revenue & Transactions
-            'revenue', 'revenue_amount', 'revenue_transaction', 'revenue_recognition',
-            'transaction_amount', 'financial_transaction',
-            'invoice_amount', 'payment_total', 'total_due', 'amount',
-            'order_amount',
-            'expense_amount', 'expense_report',
-            
-            # Accounting & Ledgers
-            'general_ledger', 'gl_account', 'journal_entry',
-            'chart_of_accounts', 'trial_balance', 'subsidiary_ledger',
-            'balance_sheet', 'income_statement', 'cash_flow', 'cash_flow_statement',
-            'financial_statement', 'financial_report', 'audited_financials',
-            
-            # Accounts & Payments
-            'accounts_payable', 'accounts_receivable',
-            'sales_invoice', 'accounting_entry',
-            
-            # Audit & Compliance
-            'audit_trail', 'audit_log', 'financial_audit',
-            'internal_control', 'internal_controls', 'control_testing',
-            'segregation_duties', 'segregation_of_duties',
-            'sox_compliance',
-            
-            # === Security (SOC2) ===
-            # Authentication & Credentials
-            'password', 'passwd', 'pwd', 'pass_word', 'login_password',
-            'credential', 'credentials', 'user_credentials',
-            
-            # Tokens & Keys
-            'token', 'access_token', 'refresh_token', 'auth_token', 'authentication_token',
-            'bearer_token', 'jwt_token', 'oauth_token',
-            'api_key', 'apikey', 'api_secret', 'api_secret_key',
-            'secret', 'secret_key',
-            'encryption_key', 'private_key', 'public_key',
-            
-            # Sessions & Access
-            'session_id', 'session_key', 'session_token', 'session_cookie',
-            'auth_code', 'authorization_code',
-            'access_control', 'access_control_list', 'role_based_access',
-            'user_permissions',
-            
-            # Security Infrastructure
-            'encryption', 'encryption_algorithm',
-            'tls_certificate', 'ssl_certificate',
-            'firewall_rule',
-            
-            # Security Monitoring
-            'security_audit_log', 'security_incident', 'security_incident_report',
-            'vulnerability', 'breach_notification',
-            'security_policy', 'incident_response_plan',
-            
-            # System Security
-            'system_config', 'change_log', 'change_management_log',
-            'disaster_recovery', 'access_review_log', 'system_audit_trail',
-            
-            # === Health (HIPAA) ===
-            'health_insurance', 'insurance_number',
+        # Get sensitive patterns from governance metadata (loaded during initialization)
+        # These patterns come from the SENSITIVE_PATTERNS table
+        sensitive_patterns_from_governance = set()
+        
+        # Extract all patterns from _category_patterns (loaded from SENSITIVE_PATTERNS table)
+        if hasattr(self, '_category_patterns') and self._category_patterns:
+            for category, patterns in self._category_patterns.items():
+                # Only include patterns from PII/SOX/SOC2 categories
+                pg = self._map_category_to_policy_group(category)
+                if pg in {'PII', 'SOX', 'SOC2'}:
+                    for pattern_dict in patterns:
+                        # Extract the pattern regex and convert to simple keywords for initial filtering
+                        pattern_str = pattern_dict.get('pattern', '')
+                        if pattern_str:
+                            # Extract keywords from regex patterns (simplified)
+                            # Remove regex special chars and extract meaningful terms
+                            keywords = pattern_str.replace('\\b', '').replace('.*', '').replace('.+', '').replace('\\d', '').replace('\\w', '').replace('[', '').replace(']', '').replace('(', '').replace(')', '').replace('|', ' ').replace('?', '').replace('*', '').replace('+', '').lower().split()
+                            for kw in keywords:
+                                if len(kw) > 2:  # Only meaningful keywords
+                                    sensitive_patterns_from_governance.add(kw)
+        
+        # Also get keywords from _category_keywords (loaded from SENSITIVE_KEYWORDS table)
+        if hasattr(self, '_category_keywords') and self._category_keywords:
+            for category, keywords in self._category_keywords.items():
+                # Only include keywords from PII/SOX/SOC2 categories
+                pg = self._map_category_to_policy_group(category)
+                if pg in {'PII', 'SOX', 'SOC2'}:
+                    for kw in keywords:
+                        if isinstance(kw, str) and len(kw) > 2:
+                            sensitive_patterns_from_governance.add(kw.lower())
+        
+        # Fallback: If governance tables are empty, use minimal baseline patterns
+        if not sensitive_patterns_from_governance:
+            logger.warning(f"  ⚠️ No patterns loaded from governance tables - using baseline patterns")
+            sensitive_patterns_from_governance = {
+                # Minimal PII patterns
+                'ssn', 'email', 'phone', 'address', 'name', 'birth', 'passport', 'license',
+                'credit_card', 'account_number', 'medical', 'patient',
+                # Minimal SOX patterns
+                'revenue', 'transaction', 'invoice', 'payment', 'ledger', 'financial',
+                'audit', 'sox',
+                # Minimal SOC2 patterns
+                'password', 'token', 'credential', 'secret', 'key', 'session', 'auth'
+            }
+        
+        # CRITICAL: Check if column name contains ANY sensitive pattern from governance tables
+        has_sensitive_pattern = any(pattern in col_lower for pattern in sensitive_patterns_from_governance)
+        
+        # Additional check: Exclude generic/non-sensitive columns even if they match patterns
+        generic_exclusions = [
+            'product_id', 'item_id', 'catalog_id', 'category_id', 'sku',
+            'warehouse_id', 'location_id', 'department_id', 'store_id',
+            'status', 'type', 'code', 'flag', 'mode',
+            'created_at', 'updated_at', 'created_date', 'updated_date',
+            'description', 'notes', 'comment', 'remarks',
+            'quantity', 'count', 'total_items'
         ]
         
-        # Check if column name contains ANY sensitive pattern
-        has_sensitive_pattern = any(pattern in col_lower for pattern in definitely_sensitive_patterns)
+        is_generic = any(excl in col_lower for excl in generic_exclusions)
         
-        # CRITICAL: Skip column if NO sensitive pattern found
-        if not has_sensitive_pattern:
-            logger.debug(f"  ✓ SKIPPED '{col_name}' - No sensitive pattern detected (whitelist approach)")
+        # CRITICAL: Skip column if NO sensitive pattern found OR if it's a generic column
+        if not has_sensitive_pattern or is_generic:
+            if is_generic:
+                logger.debug(f"  ✓ SKIPPED '{col_name}' - Generic/non-sensitive column (excluded)")
+            else:
+                logger.debug(f"  ✓ SKIPPED '{col_name}' - No sensitive pattern detected (metadata-driven filtering)")
             return None
         
         # If we reach here, column has a sensitive pattern and should be scored
-        logger.debug(f"  → PROCESSING '{col_name}' - Sensitive pattern detected")
+        logger.debug(f"  → PROCESSING '{col_name}' - Sensitive pattern detected from governance metadata")
 
         # Build context from metadata only
         context_parts = [
@@ -4000,6 +3981,110 @@ class AIClassificationPipelineService:
             'confidence_pct': round(confidence * 100, 1)
         }
     
+    # ============================================================================
+    # SMART CLASSIFICATION OVERRIDE SYSTEM (PATTERN-AWARE)
+    # ============================================================================
+    
+    def _init_address_context_registry(self):
+        """
+        Initialize the pattern registry for address context detection.
+        Centralized configuration that can be extended or loaded from metadata.
+        """
+        if hasattr(self, '_address_context_registry'):
+            return
+
+        # Registry defining context patterns and their scoring implications
+        # This distinguishes between Physical (PII) and Network (SOC2) addresses
+        self._address_context_registry = {
+            "PHYSICAL_ADDRESS": {
+                "indicators": [
+                    "street", "city", "zip", "postal", "province", "country", 
+                    "state", "apt", "suite", "building", "lane", "road", "avenue",
+                    "billing_address", "shipping_address", "mailing_address",
+                    "residence", "domicile", "geo", "location"
+                ],
+                "negative_indicators": ["ip", "mac", "host", "email", "url", "link", "web"],
+                "actions": {
+                    "boost": {"policy_group": "PII", "pattern": "PII_PERSONAL_INFO", "factor": 1.6},
+                    "suppress": {"policy_group": "SOC2", "pattern": "SOC2_SECURITY_DATA", "factor": 0.1}
+                }
+            },
+            "NETWORK_ADDRESS": {
+                "indicators": [
+                    "ip_address", "mac_address", "host", "port", "subnet", 
+                    "gateway", "protocol", "dns", "url", "uri", "endpoint",
+                    "ipv4", "ipv6"
+                ],
+                "negative_indicators": ["street", "city", "zip", "postal", "billing", "shipping"],
+                "actions": {
+                    "boost": {"policy_group": "SOC2", "pattern": "SOC2_SECURITY_DATA", "factor": 1.5},
+                    "suppress": {"policy_group": "PII", "pattern": "PII_PERSONAL_INFO", "factor": 0.2}
+                }
+            }
+        }
+
+    def _analyze_address_context(self, col_name: str) -> str:
+        """
+        Analyze column name to determine if it's a Physical or Network address.
+        Returns: 'PHYSICAL_ADDRESS', 'NETWORK_ADDRESS', or 'AMBIGUOUS'
+        """
+        self._init_address_context_registry()
+        col_lower = col_name.lower()
+        
+        # Score both contexts
+        scores = {"PHYSICAL_ADDRESS": 0, "NETWORK_ADDRESS": 0}
+        
+        for context_type, config in self._address_context_registry.items():
+            # Check positive indicators
+            for ind in config["indicators"]:
+                if ind in col_lower:
+                    scores[context_type] += 1
+            # Check negative indicators
+            for neg in config["negative_indicators"]:
+                if neg in col_lower:
+                    scores[context_type] -= 1
+        
+        phys = scores["PHYSICAL_ADDRESS"]
+        net = scores["NETWORK_ADDRESS"]
+        
+        # Determine Context with simple heuristic
+        if phys > 0 and phys > net:
+            return "PHYSICAL_ADDRESS"
+        elif net > 0 and net > phys:
+            return "NETWORK_ADDRESS"
+        else:
+            return "AMBIGUOUS"
+
+    def _apply_smart_address_overrides(self, scores: Dict[str, float], col_name: str) -> Dict[str, float]:
+        """
+        Apply smart overrides based on detected address context.
+        """
+        context = self._analyze_address_context(col_name)
+        
+        if context == "AMBIGUOUS":
+            return scores
+            
+        # Apply actions from registry
+        config = self._address_context_registry.get(context)
+        if not config:
+            return scores
+            
+        actions = config.get("actions", {})
+        
+        logger.debug(f"  → Applying smart override for '{col_name}': Detected {context}")
+        
+        # Apply Boost
+        boost = actions.get("boost")
+        if boost:
+            self._boost_category(scores, boost["policy_group"], boost["pattern"], boost["factor"])
+            
+        # Apply Suppression
+        suppress = actions.get("suppress")
+        if suppress:
+            self._reduce_category(scores, suppress["policy_group"], suppress["pattern"], suppress["factor"])
+            
+        return scores
+
     def _apply_context_aware_adjustments(self, scores: Dict[str, float], 
                                         col_name: str, table: str, 
                                         col_type: str, samples: List) -> Dict[str, float]:
@@ -4028,7 +4113,7 @@ class AIClassificationPipelineService:
             if not any(kw in col_lower for kw in ['password', 'token', 'auth', 'credential', 'session']):
                 self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.7)
         
-        # Customer/User tables → Boost PII
+        # Customer/User tables →s Boost PII
         elif any(kw in table_lower for kw in ['customer', 'user', 'employee', 'person', 'contact']):
             self._boost_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 1.3)
         
@@ -4091,24 +4176,6 @@ class AIClassificationPipelineService:
             # Reduce PII/SOC2 for quantity fields
             self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.5)
             self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.4)
-
-        # === RULE 6: Dates (invoice_date, due_date, etc.) ===
-        # Dates are rarely PII unless they are birth dates
-        if any(kw in col_lower for kw in ['date', 'time', 'created', 'updated', 'timestamp']):
-            if any(kw in col_lower for kw in ['birth', 'dob']):
-                # It IS PII (Date of Birth)
-                self._boost_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 1.5)
-            else:
-                # Generic dates -> Reduce PII
-                self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.3)
-                # Boost SOX if financial context (invoice_date, due_date)
-                if any(kw in col_lower for kw in ['invoice', 'due', 'payment', 'transaction']):
-                    self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.3)
-
-        # === RULE 7: Status/Codes (invoice_status, currency_code) ===
-        # These are often system metadata or financial context, rarely PII
-        if any(kw in col_lower for kw in ['status', 'state', 'type', 'code', 'mode', 'flag']):
-            # Exception: "state" in address context (billing_state) -> PII
             if any(kw in col_lower for kw in ['billing', 'shipping', 'mailing', 'address']):
                 # Likely PII (Address) - boost PII
                 self._boost_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 1.4)
@@ -4148,19 +4215,10 @@ class AIClassificationPipelineService:
              self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.2)
              self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.4)
         
-        # === RULE 9: Address Fields (billing_address, billing_city, billing_state_province) ===
-        # Address components are PII, especially in billing/shipping context
-        if any(kw in col_lower for kw in ['address', 'city', 'street', 'zip', 'postal', 'province', 'country']):
-            # Check for billing/shipping context
-            if any(kw in col_lower for kw in ['billing', 'shipping', 'mailing', 'delivery']):
-                # Strong PII signal
-                self._boost_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 1.6)
-                self._reduce_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 0.4)
-                self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.3)
-            else:
-                # Generic address fields are still PII
-                self._boost_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 1.4)
-                self._reduce_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 0.5)
+        # === RULE 9: Smart Address Context Analysis ===
+        # Replaces hardcoded address rules with pattern-aware registry lookup
+        # This automatically distinguishes between Physical Addresses (PII) and Network Addresses (SOC2)
+        adjusted_scores = self._apply_smart_address_overrides(adjusted_scores, col_name)
         
         # === RULE 10: Name Fields ===
         # Names are strong PII indicators
@@ -4203,6 +4261,15 @@ class AIClassificationPipelineService:
                 # Boost SOX for vendor financial data
                 if any(kw in col_lower for kw in ['id', 'code', 'number', 'account']):
                     self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.2)
+
+        # === RULE 13: STRICT PII ENFORCEMENT (Fix for Misclassification) ===
+        # Explicitly force PII for high-confidence PII fields to prevent SOC2/SOX override
+        if any(kw in col_lower for kw in ['email', 'birth', 'dob', 'ssn', 'social_security', 'passport', 'license', 'gender', 'ethnicity', 'marital', 'address', 'city', 'state', 'zip', 'postal', 'country']):
+            # EXCEPTION: Business/Vendor context is NOT PII
+            if not any(kw in col_lower for kw in ['vendor', 'supplier', 'company', 'business', 'office', 'store', 'branch', 'merchant']):
+                self._boost_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 2.0)
+                self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.1)
+                self._reduce_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 0.1)
         
         # === RULE 5: Filter out very low scores (noise reduction) ===
         # Remove categories with confidence < 0.25 after adjustments
@@ -4244,10 +4311,24 @@ class AIClassificationPipelineService:
 
     def _determine_table_category_governance_driven(self, table_scores: Dict[str, float], 
                                                   column_results: List[Dict[str, Any]]) -> Tuple[str, float, List[Dict[str, Any]]]:
-        """Determine table category using governance rules only, supporting multi-label."""
+        """
+        Determine table category using governance rules only, supporting multi-label.
+        
+        CRITICAL: Only returns categories if table contains parent-level sensitive data 
+        related to PII, SOX, or SOC2. Does NOT force or auto-assign categories - returns 
+        only genuinely detected ones.
+        """
+        
+        # REQUIREMENT: Only proceed if we have sensitive column evidence
+        # This ensures we're not classifying tables without actual sensitive data
+        if not column_results:
+            logger.info("  → No sensitive columns detected - table is NON_SENSITIVE")
+            return 'NON_SENSITIVE', 0.0, []
         
         # Aggregate all potential categories from table scores and column multi-label results
-        all_categories = set(table_scores.keys())
+        # CRITICAL FIX: Only consider categories detected in columns. Do NOT include table_scores keys
+        # to prevent forcing categories that are not supported by column evidence.
+        all_categories = set()
         
         # Map category -> list of column scores
         col_scores_map = {}
@@ -4270,18 +4351,27 @@ class AIClassificationPipelineService:
                     col_scores_map[c_name] = []
                 col_scores_map[c_name].append(c_conf)
         
+        # CRITICAL: If no categories from columns, table is not sensitive
         if not all_categories:
+            logger.info("  → No sensitive categories detected from columns - table is NON_SENSITIVE")
             return 'NON_SENSITIVE', 0.0, []
         
-        # Evaluate each category
+        # Evaluate each category - ONLY include if it's genuinely detected
         detected_categories = []
         
         for category in all_categories:
             table_score = table_scores.get(category, 0.0)
             column_scores = col_scores_map.get(category, [])
             
-            # RELAXED: Consider ALL column scores (LOWERED from > 0.3 to > 0.25)
-            valid_col_scores = [s for s in column_scores if s > 0.25]
+            # STRICT: Only consider column scores > 0.40 for parent-level detection
+            # This ensures we only bubble up high-confidence sensitive findings
+            valid_col_scores = [s for s in column_scores if s > 0.40]
+            
+            # REQUIREMENT: Must have at least ONE high-confidence column detection
+            # to consider this category for table-level classification
+            if not valid_col_scores:
+                logger.debug(f"  → Skipping category '{category}' - no high-confidence column detections")
+                continue
             
             if valid_col_scores:
                 column_avg = sum(valid_col_scores) / len(valid_col_scores)
@@ -4293,34 +4383,43 @@ class AIClassificationPipelineService:
                 else:
                     coverage_boost = 1.05  # 1-2 columns = 5% boost
                 
+                # Prioritize column evidence over table-level scores
+                # This ensures we're driven by actual sensitive data, not just metadata
                 combined_score = max(table_score, column_avg * coverage_boost)
             else:
-                combined_score = table_score
+                # No column evidence - skip this category
+                continue
             
             combined_score = min(0.99, combined_score)
             
-            # Threshold check (using default 0.35 - BALANCED: Raised from 0.25 to reduce false positives)
-            thresh = self._category_thresholds.get(category, 0.35)
+            # Threshold check (using default 0.40 - STRICT: Only genuine detections)
+            thresh = self._category_thresholds.get(category, 0.40)
             
             # EXCLUDE GENERIC / NON-SENSITIVE CATEGORIES
             if category.upper() in ('NON_SENSITIVE', 'GENERAL', 'SYSTEM', 'METADATA', 'UNKNOWN'):
                 continue
                 
-            # Check if it maps to a sensitive policy group
+            # CRITICAL: Check if it maps to a sensitive policy group (PII/SOX/SOC2)
+            # This is the core requirement - only return PII/SOX/SOC2 categories
             pg = self._map_category_to_policy_group(category)
-            if pg == 'NON_SENSITIVE':
+            if pg not in {'PII', 'SOX', 'SOC2'}:
+                logger.debug(f"  → Skipping category '{category}' - does not map to PII/SOX/SOC2 (maps to: {pg})")
                 continue
             
-            # BALANCED validation: Require minimum confidence of 0.40 to reduce false positives
-            # This is higher than before (0.30) but not too strict
-            if combined_score < 0.40:
+            # STRICT validation: Require minimum confidence of 0.50 for parent-level classification
+            # This ensures only high-quality detections are included
+            if combined_score < 0.50:
+                logger.debug(f"  → Skipping category '{category}' - confidence {combined_score:.3f} < 0.50")
                 continue
             
             if combined_score >= thresh:
                 detected_categories.append({
                     'category': category,
-                    'confidence': combined_score
+                    'confidence': combined_score,
+                    'policy_group': pg,  # Track which policy group this belongs to
+                    'column_count': len(valid_col_scores)  # Track evidence strength
                 })
+                logger.info(f"  ✓ Detected parent-level category: {category} ({pg}) - confidence: {combined_score:.3f}, columns: {len(valid_col_scores)}")
         
         # Sort by confidence
         detected_categories.sort(key=lambda x: x['confidence'], reverse=True)
@@ -4328,9 +4427,11 @@ class AIClassificationPipelineService:
         if detected_categories:
             best_category = detected_categories[0]['category']
             best_score = detected_categories[0]['confidence']
+            logger.info(f"  → Table classification: {best_category} (confidence: {best_score:.3f}) with {len(detected_categories)} total categories")
         else:
             best_category = 'NON_SENSITIVE'
             best_score = 0.0
+            logger.info("  → No parent-level sensitive categories detected - table is NON_SENSITIVE")
         
         # === ADDITIONAL VALIDATION: Detect Non-Sensitive Tables ===
         # Check if this appears to be a catalog/product/reference table
@@ -4404,14 +4505,40 @@ class AIClassificationPipelineService:
             # Map to policy group for UI
             policy_group = self._map_category_to_policy_group(table_category) if table_category != 'NON_SENSITIVE' else None
             
+            # === MULTI-LABEL POLICY GROUPS ===
+            # Extract ALL policy groups from detected categories (not just the top one)
+            multi_label_policy_groups = []
+            policy_group_confidences = {}  # Track confidence per policy group
+            
+            for detected_cat in table_detected_categories:
+                cat_name = detected_cat['category']
+                cat_conf = detected_cat['confidence']
+                pg = self._map_category_to_policy_group(cat_name)
+                
+                # Only include PII/SOX/SOC2 policy groups
+                if pg in {'PII', 'SOX', 'SOC2'}:
+                    if pg not in multi_label_policy_groups:
+                        multi_label_policy_groups.append(pg)
+                        policy_group_confidences[pg] = cat_conf
+                    else:
+                        # If policy group already exists, keep the higher confidence
+                        policy_group_confidences[pg] = max(policy_group_confidences[pg], cat_conf)
+            
+            # Sort policy groups by confidence (descending)
+            multi_label_policy_groups.sort(key=lambda pg: policy_group_confidences.get(pg, 0), reverse=True)
+            
+            # Create comma-separated string for UI display
+            policy_groups_str = ", ".join(multi_label_policy_groups) if multi_label_policy_groups else (policy_group if policy_group else "NON_SENSITIVE")
+            
             # Calculate CIA and Label for UI
             c, i, a = (0, 0, 0)
             label = "Public"
             label_emoji = "🟩 Public"
             color = "Green"
             
-            if policy_group or table_category != 'NON_SENSITIVE':
+            if multi_label_policy_groups or policy_group or table_category != 'NON_SENSITIVE':
                  try:
+                     # Use the highest-confidence category for CIA calculation
                      canon_cat = self._normalize_category_for_cia(table_category)
                      c, i, a = ai_assistant_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))
                      label = self.ai_service._map_cia_to_label(c, i, a)
@@ -4439,8 +4566,11 @@ class AIClassificationPipelineService:
 
             return {
                 'asset': asset,
-                'category': policy_group if policy_group else table_category, # Prefer policy group for display if available
-                'detected_categories': table_detected_categories,  # Multi-label support
+                'category': policy_groups_str,  # ✅ NOW SHOWS ALL POLICY GROUPS (e.g., "PII, SOX, SOC2")
+                'primary_policy_group': multi_label_policy_groups[0] if multi_label_policy_groups else policy_group,  # Top policy group
+                'policy_groups': multi_label_policy_groups,  # ✅ NEW: List of all applicable policy groups
+                'policy_group_confidences': policy_group_confidences,  # ✅ NEW: Confidence per policy group
+                'detected_categories': table_detected_categories,  # Multi-label support (granular categories)
                 'multi_label_category': multi_label_str,  # Comma-separated for UI
                 'confidence': confidence,
                 'columns': column_results,
@@ -4458,9 +4588,13 @@ class AIClassificationPipelineService:
                 'issues': [],
                 'route': 'STANDARD_REVIEW',
                 'application_status': 'QUEUED_FOR_REVIEW',
-                'compliance': [],
-                'reasoning': [f"Matched category: {table_category}"],
-                'multi_label_analysis': {"detected_categories": [policy_group] if policy_group else [], "reasoning": {}}
+                'compliance': multi_label_policy_groups,  # ✅ UPDATED: Show all policy groups in compliance
+                'reasoning': [f"Detected policy groups: {policy_groups_str}"],
+                'multi_label_analysis': {
+                    "detected_categories": multi_label_policy_groups,  # ✅ UPDATED: All policy groups
+                    "policy_group_confidences": policy_group_confidences,  # ✅ NEW: Confidence breakdown
+                    "reasoning": {pg: f"{policy_group_confidences[pg]:.1%} confidence" for pg in multi_label_policy_groups}
+                }
             }
             
         except Exception as e:

@@ -11,26 +11,19 @@ USE SCHEMA DATA_CLASSIFICATION_GOVERNANCE;
 SHOW TABLES LIKE 'SENSITIVE_PATTERNS';
 
 -- ============================================================================
--- STEP 2: Check current pattern count
+-- STEP 2: Clear existing patterns to avoid duplicates and remove bad patterns
 -- ============================================================================
-SELECT COUNT(*) as TOTAL_PATTERNS FROM SENSITIVE_PATTERNS;
-
-SELECT 
-    sc.CATEGORY_NAME,
-    COUNT(sp.PATTERN_ID) as PATTERN_COUNT
-FROM SENSITIVITY_CATEGORIES sc
-LEFT JOIN SENSITIVE_PATTERNS sp ON sc.CATEGORY_ID = sp.CATEGORY_ID
-GROUP BY sc.CATEGORY_NAME
-ORDER BY sc.CATEGORY_NAME;
+DELETE FROM SENSITIVE_PATTERNS;
 
 -- ============================================================================
--- STEP 3: If table is empty, populate with essential patterns
+-- STEP 3: Populate with essential patterns
 -- ============================================================================
 
 -- PII Patterns
 INSERT INTO SENSITIVE_PATTERNS (
     PATTERN_ID, 
     CATEGORY_ID, 
+    PATTERN_NAME,
     PATTERN_REGEX, 
     SENSITIVITY_TYPE, 
     SENSITIVITY_WEIGHT, 
@@ -42,6 +35,7 @@ INSERT INTO SENSITIVE_PATTERNS (
 SELECT 
     UUID_STRING() as PATTERN_ID,
     (SELECT CATEGORY_ID FROM SENSITIVITY_CATEGORIES WHERE CATEGORY_NAME = 'PII') as CATEGORY_ID,
+    sensitivity_type as PATTERN_NAME,
     pattern_regex,
     sensitivity_type,
     sensitivity_weight,
@@ -85,16 +79,13 @@ FROM (
         '(0[1-9]|1[0-2])/(0[1-9]|[12][0-9]|3[01])/(19|20)\\d{2}',
         'DATE_OF_BIRTH',
         0.85
-) patterns
-WHERE NOT EXISTS (
-    SELECT 1 FROM SENSITIVE_PATTERNS 
-    WHERE PATTERN_REGEX = patterns.pattern_regex
-);
+) patterns;
 
 -- SOX Patterns
 INSERT INTO SENSITIVE_PATTERNS (
     PATTERN_ID, 
     CATEGORY_ID, 
+    PATTERN_NAME,
     PATTERN_REGEX, 
     SENSITIVITY_TYPE, 
     SENSITIVITY_WEIGHT, 
@@ -106,6 +97,7 @@ INSERT INTO SENSITIVE_PATTERNS (
 SELECT 
     UUID_STRING() as PATTERN_ID,
     (SELECT CATEGORY_ID FROM SENSITIVITY_CATEGORIES WHERE CATEGORY_NAME = 'SOX') as CATEGORY_ID,
+    sensitivity_type as PATTERN_NAME,
     pattern_regex,
     sensitivity_type,
     sensitivity_weight,
@@ -137,16 +129,13 @@ FROM (
         'TXN-[A-Z0-9]{10,}',
         'TRANSACTION_ID',
         0.75
-) patterns
-WHERE NOT EXISTS (
-    SELECT 1 FROM SENSITIVE_PATTERNS 
-    WHERE PATTERN_REGEX = patterns.pattern_regex
-);
+) patterns;
 
 -- SOC2 Patterns
 INSERT INTO SENSITIVE_PATTERNS (
     PATTERN_ID, 
     CATEGORY_ID, 
+    PATTERN_NAME,
     PATTERN_REGEX, 
     SENSITIVITY_TYPE, 
     SENSITIVITY_WEIGHT, 
@@ -158,6 +147,7 @@ INSERT INTO SENSITIVE_PATTERNS (
 SELECT 
     UUID_STRING() as PATTERN_ID,
     (SELECT CATEGORY_ID FROM SENSITIVITY_CATEGORIES WHERE CATEGORY_NAME = 'SOC2') as CATEGORY_ID,
+    sensitivity_type as PATTERN_NAME,
     pattern_regex,
     sensitivity_type,
     sensitivity_weight,
@@ -195,11 +185,7 @@ FROM (
         '-----BEGIN (RSA |EC )?PRIVATE KEY-----',
         'PRIVATE_KEY',
         1.0
-) patterns
-WHERE NOT EXISTS (
-    SELECT 1 FROM SENSITIVE_PATTERNS 
-    WHERE PATTERN_REGEX = patterns.pattern_regex
-);
+) patterns;
 
 -- ============================================================================
 -- STEP 4: Verify patterns were added
@@ -225,11 +211,3 @@ SELECT
 FROM SENSITIVE_PATTERNS sp
 JOIN SENSITIVITY_CATEGORIES sc ON sp.CATEGORY_ID = sc.CATEGORY_ID
 ORDER BY sc.CATEGORY_NAME, sp.SENSITIVITY_WEIGHT DESC;
-
--- ============================================================================
--- EXPECTED RESULTS
--- ============================================================================
--- PII: 6 patterns (EMAIL, PHONE, SSN, CREDIT_CARD, ZIP_CODE, DATE_OF_BIRTH)
--- SOX: 4 patterns (CURRENCY, INVOICE_NUMBER, ACCOUNT_NUMBER, TRANSACTION_ID)
--- SOC2: 5 patterns (API_KEY, BEARER_TOKEN, JWT_TOKEN, AWS_ACCESS_KEY, PRIVATE_KEY)
--- TOTAL: 15 patterns

@@ -99,7 +99,7 @@ LATERAL FLATTEN(
             )
             WHEN C.CATEGORY_NAME = 'INTERNAL' THEN ARRAY_CONSTRUCT(
                 'internal_doc','confidential','restricted','project_code','internal_use_only',
-                'roadmap','strategy','internal_id'
+                'roadmap','strategy','internal_id','currency_key'
             )
             ELSE ARRAY_CONSTRUCT()
         END

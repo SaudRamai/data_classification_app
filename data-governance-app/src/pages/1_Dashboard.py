@@ -534,7 +534,7 @@ def render_realtime_dashboard():
         SELECT
             total_assets,
             tagged_assets,
-            ROUND((tagged_assets * 100.0 / total_assets), 2) AS coverage_percentage
+            ROUND((tagged_assets * 100.0 / NULLIF(total_assets, 0)), 2) AS coverage_percentage
         FROM AssetClassification
         """
         

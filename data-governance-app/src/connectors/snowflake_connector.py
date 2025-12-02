@@ -65,7 +65,9 @@ class SnowflakeConnector:
             if getattr(settings, "SNOWFLAKE_WAREHOUSE", None):
                 self.connection_params["warehouse"] = settings.SNOWFLAKE_WAREHOUSE
             if getattr(settings, "SNOWFLAKE_DATABASE", None):
-                self.connection_params["database"] = settings.SNOWFLAKE_DATABASE
+                db = str(settings.SNOWFLAKE_DATABASE).strip()
+                if db.upper() not in ("NONE", "NULL", "(NONE)", "UNKNOWN", ""):
+                    self.connection_params["database"] = db
             if getattr(settings, "SNOWFLAKE_SCHEMA", None):
                 self.connection_params["schema"] = settings.SNOWFLAKE_SCHEMA
         except Exception:
@@ -153,7 +155,7 @@ class SnowflakeConnector:
                         params = {"account": acct_norm, "user": user, "password": pwd}
                     if wh:
                         params["warehouse"] = wh
-                    if db:
+                    if db and str(db).strip().upper() not in ("NONE", "NULL", "(NONE)", "UNKNOWN", ""):
                         params["database"] = db
                     if sc:
                         params["schema"] = sc
@@ -224,7 +226,7 @@ class SnowflakeConnector:
                     params = {"account": acct_norm, "user": user, "password": pwd}
                 if wh:
                     params["warehouse"] = wh
-                if db:
+                if db and str(db).strip().upper() not in ("NONE", "NULL", "(NONE)", "UNKNOWN", ""):
                     params["database"] = db
                 if sc:
                     params["schema"] = sc

@@ -2132,15 +2132,32 @@ _Download the template below to begin_
                                                 except Exception:
                                                     _cmpl = ''
                                                 # Derived label
-                                                def _label_from_cia2(c,i,a):
-                                                    if c >= 3 and i >= 3 and a >= 2: return 'Confidential'
-                                                    if c >= 2 and i >= 2 and (1 <= a <= 2): return 'Restricted'
-                                                    if c == 1 and i == 1 and a == 1: return 'Internal'
-                                                    if c == 0 and i == 0 and a == 0: return 'Public'
-                                                    if max(c,i,a) >= 3: return 'Confidential'
-                                                    if max(c,i,a) == 2: return 'Restricted'
-                                                    if max(c,i,a) == 1: return 'Internal'
-                                                    return 'Public'
+                                                def _label_from_cia2(c, i, a):
+                                                    """Convert CIA scores to human-readable labels with emojis.
+                                                    
+                                                    Args:
+                                                        c: Confidentiality score (0-3)
+                                                        i: Integrity score (0-3)
+                                                        a: Availability score (0-3)
+                                                        
+                                                    Returns:
+                                                        str: Formatted label with emoji and description
+                                                    """
+                                                    # Get max of all three scores
+                                                    max_score = max(int(c or 0), int(i or 0), int(a or 0))
+                                                    
+                                                    # Map scores to labels with emojis and descriptions
+                                                    if max_score == 0:
+                                                        return "🟢 Public (C0) - Data is public; no confidentiality risk. Example: Public holidays, published press release dates"
+                                                    elif max_score == 1:
+                                                        return "🟡 Internal (C1) - For internal use only; minor impact if leaked. Example: Employee training schedule dates, internal project timelines"
+                                                    elif max_score == 2:
+                                                        return "🟠 Restricted (C2) - Sensitive data; unauthorized disclosure could cause moderate to significant harm. Example: Customer contract start/end dates, financial reporting period dates"
+                                                    else:  # max_score >= 3
+                                                        return "🔴 Confidential (C3) - Highly sensitive or regulated data; severe business, financial, or legal impact if disclosed. Example: Employee date of birth, social security numbers, payroll dates"
+                                                    elif max_score >= 3:
+                                                        return "🔴 Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
+                                                    return "🟡 Internal (C1) - Default classification"
                                                 c_val,i_val,a_val = int(cia.get('C',0)), int(cia.get('I',0)), int(cia.get('A',0))
                                                 _lbl = _label_from_cia2(c_val,i_val,a_val)
                                                 # Generate tag SQL for column
@@ -2185,15 +2202,30 @@ _Download the template below to begin_
                                                             except Exception:
                                                                 pass
                                                             return 1,1,1
-                                                        def _label_from_cia2(c,i,a):
-                                                            if c >= 3 and i >= 3 and a >= 2: return 'Confidential'
-                                                            if c >= 2 and i >= 2 and (1 <= a <= 2): return 'Restricted'
-                                                            if c == 1 and i == 1 and a == 1: return 'Internal'
-                                                            if c == 0 and i == 0 and a == 0: return 'Public'
-                                                            if max(c,i,a) >= 3: return 'Confidential'
-                                                            if max(c,i,a) == 2: return 'Restricted'
-                                                            if max(c,i,a) == 1: return 'Internal'
-                                                            return 'Public'
+                                                        def _label_from_cia2(c, i, a):
+                                                            """Convert CIA scores to human-readable labels with emojis.
+                                                            
+                                                            Args:
+                                                                c: Confidentiality score (0-3)
+                                                                i: Integrity score (0-3)
+                                                                a: Availability score (0-3)
+                                                                
+                                                            Returns:
+                                                                str: Formatted label with emoji and description
+                                                            """
+                                                            # Get max of all three scores
+                                                            max_score = max(int(c or 0), int(i or 0), int(a or 0))
+                                                            
+                                                            # Map scores to labels
+                                                            if max_score == 0:
+                                                                return "🟢 Public (C0) - Data is public, no confidentiality risk"
+                                                            elif max_score == 1:
+                                                                return "🟡 Internal (C1) - For internal use, minor impact if leaked"
+                                                            elif max_score == 2:
+                                                                return "🟠 Restricted (C2) - Sensitive business info, moderate to significant impact if disclosed"
+                                                            elif max_score >= 3:
+                                                                return "🔴 Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
+                                                            return "🟡 Internal (C1) - Default classification"
                                                         rowc = df_dd[df_dd['COLUMN_NAME'] == sel_col].iloc[0]
                                                         c_txt = str(rowc.get('CIA') or '')
                                                         c_val,i_val,a_val = _parse_cia(c_txt)

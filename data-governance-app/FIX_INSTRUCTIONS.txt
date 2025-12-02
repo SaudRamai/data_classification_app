@@ -1,0 +1,39 @@
+# 🚨 CRITICAL FIX INSTRUCTIONS
+
+## 1. Execute SQL Fix Script (REQUIRED)
+
+Since the automated script cannot run in your environment, you **MUST** execute the SQL fix script manually in Snowflake.
+
+1.  Open **Snowflake Web UI** (Snowsight) or your preferred SQL client.
+2.  Copy the entire content of the file:
+    `c:\Users\ramai.saud\Downloads\DATA_CLASSIFICATION_APP\data-governance-app\fix_all_schema_issues_final.sql`
+3.  Paste it into a Snowflake worksheet.
+4.  **Run All** statements.
+
+This script will:
+*   ✅ Add missing columns: `COLOR_CODE`, `DEFAULT_THRESHOLD`, `PATTERN_STRING`, `DATABASE_NAME`, `SCHEMA_NAME`, `SENSITIVITY_CATEGORY_ID`.
+*   ✅ Create the `CLASSIFICATION_AI_RESULTS` table if it's missing.
+*   ✅ Fix broken regex patterns (e.g., `y(?:account...`).
+
+## 2. Restart Streamlit App
+
+After running the SQL script:
+
+1.  Stop your running Streamlit application (Ctrl+C).
+2.  Start it again:
+    ```bash
+    streamlit run src/app.py
+    ```
+
+## 3. Verify Fixes
+
+The application should now:
+*   Load without "Invalid identifier" errors.
+*   Run classification without "str object has no attribute get" errors.
+*   Display results with correct colors and metadata.
+
+## What Was Fixed in Python Code?
+
+I have also updated `src/services/ai_classification_pipeline_service.py` to:
+*   **Prevent Crashes:** Added robust type checking to handle cases where Snowflake returns unexpected data formats (fixing the `'str' object has no attribute 'get'` error).
+*   **Handle Missing Columns:** The code now gracefully handles missing `PATTERN_STRING` or other columns by falling back to defaults.

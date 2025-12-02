@@ -212,6 +212,7 @@ USING (
         (UUID_STRING(), 'INTERNAL', 'type', 'EXACT', 1.0, TRUE, CURRENT_USER(), CURRENT_TIMESTAMP(), 1),
         (UUID_STRING(), 'INTERNAL', 'category', 'EXACT', 1.0, TRUE, CURRENT_USER(), CURRENT_TIMESTAMP(), 1),
         (UUID_STRING(), 'INTERNAL', 'currency_code', 'EXACT', 1.0, TRUE, CURRENT_USER(), CURRENT_TIMESTAMP(), 1),
+        (UUID_STRING(), 'INTERNAL', 'currency_key', 'EXACT', 1.0, TRUE, CURRENT_USER(), CURRENT_TIMESTAMP(), 1),
         (UUID_STRING(), 'INTERNAL', 'country_code', 'EXACT', 1.0, TRUE, CURRENT_USER(), CURRENT_TIMESTAMP(), 1)
     ) AS source_data
 ) AS source

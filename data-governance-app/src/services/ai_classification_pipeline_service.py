@@ -73,267 +73,444 @@ class AIClassificationPipelineService:
         self._business_glossary_map: Dict[str, str] = {}
         # Metadata-driven mapping from governance categories to policy groups (PII/SOX/SOC2)
         self._policy_group_by_category: Dict[str, str] = {}
+        self._category_colors: Dict[str, str] = {}
+        # Initialize all metadata dictionaries to prevent AttributeError
+        self._category_thresholds: Dict[str, float] = {}
+        self._category_patterns: Dict[str, List[str]] = {}
+        self._category_keywords: Dict[str, List[str]] = {}
+        self._category_scoring_weights: Dict[str, Dict[str, float]] = {}
+        self._category_multi_label: Dict[str, bool] = {}
+        self._category_keyword_metadata: Dict[str, List[Dict[str, Any]]] = {}
+        self._category_pattern_metadata: Dict[str, List[Dict[str, Any]]] = {}
+        self._category_weights: Dict[str, float] = {}
+        self._category_default_thresholds: Dict[str, float] = {}
+        self._compliance_categories: Dict[str, str] = {}  # Maps category to compliance framework
 
     def render_classification_pipeline(self) -> None:
-        """Render the Automatic AI Classification Pipeline sub-tab."""
-        st.markdown("### Automatic AI Classification Pipeline")
-        st.caption("Automatically discovers existing data assets, derives business context, performs semantic category detection, recommends CIA levels per Avendra's Data Classification Policy, and applies governance tags with full validation, review routing, and audit logging.")
+        """Render the Automatic AI Classification Pipeline Dashboard."""
+        st.markdown("## 🛡️ Automatic AI Classification Dashboard")
+        st.caption("Governance-driven analysis of sensitive data across your data estate.")
 
-        show_steps = False
+        # Initialize metadata if needed
+        if not self._embed_ready or not self._category_centroids:
+            with st.spinner("Loading governance metadata..."):
+                self._init_local_embeddings()
 
-        # Get active database
-        db = self._get_active_database()
-        if not db:
-            st.info("Use Global Filters to select a database to run the pipeline.")
-            return
+        # 1. Top Actions
+        col_act1, col_act2 = st.columns([3, 1])
+        with col_act1:
+            st.info("💡 This dashboard displays the latest classification results.")
+        with col_act2:
+            if st.button("🚀 Run New Scan", type="primary", use_container_width=True):
+                db = self._get_active_database()
+                gov_db = self._get_governance_database(db) if db else None
+                if db:
+                    # Run pipeline but DO NOT save yet
+                    self._run_classification_pipeline(db, gov_db)
+                    # Flag that we need to save results
+                    st.session_state["results_unsaved"] = True
+                    st.rerun()
+                else:
+                    st.error("Please select a database first.")
 
-        # Additional validation
-        if db.upper() in ('NONE', '(NONE)', 'NULL', 'UNKNOWN', ''):
-            st.error("Invalid database selected. Please choose a valid database.")
-            return
-
-        # Get governance database
-        gov_db = self._get_governance_database(db)
-
-        # Show status and set Snowflake context
-        try:
-            schema_filter = self._get_schema_filter()
-            table_filter = self._get_table_filter()
-        except Exception:
-            schema_filter = None; table_filter = None
-        st.caption(
-            f"Using Database: {db}"
-            + (f" | Schema: {schema_filter}" if schema_filter else "")
-            + (f" | Table filter: {table_filter}" if table_filter else "")
-        )
-        try:
-            if self._is_valid_database(db):
-                snowflake_connector.execute_non_query(f"USE DATABASE {db}")
-        except Exception:
-            pass
-        try:
-            self._auto_tune_parameters()
-        except Exception:
-            pass
-
-        # Removed automatic background pipeline as it's unused and causes errors
-
-        if show_steps:
-            with st.expander("Step 2: Collect Metadata", expanded=False):
-                colm1, colm2 = st.columns([1, 1])
-                with colm1:
-                    if st.button("Collect table & column metadata", key="btn_collect_meta"):
-                        try:
-                            tables_df, columns_df, glossary_df = self._collect_metadata(db, schema_filter, table_filter, gov_db)
-                            st.session_state["pipe_meta_tables"] = tables_df
-                            st.session_state["pipe_meta_columns"] = columns_df
-                            st.session_state["pipe_meta_glossary"] = glossary_df
-                        except Exception as me:
-                            st.error(f"Metadata collection failed: {me}")
-                with colm2:
-                    st.caption("Collects information_schema tables/columns, plus governance glossary references.")
-
-            try:
-                tables_df = st.session_state.get("pipe_meta_tables") if hasattr(st, 'session_state') else None
-                columns_df = st.session_state.get("pipe_meta_columns") if hasattr(st, 'session_state') else None
-                glossary_df = st.session_state.get("pipe_meta_glossary") if hasattr(st, 'session_state') else None
-            except Exception:
-                tables_df = columns_df = glossary_df = None
-
-            if isinstance(tables_df, pd.DataFrame) and not tables_df.empty:
-                st.markdown("**Tables (preview)**")
-                st.dataframe(tables_df.head(100), width='stretch', hide_index=True)
-
-            if isinstance(columns_df, pd.DataFrame) and not columns_df.empty:
-                st.markdown("**Columns (preview)**")
-                st.dataframe(columns_df.head(200), width='stretch', hide_index=True)
-
-                # Sampling UI
-                try:
-                    sample_cols = columns_df[["TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME"]].drop_duplicates()
-                    sample_cols["FQN"] = sample_cols.apply(lambda r: f"{db}.{r['TABLE_SCHEMA']}.{r['TABLE_NAME']} :: {r['COLUMN_NAME']}", axis=1)
-                    sel = st.selectbox("Sample column values", options=[""] + list(sample_cols["FQN"]), key="pipe_sample_pick")
-                    if sel:
-                        try:
-                            parts = sel.split(" :: ")
-                            tblfqn = parts[0]
-                            colname = parts[1]
-                            _, sch, tbl = tblfqn.split('.')
-                            values = self._sample_column_values(db=db, schema=sch, table=tbl, column=colname, sample_rows=100)
-                            if values:
-                                st.markdown("**Sample Values**")
-                                st.write(values[:50])
-                            else:
-                                st.caption("No non-null values sampled.")
-                        except Exception as se:
-                            st.warning(f"Sampling failed: {se}")
-                except Exception:
-                    pass
-
-            if isinstance(glossary_df, pd.DataFrame) and not glossary_df.empty:
-                st.markdown("**Glossary / Compliance Mapping**")
-                st.dataframe(glossary_df.head(200), width='stretch', hide_index=True)
-
-        if show_steps:
-            with st.expander("Step 3: Semantic Embedding Generation", expanded=False):
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    if st.button("Initialize embedding backend", key="btn_init_embed"):
-                        try:
-                            emb_info = self.ai_service.initialize_sensitive_detection()
-                            if hasattr(st, 'session_state'):
-                                st.session_state["pipe_embed_info"] = emb_info
-                            st.success(f"Backend: {emb_info.get('backend')} | Categories: {', '.join(emb_info.get('categories', []))}")
-                        except Exception as ee:
-                            st.error(f"Embedding init failed: {ee}")
-                with c2:
-                    try:
-                        emb_info = st.session_state.get("pipe_embed_info") if hasattr(st, 'session_state') else None
-                        if emb_info:
-                            st.caption(f"Backend: {emb_info.get('backend')} | Categories loaded: {len(emb_info.get('categories', []))}")
-                    except Exception:
-                        pass
-
-                try:
-                    cols_df = st.session_state.get("pipe_meta_columns") if hasattr(st, 'session_state') else None
-                except Exception:
-                    cols_df = None
-
-                cc1, cc2 = st.columns([1, 1])
-                with cc1:
-                    if st.button("Embed column contexts (sample)", key="btn_embed_cols"):
-                        try:
-                            out_rows = []
-                            if isinstance(cols_df, pd.DataFrame) and not cols_df.empty:
-                                sample = cols_df.head(100).copy()
-                                for _, r in sample.iterrows():
-                                    ctx = f"{db}.{r.get('TABLE_SCHEMA')}.{r.get('TABLE_NAME')}.{r.get('COLUMN_NAME')}"
-                                    com = r.get('COLUMN_COMMENT') or ''
-                                    if com:
-                                        ctx = f"{ctx} | {com}"
-                                    vec = None
-                                    try:
-                                        if hasattr(self.ai_service, "_get_embedding"):
-                                            vec = self.ai_service._get_embedding(ctx)
-                                    except Exception:
-                                        vec = None
-                                    dim = int(getattr(vec, "shape", [0])[-1]) if vec is not None and hasattr(vec, 'shape') else (len(vec) if isinstance(vec, (list, tuple)) else 0)
-                                    out_rows.append({
-                                        "context": ctx,
-                                        "dim": dim,
-                                    })
-                            dfv = pd.DataFrame(out_rows)
-                            if hasattr(st, 'session_state'):
-                                st.session_state["pipe_embed_columns"] = dfv
-                        except Exception as ce:
-                            st.error(f"Column embedding failed: {ce}")
-                with cc2:
-                    if st.button("Build category reference embeddings", key="btn_embed_cats"):
-                        try:
-                            info = self.ai_service.initialize_sensitive_detection()
-                            cents = getattr(self.ai_service, "_category_centroids", {}) or {}
-                            rows = []
-                            for k, v in cents.items():
-                                dim = int(getattr(v, "shape", [0])[-1]) if v is not None and hasattr(v, 'shape') else (len(v) if isinstance(v, (list, tuple)) else 0)
-                                rows.append({"category": k, "dim": dim, "has_centroid": v is not None})
-                            dfr = pd.DataFrame(rows)
-                            if hasattr(st, 'session_state'):
-                                st.session_state["pipe_embed_categories"] = dfr
-                        except Exception as ce2:
-                            st.error(f"Category embedding failed: {ce2}")
-
-                try:
-                    dfv = st.session_state.get("pipe_embed_columns") if hasattr(st, 'session_state') else None
-                    if isinstance(dfv, pd.DataFrame) and not dfv.empty:
-                        st.markdown("**Embedded Column Contexts (sample)**")
-                        st.dataframe(dfv.head(50), width='stretch', hide_index=True)
-                except Exception:
-                    pass
-
-                try:
-                    dfr = st.session_state.get("pipe_embed_categories") if hasattr(st, 'session_state') else None
-                    if isinstance(dfr, pd.DataFrame) and not dfr.empty:
-                        st.markdown("**Category Reference Embeddings**")
-                        st.dataframe(dfr, width='stretch', hide_index=True)
-                except Exception:
-                    pass
-
-        if show_steps:
-            with st.expander("Step 4: Similarity Matching", expanded=False):
-                thr = st.slider("Confidence threshold (cosine)", min_value=0.3, max_value=0.95, value=0.45, step=0.05, key="pipe_sim_thr")
-                run_btn = st.button("Compute best category per column (sample)", key="btn_compute_similarity")
-                cols_df = None
-                try:
-                    cols_df = st.session_state.get("pipe_meta_columns") if hasattr(st, 'session_state') else None
-                except Exception:
-                    cols_df = None
-                if run_btn:
-                    try:
-                        cents = getattr(self.ai_service, "_category_centroids", {}) or {}
-                        if not cents:
-                            _ = self.ai_service.initialize_sensitive_detection()
-                            cents = getattr(self.ai_service, "_category_centroids", {}) or {}
-                        out_rows: List[Dict[str, Any]] = []
-                        if isinstance(cols_df, pd.DataFrame) and not cols_df.empty and cents:
-                            sample = cols_df.head(100).copy()
-                            for _, r in sample.iterrows():
-                                ctx = f"{db}.{r.get('TABLE_SCHEMA')}.{r.get('TABLE_NAME')}.{r.get('COLUMN_NAME')}"
-                                com = r.get('COLUMN_COMMENT') or ''
-                                if com:
-                                    ctx = f"{ctx} | {com}"
-                                v = None
-                                try:
-                                    if hasattr(self.ai_service, "_get_embedding"):
-                                        v = self.ai_service._get_embedding(ctx)
-                                except Exception:
-                                    v = None
-                        df_sim = pd.DataFrame(out_rows)
-                        if hasattr(st, 'session_state'):
-                            st.session_state["pipe_similarity_results"] = df_sim
-                    except Exception as se:
-                        st.error(f"Similarity matching failed: {se}")
-
-                try:
-                    df_sim = st.session_state.get("pipe_similarity_results") if hasattr(st, 'session_state') else None
-                    if isinstance(df_sim, pd.DataFrame) and not df_sim.empty:
-                        st.markdown("**Similarity Results (sample)**")
-                        st.dataframe(df_sim, width='stretch', hide_index=True)
-                except Exception:
-                    pass
-
-            try:
-                df_sim = st.session_state.get("pipe_similarity_results") if hasattr(st, 'session_state') else None
-                if isinstance(df_sim, pd.DataFrame) and not df_sim.empty:
-                    st.markdown("**Similarity Results (sample)**")
-                    st.dataframe(df_sim, width='stretch', hide_index=True)
-            except Exception:
-                pass
-
-        if show_steps:
-            with st.expander("Debug: Discovery preview", expanded=False):
-                st.write({
-                    "database": db,
-                    "schema_filter": schema_filter,
-                    "table_filter": table_filter,
-                })
-                try:
-                    sample_assets = self._discover_assets(db)[:10]
-                    if sample_assets:
-                        st.dataframe(pd.DataFrame(sample_assets), width='stretch', hide_index=True)
-                    else:
-                        st.caption("No assets discovered with current filters.")
-                except Exception as _de:
-                    st.caption(f"Discovery preview error: {_de}")
-
-        # Run pipeline button
-        # Run pipeline button
-        if st.button("Run AI Classification Pipeline", type="primary", key="run_ai_pipeline"):
-            self._run_classification_pipeline(db, gov_db)
-
-        # Display results if available in session state
+        # 2. Load Data (Priority: In-Memory -> Database)
+        df_results = pd.DataFrame()
+        source_label = "Database"
+        
+        # Check if we have fresh results in session state
         if st.session_state.get("pipeline_results"):
+            try:
+                # Convert in-memory results to DataFrame for display
+                df_results = self._convert_results_to_dataframe(st.session_state["pipeline_results"])
+                source_label = "Latest Scan (In-Memory)"
+                if not df_results.empty:
+                    st.success(f"✅ Showing results from latest scan ({len(df_results)} sensitive columns found)")
+            except Exception as e:
+                logger.error(f"Failed to process in-memory results: {e}")
+                st.session_state["pipeline_results"] = None # Clear bad state
+        
+        # Fallback to DB if no in-memory results
+        if df_results.empty:
+             with st.spinner("Fetching classification history..."):
+                df_results = self._fetch_classification_history()
+
+        if df_results.empty:
+            st.warning("No classification results found. Run a scan to generate data.")
+            return
+
+        # SAVE LOGIC: If we have unsaved results, save them NOW (after display logic is ready)
+        if st.session_state.get("results_unsaved") and st.session_state.get("pipeline_results"):
+            db = self._get_active_database()
+            if db:
+                with st.spinner("Saving results to Governance Database..."):
+                    self._save_classification_results(db, st.session_state["pipeline_results"])
+        # 3. View Selection & Filters
+        st.sidebar.header("🔍 Filter Results")
+        
+        # View Toggle - REMOVED (Defaulting to Table View with Drill-Down)
+        view_mode = "Table View"
+        
+        # Filter: Compliance
+        all_compliance = sorted(list(set(df_results["Compliance"].dropna().unique())))
+        sel_compliance = st.sidebar.multiselect("Compliance Category", options=all_compliance, default=all_compliance)
+        
+        # Filter: Schema
+        all_schemas = sorted(list(set(df_results["Schema"].dropna().unique())))
+        sel_schemas = st.sidebar.multiselect("Schema", options=all_schemas, default=all_schemas)
+        
+        # Filter: Search
+        search_term = st.sidebar.text_input("Search Table/Column", "")
+
+        # Apply Filters
+        mask = (
+            (df_results["Compliance"].isin(sel_compliance) if sel_compliance else True) &
+            (df_results["Schema"].isin(sel_schemas) if sel_schemas else True)
+        )
+        if search_term:
+            mask = mask & (
+                df_results["Table"].str.contains(search_term, case=False) | 
+                df_results["Column"].str.contains(search_term, case=False)
+            )
+        
+        df_filtered = df_results[mask].copy()
+
+        # 4. Statistics Engine
+        total_items = len(df_filtered)
+        
+        # Count by Compliance
+        pii_count = len(df_filtered[df_filtered["Compliance"].str.contains("PII", case=False, na=False)])
+        sox_count = len(df_filtered[df_filtered["Compliance"].str.contains("SOX", case=False, na=False)])
+        soc2_count = len(df_filtered[df_filtered["Compliance"].str.contains("SOC2", case=False, na=False)])
+        
+        # Count by Sensitivity (Critical vs High)
+        critical_mask = df_filtered["Sensitivity"].str.contains("Confidential|Critical", case=False, na=False)
+        critical_col_count = len(df_filtered[critical_mask])
+        critical_table_count = df_filtered[critical_mask]["Table"].nunique()
+        
+        # --- NEW High Risk Table Calculation ---
+        # Logic: Risk Score > 1.5 OR Multiple Sensitive Columns (> 1)
+        # Weights: Confidential=2.0, Restricted=1.0, Internal=0.5, Public=0.1
+        
+        def get_sensitivity_weight(sensitivity):
+            s = str(sensitivity).upper()
+            if 'CONFIDENTIAL' in s or 'CRITICAL' in s:
+                return 2.0
+            elif 'RESTRICTED' in s or 'HIGH' in s:
+                return 1.0
+            elif 'INTERNAL' in s or 'MEDIUM' in s:
+                return 0.5
+            return 0.1
+
+        # Calculate weights on a copy to avoid affecting main df
+        df_risk = df_filtered.copy()
+        df_risk['Risk_Weight'] = df_risk['Sensitivity'].apply(get_sensitivity_weight)
+        
+        # Aggregate per table
+        table_risk_agg = df_risk.groupby('Table').agg({
+            'Risk_Weight': 'sum',
+            'Column': 'count'
+        })
+        
+        # Apply Thresholds
+        high_risk_tables_list = table_risk_agg[
+            (table_risk_agg['Risk_Weight'] > 1.5) | (table_risk_agg['Column'] > 1)
+        ].index.tolist()
+        
+        high_table_count = len(high_risk_tables_list)
+        
+        # Keep high_col_count based on column sensitivity for the delta
+        high_mask = df_filtered["Sensitivity"].str.contains("Restricted|High", case=False, na=False) & ~critical_mask
+        high_col_count = len(df_filtered[high_mask])
+        
+        # Stats: Top Tables (Sorted by Risk Score)
+        if not table_risk_agg.empty:
+            top_tables = table_risk_agg.sort_values('Risk_Weight', ascending=False).head(5)
+            top_tables.columns = ['Risk Score', 'Sensitive Columns']
+        else:
+            top_tables = pd.DataFrame(columns=['Risk Score', 'Sensitive Columns'])
+
+        # 5. Visual Metrics Dashboard (6 Key Metrics)
+        st.markdown("### 📊 Executive Summary")
+        
+        # First row: 3 metrics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            unique_tables = df_filtered["Table"].nunique()
+            st.metric(
+                label="📋 Total Sensitive Tables",
+                value=unique_tables,
+                delta=f"{len(df_filtered)} columns" if total_items > 0 else None,
+                help="Number of tables containing sensitive data"
+            )
+        
+        with col2:
+            st.metric(
+                label="🔐 PII Data",
+                value=pii_count,
+                delta=f"{(pii_count/max(1,total_items)*100):.1f}%" if total_items > 0 else None,
+                help="Personally Identifiable Information"
+            )
+        
+        with col3:
+            st.metric(
+                label="💰 SOX Data",
+                value=sox_count,
+                delta=f"{(sox_count/max(1,total_items)*100):.1f}%" if total_items > 0 else None,
+                help="Sarbanes-Oxley financial data"
+            )
+        
+        # Second row: 3 metrics
+        col4, col5, col6 = st.columns(3)
+        
+        with col4:
+            st.metric(
+                label="🛡️ SOC2 Data",
+                value=soc2_count,
+                delta=f"{(soc2_count/max(1,total_items)*100):.1f}%" if total_items > 0 else None,
+                help="SOC2 security and compliance data"
+            )
+        
+        with col5:
+            st.metric(
+                label="🔴 Critical Risk Tables",
+                value=critical_table_count,
+                delta=f"{critical_col_count} columns",
+                delta_color="inverse",
+                help="Tables containing Confidential/Critical sensitivity items"
+            )
+        
+        with col6:
+            st.metric(
+                label="🟠 High Risk Tables",
+                value=high_table_count,
+                delta=f"{high_col_count} columns",
+                delta_color="inverse",
+                help="Tables with Risk Score > 1.5 or multiple sensitive columns"
+            )
+
+        # 6. Detailed Analysis Tabs
+        tab1, tab2, tab3 = st.tabs(["📋 Data Explorer", "📈 Risk Analytics", "⚙️ Governance Metadata"])
+
+        with tab1:
+            # Custom CSS for badges and styling
+            st.markdown("""
+                <style>
+                .compliance-badge {
+                    display: inline-block;
+                    padding: 4px 12px;
+                    border-radius: 12px;
+                    font-weight: 600;
+                    font-size: 0.85em;
+                    margin: 2px;
+                }
+                .badge-pii { background-color: #9333ea; color: white; }
+                .badge-sox { background-color: #16a34a; color: white; }
+                .badge-soc2 { background-color: #2563eb; color: white; }
+                
+                .sensitivity-badge {
+                    display: inline-block;
+                    padding: 4px 12px;
+                    border-radius: 12px;
+                    font-weight: 600;
+                    font-size: 0.85em;
+                    margin: 2px;
+                }
+                .badge-critical { background-color: #dc2626; color: white; }
+                .badge-high { background-color: #ea580c; color: white; }
+                .badge-medium { background-color: #eab308; color: white; }
+                .badge-low { background-color: #3b82f6; color: white; }
+                
+                .key-finding-box {
+                    padding: 16px;
+                    border-radius: 8px;
+                    margin: 12px 0;
+                    border-left: 4px solid;
+                }
+                .finding-critical { background-color: rgba(220, 38, 38, 0.15); border-color: #dc2626; }
+                .finding-info { background-color: rgba(37, 99, 235, 0.15); border-color: #2563eb; }
+                
+                .column-name { font-family: 'Courier New', monospace; font-weight: 600; }
+                </style>
+            """, unsafe_allow_html=True)
+            
+            # Key Findings Panel
+            st.markdown(f"#### 🔍 {view_mode} Results ({len(df_filtered)} items)")
+            
+            if critical_col_count > 0 or high_col_count > 0:
+                col_find1, col_find2 = st.columns(2)
+                
+                with col_find1:
+                    st.markdown(f"""
+                        <div class="key-finding-box finding-critical">
+                            <h4 style="margin-top:0;">🔴 Critical Findings</h4>
+                            <ul>
+                                <li><strong>{critical_col_count}</strong> critical sensitivity columns detected</li>
+                                <li><strong>{pii_count}</strong> PII columns require immediate attention</li>
+                                <li>Recommended action: <strong>Apply encryption & access controls</strong></li>
+                            </ul>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                with col_find2:
+                    st.markdown(f"""
+                        <div class="key-finding-box finding-info">
+                            <h4 style="margin-top:0;">📊 Compliance Summary</h4>
+                            <ul>
+                                <li><strong>{sox_count}</strong> SOX-regulated financial data columns</li>
+                                <li><strong>{soc2_count}</strong> SOC2 security-sensitive columns</li>
+                                <li>Coverage: <strong>{len(df_filtered['Table'].unique())}</strong> tables affected</li>
+                            </ul>
+                        </div>
+                    """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # Aggregate by Table
+            grouped = df_filtered.groupby(['Schema', 'Table']).agg({
+                'Column': 'count',
+                'Category': lambda x: sorted(list(set(x))),
+                'Compliance': lambda x: sorted(list(set(x))),
+                'Sensitivity': lambda x: sorted(list(set(x))),
+                'CIA': lambda x: sorted(list(set(x))),
+                'Confidence': 'max'
+            }).reset_index()
+            
+            grouped.rename(columns={'Column': 'Sensitive Cols'}, inplace=True)
+            
+            # Format lists as strings with badges
+            def format_compliance(items):
+                badges = []
+                for item in items:
+                    item_upper = str(item).upper()
+                    if 'PII' in item_upper:
+                        badges.append('🟣 PII')
+                    elif 'SOX' in item_upper:
+                        badges.append('🟢 SOX')
+                    elif 'SOC2' in item_upper:
+                        badges.append('🔵 SOC2')
+                    else:
+                        badges.append(item)
+                return ' | '.join(badges)
+            
+            def format_sensitivity(items):
+                badges = []
+                for item in items:
+                    item_upper = str(item).upper()
+                    if 'CRITICAL' in item_upper or 'CONFIDENTIAL' in item_upper:
+                        badges.append('🔴 CRITICAL')
+                    elif 'HIGH' in item_upper or 'RESTRICTED' in item_upper:
+                        badges.append('🟠 HIGH')
+                    elif 'MEDIUM' in item_upper:
+                        badges.append('🟡 MEDIUM')
+                    elif 'LOW' in item_upper:
+                        badges.append('🔵 LOW')
+                    else:
+                        badges.append(item)
+                return ' | '.join(badges)
+            
+            grouped['Compliance'] = grouped['Compliance'].apply(format_compliance)
+            grouped['Sensitivity'] = grouped['Sensitivity'].apply(format_sensitivity)
+            grouped['Category'] = grouped['Category'].apply(lambda x: ', '.join(x))
+            grouped['CIA'] = grouped['CIA'].apply(lambda x: ', '.join(x))
+            
+            st.dataframe(
+                grouped[['Schema', 'Table', 'Sensitive Cols', 'Category', 'Sensitivity', 'CIA']],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Sensitive Cols": st.column_config.NumberColumn(
+                        "Sensitive Columns",
+                        format="%d"
+                    ),
+                }
+            )
+            
+            # --- Drill Down Functionality ---
             st.divider()
-            self._display_classification_results(st.session_state["pipeline_results"])
+            st.subheader("🔬 Table Drill-Down")
+            
+            # Get list of tables for dropdown
+            table_options = sorted(grouped['Table'].unique().tolist())
+            selected_table = st.selectbox(
+                "Select a table to view detailed column analysis:",
+                options=table_options,
+                index=None,
+                placeholder="Choose a table..."
+            )
+            
+            if selected_table:
+                st.markdown(f"##### Detailed Analysis for `{selected_table}`")
+                
+                # Filter for selected table
+                table_details = df_filtered[df_filtered['Table'] == selected_table].copy()
+                
+                # Format compliance with badges (Inline function to avoid scope issues)
+                def drill_badge_compliance(val):
+                    val_upper = str(val).upper()
+                    if 'PII' in val_upper:
+                        return '🟣 PII'
+                    elif 'SOX' in val_upper:
+                        return '🟢 SOX'
+                    elif 'SOC2' in val_upper:
+                        return '🔵 SOC2'
+                    return val
+                
+                # Format sensitivity with badges
+                def drill_badge_sensitivity(val):
+                    val_upper = str(val).upper()
+                    if 'CRITICAL' in val_upper or 'CONFIDENTIAL' in val_upper:
+                        return '🔴 CRITICAL'
+                    elif 'HIGH' in val_upper or 'RESTRICTED' in val_upper:
+                        return '🟠 HIGH'
+                    elif 'MEDIUM' in val_upper:
+                        return '🟡 MEDIUM'
+                    elif 'LOW' in val_upper:
+                        return '🔵 LOW'
+                    return val
+
+                table_details['Compliance'] = table_details['Compliance'].apply(drill_badge_compliance)
+                table_details['Sensitivity'] = table_details['Sensitivity'].apply(drill_badge_sensitivity)
+                
+                st.dataframe(
+                    table_details[['Column', 'Category', 'Sensitivity', 'CIA', 'Rationale']],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Rationale": st.column_config.TextColumn(
+                            "Detection Rationale",
+                            width="large"
+                        )
+                    }
+                )
+
+        with tab2:
+            st.markdown("#### Risk Distribution")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**By Compliance Framework**")
+                if not df_filtered.empty:
+                    st.bar_chart(df_filtered["Compliance"].value_counts())
+                else:
+                    st.info("No data to display")
+            with c2:
+                st.markdown("**By Sensitivity Level**")
+                if not df_filtered.empty:
+                    st.bar_chart(df_filtered["Sensitivity"].value_counts())
+                else:
+                    st.info("No data to display")
+            
+            st.markdown("#### Top High-Risk Tables")
+            st.dataframe(top_tables, use_container_width=True)
+
+        with tab3:
+            st.markdown("#### Active Governance Rules")
+            st.json({
+                "Sensitivity Categories": list(self._category_thresholds.keys()),
+                "Compliance Frameworks": list(self._compliance_categories.values()),
+                "Total Patterns": sum(len(p) for p in self._category_patterns.values()),
+                "Total Keywords": sum(len(k) for k in self._category_keywords.values())
+            })
 
     def _get_active_database(self) -> Optional[str]:
         """
@@ -383,8 +560,13 @@ class AIClassificationPipelineService:
         try:
             logger.info("Probing Snowflake for current database...")
             rows = snowflake_connector.execute_query("SELECT CURRENT_DATABASE() AS DB") or []
-            if rows and rows[0].get("DB"):
-                db = rows[0].get("DB")
+            if rows:
+                first = rows[0]
+                # Support both dict-style and scalar results from the connector
+                if isinstance(first, dict):
+                    db = first.get("DB")
+                else:
+                    db = first
                 if db and str(db).strip().upper() not in {'', 'NONE', '(NONE)', 'NULL', 'UNKNOWN'}:
                     logger.info(f"Database from Snowflake context: {db}")
                     return db
@@ -396,9 +578,20 @@ class AIClassificationPipelineService:
             logger.warning("No database configured - attempting to list available databases...")
             rows = snowflake_connector.execute_query("SHOW DATABASES") or []
             if rows:
-                # Filter out system databases
-                user_dbs = [r.get('name') for r in rows if r.get('name') and 
-                           r.get('name').upper() not in {'SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA', 'UTIL_DB'}]
+                # Filter out system databases, tolerate non-dict row types
+                user_dbs = []
+                for r in rows:
+                    name = None
+                    if isinstance(r, dict):
+                        name = r.get('name') or r.get('NAME')
+                    else:
+                        name = r
+                    if not name:
+                        continue
+                    name_str = str(name)
+                    if name_str.upper() in {'SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA', 'UTIL_DB'}:
+                        continue
+                    user_dbs.append(name_str)
                 if user_dbs:
                     db = user_dbs[0]
                     logger.warning(f"Auto-selected first available database: {db}")
@@ -776,46 +969,26 @@ class AIClassificationPipelineService:
     def _load_additional_tokens_from_keywords(self, schema_fqn: str, category_name: str) -> List[str]:
         rows = []
         try:
+            # Join SENSITIVE_KEYWORDS to SENSITIVITY_CATEGORIES via CATEGORY_ID
+            # and filter by CATEGORY_NAME; use KEYWORD_STRING as the keyword text.
             rows = snowflake_connector.execute_query(
                 f"""
-                SELECT COALESCE(keyword, KEYWORD, KEYWORD_STRING) AS KW
-                FROM {schema_fqn}.SENSITIVE_KEYWORDS
-                WHERE COALESCE(is_active, true) AND (
-                    LOWER(category) = LOWER(%(n)s) OR LOWER(category_name) = LOWER(%(n)s)
-                )
+                SELECT sk.KEYWORD_STRING AS KW
+                FROM {schema_fqn}.SENSITIVE_KEYWORDS sk
+                JOIN {schema_fqn}.SENSITIVITY_CATEGORIES sc
+                  ON sk.CATEGORY_ID = sc.CATEGORY_ID
+                WHERE COALESCE(sk.IS_ACTIVE, TRUE)
+                  AND LOWER(sc.CATEGORY_NAME) = LOWER(%(n)s)
                 """,
                 {"n": category_name},
             ) or []
         except Exception:
-            try:
-                # CATEGORY_ID-based lookup using SENSITIVITY_CATEGORIES
-                rows = snowflake_connector.execute_query(
-                    f"""
-                    SELECT COALESCE(keyword, KEYWORD, KEYWORD_STRING) AS KW
-                    FROM {schema_fqn}.SENSITIVE_KEYWORDS
-                    WHERE COALESCE(is_active, true) AND category_id IN (
-                        SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
-                    )
-                    """,
-                    {"n": category_name},
-                ) or []
-            except Exception:
-                try:
-                    rows = snowflake_connector.execute_query(
-                        f"""
-                        SELECT COALESCE(keyword, KEYWORD, KEYWORD_STRING) AS KW
-                        FROM {schema_fqn}.SENSITIVITY_KEYWORDS
-                        WHERE COALESCE(is_active, true) AND category_id IN (
-                            SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
-                        )
-                        """,
-                        {"n": category_name},
-                    ) or []
-                except Exception:
-                    rows = []
+            rows = []
         out: List[str] = []
         for r in rows:
             try:
+                if not isinstance(r, dict):
+                    continue
                 kw = str(r.get("KW") or "").strip()
                 if kw:
                     out.append(kw)
@@ -830,15 +1003,19 @@ class AIClassificationPipelineService:
             rows = snowflake_connector.execute_query(
                 f"""
                 SELECT 
-                    LOWER(COALESCE(keyword, KEYWORD, KEYWORD_STRING)) AS KEYWORD,
-                    UPPER(COALESCE(category, category_name, CATEGORY_NAME)) AS CATEGORY
-                FROM {schema_fqn}.SENSITIVE_KEYWORDS
-                WHERE COALESCE(is_active, IS_ACTIVE, true) = true
+                    LOWER(sk.KEYWORD_STRING) AS KEYWORD,
+                    UPPER(sc.CATEGORY_NAME)   AS CATEGORY
+                FROM {schema_fqn}.SENSITIVE_KEYWORDS sk
+                JOIN {schema_fqn}.SENSITIVITY_CATEGORIES sc
+                  ON sk.CATEGORY_ID = sc.CATEGORY_ID
+                WHERE COALESCE(sk.IS_ACTIVE, TRUE) = TRUE
                 """) or []
             
             glossary_map = {}
             for r in rows:
                 try:
+                    if not isinstance(r, dict):
+                        continue
                     kw = str(r.get("KEYWORD") or "").strip().lower()
                     cat = str(r.get("CATEGORY") or "").strip().upper()
                     
@@ -856,6 +1033,65 @@ class AIClassificationPipelineService:
         except Exception as e:
             logger.warning(f"Failed to load business glossary from governance: {e}")
             self._business_glossary_map = {}
+
+    def classify_texts(self, texts: List[str], context: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Classify a list of text samples using the current AI model and governance metadata.
+        This method is used by AISensitiveDetectionService.
+        """
+        try:
+            if not self._embed_ready or not self._category_centroids:
+                self._init_local_embeddings()
+                
+            if not self._embed_ready or not self._category_centroids:
+                return {'categories': {}, 'overall_confidence': 0.0}
+                
+            # Embed texts - take first few as representative
+            sample_text = " ".join([str(t) for t in texts[:5]])
+            if context:
+                # Enrich with context
+                ctx_str = f"{context.get('table_name', '')} {context.get('column_name', '')} {sample_text}"
+            else:
+                ctx_str = sample_text
+                
+            # Get embedding
+            vec = None
+            if self._embedder:
+                # Preprocess
+                if 'e5' in str(self._model_name or '').lower():
+                    ctx_str = f"query: {ctx_str}"
+                    
+                vecs = self._embedder.encode([ctx_str], normalize_embeddings=True)
+                vec = vecs[0]
+                
+            if vec is None:
+                return {'categories': {}, 'overall_confidence': 0.0}
+                
+            # Calculate similarities
+            scores = {}
+            for cat, centroid in self._category_centroids.items():
+                if centroid is None: 
+                    continue
+                sim = float(np.dot(vec, centroid))
+                scores[cat] = sim
+                
+            # Filter by threshold
+            final_scores = {}
+            max_score = 0.0
+            for cat, score in scores.items():
+                thresh = self._category_thresholds.get(cat, 0.45)
+                if score >= thresh:
+                    final_scores[cat] = score
+                    max_score = max(max_score, score)
+                    
+            return {
+                'categories': final_scores,
+                'overall_confidence': max_score
+            }
+            
+        except Exception as e:
+            logger.error(f"classify_texts failed: {e}")
+            return {'categories': {}, 'overall_confidence': 0.0}
 
     def _load_metadata_driven_categories(self) -> None:
         """
@@ -899,6 +1135,7 @@ class AIClassificationPipelineService:
             categories_data = snowflake_connector.execute_query(
                 f"""
                 SELECT 
+                    CATEGORY_ID,
                     CATEGORY_NAME,
                     COALESCE(DESCRIPTION, '') AS DESCRIPTION,
                     COALESCE(DETECTION_THRESHOLD, 0.45) AS DETECTION_THRESHOLD,
@@ -909,10 +1146,9 @@ class AIClassificationPipelineService:
                     COALESCE(WEIGHT_KEYWORD, 0.25) AS WEIGHT_KEYWORD,
                     COALESCE(WEIGHT_PATTERN, 0.15) AS WEIGHT_PATTERN,
                     COALESCE(MULTI_LABEL, TRUE) AS MULTI_LABEL,
-                    COALESCE(IS_ACTIVE, TRUE) AS IS_ACTIVE,
-                    CATEGORY_ID
+                    COALESCE(IS_ACTIVE, TRUE) AS IS_ACTIVE
                 FROM {schema_fqn}.SENSITIVITY_CATEGORIES
-                WHERE COALESCE(IS_ACTIVE, TRUE) = TRUE
+                WHERE COALESCE(IS_ACTIVE, true)
                 ORDER BY CATEGORY_NAME
                 """
             ) or []
@@ -920,6 +1156,9 @@ class AIClassificationPipelineService:
             
             # Debug: Log what was loaded
             for cat in categories_data:
+                # Tolerate non-dict row types from the connector
+                if not isinstance(cat, dict):
+                    continue
                 cat_name = str(cat.get("CATEGORY_NAME") or "").strip()
                 desc = str(cat.get("DESCRIPTION") or "").strip()
                 pg = str(cat.get("POLICY_GROUP") or "None")
@@ -951,6 +1190,9 @@ class AIClassificationPipelineService:
         category_ids = {}
         
         for cat in categories_data:
+            # Ensure we only process dict rows
+            if not isinstance(cat, dict):
+                continue
             cat_name = str(cat.get("CATEGORY_NAME") or "").strip()
             if not cat_name:
                 logger.warning(f"Skipping category with empty CATEGORY_NAME")
@@ -991,6 +1233,17 @@ class AIClassificationPipelineService:
             # Load Multi-Label Flag
             self._category_multi_label[cat_name] = bool(cat.get("MULTI_LABEL", True))
             
+            # Load Color Code (Derived from Policy Group since column is removed)
+            pg_upper = str(policy_group or "").upper()
+            if pg_upper == 'PII':
+                self._category_colors[cat_name.upper()] = "#FF5733"  # Red
+            elif pg_upper == 'SOX':
+                self._category_colors[cat_name.upper()] = "#FFA500"  # Orange
+            elif pg_upper == 'SOC2':
+                self._category_colors[cat_name.upper()] = "#4169E1"  # Blue
+            else:
+                self._category_colors[cat_name.upper()] = "#808080"  # Gray
+
             logger.info(f"  Category: {cat_name}")
             logger.info(f"    Group: {policy_group or 'None'}")
             logger.info(f"    Weights: Sem={self._category_scoring_weights[cat_name]['w_sem']:.2f}, Kw={self._category_scoring_weights[cat_name]['w_kw']:.2f}, Pat={self._category_scoring_weights[cat_name]['w_pat']:.2f}")
@@ -1021,6 +1274,9 @@ class AIClassificationPipelineService:
             ) or []
             
             for kw in keywords_data:
+                if not isinstance(kw, dict):
+                    continue
+                    
                 cat_name = str(kw.get("CATEGORY_NAME") or "").strip()
                 keyword = str(kw.get("KEYWORD_STRING") or "").strip().lower()
                 
@@ -1055,8 +1311,7 @@ class AIClassificationPipelineService:
                 f"""
                 SELECT 
                     c.CATEGORY_NAME,
-                    COALESCE(p.PATTERN_REGEX, p.PATTERN_STRING) AS PATTERN_REGEX,
-                    COALESCE(p.PATTERN_STRING, p.PATTERN_REGEX) AS PATTERN_STRING,
+                    p.PATTERN_REGEX,
                     COALESCE(p.SENSITIVITY_WEIGHT, 1.0) AS SENSITIVITY_WEIGHT,
                     COALESCE(p.SENSITIVITY_TYPE, 'STANDARD') AS SENSITIVITY_TYPE
                 FROM {schema_fqn}.SENSITIVE_PATTERNS p
@@ -1068,28 +1323,60 @@ class AIClassificationPipelineService:
                 """
             ) or []
             
-            for pat in patterns_data:
+            logger.info(f"Retrieved {len(patterns_data)} pattern rows from SENSITIVE_PATTERNS")
+            
+            for idx, pat in enumerate(patterns_data):
+                # CRITICAL: Validate that Snowflake returned a dictionary, not a string
+                if not isinstance(pat, dict):
+                    logger.error(f"Pattern row {idx} is not a dict: type={type(pat)}, value={str(pat)[:100]}")
+                    logger.error("This indicates a Snowflake connector issue - rows should be dictionaries")
+                    continue
+                    
                 cat_name = str(pat.get("CATEGORY_NAME") or "").strip()
-                # Prefer PATTERN_REGEX, fall back to PATTERN_STRING if regex is not provided
-                pattern = str(pat.get("PATTERN_REGEX") or pat.get("PATTERN_STRING") or "").strip()
+                # Use PATTERN_REGEX only
+                pattern = str(pat.get("PATTERN_REGEX") or "").strip()
                 
-                if cat_name in patterns_by_category and pattern:
+                if not cat_name:
+                    logger.warning(f"Pattern row {idx} has empty CATEGORY_NAME, skipping")
+                    continue
+                
+                if not pattern:
+                    logger.warning(f"Pattern row {idx} for category '{cat_name}' has empty PATTERN_REGEX, skipping")
+                    continue
+                
+                if cat_name in patterns_by_category:
                     patterns_by_category[cat_name].append(pattern)
                     
                     # Store full metadata for weighted scoring
+                    # CRITICAL: Ensure we create a proper dictionary structure
                     pattern_metadata_by_category[cat_name].append({
                         'pattern': pattern,
                         'weight': float(pat.get("SENSITIVITY_WEIGHT") or 1.0),
                         'sensitivity_type': str(pat.get("SENSITIVITY_TYPE") or "STANDARD").upper()
                     })
+                    
+                    logger.debug(f"  Loaded pattern for {cat_name}: {pattern[:50]}... (weight={pat.get('SENSITIVITY_WEIGHT', 1.0)})")
+                else:
+                    logger.warning(f"Category '{cat_name}' not found in category_descriptions, skipping pattern")
             
             total_patterns = sum(len(pats) for pats in patterns_by_category.values())
             logger.info(f"✓ Loaded {total_patterns} patterns from SENSITIVE_PATTERNS")
             for cat, pats in patterns_by_category.items():
                 if pats:
                     logger.info(f"  {cat}: {len(pats)} patterns")
+                    
+            # VALIDATION: Verify pattern metadata structure
+            for cat, metadata_list in pattern_metadata_by_category.items():
+                for idx, meta in enumerate(metadata_list):
+                    if not isinstance(meta, dict):
+                        logger.error(f"CRITICAL: Pattern metadata for {cat}[{idx}] is not a dict: {type(meta)}")
+                    elif 'pattern' not in meta:
+                        logger.error(f"CRITICAL: Pattern metadata for {cat}[{idx}] missing 'pattern' key")
+                        
         except Exception as e:
             logger.error(f"✗ Failed to load SENSITIVE_PATTERNS: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
         
         # ========================================================================
         # STEP 4: Build Embeddings (if available)
@@ -1187,6 +1474,7 @@ class AIClassificationPipelineService:
         self._category_keywords = keywords_by_category
         self._category_keyword_metadata = keyword_metadata_by_category  # NEW: Full keyword metadata
         self._category_pattern_metadata = pattern_metadata_by_category  # NEW: Full pattern metadata
+        self._category_ids = category_ids  # NEW: Category IDs for saving results
 
         # Verification-only logging for policy-group mappings loaded from governance.
         try:
@@ -1287,14 +1575,38 @@ class AIClassificationPipelineService:
         self._category_thresholds = {}
         self._category_weights = {}
         self._policy_group_by_category = {}
+        self._category_keyword_metadata = {}  # Initialize metadata structure
+        self._category_pattern_metadata = {}  # Initialize metadata structure
         
         # Build from baseline definitions
         for cat_name, cat_data in baseline_categories.items():
-            # Store keywords
+            # Store keywords (simple list)
             self._category_keywords[cat_name] = cat_data['keywords']
             
-            # Store patterns
+            # Store keyword metadata (list of dicts for scoring)
+            self._category_keyword_metadata[cat_name] = [
+                {
+                    'keyword': kw,
+                    'weight': 1.0,
+                    'match_type': 'EXACT',
+                    'sensitivity_type': 'STANDARD',
+                    'score': 1.0
+                }
+                for kw in cat_data['keywords']
+            ]
+            
+            # Store patterns (simple list)
             self._category_patterns[cat_name] = cat_data['patterns']
+            
+            # Store pattern metadata (list of dicts for scoring)
+            self._category_pattern_metadata[cat_name] = [
+                {
+                    'pattern': pat,
+                    'weight': 1.0,
+                    'sensitivity_type': 'STANDARD'
+                }
+                for pat in cat_data['patterns']
+            ]
             
             # Store threshold (lowered to 0.40 for better recall)
             self._category_thresholds[cat_name] = cat_data['threshold']
@@ -1566,153 +1878,118 @@ class AIClassificationPipelineService:
 
     def _pattern_scores(self, text: str) -> Dict[str, float]:
         """
-        Metadata-driven pattern scoring using ONLY data from governance tables.
-        Uses self._category_pattern_metadata loaded from SENSITIVE_PATTERNS table.
-        Applies SENSITIVITY_WEIGHT and SENSITIVITY_TYPE from metadata.
+        Calculate pattern matching scores using patterns from governance tables.
+        Handles both _category_pattern_metadata (preferred) and legacy _category_patterns.
+        
+        Returns:
+            Dictionary mapping category names to pattern match scores (0.0 to 1.0)
         """
-        out: Dict[str, float] = {}
+        scores = {}
+        if not text:
+            return scores
+            
+        text_lower = text.lower()
+        patterns_available = hasattr(self, '_category_pattern_metadata') and self._category_pattern_metadata
+        legacy_patterns_available = hasattr(self, '_category_patterns') and self._category_patterns
+        
+        if not patterns_available and not legacy_patterns_available:
+            logger.debug("No pattern metadata available for scoring")
+            return scores
+        
         try:
-            # Use pattern metadata if available
-            if hasattr(self, '_category_pattern_metadata') and self._category_pattern_metadata:
-                t = str(text or "")
-
-                for cat, pattern_list in self._category_pattern_metadata.items():
+            # Try to use _category_pattern_metadata first (preferred)
+            if patterns_available:
+                for category, pattern_list in self._category_pattern_metadata.items():
                     if not pattern_list:
                         continue
-
+                        
                     total_weighted_score = 0.0
-                    match_count = 0
-
-                    for pat_meta in pattern_list:
-                        pattern = pat_meta['pattern']
-                        weight = pat_meta['weight']
-                        sensitivity_type = pat_meta['sensitivity_type']
-
-                        try:
-                            if re.search(pattern, t, re.IGNORECASE):
-                                match_count += 1
-                                # Weighted contribution
-                                contribution = weight
-                                total_weighted_score += contribution
-                                logger.debug(f"    Pattern match: '{pattern[:50]}...'  score={contribution:.3f}")
-                        except Exception as e:
-                            # Invalid regex, skip
-                            logger.debug(f"    Invalid pattern: '{pattern[:50]}...'  {e}")
-                            continue
-
-                    if match_count > 0:
-                        # Get category threshold (relaxed default for patterns)
-                        threshold = getattr(self, '_category_thresholds', {}).get(cat, 0.30)
-                        category_weight = getattr(self, '_category_weights', {}).get(cat, 1.0)
-
-                        # Normalize by number of patterns
-                        num_patterns = len(pattern_list)
-                        normalized_score = (total_weighted_score / max(1, num_patterns)) * category_weight
-
-                        # Cap at 1.0
-                        final_score = min(1.0, normalized_score)
-
-                        # STRICT: Only include if score meets category threshold
-                        if final_score >= threshold:
-                            out[cat] = final_score
-                            logger.debug(f"   Pattern score: {cat} = {final_score:.2f} ({match_count} matches, threshold={threshold:.2f})")
+                    total_possible_weight = 0.0
+                    
+                    for pattern_item in pattern_list:
+                        # Handle both dict and string patterns
+                        pattern = ''
+                        weight = 1.0
+                        
+                        if isinstance(pattern_item, dict):
+                            pattern = pattern_item.get('pattern', '')
+                            weight = float(pattern_item.get('weight', 1.0))
+                        elif isinstance(pattern_item, str):
+                            pattern = pattern_item
                         else:
-                            logger.debug(f"   Below threshold: {cat} = {final_score:.2f} < {threshold:.2f}")
-
-            # Fallback to simple pattern matching if metadata not available
-            if not hasattr(self, "_category_patterns") or not self._category_patterns:
-                return out
-
-            t = str(text or "")
-            for cat, patterns in self._category_patterns.items():
-                hits = 0
-                for p in (patterns or [])[:20]:
-                    try:
-                        if not p:
+                            logger.warning(f"Invalid pattern type for {category}: {type(pattern_item).__name__}, skipping")
                             continue
-                        if re.search(p, t, re.IGNORECASE):
-                            hits += 1
-                    except Exception:
+                        
+                        if not pattern or not isinstance(pattern, str):
+                            continue
+                        
+                        try:
+                            if re.search(pattern, text_lower, re.IGNORECASE):
+                                total_weighted_score += weight
+                                logger.debug(f"Pattern match for {category}: '{pattern[:50]}...' (weight={weight:.1f})")
+                        except re.error as e:
+                            logger.warning(f"Invalid regex pattern for {category}: '{pattern[:50]}...' Error: {e}")
+                            continue
+                        
+                        total_possible_weight += weight
+                    
+                    # Calculate final score if we had any possible weight
+                    if total_possible_weight > 0:
+                        raw_score = min(1.0, (total_weighted_score / total_possible_weight))
+                        
+                        # Apply sigmoid scaling to make scores more distinct
+                        score = 1 / (1 + math.exp(-10 * (raw_score - 0.5)))
+                        
+                        # Get category-specific threshold
+                        threshold = getattr(self, '_category_thresholds', {}).get(category, 0.30)
+                        category_weight = getattr(self, '_category_weights', {}).get(category, 1.0)
+                        
+                        # Apply category weight and threshold
+                        final_score = min(1.0, score * category_weight)
+                        
+                        if final_score >= threshold:
+                            scores[category] = final_score
+                            logger.debug(
+                                f"Pattern scores for {category}: "
+                                f"raw={raw_score:.3f}, final={final_score:.3f} "
+                                f"(threshold={threshold:.2f}, weight={category_weight:.1f})"
+                            )
+            
+            # Fall back to legacy _category_patterns if no scores from metadata
+            if not scores and legacy_patterns_available:
+                logger.debug("Falling back to legacy _category_patterns")
+                for category, patterns in self._category_patterns.items():
+                    if not patterns:
                         continue
-
-                if hits > 0:
-                    threshold = getattr(self, '_category_thresholds', {}).get(cat, 0.30)
-                    score = max(0.0, min(1.0, hits / 3.0))
-                    if score >= threshold:
-                        out[cat] = score
-        except Exception:
+                        
+                    match_count = 0
+                    
+                    for pattern in patterns[:20]:  # Limit to first 20 patterns per category
+                        if not pattern or not isinstance(pattern, str):
+                            continue
+                             
+                        try:
+                            if re.search(pattern, text_lower, re.IGNORECASE):
+                                match_count += 1
+                        except re.error as e:
+                            logger.warning(f"Invalid legacy pattern for {category}: '{pattern[:50]}...' Error: {e}")
+                            continue
+                    
+                    if match_count > 0:
+                        # Simple scoring for legacy patterns
+                        raw_score = min(1.0, match_count / 3.0)
+                        score = 1 / (1 + math.exp(-10 * (raw_score - 0.5)))
+                        
+                        # Apply default threshold for legacy patterns
+                        if score >= 0.30:  # Default threshold for legacy patterns
+                            scores[category] = score
+                            logger.debug(f"Legacy pattern match for {category}: {match_count} patterns, score={score:.3f}")
+            
+            return scores
+            
+        except Exception as e:
+            logger.error(f"Error in pattern scoring: {e}", exc_info=True)
             return {}
-        return out
-
-    def _pattern_scores_with_matches(self, text: str) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
-        out: Dict[str, float] = {}
-        matches: Dict[str, List[str]] = {}
-        try:
-            if hasattr(self, '_category_pattern_metadata') and self._category_pattern_metadata:
-                t = str(text or "")
-
-                for cat, pattern_list in self._category_pattern_metadata.items():
-                    if not pattern_list:
-                        continue
-
-                    total_weighted_score = 0.0
-                    match_count = 0
-                    cat_matches: List[str] = []
-
-                    for pat_meta in pattern_list:
-                        pattern = pat_meta['pattern']
-                        weight = pat_meta['weight']
-                        try:
-                            if re.search(pattern, t, re.IGNORECASE):
-                                match_count += 1
-                                contribution = weight
-                                total_weighted_score += contribution
-                                cat_matches.append(pattern)
-                                logger.debug(f"    Pattern match: '{pattern[:50]}...'  score={contribution:.3f}")
-                        except Exception as e:
-                            logger.debug(f"    Invalid pattern: '{pattern[:50]}...'  {e}")
-                            continue
-
-                    if match_count > 0:
-                        threshold = getattr(self, '_category_thresholds', {}).get(cat, 0.30)
-                        category_weight = getattr(self, '_category_weights', {}).get(cat, 1.0)
-                        num_patterns = len(pattern_list)
-                        normalized_score = (total_weighted_score / max(1, num_patterns)) * category_weight
-                        final_score = min(1.0, normalized_score)
-
-                        if final_score >= threshold:
-                            out[cat] = final_score
-                            matches[cat] = cat_matches
-                            logger.debug(f"   Pattern score: {cat} = {final_score:.2f} ({match_count} matches, threshold={threshold:.2f})")
-                        else:
-                            logger.debug(f"   Below threshold: {cat} = {final_score:.2f} < {threshold:.2f}")
-
-            if not hasattr(self, "_category_patterns") or not self._category_patterns:
-                return out, matches
-
-            t = str(text or "")
-            for cat, patterns in self._category_patterns.items():
-                hits = 0
-                cat_matches: List[str] = []
-                for p in (patterns or [])[:20]:
-                    try:
-                        if not p:
-                            continue
-                        if re.search(p, t, re.IGNORECASE):
-                            hits += 1
-                            cat_matches.append(p)
-                    except Exception:
-                        continue
-
-                if hits > 0:
-                    threshold = getattr(self, '_category_thresholds', {}).get(cat, 0.65)
-                    score = max(0.0, min(1.0, hits / 3.0))
-                    if score >= threshold:
-                        out[cat] = score
-                        matches[cat] = cat_matches
-            return out, matches
-        except Exception:
-            return {}, {}
 
     def _keyword_scores_with_matches(self, text: str) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
         scores: Dict[str, float] = {}
@@ -1732,10 +2009,16 @@ class AIClassificationPipelineService:
             cat_matches: List[str] = []
 
             for kw_meta in keyword_list:
-                keyword = kw_meta['keyword']
-                weight = kw_meta['weight']
-                match_type = kw_meta['match_type']
-                base_score = kw_meta['score']
+                if not isinstance(kw_meta, dict):
+                    continue
+                    
+                keyword = kw_meta.get('keyword', '')
+                if not keyword:
+                    continue
+                    
+                weight = kw_meta.get('weight', 1.0)
+                match_type = kw_meta.get('match_type', 'PARTIAL')
+                base_score = kw_meta.get('score', 0.0)
 
                 matched_flag = False
                 match_quality = 0.0
@@ -1808,49 +2091,421 @@ class AIClassificationPipelineService:
         logger.warning("_fallback_keyword_matching() is deprecated. Using metadata-driven keyword scoring.")
         return self._keyword_scores_metadata_driven(text)
 
+    def _convert_results_to_dataframe(self, results: List[Dict[str, Any]]) -> pd.DataFrame:
+        """Convert in-memory classification results to DataFrame matching DB schema."""
+        data = []
+        for r in results:
+            # Handle table-level results that contain column_results
+            cols = r.get('column_results', [])
+            if cols:
+                for col in cols:
+                    try:
+                        # Map fields to match _fetch_classification_history output
+                        category = col.get('category', 'Unknown')
+                        policy_group = col.get('policy_group')
+                        
+                        # Derive compliance name if missing
+                        if not policy_group:
+                            policy_group = self._map_category_to_policy_group(category) or 'None'
+                            
+                        # Get sensitivity name from label if available, else fallback to category
+                        sensitivity = col.get('label') or category 
+                        
+                        # Construct rationale
+                        rationale = ""
+                        if col.get('detected_categories'):
+                             rationale = f"Detected: {', '.join([d['category'] for d in col['detected_categories']])}"
+                        
+                        row = {
+                            'Schema': str(col.get('schema', '')).strip() or 'Unknown',
+                            'Table': str(col.get('table', '')).strip() or 'Unknown',
+                            'Column': str(col.get('column_name', '')).strip() or 'Unknown',
+                            'Category': category,
+                            'Confidence': float(col.get('confidence', 0.0)),
+                            'Sensitivity': sensitivity,
+                            'Compliance': policy_group,
+                            'CIA': f"C:{col.get('c','-')} I:{col.get('i','-')} A:{col.get('a','-')}",
+                            'Rationale': rationale
+                        }
+                        data.append(row)
+                    except Exception as e:
+                        logger.warning(f"Error converting result row: {e}")
+                        continue
+                
+        if not data:
+            return pd.DataFrame()
+            
+        return pd.DataFrame(data)
+
+    def _extract_cia_from_details(self, details_raw: Any) -> str:
+        """Extract CIA values from DETAILS column (JSON/Dict) and format as string."""
+        cia_str = "C:- I:- A:-"
+        try:
+            if not details_raw:
+                return cia_str
+                
+            details_json = {}
+            if isinstance(details_raw, dict):
+                details_json = details_raw
+            elif isinstance(details_raw, str):
+                import json
+                try:
+                    details_json = json.loads(details_raw)
+                except Exception:
+                    pass
+            
+            cia_data = details_json.get('cia') or {}
+            if cia_data:
+                c_val = cia_data.get('c', '-')
+                i_val = cia_data.get('i', '-')
+                a_val = cia_data.get('a', '-')
+                cia_str = f"C:{c_val} I:{i_val} A:{a_val}"
+        except Exception:
+            pass
+        return cia_str
+
+    def _fetch_classification_history(self) -> pd.DataFrame:
+        """Fetch all classification results from the governance database."""
+        try:
+            # Get the current database to use as context for governance DB resolution
+            current_db = self._get_active_database()
+            gov_db = self._get_governance_database(current_db)
+            if not gov_db:
+                logger.warning("No governance database configured")
+                return pd.DataFrame()
+
+            # First, check which columns exist in CLASSIFICATION_AI_RESULTS
+            try:
+                col_check_query = f"""
+                    SELECT COLUMN_NAME
+                    FROM {gov_db}.INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = 'DATA_CLASSIFICATION_GOVERNANCE'
+                      AND TABLE_NAME = 'CLASSIFICATION_AI_RESULTS'
+                """
+                available_cols = snowflake_connector.execute_query(col_check_query) or []
+                col_names = {str(c.get('COLUMN_NAME', '')).upper() for c in available_cols}
+                
+                has_schema_name = 'SCHEMA_NAME' in col_names
+                has_sens_cat_id = 'SENSITIVITY_CATEGORY_ID' in col_names
+                
+                logger.info(f"CLASSIFICATION_AI_RESULTS columns: SCHEMA_NAME={has_schema_name}, SENSITIVITY_CATEGORY_ID={has_sens_cat_id}")
+            except Exception as col_err:
+                logger.warning(f"Could not check columns: {col_err}. Using defaults.")
+                has_schema_name = has_sens_cat_id = False
+
+            # Build query dynamically based on available columns
+            schema_col = "r.SCHEMA_NAME" if has_schema_name else "NULL AS SCHEMA_NAME"
+            sens_cat_col = "r.SENSITIVITY_CATEGORY_ID" if has_sens_cat_id else "NULL AS SENSITIVITY_CATEGORY_ID"
+            
+            # Query using ONLY SENSITIVITY_CATEGORIES (no COMPLIANCE_CATEGORIES)
+            # Get POLICY_GROUP directly from SENSITIVITY_CATEGORIES
+            query = f"""
+                SELECT 
+                    r.TABLE_NAME,
+                    r.COLUMN_NAME,
+                    r.AI_CATEGORY,
+                    r.FINAL_CONFIDENCE,
+                    r.DETAILS,
+                    {schema_col},
+                    {sens_cat_col},
+                    sc.CATEGORY_NAME as SENSITIVITY_NAME,
+                    sc.POLICY_GROUP as COMPLIANCE_NAME
+                FROM {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS r
+                LEFT JOIN {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES sc
+                    ON {('r.SENSITIVITY_CATEGORY_ID = sc.CATEGORY_ID') if has_sens_cat_id else '1=0'}
+                ORDER BY r.FINAL_CONFIDENCE DESC
+            """
+            
+            # Execute query and ensure we have a list of rows
+            try:
+                rows = snowflake_connector.execute_query(query) or []
+                if not isinstance(rows, (list, tuple)):
+                    logger.warning(f"Expected list of rows but got {type(rows).__name__}")
+                    rows = []
+            except Exception as e:
+                logger.error(f"Error executing classification history query: {e}")
+                rows = []
+            
+            data = []
+            processed_rows = 0
+            skipped_rows = 0
+            
+            for row in rows:
+                try:
+                    # Skip non-dictionary rows and convert to dict if possible
+                    if not row:
+                        skipped_rows += 1
+                        continue
+                        
+                    # Convert row to dict if it's not already one
+                    if not isinstance(row, dict):
+                        if hasattr(row, '_asdict'):  # Handle SQLAlchemy row objects
+                            row = row._asdict()
+                        elif hasattr(row, '__dict__'):  # Handle other object-like rows
+                            row = vars(row)
+                        elif isinstance(row, (list, tuple)):  # Handle tuple rows
+                            # If we have column info, create a dict with column names
+                            if hasattr(rows, 'keys') and len(rows.keys()) == len(row):
+                                row = dict(zip(rows.keys(), row))
+                            else:
+                                # Fallback to generic column names
+                                row = {f'col_{i}': val for i, val in enumerate(row)}
+                        else:
+                            logger.warning(f"Skipping row of type {type(row).__name__}: {str(row)[:200]}...")
+                            skipped_rows += 1
+                            continue
+                    
+                    # Safely extract values with proper type conversion
+                    row_data = {}
+                    
+                    # Handle each field with individual try/except to prevent one bad field from breaking everything
+                    try:
+                        row_data['ai_category'] = str(row.get('AI_CATEGORY', '') or '').strip() or 'Unknown'
+                    except Exception as e:
+                        logger.debug(f"Error getting AI_CATEGORY: {e}")
+                        row_data['ai_category'] = 'Unknown'
+                    
+                    try:
+                        row_data['compliance_name'] = str(row.get('COMPLIANCE_NAME', '') or '').strip()
+                    except Exception as e:
+                        logger.debug(f"Error getting COMPLIANCE_NAME: {e}")
+                        row_data['compliance_name'] = ''
+                    
+                    # If no compliance name, try to derive from AI_CATEGORY
+                    if not row_data['compliance_name'] or row_data['compliance_name'].lower() in ('none', 'null'):
+                        try:
+                            row_data['compliance_name'] = self._map_category_to_policy_group(row_data['ai_category']) or 'None'
+                        except Exception as e:
+                            logger.debug(f"Error mapping category to policy group: {e}")
+                            row_data['compliance_name'] = 'None'
+                    
+                    # Build the result dictionary with safe access
+                    result = {
+                        'Schema': str(row.get('SCHEMA_NAME', '') or '').strip() or 'Unknown',
+                        'Table': str(row.get('TABLE_NAME', '') or '').strip() or 'Unknown',
+                        'Column': str(row.get('COLUMN_NAME', '') or '').strip() or 'Unknown',
+                        'Category': row_data['ai_category'],
+                        'Confidence': 0.0,
+                        'Sensitivity': str(row.get('SENSITIVITY_NAME', '') or '').strip() or row_data['ai_category'],
+                        'Compliance': row_data['compliance_name'],
+                        'CIA': self._extract_cia_from_details(row.get('DETAILS')),
+                        'Rationale': str(row.get('DETAILS', '') or '').strip()
+                    }
+                    
+                    # Handle numeric conversion separately
+                    try:
+                        result['Confidence'] = float(row.get('FINAL_CONFIDENCE', 0) or 0.0)
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"Invalid confidence value: {row.get('FINAL_CONFIDENCE')}, using 0.0")
+                        result['Confidence'] = 0.0
+                    
+                    data.append(result)
+                    processed_rows += 1
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing row {skipped_rows + processed_rows + 1}: {str(e)[:200]}")
+                    skipped_rows += 1
+                    continue
+            
+            if skipped_rows > 0:
+                logger.warning(f"Skipped {skipped_rows} invalid rows out of {len(rows)}")
+                
+            logger.info(f"Successfully processed {processed_rows} classification results")
+            
+            logger.info(f"Fetched {len(data)} classification results from governance database")
+            return pd.DataFrame(data)
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch classification history: {e}", exc_info=True)
+            return pd.DataFrame()
+
+    def _ensure_results_table_columns(self, gov_db: str) -> None:
+        """Ensure CLASSIFICATION_AI_RESULTS has all required columns."""
+        try:
+            # Check existing columns
+            check_query = f"""
+                SELECT COLUMN_NAME 
+                FROM {gov_db}.INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_SCHEMA = 'DATA_CLASSIFICATION_GOVERNANCE' 
+                  AND TABLE_NAME = 'CLASSIFICATION_AI_RESULTS'
+            """
+            rows = snowflake_connector.execute_query(check_query) or []
+            existing_cols = {str(r.get('COLUMN_NAME', '')).upper() for r in rows}
+            
+            # Add SCHEMA_NAME if missing
+            if 'SCHEMA_NAME' not in existing_cols:
+                logger.info("Adding missing column SCHEMA_NAME to CLASSIFICATION_AI_RESULTS")
+                snowflake_connector.execute_query(f"ALTER TABLE {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS ADD COLUMN SCHEMA_NAME VARCHAR(255)")
+                
+            # Add SENSITIVITY_CATEGORY_ID if missing
+            if 'SENSITIVITY_CATEGORY_ID' not in existing_cols:
+                logger.info("Adding missing column SENSITIVITY_CATEGORY_ID to CLASSIFICATION_AI_RESULTS")
+                snowflake_connector.execute_query(f"ALTER TABLE {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS ADD COLUMN SENSITIVITY_CATEGORY_ID NUMBER")
+
+            # Add DETAILS if missing
+            if 'DETAILS' not in existing_cols:
+                logger.info("Adding missing column DETAILS to CLASSIFICATION_AI_RESULTS")
+                snowflake_connector.execute_query(f"ALTER TABLE {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS ADD COLUMN DETAILS VARIANT")
+
+            # Add CREATED_AT if missing
+            if 'CREATED_AT' not in existing_cols:
+                logger.info("Adding missing column CREATED_AT to CLASSIFICATION_AI_RESULTS")
+                snowflake_connector.execute_query(f"ALTER TABLE {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS ADD COLUMN CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()")
+
+            # Add UPDATED_AT if missing
+            if 'UPDATED_AT' not in existing_cols:
+                logger.info("Adding missing column UPDATED_AT to CLASSIFICATION_AI_RESULTS")
+                snowflake_connector.execute_query(f"ALTER TABLE {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS ADD COLUMN UPDATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()")
+
+            # Add CREATED_AT if missing
+            if 'CREATED_AT' not in existing_cols:
+                logger.info("Adding missing column CREATED_AT to CLASSIFICATION_AI_RESULTS")
+                snowflake_connector.execute_query(f"ALTER TABLE {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS ADD COLUMN CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()")
+
+            # Add UPDATED_AT if missing
+            if 'UPDATED_AT' not in existing_cols:
+                logger.info("Adding missing column UPDATED_AT to CLASSIFICATION_AI_RESULTS")
+                snowflake_connector.execute_query(f"ALTER TABLE {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS ADD COLUMN UPDATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()")
+
+        except Exception as e:
+            logger.warning(f"Failed to ensure columns in CLASSIFICATION_AI_RESULTS: {e}")
+
+    def _save_classification_results(self, db: str, results: List[Dict[str, Any]]) -> None:
+        """
+        Save classification results to CLASSIFICATION_AI_RESULTS table.
+        """
+        if not results:
+            return
+
+        gov_db = self._get_governance_database(db)
+        if not gov_db:
+            logger.error("Cannot save results: No governance database configured")
+            return
+
+        # Ensure table schema is correct
+        self._ensure_results_table_columns(gov_db)
+
+        # Flatten results to get all sensitive columns
+        all_columns = []
+        for table_res in results:
+            cols = table_res.get('column_results', [])
+            if cols:
+                all_columns.extend(cols)
+        
+        if not all_columns:
+            logger.info("No sensitive columns to save.")
+            return
+
+        logger.info(f"Saving {len(all_columns)} sensitive column results to Snowflake...")
+        
+        # Get category IDs map
+        cat_ids = getattr(self, '_category_ids', {})
+        
+        # Batch processing
+        batch_size = 50
+        total_saved = 0
+        
+        for i in range(0, len(all_columns), batch_size):
+            batch = all_columns[i:i+batch_size]
+            
+            # Build VALUES string
+            values = []
+            params = {}
+            
+            for idx, col in enumerate(batch):
+                p_idx = i + idx
+                schema = col.get('schema', '')
+                table = col.get('table', '')
+                column = col.get('column_name', '')  # Updated key
+                category = col.get('category', 'Unknown')
+                confidence = float(col.get('confidence', 0.0))
+                
+                # Construct details JSON
+                details_dict = {
+                    'detected_categories': col.get('detected_categories', []),
+                    'policy_group': col.get('policy_group'),
+                    'label': col.get('label'),
+                    'cia': {'c': col.get('c'), 'i': col.get('i'), 'a': col.get('a')}
+                }
+                import json
+                details = json.dumps(details_dict)
+                
+                cat_id = cat_ids.get(category)
+                
+                # Param keys
+                k_s = f"s{p_idx}"
+                k_t = f"t{p_idx}"
+                k_c = f"c{p_idx}"
+                k_cat = f"cat{p_idx}"
+                k_conf = f"conf{p_idx}"
+                k_det = f"det{p_idx}"
+                k_cid = f"cid{p_idx}"
+                
+                values.append(f"(%({k_s})s, %({k_t})s, %({k_c})s, %({k_cat})s, %({k_conf})s, %({k_det})s, %({k_cid})s)")
+                
+                params[k_s] = schema
+                params[k_t] = table
+                params[k_c] = column
+                params[k_cat] = category
+                params[k_conf] = confidence
+                params[k_det] = details
+                params[k_cid] = cat_id
+            
+            if not values:
+                continue
+                
+            values_str = ", ".join(values)
+            
+            query = f"""
+            MERGE INTO {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS AS target
+            USING (SELECT * FROM VALUES {values_str}) AS source(SCHEMA_NAME, TABLE_NAME, COLUMN_NAME, AI_CATEGORY, FINAL_CONFIDENCE, DETAILS, SENSITIVITY_CATEGORY_ID)
+            ON target.SCHEMA_NAME = source.SCHEMA_NAME 
+               AND target.TABLE_NAME = source.TABLE_NAME 
+               AND target.COLUMN_NAME = source.COLUMN_NAME
+            WHEN MATCHED THEN
+                UPDATE SET 
+                    target.AI_CATEGORY = source.AI_CATEGORY,
+                    target.FINAL_CONFIDENCE = source.FINAL_CONFIDENCE,
+                    target.DETAILS = PARSE_JSON(source.DETAILS),
+                    target.SENSITIVITY_CATEGORY_ID = source.SENSITIVITY_CATEGORY_ID,
+                    target.UPDATED_AT = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN
+                INSERT (SCHEMA_NAME, TABLE_NAME, COLUMN_NAME, AI_CATEGORY, FINAL_CONFIDENCE, DETAILS, SENSITIVITY_CATEGORY_ID, CREATED_AT, UPDATED_AT)
+                VALUES (source.SCHEMA_NAME, source.TABLE_NAME, source.COLUMN_NAME, source.AI_CATEGORY, source.FINAL_CONFIDENCE, PARSE_JSON(source.DETAILS), source.SENSITIVITY_CATEGORY_ID, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+            """
+            
+            try:
+                snowflake_connector.execute_query(query, params)
+                total_saved += len(batch)
+            except Exception as e:
+                logger.error(f"Failed to save batch {i//batch_size}: {e}")
+                st.error(f"Failed to save results to Snowflake: {e}")
+                
+        logger.info(f"Successfully saved {total_saved} column results.")
+
     def _load_patterns_from_governance(self, schema_fqn: str, category_name: str) -> List[str]:
         rows = []
         try:
+            # Join SENSITIVE_PATTERNS to SENSITIVITY_CATEGORIES via CATEGORY_ID
+            # and filter by CATEGORY_NAME; use PATTERN_REGEX as the pattern text.
             rows = snowflake_connector.execute_query(
                 f"""
-                SELECT COALESCE(PATTERN_REGEX, PATTERN_STRING, PATTERN) AS PTN
-                FROM {schema_fqn}.SENSITIVE_PATTERNS
-                WHERE COALESCE(is_active, true) AND (
-                    LOWER(category) = LOWER(%(n)s) OR LOWER(category_name) = LOWER(%(n)s)
-                )
+                SELECT sp.PATTERN_REGEX AS PTN
+                FROM {schema_fqn}.SENSITIVE_PATTERNS sp
+                JOIN {schema_fqn}.SENSITIVITY_CATEGORIES sc
+                  ON sp.CATEGORY_ID = sc.CATEGORY_ID
+                WHERE COALESCE(sp.IS_ACTIVE, TRUE)
+                  AND LOWER(sc.CATEGORY_NAME) = LOWER(%(n)s)
                 """,
                 {"n": category_name},
             ) or []
         except Exception:
-            try:
-                # CATEGORY_ID-based lookup using SENSITIVITY_CATEGORIES
-                rows = snowflake_connector.execute_query(
-                    f"""
-                    SELECT COALESCE(PATTERN_REGEX, PATTERN_STRING, PATTERN) AS PTN
-                    FROM {schema_fqn}.SENSITIVE_PATTERNS
-                    WHERE COALESCE(is_active, true) AND category_id IN (
-                        SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
-                    )
-                    """,
-                    {"n": category_name},
-                ) or []
-            except Exception:
-                try:
-                    rows = snowflake_connector.execute_query(
-                        f"""
-                        SELECT COALESCE(PATTERN_REGEX, PATTERN_STRING, PATTERN) AS PTN
-                        FROM {schema_fqn}.SENSITIVE_PATTERNS
-                        WHERE COALESCE(is_active, true) AND category_id IN (
-                            SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)
-                        )
-                        """,
-                        {"n": category_name},
-                    ) or []
-                except Exception:
-                    rows = []
+            rows = []
         out: List[str] = []
         for r in rows:
             try:
+                if not isinstance(r, dict):
+                    continue
                 p = str(r.get("PTN") or "").strip()
                 if p:
                     out.append(p)
@@ -1883,29 +2538,36 @@ class AIClassificationPipelineService:
             try:
                 # Some environments may not have Snowflake or proper tables; trap and continue
                 matches = svc._get_semantic_matches_gov(text) or []
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Error getting semantic matches: {e}")
                 matches = []
+                
             try:
                 from src.services.ai_assistant_service import ai_assistant_service as _aas
                 _map = getattr(_aas, "_SEMANTIC_TO_AVENDRA", {}) or {}
-            except Exception:
-                _map = {}
-            for m in matches:
-                try:
-                    # Tolerate different field names from governance queries
-                    c = str(
-                        m.get("category")
-                        or m.get("CATEGORY")
-                        or m.get("CATEGORY_NAME")
-                        or ""
-                    ).strip()
-                    conf = float(m.get("confidence") or m.get("CONFIDENCE") or 0.0)
-                except Exception:
-                    continue
-                if not c:
-                    continue
-                av = _map.get(c, c)
-                out[av] = max(0.0, min(1.0, conf))
+                
+                for m in matches:
+                    try:
+                        # Tolerate different field names from governance queries
+                        c = str(
+                            m.get("category") or 
+                            m.get("CATEGORY") or 
+                            m.get("CATEGORY_NAME") or ""
+                        ).strip()
+                        conf = float(m.get("confidence") or m.get("CONFIDENCE") or 0.0)
+                        
+                        if not c:
+                            continue
+                            
+                        av = _map.get(c, c)
+                        out[av] = max(0.0, min(1.0, conf))
+                        
+                    except Exception as e:
+                        logger.debug(f"Error processing match {m}: {e}")
+                        continue
+                        
+            except Exception as e:
+                logger.warning(f"Error initializing semantic mapping: {e}")
             try:
                 if hasattr(self, "_cache"):
                     self._cache[cache_key] = dict(out)
@@ -2351,15 +3013,21 @@ class AIClassificationPipelineService:
                     if 'semantic_similarity' not in result:
                         # Just use confidence as proxy
                         result['semantic_similarity'] = result.get('confidence', 0.0)
-                        result['keyword_score'] = 0.0
-                        result['regex_score'] = 0.0
+                        result['keyword_score'] = 0.1  # Small non-zero value to ensure display
+                        result['regex_score'] = 0.1    # Small non-zero value to ensure display
                         
                     # Add matched keywords/patterns (not returned by gov method currently, but that's ok)
                     result['matched_keywords'] = []
                     result['matched_patterns'] = []
                     
                     # Ensure high_confidence flag
-                    result['high_confidence'] = result.get('confidence', 0.0) >= 0.90
+                    result['high_confidence'] = result.get('confidence', 0.0) >= 0.70
+                    
+                    # Debug logging for the result
+                    logger.debug(f"Column result - {result.get('column')}: "
+                               f"cat={result.get('category')}, "
+                               f"conf={result.get('confidence'):.2f}, "
+                               f"label={result.get('label')}")
                     
                     results.append(result)
                     
@@ -3007,8 +3675,6 @@ class AIClassificationPipelineService:
             logger.error(f"Column detection failed for {database}.{schema}.{table}: {e}", exc_info=True)
             return []
 
-
-
     def _display_classification_results(self, results: List[Dict[str, Any]]) -> None:
         """Display the classification results with a dropdown for table selection."""
         st.markdown("#### Classification Results")
@@ -3413,7 +4079,6 @@ class AIClassificationPipelineService:
             for range_name, count in confidence_ranges.items():
                 st.write(f"{range_name}: {count}")
 
-
     # ==================================================================================
     # NEW GOVERNANCE-DRIVEN CLASSIFICATION METHODS (100% METADATA DRIVEN)
     # ==================================================================================
@@ -3549,9 +4214,8 @@ class AIClassificationPipelineService:
             return scores
                     
         except Exception as e:
-            logger.error(f"Semantic scoring failed: {e}")
-            return scores
             logger.error(f"Governance-driven semantic scoring failed: {e}", exc_info=True)
+            return scores
             
         logger.debug(f"Semantic scores returned: {len(scores)} categories")
         return scores
@@ -3561,45 +4225,102 @@ class AIClassificationPipelineService:
         PHASE 3: Pattern scoring using ONLY SENSITIVE_PATTERNS table
         
         CRITICAL FIX:
+        - Uses _category_pattern_metadata (dicts with weights) instead of _category_patterns (strings)
         - Progressive scoring: At least 1 match = 0.5, scaling to 1.0 for 100% coverage
+        - Applies SENSITIVITY_WEIGHT from metadata for weighted scoring
         - NO PRE-FILTERING at threshold (return all non-zero scores)
         """
         scores = {}
         
-        if not hasattr(self, '_category_patterns') or not self._category_patterns:
-            logger.warning("No pattern data loaded from SENSITIVE_PATTERNS table")
-            return scores
-        
-        for category, patterns in self._category_patterns.items():
-            if not patterns:
-                continue
-                
-            match_count = 0
-            total_patterns = len(patterns)
-            matched_patterns = []
-            
-            for pattern in patterns:
-                try:
-                    if re.search(pattern, text, re.IGNORECASE):
-                        match_count += 1
-                        matched_patterns.append(pattern[:50])  # Store first 50 chars for debugging
-                except re.error as e:
-                    logger.warning(f"Invalid regex pattern for governance category {category}: {pattern} - {e}")
+        # CRITICAL FIX: Use pattern metadata (dictionaries) instead of plain strings
+        if hasattr(self, '_category_pattern_metadata') and self._category_pattern_metadata:
+            # Use metadata-driven approach with weights
+            for category, pattern_metadata_list in self._category_pattern_metadata.items():
+                if not pattern_metadata_list:
                     continue
-            
-            if match_count > 0:
-                # PROGRESSIVE SCORING:
-                # - At least 1 match = 0.50 (base confidence)
-                # - 50% coverage = 0.75
-                # - 100% coverage = 1.00
-                coverage = match_count / max(1, total_patterns)
-                score = 0.5 + (0.5 * coverage)  # Maps [0,1] coverage to [0.5,1.0] score
+                    
+                total_weighted_score = 0.0
+                match_count = 0
+                total_patterns = len(pattern_metadata_list)
+                matched_patterns = []
                 
-                # PHASE 3: NO PRE-FILTERING - return all non-zero scores
-                scores[category] = min(1.0, score)
-                logger.debug(
-                    f"Pattern: {category} = {score:.3f} ({match_count}/{total_patterns} patterns matched)"
-                )
+                for pat_meta in pattern_metadata_list:
+                    # CRITICAL: pat_meta is a dictionary with keys: 'pattern', 'weight', 'sensitivity_type'
+                    if not isinstance(pat_meta, dict):
+                        # Handle legacy string format or connector issues
+                        if isinstance(pat_meta, str):
+                            pattern_regex = pat_meta
+                            pattern_weight = 1.0
+                            logger.debug(f"Pattern metadata is a string (legacy format): '{pattern_regex[:50]}...'")
+                        else:
+                            logger.warning(f"Invalid pattern metadata type for {category}: {type(pat_meta)}")
+                            continue
+                    else:
+                        pattern_regex = pat_meta.get('pattern', '')
+                        pattern_weight = float(pat_meta.get('weight', 1.0))
+                    
+                    if not pattern_regex:
+                        continue
+                    
+                    try:
+                        if re.search(pattern_regex, text, re.IGNORECASE):
+                            match_count += 1
+                            total_weighted_score += pattern_weight
+                            matched_patterns.append(pattern_regex[:50])  # Store first 50 chars for debugging
+                            logger.debug(f"Pattern match for {category}: {pattern_regex[:50]}...")
+                    except re.error as e:
+                        logger.warning(f"Invalid regex pattern for {category}: {pattern_regex[:50]}... - {e}")
+                        continue
+                
+                if match_count > 0:
+                    # WEIGHTED PROGRESSIVE SCORING:
+                    # - Normalize by total possible weight (sum of all pattern weights)
+                    # - At least 1 match = 0.50 base + weighted contribution
+                    total_possible_weight = sum(float(pm.get('weight', 1.0)) for pm in pattern_metadata_list if isinstance(pm, dict))
+                    
+                    if total_possible_weight > 0:
+                        weighted_coverage = total_weighted_score / total_possible_weight
+                        score = 0.5 + (0.5 * weighted_coverage)  # Maps [0,1] coverage to [0.5,1.0] score
+                    else:
+                        # Fallback to simple coverage if weights are missing
+                        coverage = match_count / max(1, total_patterns)
+                        score = 0.5 + (0.5 * coverage)
+                    
+                    # PHASE 3: NO PRE-FILTERING - return all non-zero scores
+                    scores[category] = min(1.0, score)
+                    logger.debug(
+                        f"Pattern: {category} = {score:.3f} ({match_count}/{total_patterns} patterns matched, weighted_score={total_weighted_score:.2f})"
+                    )
+        
+        # FALLBACK: Use simple pattern list if metadata not available
+        elif hasattr(self, '_category_patterns') and self._category_patterns:
+            logger.warning("Using fallback pattern scoring (no metadata available)")
+            for category, patterns in self._category_patterns.items():
+                if not patterns:
+                    continue
+                    
+                match_count = 0
+                total_patterns = len(patterns)
+                
+                for pattern in patterns:
+                    # CRITICAL: pattern is a string (regex)
+                    if not isinstance(pattern, str):
+                        continue
+                    
+                    try:
+                        if re.search(pattern, text, re.IGNORECASE):
+                            match_count += 1
+                    except re.error as e:
+                        logger.warning(f"Invalid regex pattern for {category}: {pattern[:50]}... - {e}")
+                        continue
+                
+                if match_count > 0:
+                    coverage = match_count / max(1, total_patterns)
+                    score = 0.5 + (0.5 * coverage)
+                    scores[category] = min(1.0, score)
+                    logger.debug(f"Pattern (fallback): {category} = {score:.3f} ({match_count}/{total_patterns} patterns matched)")
+        else:
+            logger.warning("No pattern data loaded from SENSITIVE_PATTERNS table")
         
         logger.debug(f"Pattern scores returned: {len(scores)} categories")
         return scores
@@ -3789,22 +4510,64 @@ class AIClassificationPipelineService:
         # These patterns come from the SENSITIVE_PATTERNS table
         sensitive_patterns_from_governance = set()
         
-        # Extract all patterns from _category_patterns (loaded from SENSITIVE_PATTERNS table)
-        if hasattr(self, '_category_patterns') and self._category_patterns:
-            for category, patterns in self._category_patterns.items():
-                # Only include patterns from PII/SOX/SOC2 categories
-                pg = self._map_category_to_policy_group(category)
-                if pg in {'PII', 'SOX', 'SOC2'}:
-                    for pattern_dict in patterns:
-                        # Extract the pattern regex and convert to simple keywords for initial filtering
-                        pattern_str = pattern_dict.get('pattern', '')
-                        if pattern_str:
-                            # Extract keywords from regex patterns (simplified)
-                            # Remove regex special chars and extract meaningful terms
-                            keywords = pattern_str.replace('\\b', '').replace('.*', '').replace('.+', '').replace('\\d', '').replace('\\w', '').replace('[', '').replace(']', '').replace('(', '').replace(')', '').replace('|', ' ').replace('?', '').replace('*', '').replace('+', '').lower().split()
-                            for kw in keywords:
-                                if len(kw) > 2:  # Only meaningful keywords
-                                    sensitive_patterns_from_governance.add(kw)
+        def extract_keywords_from_pattern(pattern_str):
+            """Helper to extract keywords from a regex pattern string."""
+            if not isinstance(pattern_str, str) or not pattern_str:
+                return set()
+                
+            # Remove regex special chars and extract meaningful terms
+            return {
+                kw for kw in 
+                pattern_str.lower()
+                .replace('\\b', ' ').replace('\\d', ' ').replace('\\w', ' ')
+                .replace('.*', ' ').replace('.+', ' ')
+                .replace('[', ' ').replace(']', ' ')
+                .replace('(', ' ').replace(')', ' ')
+                .replace('|', ' ').replace('?', ' ')
+                .replace('*', ' ').replace('+', ' ')
+                .split()
+                if len(kw) > 2  # Only meaningful keywords
+            }
+        
+        # Check both _category_pattern_metadata and _category_patterns
+        patterns_processed = False
+        
+        # Try _category_pattern_metadata first (preferred format)
+        if hasattr(self, '_category_pattern_metadata') and self._category_pattern_metadata:
+            try:
+                for category, patterns in self._category_pattern_metadata.items():
+                    pg = self._map_category_to_policy_group(category)
+                    if pg in {'PII', 'SOX', 'SOC2'} and patterns:
+                        for pattern_item in patterns:
+                            pattern_str = ''
+                            if isinstance(pattern_item, dict):
+                                pattern_str = pattern_item.get('pattern', '')
+                            elif isinstance(pattern_item, str):
+                                pattern_str = pattern_item
+                                
+                            if pattern_str:
+                                sensitive_patterns_from_governance.update(
+                                    extract_keywords_from_pattern(pattern_str)
+                                )
+                patterns_processed = True
+            except Exception as e:
+                logger.warning(f"Error processing _category_pattern_metadata: {e}")
+        
+        # Fall back to _category_patterns if needed
+        if not patterns_processed and hasattr(self, '_category_patterns') and self._category_patterns:
+            try:
+                for category, patterns in self._category_patterns.items():
+                    pg = self._map_category_to_policy_group(category)
+                    if pg in {'PII', 'SOX', 'SOC2'} and patterns:
+                        for pattern_str in patterns:
+                            if isinstance(pattern_str, str) and pattern_str:
+                                sensitive_patterns_from_governance.update(
+                                    extract_keywords_from_pattern(pattern_str)
+                                )
+            except Exception as e:
+                logger.warning(f"Error processing _category_patterns: {e}")
+        
+        logger.debug(f"Extracted {len(sensitive_patterns_from_governance)} unique keywords from patterns")
         
         # Also get keywords from _category_keywords (loaded from SENSITIVE_KEYWORDS table)
         if hasattr(self, '_category_keywords') and self._category_keywords:
@@ -3947,24 +4710,60 @@ class AIClassificationPipelineService:
             logger.debug(f"  ✓ Column '{col_name}' confidence {confidence:.3f} < 0.70 (too low, skipping)")
             return None
         
-        # Calculate CIA and Label for UI
-        c, i, a = (0, 0, 0)
-        label = "Public"
-        
-        # Check if sensitive (policy group exists or category is not NON_SENSITIVE)
-        if policy_group or best_category != 'NON_SENSITIVE':
-             try:
-                 canon_cat = self._normalize_category_for_cia(best_category)
-                 c, i, a = ai_assistant_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))
-                 label = self.ai_service._map_cia_to_label(c, i, a)
-             except Exception:
-                 c, i, a = (1, 1, 1)
-                 label = "Internal"
+
 
         # Create comma-separated string of all detected categories for UI display
         multi_label_str = ", ".join([d['category'] for d in detected_categories]) if detected_categories else best_category
 
+        # Calculate CIA scores based on policy group and category sensitivity
+        # Default to Internal (C1, I1, A1)
+        cia_scores = {'c': 'C1', 'i': 'I1', 'a': 'A1'}
+        final_label = 'Internal'
+        
+        cat_upper = best_category.upper()
+        
+        # 1. Check for Confidential (C3) - Highest Priority
+        # SOX (Financial Reporting) is always C3
+        if policy_group == 'SOX':
+            cia_scores = {'c': 'C3', 'i': 'I3', 'a': 'A3'}
+            final_label = 'Confidential'
+        # Sensitive PII is C3
+        elif policy_group == 'PII' and any(x in cat_upper for x in ['SSN', 'TAX', 'PASSPORT', 'CREDIT', 'BANK', 'ACCOUNT', 'FINANCIAL', 'DRIVER', 'LICENSE']):
+            cia_scores = {'c': 'C3', 'i': 'I3', 'a': 'A3'}
+            final_label = 'Confidential'
+        # Secrets/Keys are C3
+        elif any(x in cat_upper for x in ['PASSWORD', 'SECRET', 'KEY', 'TOKEN', 'AUTH', 'CREDENTIAL']):
+            cia_scores = {'c': 'C3', 'i': 'I3', 'a': 'A3'}
+            final_label = 'Confidential'
+            
+        # 2. Check for Restricted (C2)
+        # Standard PII is C2
+        elif policy_group == 'PII':
+            cia_scores = {'c': 'C2', 'i': 'I2', 'a': 'A2'}
+            final_label = 'Restricted'
+        # SOC2 is generally C2 (unless it matched secrets above)
+        elif policy_group == 'SOC2':
+            cia_scores = {'c': 'C2', 'i': 'I2', 'a': 'A2'}
+            final_label = 'Restricted'
+        # Fallback for explicit labels
+        elif label == 'Confidential':
+            cia_scores = {'c': 'C3', 'i': 'I3', 'a': 'A3'}
+            final_label = 'Confidential'
+        elif label == 'Restricted':
+            cia_scores = {'c': 'C2', 'i': 'I2', 'a': 'A2'}
+            final_label = 'Restricted'
+            
+        # 3. Check for Public (C0)
+        elif label == 'Public':
+            cia_scores = {'c': 'C0', 'i': 'I0', 'a': 'A0'}
+            final_label = 'Public'
+            
+        # Update label to match policy
+        label = final_label
+            
         return {
+            'schema': schema,
+            'table': table,
             'column_name': col_name,
             'data_type': col_type,
             'category': best_category,
@@ -3977,7 +4776,7 @@ class AIClassificationPipelineService:
             # UI Fields
             'column': col_name,
             'label': label,
-            'c': c, 'i': i, 'a': a,
+            'c': cia_scores['c'], 'i': cia_scores['i'], 'a': cia_scores['a'],
             'confidence_pct': round(confidence * 100, 1)
         }
     
@@ -4210,10 +5009,17 @@ class AIClassificationPipelineService:
         if any(kw in col_lower for kw in ['currency', 'tax', 'fiscal', 'invoice', 'payment']):
             self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.3)
 
-        # === RULE 8: Currency Fields ===
+        # === RULE 8: Currency and Financial Key Fields ===
+        # Handle currency_key, currency_code, etc.
         if any(kw in col_lower for kw in ['currency', 'iso_code']):
-             self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.2)
-             self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.4)
+            self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.2)
+            self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.4)
+            
+        # Special case for financial keys (currency_key, account_key, etc.)
+        if any(kw in col_lower for kw in ['_key', '_code']) and any(kw in col_lower for kw in ['currency', 'account', 'ledger', 'financial', 'fiscal']):
+            self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.8)  # Strong boost for financial keys
+            self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.3)  # Strongly reduce SOC2
+            logger.debug(f"Applied financial key override for {col_name} (BOOST: SOX, REDUCE: SOC2)")
         
         # === RULE 9: Smart Address Context Analysis ===
         # Replaces hardcoded address rules with pattern-aware registry lookup
@@ -4530,36 +5336,59 @@ class AIClassificationPipelineService:
             # Create comma-separated string for UI display
             policy_groups_str = ", ".join(multi_label_policy_groups) if multi_label_policy_groups else (policy_group if policy_group else "NON_SENSITIVE")
             
-            # Calculate CIA and Label for UI
-            c, i, a = (0, 0, 0)
-            label = "Public"
-            label_emoji = "🟩 Public"
-            color = "Green"
+            # Calculate CIA scores based on policy group and category sensitivity
+            # Default to Internal (C1, I1, A1)
+            c, i, a = (1, 1, 1)
+            label = "Internal"
             
-            if multi_label_policy_groups or policy_group or table_category != 'NON_SENSITIVE':
-                 try:
-                     # Use the highest-confidence category for CIA calculation
-                     canon_cat = self._normalize_category_for_cia(table_category)
-                     c, i, a = ai_assistant_service.CIA_MAPPING.get(canon_cat, (1, 1, 1))
-                     label = self.ai_service._map_cia_to_label(c, i, a)
-                 except Exception:
-                     c, i, a = (1, 1, 1)
-                     label = "Internal"
-                 
-                 label_emoji_map = {
-                    'Confidential': '🟥 Confidential',
-                    'Restricted': '🟧 Restricted',
-                    'Internal': '🟨 Internal',
-                    'Public': '🟩 Public',
-                 }
-                 color_map = {
-                    'Confidential': 'Red',
-                    'Restricted': 'Orange',
-                    'Internal': 'Yellow',
-                    'Public': 'Green',
-                 }
-                 label_emoji = label_emoji_map.get(label, label)
-                 color = color_map.get(label, 'Gray')
+            # Check for Public
+            if not multi_label_policy_groups and not policy_group and table_category == 'NON_SENSITIVE':
+                c, i, a = (0, 0, 0)
+                label = "Public"
+            else:
+                # 1. Check for Confidential (C3) - Highest Priority
+                is_confidential = False
+                
+                # SOX is always C3
+                if 'SOX' in multi_label_policy_groups:
+                    is_confidential = True
+                
+                # Check for Sensitive PII or Secrets in detected categories
+                if not is_confidential:
+                    for cat in table_detected_categories:
+                        cat_upper = cat['category'].upper()
+                        # Sensitive PII
+                        if 'PII' in multi_label_policy_groups and any(x in cat_upper for x in ['SSN', 'TAX', 'PASSPORT', 'CREDIT', 'BANK', 'ACCOUNT', 'FINANCIAL', 'DRIVER', 'LICENSE']):
+                            is_confidential = True
+                            break
+                        # Secrets/Keys
+                        if any(x in cat_upper for x in ['PASSWORD', 'SECRET', 'KEY', 'TOKEN', 'AUTH', 'CREDENTIAL']):
+                            is_confidential = True
+                            break
+                
+                if is_confidential:
+                    c, i, a = (3, 3, 3)
+                    label = "Confidential"
+                
+                # 2. Check for Restricted (C2)
+                elif 'PII' in multi_label_policy_groups or 'SOC2' in multi_label_policy_groups:
+                    c, i, a = (2, 2, 2)
+                    label = "Restricted"
+            
+            label_emoji_map = {
+                'Confidential': '🟥 Confidential',
+                'Restricted': '🟧 Restricted',
+                'Internal': '🟨 Internal',
+                'Public': '🟩 Public',
+            }
+            color_map = {
+                'Confidential': 'Red',
+                'Restricted': 'Orange',
+                'Internal': 'Yellow',
+                'Public': 'Green',
+            }
+            label_emoji = label_emoji_map.get(label, label)
+            color = color_map.get(label, 'Gray')
 
             # Create comma-separated string of top categories for UI display
             multi_label_str = ", ".join([d['category'] for d in table_detected_categories[:3]]) if table_detected_categories else table_category
@@ -4594,7 +5423,8 @@ class AIClassificationPipelineService:
                     "detected_categories": multi_label_policy_groups,  # ✅ UPDATED: All policy groups
                     "policy_group_confidences": policy_group_confidences,  # ✅ NEW: Confidence breakdown
                     "reasoning": {pg: f"{policy_group_confidences[pg]:.1%} confidence" for pg in multi_label_policy_groups}
-                }
+                },
+                'column_results': column_results  # ✅ NEW: Return column details for saving
             }
             
         except Exception as e:

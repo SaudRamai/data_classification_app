@@ -58,7 +58,9 @@ LATERAL FLATTEN(
                 'email','e-mail','mail_id','ssn','social_security','passport',
                 'aadhaar','aadhar','driving_license','phone','mobile','contact',
                 'address','residence','city','pincode','zipcode','fullname',
-                'name','dob','birthdate','gender','national_id'
+                'first_name','last_name','full_name','user_name','customer_name',
+                'employee_name','person_name','individual_name','given_name','surname',
+                'dob','birthdate','date_of_birth','gender','national_id'
             )
             WHEN C.CATEGORY_NAME = 'FINANCIAL' THEN ARRAY_CONSTRUCT(
                 'credit_card','card_number','cvv','iban','swift','bank_account',

@@ -789,7 +789,10 @@ def render_realtime_dashboard():
             limit 200
         """, params)
         df = pd.DataFrame(rows or [])
-        st.info("No recent classifications.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
+        if df.empty:
+            st.info("No recent classifications.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
         _rt_show_error("Failed to load New Classifications", e)
 
@@ -810,7 +813,10 @@ def render_realtime_dashboard():
             limit 200
         """, params_appr)
         df = pd.DataFrame(rows or [])
-        st.info("No reclassification requests pending.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
+        if df.empty:
+            st.info("No reclassification requests pending.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
         _rt_show_error("Failed to load Reclassification Requests", e)
 
@@ -829,7 +835,10 @@ def render_realtime_dashboard():
             limit 500
         """, params)
         df = pd.DataFrame(rows or [])
-        st.info("No policy updates.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
+        if df.empty:
+            st.info("No policy updates.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
         _rt_show_error("Failed to load Policy Updates", e)
 
@@ -877,7 +886,10 @@ def render_realtime_dashboard():
             limit 200
         """, params_rev)
         df = pd.DataFrame(rows or [])
-        st.info("No reviews due this week.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
+        if df.empty:
+            st.info("No reviews due this week.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
         _rt_show_error("Failed to load Due This Week", e)
 
@@ -892,7 +904,10 @@ def render_realtime_dashboard():
             limit 200
         """)
         df = pd.DataFrame(rows or [])
-        st.info("No overdue reviews.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
+        if df.empty:
+            st.info("No overdue reviews.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
         _rt_show_error("Failed to load Overdue Reviews", e)
 
@@ -915,7 +930,10 @@ def render_realtime_dashboard():
             limit 200
         """, params_appr)
         df = pd.DataFrame(rows or [])
-        st.info("No pending approvals assigned to you.") if df.empty else st.dataframe(df, use_container_width=True, hide_index=True)
+        if df.empty:
+            st.info("No pending approvals assigned to you.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
         _rt_show_error("Failed to load My Pending Approvals", e)
 

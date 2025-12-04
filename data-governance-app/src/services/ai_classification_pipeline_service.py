@@ -87,9 +87,7 @@ class AIClassificationPipelineService:
         self._compliance_categories: Dict[str, str] = {}  # Maps category to compliance framework
 
     def render_classification_pipeline(self) -> None:
-        """Render the Automatic AI Classification Pipeline Dashboard."""
-        st.markdown("## 🛡️ Automatic AI Classification Dashboard")
-        st.caption("Governance-driven analysis of sensitive data across your data estate.")
+        """Render the Automatic AI Classification Dashboard."""
 
         # Initialize metadata if needed
         if not self._embed_ready or not self._category_centroids:
@@ -99,7 +97,7 @@ class AIClassificationPipelineService:
         # 1. Top Actions
         col_act1, col_act2 = st.columns([3, 1])
         with col_act1:
-            st.info("💡 This dashboard displays the latest classification results.")
+            st.info("")
         with col_act2:
             if st.button("🚀 Run New Scan", type="primary", use_container_width=True):
                 db = self._get_active_database()
@@ -123,8 +121,6 @@ class AIClassificationPipelineService:
                 # Convert in-memory results to DataFrame for display
                 df_results = self._convert_results_to_dataframe(st.session_state["pipeline_results"])
                 source_label = "Latest Scan (In-Memory)"
-                if not df_results.empty:
-                    st.success(f"✅ Showing results from latest scan ({len(df_results)} sensitive columns found)")
             except Exception as e:
                 logger.error(f"Failed to process in-memory results: {e}")
                 st.session_state["pipeline_results"] = None # Clear bad state
@@ -145,34 +141,42 @@ class AIClassificationPipelineService:
                 with st.spinner("Saving results to Governance Database..."):
                     self._save_classification_results(db, st.session_state["pipeline_results"])
         # 3. View Selection & Filters
-        st.sidebar.header("🔍 Filter Results")
-        
-        # View Toggle - REMOVED (Defaulting to Table View with Drill-Down)
+        # 3. View Selection & Filters
+        # Local filters removed in favor of Global Filters
         view_mode = "Table View"
         
-        # Filter: Compliance
-        all_compliance = sorted(list(set(df_results["Compliance"].dropna().unique())))
-        sel_compliance = st.sidebar.multiselect("Compliance Category", options=all_compliance, default=all_compliance)
+        # Apply Global Filters
+        global_filters = st.session_state.get("global_filters", {})
+        global_schema = global_filters.get("schema")
         
-        # Filter: Schema
-        all_schemas = sorted(list(set(df_results["Schema"].dropna().unique())))
-        sel_schemas = st.sidebar.multiselect("Schema", options=all_schemas, default=all_schemas)
+        mask = pd.Series(True, index=df_results.index)
         
-        # Filter: Search
-        search_term = st.sidebar.text_input("Search Table/Column", "")
-
-        # Apply Filters
-        mask = (
-            (df_results["Compliance"].isin(sel_compliance) if sel_compliance else True) &
-            (df_results["Schema"].isin(sel_schemas) if sel_schemas else True)
-        )
-        if search_term:
-            mask = mask & (
-                df_results["Table"].str.contains(search_term, case=False) | 
-                df_results["Column"].str.contains(search_term, case=False)
-            )
+        # Apply Schema Filter if present
+        if global_schema and str(global_schema).strip().upper() not in {'', 'NONE', '(NONE)', 'NULL', 'ALL', '[]'}:
+            # Handle potential list of schemas or single schema
+            if isinstance(global_schema, list):
+                if len(global_schema) > 0:
+                    mask = mask & df_results["Schema"].isin(global_schema)
+            else:
+                mask = mask & (df_results["Schema"] == global_schema)
         
         df_filtered = df_results[mask].copy()
+
+        # Helper to parse CIA string into components
+        def parse_cia_component(cia_str, component):
+            # component is 'C', 'I', or 'A'
+            # cia_str looks like "C:3 I:2 A:1"
+            if not isinstance(cia_str, str): return '-'
+            parts = cia_str.split()
+            for p in parts:
+                if p.startswith(component + ':'):
+                    return p.split(':')[1]
+            return '-'
+
+        # Split CIA into separate columns
+        df_filtered['Confidentiality'] = df_filtered['CIA'].apply(lambda x: parse_cia_component(x, 'C'))
+        df_filtered['Integrity'] = df_filtered['CIA'].apply(lambda x: parse_cia_component(x, 'I'))
+        df_filtered['Availability'] = df_filtered['CIA'].apply(lambda x: parse_cia_component(x, 'A'))
 
         # 4. Statistics Engine
         total_items = len(df_filtered)
@@ -290,7 +294,7 @@ class AIClassificationPipelineService:
             )
 
         # 6. Detailed Analysis Tabs
-        tab1, tab2, tab3 = st.tabs(["📋 Data Explorer", "📈 Risk Analytics", "⚙️ Governance Metadata"])
+        tab1, tab2 = st.tabs(["📋 Data Explorer", "📈 Risk Analytics"])
 
         with tab1:
             # Custom CSS for badges and styling
@@ -372,7 +376,9 @@ class AIClassificationPipelineService:
                 'Category': lambda x: sorted(list(set(x))),
                 'Compliance': lambda x: sorted(list(set(x))),
                 'Sensitivity': lambda x: sorted(list(set(x))),
-                'CIA': lambda x: sorted(list(set(x))),
+                'Confidentiality': lambda x: sorted(list(set(x))),
+                'Integrity': lambda x: sorted(list(set(x))),
+                'Availability': lambda x: sorted(list(set(x))),
                 'Confidence': 'max'
             }).reset_index()
             
@@ -409,13 +415,49 @@ class AIClassificationPipelineService:
                         badges.append(item)
                 return ' | '.join(badges)
             
+            def format_confidentiality_val(val):
+                labels = {
+                    '0': 'C0 - Public',
+                    '1': 'C1 - Internal',
+                    '2': 'C2 - Restricted',
+                    '3': 'C3 - Confidential',
+                    '-': '-'
+                }
+                return labels.get(str(val), str(val))
+
+            def format_integrity_val(val):
+                labels = {
+                    '0': 'I0 - None',
+                    '1': 'I1 - Low',
+                    '2': 'I2 - Moderate',
+                    '3': 'I3 - High',
+                    '-': '-'
+                }
+                return labels.get(str(val), str(val))
+
+            def format_availability_val(val):
+                labels = {
+                    '0': 'A0 - None',
+                    '1': 'A1 - Low',
+                    '2': 'A2 - Moderate',
+                    '3': 'A3 - High',
+                    '-': '-'
+                }
+                return labels.get(str(val), str(val))
+
+            def format_list_helper(items, formatter):
+                unique_items = sorted(list(set(items)))
+                return ' | '.join([formatter(x) for x in unique_items])
+
             grouped['Compliance'] = grouped['Compliance'].apply(format_compliance)
             grouped['Sensitivity'] = grouped['Sensitivity'].apply(format_sensitivity)
             grouped['Category'] = grouped['Category'].apply(lambda x: ', '.join(x))
-            grouped['CIA'] = grouped['CIA'].apply(lambda x: ', '.join(x))
+            grouped['Confidentiality'] = grouped['Confidentiality'].apply(lambda x: format_list_helper(x, format_confidentiality_val))
+            grouped['Integrity'] = grouped['Integrity'].apply(lambda x: format_list_helper(x, format_integrity_val))
+            grouped['Availability'] = grouped['Availability'].apply(lambda x: format_list_helper(x, format_availability_val))
             
             st.dataframe(
-                grouped[['Schema', 'Table', 'Sensitive Cols', 'Category', 'Sensitivity', 'CIA']],
+                grouped[['Schema', 'Table', 'Sensitive Cols', 'Category', 'Sensitivity', 'Confidentiality', 'Integrity', 'Availability']],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -426,6 +468,14 @@ class AIClassificationPipelineService:
                 }
             )
             
+            
+            # Add Keyword Button (Table View)
+            if st.button("➕ Add Keyword", key="btn_add_kw_main_btm"):
+                st.session_state['kw_action_main'] = 'add'
+            
+            if st.session_state.get('kw_action_main') == 'add':
+                self._render_keyword_actions("main")
+
             # --- Drill Down Functionality ---
             st.divider()
             st.subheader("🔬 Table Drill-Down")
@@ -471,18 +521,182 @@ class AIClassificationPipelineService:
 
                 table_details['Compliance'] = table_details['Compliance'].apply(drill_badge_compliance)
                 table_details['Sensitivity'] = table_details['Sensitivity'].apply(drill_badge_sensitivity)
+                table_details['Confidentiality'] = table_details['Confidentiality'].apply(format_confidentiality_val)
+                table_details['Integrity'] = table_details['Integrity'].apply(format_integrity_val)
+                table_details['Availability'] = table_details['Availability'].apply(format_availability_val)
                 
-                st.dataframe(
-                    table_details[['Column', 'Category', 'Sensitivity', 'CIA', 'Rationale']],
+                # Inline Editing for Drill-Down
+                categories_list = sorted(list(self._category_thresholds.keys())) if self._category_thresholds else ["PII", "SOX", "SOC2", "INTERNAL"]
+                
+                edited_df = st.data_editor(
+                    table_details[['Column', 'Category', 'Sensitivity', 'Confidentiality', 'Integrity', 'Availability', 'Rationale']],
                     use_container_width=True,
                     hide_index=True,
+                    key="drill_down_editor",
+                    disabled=['Column', 'Sensitivity', 'Confidentiality', 'Integrity', 'Availability', 'Rationale'],
                     column_config={
+                        "Category": st.column_config.SelectboxColumn(
+                            "Category (Edit to Upsert)",
+                            help="Change the category to automatically update the keyword rule.",
+                            width="medium",
+                            options=categories_list,
+                            required=True
+                        ),
                         "Rationale": st.column_config.TextColumn(
                             "Detection Rationale",
                             width="large"
                         )
                     }
                 )
+
+                # Handle Inline Edits
+                if st.session_state.get("drill_down_editor"):
+                    edits = st.session_state["drill_down_editor"].get("edited_rows", {})
+                    if edits:
+                        for idx, changes in edits.items():
+                            if "Category" in changes:
+                                new_cat = changes["Category"]
+                                # Get original column name (index matches table_details)
+                                col_name = table_details.iloc[idx]['Column']
+                                
+                                with st.spinner(f"Updating keyword '{col_name}' to '{new_cat}'..."):
+                                    if self.upsert_sensitive_keyword(col_name, new_cat, "CONTAINS"):
+                                        st.toast(f"✅ Updated '{col_name}' to {new_cat}!", icon="💾")
+                                        # Clear edit state to prevent loop (optional, but good practice)
+                                        # st.session_state["drill_down_editor"]["edited_rows"] = {} 
+                                        # Rerun to refresh data
+                                        st.rerun()
+
+                # Add Keyword Button (Drill-Down View)
+                if st.button("➕ Add Keyword", key="btn_add_kw_drill_btm"):
+                    st.session_state['kw_action_drill'] = 'add'
+                
+                if st.session_state.get('kw_action_drill') == 'add':
+                    self._render_keyword_actions("drill")
+
+                # --- Tagging Assistant ---
+                st.divider()
+                st.subheader("🏷️ Tagging Assistant")
+                st.markdown("""
+                The Tagging Assistant provides a comprehensive solution for managing data classification within the system. """)
+                
+                tag_tab1, tag_tab2 = st.tabs(["📝 Generate SQL", "⚡ Apply Tags"])
+                
+                # Common Inputs
+                with st.container():
+                    col_t1, col_t2 = st.columns(2)
+                    with col_t1:
+                        target_type = st.radio("Target Type", ["Table", "Column"], horizontal=True, key="tag_target_type")
+                    
+                    target_col = None
+                    if target_type == "Column":
+                        with col_t2:
+                            # Get columns from table_details
+                            cols = sorted(table_details['Column'].unique().tolist())
+                            target_col = st.selectbox("Select Column", cols, key="tag_target_col")
+                    
+                    # Tag Inputs
+                    # Default to Restricted (C2 I2 A2) for tables, Internal (C1 I1 A1) for other types
+                    if target_type == "Table":
+                        def_class_ix = 2  # Restricted
+                        def_c_ix = 2      # C2
+                        def_i_ix = 2      # I2
+                        def_a_ix = 2      # A2
+                    else:
+                        def_class_ix = 1  # Internal
+                        def_c_ix = 1      # C1
+                        def_i_ix = 1      # I1
+                        def_a_ix = 1      # A1
+                    
+                    if target_type == "Column" and target_col:
+                        try:
+                            # Get the row for this column
+                            col_row = table_details[table_details['Column'] == target_col].iloc[0]
+                            
+                            # 1. Suggest Classification
+                            # Sensitivity is formatted with badges e.g. "🔴 CRITICAL"
+                            sens_val = str(col_row.get('Sensitivity', '')).upper()
+                            if 'CRITICAL' in sens_val or 'CONFIDENTIAL' in sens_val:
+                                def_class_ix = 3 # Confidential
+                            elif 'RESTRICTED' in sens_val or 'HIGH' in sens_val:
+                                def_class_ix = 2 # Restricted
+                            elif 'PUBLIC' in sens_val:
+                                def_class_ix = 0 # Public
+                            else:
+                                def_class_ix = 1 # Internal
+                                
+                            # 2. Suggest CIA
+                            # Values are formatted like "C3 - Confidential" or "I2 - Moderate"
+                            import re
+                            def extract_level(val):
+                                m = re.search(r'[CIA]?(\d)', str(val))
+                                return int(m.group(1)) if m else 0
+                                
+                            def_c_ix = extract_level(col_row.get('Confidentiality', '0'))
+                            def_i_ix = extract_level(col_row.get('Integrity', '0'))
+                            def_a_ix = extract_level(col_row.get('Availability', '0'))
+                            
+                            if target_type == "Table":
+                                st.info("💡 Suggested tags based on analysis: Restricted (C2 I2 A2)")
+                            else:
+                                st.info(f"💡 Suggested tags based on analysis: {['Public','Internal','Restricted','Confidential'][def_class_ix]} (C{def_c_ix} I{def_i_ix} A{def_a_ix})")
+                        except Exception:
+                            pass
+
+                    st.markdown("###### Select Tags")
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        t_class = st.selectbox("Classification", ["Public", "Internal", "Restricted", "Confidential"], index=def_class_ix, key="tag_class")
+                    with c2:
+                        t_conf = st.selectbox("Confidentiality (C)", ["0", "1", "2", "3"], index=def_c_ix, key="tag_conf")
+                    with c3:
+                        t_int = st.selectbox("Integrity (I)", ["0", "1", "2", "3"], index=def_i_ix, key="tag_int")
+                    with c4:
+                        t_avail = st.selectbox("Availability (A)", ["0", "1", "2", "3"], index=def_a_ix, key="tag_avail")
+                        
+                    tags_to_apply = {
+                        "DATA_CLASSIFICATION": t_class,
+                        "CONFIDENTIALITY_LEVEL": t_conf,
+                        "INTEGRITY_LEVEL": t_int,
+                        "AVAILABILITY_LEVEL": t_avail
+                    }
+
+                with tag_tab1:
+                    if st.button("Generate SQL", key="btn_gen_sql"):
+                        schema_name = table_details['Schema'].iloc[0] if not table_details.empty else "PUBLIC"
+                        full_obj_name = f"{self._get_active_database()}.{schema_name}.{selected_table}"
+                        
+                        if target_type == "Table":
+                            sql = tagging_service.generate_tag_sql_for_object(full_obj_name, "TABLE", tags_to_apply)
+                        else:
+                            if target_col:
+                                sql = tagging_service.generate_tag_sql_for_column(full_obj_name, target_col, tags_to_apply)
+                            else:
+                                sql = "-- Please select a column"
+                        
+                        st.code(sql, language="sql")
+                        st.info("Copy and run this SQL in your Snowflake worksheet.")
+
+                with tag_tab2:
+                    if st.button("Apply Tags Immediately", key="btn_apply_tags", type="primary"):
+                        schema_name = table_details['Schema'].iloc[0] if not table_details.empty else "PUBLIC"
+                        full_obj_name = f"{self._get_active_database()}.{schema_name}.{selected_table}"
+                        
+                        try:
+                            if target_type == "Table":
+                                tagging_service.apply_tags_to_object(full_obj_name, "TABLE", tags_to_apply)
+                            else:
+                                if target_col:
+                                    tagging_service.apply_tags_to_column(full_obj_name, target_col, tags_to_apply)
+                                else:
+                                    st.warning("Please select a column.")
+                                    raise ValueError("No column selected")
+                            st.success(f"Successfully applied tags to {target_type}!")
+                            st.balloons()
+                        except Exception as e:
+                            st.error(f"Failed to apply tags: {e}")
+                            st.session_state['last_tag_error'] = str(e)
+
 
         with tab2:
             st.markdown("#### Risk Distribution")
@@ -503,14 +717,54 @@ class AIClassificationPipelineService:
             st.markdown("#### Top High-Risk Tables")
             st.dataframe(top_tables, use_container_width=True)
 
-        with tab3:
-            st.markdown("#### Active Governance Rules")
-            st.json({
-                "Sensitivity Categories": list(self._category_thresholds.keys()),
-                "Compliance Frameworks": list(self._compliance_categories.values()),
-                "Total Patterns": sum(len(p) for p in self._category_patterns.values()),
-                "Total Keywords": sum(len(k) for k in self._category_keywords.values())
-            })
+
+    def _render_keyword_actions(self, context_key: str) -> None:
+        """Render the inline keyword action form based on session state."""
+        action_key = f'kw_action_{context_key}'
+        current_action = st.session_state.get(action_key)
+        
+        if not current_action:
+            return
+
+        form_container = st.container()
+        with form_container:
+            st.info(f"{'Add New' if current_action == 'add' else 'Upsert/Edit'} Sensitive Keyword")
+            
+            c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+            with c1:
+                new_keyword = st.text_input("Keyword", placeholder="e.g. 'project_falcon'", key=f"kw_input_{context_key}")
+            with c2:
+                # Get categories
+                categories = sorted(list(self._category_thresholds.keys())) if self._category_thresholds else ["PII", "SOX", "SOC2", "INTERNAL"]
+                target_category = st.selectbox("Category", categories, key=f"kw_cat_{context_key}")
+            with c3:
+                match_type = st.selectbox("Match Type", ["CONTAINS", "EXACT"], key=f"kw_match_{context_key}")
+            with c4:
+                st.write("")
+                st.write("")
+                # Close button
+                if st.button("❌", key=f"btn_close_{context_key}"):
+                    st.session_state[action_key] = None
+                    st.rerun()
+
+            if st.button("Save Keyword", key=f"btn_save_{context_key}", type="primary"):
+                if new_keyword and target_category:
+                    with st.spinner("Saving..."):
+                        success = False
+                        if current_action == 'add':
+                            success = self.add_sensitive_keyword(new_keyword, target_category, match_type)
+                        else:
+                            success = self.upsert_sensitive_keyword(new_keyword, target_category, match_type)
+                            
+                        if success:
+                            st.success(f"Successfully saved keyword '{new_keyword}'!")
+                            st.session_state[action_key] = None # Close form on success
+                            st.rerun()
+                        else:
+                            st.error("Failed to save keyword. It may already exist (if adding) or there was a database error.")
+                else:
+                    st.warning("Please enter a keyword and select a category.")
+            st.divider()
 
     def _get_active_database(self) -> Optional[str]:
         """
@@ -1033,6 +1287,144 @@ class AIClassificationPipelineService:
         except Exception as e:
             logger.warning(f"Failed to load business glossary from governance: {e}")
             self._business_glossary_map = {}
+
+    def get_category_id_by_name(self, category_name: str) -> Optional[str]:
+        """Get category ID for a given category name."""
+        try:
+            schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
+            gov_db = resolve_governance_db()
+            if gov_db:
+                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+
+            rows = snowflake_connector.execute_query(
+                f"SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)",
+                {"n": category_name}
+            )
+            if rows and len(rows) > 0:
+                first = rows[0]
+                if isinstance(first, dict):
+                    return first.get('CATEGORY_ID')
+                else:
+                    # Fallback for tuple/list
+                    return first[0]
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get category ID for {category_name}: {e}")
+            return None
+
+    def _log_keyword_audit(self, action: str, keyword: str, category: str, details: str):
+        """Log keyword changes to the audit table."""
+        try:
+            schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
+            gov_db = resolve_governance_db()
+            if gov_db:
+                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+            
+            # Escape single quotes for SQL
+            safe_details = details.replace("'", "''")
+            safe_keyword = keyword.replace("'", "''")
+            
+            query = f"""
+                INSERT INTO {schema_fqn}.CLASSIFICATION_AUDIT 
+                (ID, RESOURCE_ID, ACTION, DETAILS, CREATED_AT)
+                VALUES (UUID_STRING(), '{safe_keyword}', '{action}', '{safe_details}', CURRENT_TIMESTAMP())
+            """
+            snowflake_connector.execute_non_query(query)
+        except Exception as e:
+            logger.error(f"Failed to audit keyword action: {e}")
+
+    def add_sensitive_keyword(self, keyword: str, category_name: str, match_type: str = 'CONTAINS') -> bool:
+        """Add a new sensitive keyword to the governance table."""
+        try:
+            category_id = self.get_category_id_by_name(category_name)
+            if not category_id:
+                logger.error(f"Category '{category_name}' not found.")
+                return False
+
+            schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
+            gov_db = resolve_governance_db()
+            if gov_db:
+                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+
+            # Check if keyword already exists
+            existing = snowflake_connector.execute_query(
+                f"SELECT KEYWORD_ID FROM {schema_fqn}.SENSITIVE_KEYWORDS WHERE LOWER(KEYWORD_STRING) = LOWER(%(k)s) AND CATEGORY_ID = %(c)s",
+                {"k": keyword, "c": category_id}
+            )
+            if existing:
+                logger.warning(f"Keyword '{keyword}' already exists for category '{category_name}'.")
+                return False
+
+            # Insert
+            safe_keyword = keyword.replace("'", "''")
+            safe_match_type = match_type.replace("'", "''")
+            
+            query = f"""
+                INSERT INTO {schema_fqn}.SENSITIVE_KEYWORDS 
+                (KEYWORD_ID, CATEGORY_ID, KEYWORD_STRING, MATCH_TYPE, SENSITIVITY_WEIGHT, IS_ACTIVE, CREATED_BY)
+                VALUES (UUID_STRING(), '{category_id}', '{safe_keyword}', '{safe_match_type}', 0.8, TRUE, CURRENT_USER())
+            """
+            snowflake_connector.execute_non_query(query)
+            
+            # Audit
+            self._log_keyword_audit("ADD_KEYWORD", keyword, category_name, f"Added keyword '{keyword}' to category '{category_name}' with match type '{match_type}'")
+
+            # Refresh local cache
+            self._load_metadata_driven_categories()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add keyword '{keyword}': {e}")
+            return False
+
+    def upsert_sensitive_keyword(self, keyword: str, category_name: str, match_type: str = 'CONTAINS') -> bool:
+        """Upsert a sensitive keyword (Insert if new, Update if exists)."""
+        try:
+            category_id = self.get_category_id_by_name(category_name)
+            if not category_id:
+                logger.error(f"Category '{category_name}' not found.")
+                return False
+
+            schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
+            gov_db = resolve_governance_db()
+            if gov_db:
+                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+
+            # Check if keyword exists
+            existing = snowflake_connector.execute_query(
+                f"SELECT KEYWORD_ID FROM {schema_fqn}.SENSITIVE_KEYWORDS WHERE LOWER(KEYWORD_STRING) = LOWER(%(k)s) AND CATEGORY_ID = %(c)s",
+                {"k": keyword, "c": category_id}
+            )
+            
+            safe_keyword = keyword.replace("'", "''")
+            safe_match_type = match_type.replace("'", "''")
+
+            if existing:
+                # Update
+                query = f"""
+                    UPDATE {schema_fqn}.SENSITIVE_KEYWORDS 
+                    SET MATCH_TYPE = '{safe_match_type}', IS_ACTIVE = TRUE, SENSITIVITY_WEIGHT = 0.8
+                    WHERE LOWER(KEYWORD_STRING) = LOWER('{safe_keyword}') AND CATEGORY_ID = '{category_id}'
+                """
+                snowflake_connector.execute_non_query(query)
+                # Audit
+                self._log_keyword_audit("UPDATE_KEYWORD", keyword, category_name, f"Updated keyword '{keyword}' in category '{category_name}'")
+            else:
+                # Insert
+                query = f"""
+                    INSERT INTO {schema_fqn}.SENSITIVE_KEYWORDS 
+                    (KEYWORD_ID, CATEGORY_ID, KEYWORD_STRING, MATCH_TYPE, SENSITIVITY_WEIGHT, IS_ACTIVE, CREATED_BY)
+                    VALUES (UUID_STRING(), '{category_id}', '{safe_keyword}', '{safe_match_type}', 0.8, TRUE, CURRENT_USER())
+                """
+                snowflake_connector.execute_non_query(query)
+                # Audit
+                self._log_keyword_audit("ADD_KEYWORD", keyword, category_name, f"Added keyword '{keyword}' to category '{category_name}' via upsert")
+
+            # Refresh local cache
+            self._load_metadata_driven_categories()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to upsert keyword '{keyword}': {e}")
+            return False
 
     def classify_texts(self, texts: List[str], context: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -2318,6 +2710,122 @@ class AIClassificationPipelineService:
         except Exception as e:
             logger.error(f"Failed to fetch classification history: {e}", exc_info=True)
             return pd.DataFrame()
+
+    def auto_apply_policy_tags(self, database_name: str, dry_run: bool = False) -> List[Dict]:
+        """
+        Automated Snowflake tagging function that scans all tables and columns,
+        detects sensitive data, and applies classification tags according to policy.
+        
+        Returns a list of actions taken (or that would be taken in dry_run).
+        """
+        from src.services.tagging_service import tagging_service
+        
+        actions_log = []
+        logger.info(f"Starting automated policy tagging for database: {database_name} (Dry Run: {dry_run})")
+        
+        # 1. Get latest classification results
+        # We use the existing history fetch which pulls from CLASSIFICATION_AI_RESULTS
+        # This assumes the pipeline has been run recently.
+        # Ideally, we might want to trigger a fresh scan, but for now we use stored results.
+        df_results = self._fetch_classification_history()
+        
+        if df_results.empty:
+            logger.warning("No classification results found. Run the classification pipeline first.")
+            return []
+            
+        # Filter for the target database if needed (though results might be cross-db if configured)
+        # Assuming results are for the active DB context
+        
+        # 2. Iterate and determine tags
+        for index, row in df_results.iterrows():
+            try:
+                schema = row['Schema']
+                table = row['Table']
+                column = row['Column']
+                category = row['Category']
+                sensitivity = row['Sensitivity']
+                cia_str = row['CIA'] # "C:3 I:2 A:1"
+                
+                if not schema or not table or not column:
+                    continue
+                    
+                full_table_name = f"{database_name}.{schema}.{table}"
+                
+                # Parse CIA
+                c_val = '0'
+                i_val = '0'
+                a_val = '0'
+                if cia_str and isinstance(cia_str, str):
+                    parts = cia_str.split()
+                    for p in parts:
+                        if p.startswith('C:'): c_val = p.split(':')[1]
+                        elif p.startswith('I:'): i_val = p.split(':')[1]
+                        elif p.startswith('A:'): a_val = p.split(':')[1]
+                
+                # Determine Data Classification based on Sensitivity/Category
+                # Mapping Rules (Heuristic based on Avendra's policy description)
+                classification = "Internal" # Default
+                
+                sens_upper = str(sensitivity).upper()
+                cat_upper = str(category).upper()
+                
+                if 'CRITICAL' in sens_upper or 'CONFIDENTIAL' in sens_upper:
+                    classification = "Confidential"
+                elif 'RESTRICTED' in sens_upper or 'HIGH' in sens_upper:
+                    classification = "Restricted"
+                elif 'PUBLIC' in sens_upper:
+                    classification = "Public"
+                elif 'PII' in cat_upper or 'SOX' in cat_upper or 'SOC2' in cat_upper:
+                     # Fallback if sensitivity isn't explicit but category is sensitive
+                     if 'PII' in cat_upper: classification = "Confidential"
+                     else: classification = "Restricted"
+                
+                # Prepare tags
+                tags_to_apply = {
+                    "DATA_CLASSIFICATION": classification,
+                    "CONFIDENTIALITY_LEVEL": c_val,
+                    "INTEGRITY_LEVEL": i_val,
+                    "AVAILABILITY_LEVEL": a_val
+                }
+                
+                # Add special category tags if applicable
+                if 'PII' in cat_upper: tags_to_apply["SPECIAL_CATEGORY"] = "PII"
+                elif 'SOX' in cat_upper: tags_to_apply["SPECIAL_CATEGORY"] = "SOX"
+                elif 'SOC2' in cat_upper: tags_to_apply["SPECIAL_CATEGORY"] = "SOC"
+                
+                action_desc = f"Tagging {full_table_name}.{column} as {classification} (C{c_val} I{i_val} A{a_val})"
+                
+                if not dry_run:
+                    tagging_service.apply_tags_to_column(full_table_name, column, tags_to_apply)
+                    # Also apply table-level tags? 
+                    # Usually table level is the max of its columns. 
+                    # For now, we focus on column-level as per the loop.
+                    
+                    # Log success
+                    actions_log.append({
+                        "object": f"{full_table_name}.{column}",
+                        "status": "Applied",
+                        "tags": tags_to_apply,
+                        "rationale": f"Based on category {category} and sensitivity {sensitivity}"
+                    })
+                else:
+                    actions_log.append({
+                        "object": f"{full_table_name}.{column}",
+                        "status": "Dry Run",
+                        "tags": tags_to_apply,
+                        "rationale": f"Based on category {category} and sensitivity {sensitivity}"
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Failed to auto-tag {row.get('Table', 'Unknown')}.{row.get('Column', 'Unknown')}: {e}")
+                actions_log.append({
+                    "object": f"{row.get('Schema', '')}.{row.get('Table', '')}.{row.get('Column', '')}",
+                    "status": "Error",
+                    "error": str(e)
+                })
+                
+        logger.info(f"Auto-tagging complete. Processed {len(actions_log)} items.")
+        return actions_log
 
     def _ensure_results_table_columns(self, gov_db: str) -> None:
         """Ensure CLASSIFICATION_AI_RESULTS has all required columns."""
@@ -3696,69 +4204,48 @@ class AIClassificationPipelineService:
 
             # Map numeric CIA values to descriptive labels
             if c_val <= 0:
-                c_label = "C0: Public"
+                c_label = "🟢 C0: Public"
             elif c_val == 1:
-                c_label = "C1: Internal"
+                c_label = "🟡 C1: Internal"
             elif c_val == 2:
-                c_label = "C2: Restricted (PII/Financial)"
+                c_label = "🟠 C2: Restricted"
             else:
-                c_label = "C3: Confidential/Highly Sensitive"
+                c_label = "🔴 C3: Confidential"
 
             if i_val <= 0:
-                i_label = "I0: Low"
+                i_label = "🟢 I0: Low"
             elif i_val == 1:
-                i_label = "I1: Moderate"
+                i_label = "🟡 I1: Standard"
             elif i_val == 2:
-                i_label = "I2: High"
+                i_label = "🟠 I2: High"
             else:
-                i_label = "I3: Critical"
+                i_label = "🔴 I3: Critical"
 
             if a_val <= 0:
-                a_label = "A0: Days+"
+                a_label = "🟢 A0: Low"
             elif a_val == 1:
-                a_label = "A1: Hours"
+                a_label = "🟡 A1: Standard"
             elif a_val == 2:
-                a_label = "A2: <1 hour"
+                a_label = "🟠 A2: High"
             else:
-                a_label = "A3: Near real-time"
-
-            display_data.append({
-                "Asset": asset['full_name'],
-                "Business Context": result.get('business_context', '')[:100] + '...' if result.get('business_context') and len(result.get('business_context', '')) > 100 else result.get('business_context', ''),
-                "Category": result.get('category', 'N/A'),
-                "Classification": result.get('label_emoji', result.get('label', 'N/A')),
-                "Color": result.get('color', 'N/A'),
-                "Confidentiality": c_label,
-                "Integrity": i_label,
-                "Availability": a_label,
-                "Status": result.get('application_status', 'N/A'),
-            })
-
-        results_df = pd.DataFrame(display_data)
-        try:
-            try:
-                theme_base = st.get_option("theme.base")
-            except Exception:
-                theme_base = "light"
-            is_dark = str(theme_base or "").lower() == "dark"
-            if is_dark:
-                mp = {
-                    'Red': '#7f1d1d',
-                    'Orange': '#7c2d12',
-                    'Yellow': '#7a6e00',
-                    'Green': '#14532d',
-                    'Gray': '#374151',
-                }
-                fg = '#ffffff'
-            else:
-                mp = {
+                a_label = "🔴 A3: Critical"
+            
+            color_map = {
+                'Red': '#dc2626',
+                'Orange': '#7c2d12',
+                'Yellow': '#7a6e00',
+                'Green': '#14532d',
+                'Gray': '#374151',
+            }
+            fg = '#ffffff'
+            mp = {
                     'Red': '#ffe5e5',
                     'Orange': '#fff0e1',
                     'Yellow': '#fffbe5',
                     'Green': '#e9fbe5',
                     'Gray': '#f5f5f5',
                 }
-                fg = '#000000'
+            fg = '#000000'
 
             def _apply_classification_style(row: pd.Series):
                 col_name = 'Classification'
@@ -3769,18 +4256,20 @@ class AIClassificationPipelineService:
                     idx = list(row.index).index(col_name)
                     if bg:
                         styles[idx] = f'background-color: {bg}; color: {fg}; font-weight: 600'
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Error applying styles to dataframe: {str(e)}")
                 return styles
 
-            styled = results_df.style.apply(_apply_classification_style, axis=1)
-            st.dataframe(styled, width='stretch', hide_index=True)
-        except Exception:
-            st.dataframe(results_df, width='stretch', hide_index=True)
+            try:
+                styled = results_df.style.apply(_apply_classification_style, axis=1)
+                st.dataframe(styled, width='stretch', hide_index=True)
+            except Exception as e:
+                st.dataframe(results_df, width='stretch', hide_index=True)
+                logger.warning(f"Error applying styles to dataframe: {str(e)}")
 
         # Dropdown for Table Selection
         st.divider()
-        st.markdown("### 🔍 Detailed Analysis")
+        st.markdown("###  Detailed Analysis")
         
         # Create options map: "Database.Schema.Table" -> result object
         options_map = {r['asset']['full_name']: r for r in successful_results}
@@ -3854,6 +4343,60 @@ class AIClassificationPipelineService:
                         st.write("**SQL Preview:**")
                         st.code(sql_preview, language='sql')
 
+                st.divider()
+
+                # --- Edit Classification Section ---
+                st.markdown("### ✏️ Edit Classification")
+                with st.form(key=f"edit_form_{asset['full_name']}"):
+                    ec1, ec2, ec3 = st.columns(3)
+                    # Current values
+                    cur_c = int(result.get('c', 0) or 0)
+                    cur_i = int(result.get('i', 0) or 0)
+                    cur_a = int(result.get('a', 0) or 0)
+                    cur_lbl = result.get('label', 'Internal')
+                    
+                    c_opts = [0, 1, 2, 3]
+                    c_labels = {0: 'Public', 1: 'Internal', 2: 'Restricted', 3: 'Confidential'}
+                    new_c = ec1.selectbox("Confidentiality", options=c_opts, index=cur_c, format_func=lambda x: c_labels.get(x, f"C{x}"), key=f"ec_{asset['full_name']}")
+
+                    i_opts = [0, 1, 2, 3]
+                    i_labels = {0: 'Low', 1: 'Standard', 2: 'High', 3: 'Critical'}
+                    new_i = ec2.selectbox("Integrity", options=i_opts, index=cur_i, format_func=lambda x: i_labels.get(x, f"I{x}"), key=f"ei_{asset['full_name']}")
+
+                    a_opts = [0, 1, 2, 3]
+                    a_labels = {0: 'Low', 1: 'Standard', 2: 'High', 3: 'Critical'}
+                    new_a = ec3.selectbox("Availability", options=a_opts, index=cur_a, format_func=lambda x: a_labels.get(x, f"A{x}"), key=f"ea_{asset['full_name']}")
+                    
+                    lbl_opts = ["Public", "Internal", "Restricted", "Confidential"]
+                    try:
+                        lbl_idx = lbl_opts.index(cur_lbl)
+                    except ValueError:
+                        lbl_idx = 1
+                    new_label = st.selectbox("Label", options=lbl_opts, index=lbl_idx, key=f"el_{asset['full_name']}")
+                    
+                    rationale = st.text_area("Rationale (Required)", placeholder="Reason for change...", key=f"er_{asset['full_name']}")
+                    
+                    if st.form_submit_button("Save Changes"):
+                        if not rationale:
+                            st.error("Rationale is required.")
+                        else:
+                            # Recalculate Risk
+                            n_risk = "Low"
+                            if new_c >= 3 or new_i >= 3 or new_a >= 3:
+                                n_risk = "High"
+                            elif new_c >= 2 or new_i >= 2 or new_a >= 2:
+                                n_risk = "Medium"
+                                
+                            success, msg = self._update_asset_classification(
+                                asset['full_name'], new_c, new_i, new_a, new_label, n_risk, rationale
+                            )
+                            if success:
+                                st.success(msg)
+                                # Optionally rerun to refresh view
+                                # st.rerun() 
+                            else:
+                                st.error(msg)
+                
                 st.divider()
                 
                 # Column-level detection with automatic loading (full-width display)
@@ -3937,31 +4480,31 @@ class AIClassificationPipelineService:
 
                                 # Map numeric CIA values to descriptive labels (same mapping as table-level)
                                 if c_val <= 0:
-                                    c_label = "C0: Public"
+                                    c_label = "🟢 C0: Public"
                                 elif c_val == 1:
-                                    c_label = "C1: Internal"
+                                    c_label = "🟡 C1: Internal"
                                 elif c_val == 2:
-                                    c_label = "C2: Restricted (PII/Financial)"
+                                    c_label = "🟠 C2: Restricted"
                                 else:
-                                    c_label = "C3: Confidential/Highly Sensitive"
+                                    c_label = "🔴 C3: Confidential"
 
                                 if i_val <= 0:
-                                    i_label = "I0: Low"
+                                    i_label = "🟢 I0: Low"
                                 elif i_val == 1:
-                                    i_label = "I1: Moderate"
+                                    i_label = "🟡 I1: Standard"
                                 elif i_val == 2:
-                                    i_label = "I2: High"
+                                    i_label = "🟠 I2: High"
                                 else:
-                                    i_label = "I3: Critical"
+                                    i_label = "🔴 I3: Critical"
 
                                 if a_val <= 0:
-                                    a_label = "A0: Days+"
+                                    a_label = "🟢 A0: Low"
                                 elif a_val == 1:
-                                    a_label = "A1: Hours"
+                                    a_label = "🟡 A1: Standard"
                                 elif a_val == 2:
-                                    a_label = "A2: <1 hour"
+                                    a_label = "🟠 A2: High"
                                 else:
-                                    a_label = "A3: Near real-time"
+                                    a_label = "🔴 A3: Critical"
 
                                 col_display.append({
                                     "Column": col.get('column', 'N/A'),
@@ -4717,7 +5260,9 @@ class AIClassificationPipelineService:
 
         # Calculate CIA scores based on policy group and category sensitivity
         # Default to Internal (C1, I1, A1)
-        cia_scores = {'c': 'C1', 'i': 'I1', 'a': 'A1'}
+        # Confidentiality: 0=Public, 1=Internal, 2=Restricted, 3=Confidential
+        # Integrity/Availability: 0=Low, 1=Standard, 2=High, 3=Critical
+        cia_scores = {'c': 1, 'i': 1, 'a': 1}
         final_label = 'Internal'
         
         cat_upper = best_category.upper()
@@ -4725,37 +5270,37 @@ class AIClassificationPipelineService:
         # 1. Check for Confidential (C3) - Highest Priority
         # SOX (Financial Reporting) is always C3
         if policy_group == 'SOX':
-            cia_scores = {'c': 'C3', 'i': 'I3', 'a': 'A3'}
+            cia_scores = {'c': 3, 'i': 3, 'a': 3}
             final_label = 'Confidential'
         # Sensitive PII is C3
         elif policy_group == 'PII' and any(x in cat_upper for x in ['SSN', 'TAX', 'PASSPORT', 'CREDIT', 'BANK', 'ACCOUNT', 'FINANCIAL', 'DRIVER', 'LICENSE']):
-            cia_scores = {'c': 'C3', 'i': 'I3', 'a': 'A3'}
+            cia_scores = {'c': 3, 'i': 3, 'a': 3}
             final_label = 'Confidential'
         # Secrets/Keys are C3
         elif any(x in cat_upper for x in ['PASSWORD', 'SECRET', 'KEY', 'TOKEN', 'AUTH', 'CREDENTIAL']):
-            cia_scores = {'c': 'C3', 'i': 'I3', 'a': 'A3'}
+            cia_scores = {'c': 3, 'i': 3, 'a': 3}
             final_label = 'Confidential'
             
         # 2. Check for Restricted (C2)
         # Standard PII is C2
         elif policy_group == 'PII':
-            cia_scores = {'c': 'C2', 'i': 'I2', 'a': 'A2'}
+            cia_scores = {'c': 2, 'i': 2, 'a': 2}
             final_label = 'Restricted'
         # SOC2 is generally C2 (unless it matched secrets above)
         elif policy_group == 'SOC2':
-            cia_scores = {'c': 'C2', 'i': 'I2', 'a': 'A2'}
+            cia_scores = {'c': 2, 'i': 2, 'a': 2}
             final_label = 'Restricted'
         # Fallback for explicit labels
         elif label == 'Confidential':
-            cia_scores = {'c': 'C3', 'i': 'I3', 'a': 'A3'}
+            cia_scores = {'c': 3, 'i': 3, 'a': 3}
             final_label = 'Confidential'
         elif label == 'Restricted':
-            cia_scores = {'c': 'C2', 'i': 'I2', 'a': 'A2'}
+            cia_scores = {'c': 2, 'i': 2, 'a': 2}
             final_label = 'Restricted'
             
         # 3. Check for Public (C0)
         elif label == 'Public':
-            cia_scores = {'c': 'C0', 'i': 'I0', 'a': 'A0'}
+            cia_scores = {'c': 0, 'i': 0, 'a': 0}
             final_label = 'Public'
             
         # Update label to match policy
@@ -5280,7 +5825,7 @@ class AIClassificationPipelineService:
             # 1. Table-level classification using governance centroids
             table_context = self._build_table_context_from_metadata(db, schema, table)
             table_scores = self._compute_governance_scores(table_context)
-            
+
             # 2. Column-level classification using governance patterns/keywords
             columns = self._get_columns_from_information_schema(db, schema, table)
             
@@ -5375,6 +5920,15 @@ class AIClassificationPipelineService:
                     c, i, a = (2, 2, 2)
                     label = "Restricted"
             
+            # Map numeric scores to descriptive labels
+            c_labels = {0: 'Public', 1: 'Internal', 2: 'Restricted', 3: 'Confidential'}
+            i_labels = {0: 'Low', 1: 'Standard', 2: 'High', 3: 'Critical'}
+            a_labels = {0: 'Low', 1: 'Standard', 2: 'High', 3: 'Critical'}
+            
+            c_label_text = c_labels.get(c, 'Internal')
+            i_label_text = i_labels.get(i, 'Standard')
+            a_label_text = a_labels.get(a, 'Standard')
+
             label_emoji_map = {
                 'Confidential': '🟥 Confidential',
                 'Restricted': '🟧 Restricted',
@@ -5390,17 +5944,34 @@ class AIClassificationPipelineService:
             label_emoji = label_emoji_map.get(label, label)
             color = color_map.get(label, 'Gray')
 
+            # Calculate Overall Risk Level
+            # High: Any CIA score is 3 (Confidential/Critical)
+            # Medium: Any CIA score is 2 (Restricted/High)
+            # Low: All CIA scores are 0 or 1 (Public/Internal/Low/Standard)
+            risk_level = "Low"
+            if c >= 3 or i >= 3 or a >= 3:
+                risk_level = "High"
+            elif c >= 2 or i >= 2 or a >= 2:
+                risk_level = "Medium"
+            
+            risk_emoji_map = {
+                "High": "🔴 High",
+                "Medium": "🟠 Medium",
+                "Low": "🟢 Low"
+            }
+            risk_emoji = risk_emoji_map.get(risk_level, risk_level)
+
             # Create comma-separated string of top categories for UI display
             multi_label_str = ", ".join([d['category'] for d in table_detected_categories[:3]]) if table_detected_categories else table_category
 
             return {
                 'asset': asset,
-                'category': policy_groups_str,  # ✅ NOW SHOWS ALL POLICY GROUPS (e.g., "PII, SOX, SOC2")
-                'primary_policy_group': multi_label_policy_groups[0] if multi_label_policy_groups else policy_group,  # Top policy group
-                'policy_groups': multi_label_policy_groups,  # ✅ NEW: List of all applicable policy groups
-                'policy_group_confidences': policy_group_confidences,  # ✅ NEW: Confidence per policy group
-                'detected_categories': table_detected_categories,  # Multi-label support (granular categories)
-                'multi_label_category': multi_label_str,  # Comma-separated for UI
+                'category': policy_groups_str,
+                'primary_policy_group': multi_label_policy_groups[0] if multi_label_policy_groups else policy_group,
+                'policy_groups': multi_label_policy_groups,
+                'policy_group_confidences': policy_group_confidences,
+                'detected_categories': table_detected_categories,
+                'multi_label_category': multi_label_str,
                 'confidence': confidence,
                 'columns': column_results,
                 'business_context': table_context,
@@ -5410,21 +5981,26 @@ class AIClassificationPipelineService:
                 'confidence_pct': round(confidence * 100, 1),
                 'confidence_tier': "Confident" if confidence > 0.75 else "Likely" if confidence > 0.5 else "Uncertain",
                 'c': c, 'i': i, 'a': a,
+                'c_label': c_label_text,
+                'i_label': i_label_text,
+                'a_label': a_label_text,
                 'label': label,
                 'label_emoji': label_emoji,
+                'overall_risk': risk_level,
+                'risk_emoji': risk_emoji,
                 'color': color,
                 'validation_status': 'REVIEW_REQUIRED',
                 'issues': [],
-                'route': 'STANDARD_REVIEW',
-                'application_status': 'QUEUED_FOR_REVIEW',
-                'compliance': multi_label_policy_groups,  # ✅ UPDATED: Show all policy groups in compliance
+                'sql_preview': f"-- Proposed Classification for {asset['full_name']}\n-- Category: {policy_groups_str}\n-- CIA: {c_label_text} / {i_label_text} / {a_label_text}\n\nALTER TABLE {asset['full_name']} SET TAG DATA_CLASSIFICATION_TAG = '{label}';\nALTER TABLE {asset['full_name']} SET TAG CONFIDENTIALITY_LEVEL = '{c_label_text}';\nALTER TABLE {asset['full_name']} SET TAG INTEGRITY_LEVEL = '{i_label_text}';\nALTER TABLE {asset['full_name']} SET TAG AVAILABILITY_LEVEL = '{a_label_text}';",
                 'reasoning': [f"Detected policy groups: {policy_groups_str}"],
+                'compliance': multi_label_policy_groups,
+                'route': 'Governance-Driven (Metadata)',
                 'multi_label_analysis': {
-                    "detected_categories": multi_label_policy_groups,  # ✅ UPDATED: All policy groups
-                    "policy_group_confidences": policy_group_confidences,  # ✅ NEW: Confidence breakdown
+                    "detected_categories": multi_label_policy_groups,
+                    "policy_group_confidences": policy_group_confidences,
                     "reasoning": {pg: f"{policy_group_confidences[pg]:.1%} confidence" for pg in multi_label_policy_groups}
                 },
-                'column_results': column_results  # ✅ NEW: Return column details for saving
+                'column_results': column_results
             }
             
         except Exception as e:

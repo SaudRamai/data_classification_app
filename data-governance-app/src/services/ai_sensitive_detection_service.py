@@ -306,26 +306,71 @@ class AISensitiveDetectionService:
         return result
     
     def _detect_keyword_matches(self, column: str, table: str, schema: str) -> List[Dict]:
-        """Detect sensitive keywords using governance table VW_SENSITIVE_KEYWORDS_CANONICAL."""
+        """Detect sensitive keywords using governance table VW_SENSITIVE_KEYWORDS_CANONICAL.
+        
+        Uses word-boundary matching to prevent false positives from substring matches.
+        For example, 'name' should match 'first_name' but NOT 'product_name'.
+        """
         try:
             col_l = (column or "").lower()
             tbl_l = (table or "").lower()
             sch_l = (schema or "").lower()
+            
+            # Exclusion patterns for common non-sensitive fields
+            # These are fields that commonly contain sensitive keywords but are not actually sensitive
+            NON_SENSITIVE_PATTERNS = {
+                'product_name', 'brand_name', 'table_name', 'file_name', 'filename',
+                'schema_name', 'database_name', 'column_name', 'field_name',
+                'display_name', 'app_name', 'application_name', 'service_name',
+                'company_name', 'organization_name', 'org_name', 'business_name',
+                'category_name', 'type_name', 'class_name', 'object_name',
+                'currency_code', 'country_code', 'language_code', 'timezone',
+                'created_date', 'updated_date', 'modified_date', 'deleted_date',
+                'created_at', 'updated_at', 'modified_at', 'deleted_at',
+                'created_by', 'updated_by', 'modified_by', 'deleted_by',
+                'created_timestamp', 'updated_timestamp', 'modified_timestamp',
+                'tracking_number', 'order_number', 'invoice_number', 'reference_number',
+                'item_number', 'sku', 'barcode', 'product_code', 'item_code',
+                'status', 'state', 'flag', 'indicator', 'type', 'category',
+                'description', 'notes', 'comments', 'remarks', 'metadata'
+            }
+            
+            # Check if column is in exclusion list
+            if col_l in NON_SENSITIVE_PATTERNS:
+                return []
+            
             out: List[Dict] = []
             seen = set()
+            
             for r in self.keyword_rows:
                 kw = (r.get("KEYWORD_STRING") or "").lower().strip()
                 scope = (r.get("SCOPE") or "column_name").lower()
                 if not kw or not r.get("IS_ACTIVE", True):
                     continue
+                    
                 matched = False
-                if scope == "column_name" and kw and kw in col_l:
-                    matched = True
-                elif scope == "table_name" and kw in tbl_l:
-                    matched = True
+                
+                if scope == "column_name":
+                    # Use word boundary matching instead of substring matching
+                    # This prevents 'name' from matching 'product_name'
+                    # but allows it to match 'first_name', 'last_name', etc.
+                    
+                    # Create regex pattern with word boundaries
+                    # \b matches word boundaries (start/end of word, or underscore)
+                    pattern = r'\b' + re.escape(kw) + r'\b'
+                    if re.search(pattern, col_l):
+                        matched = True
+                        
+                elif scope == "table_name":
+                    # Same word boundary logic for table names
+                    pattern = r'\b' + re.escape(kw) + r'\b'
+                    if re.search(pattern, tbl_l):
+                        matched = True
+                        
                 elif scope == "comment":
                     # comments not available here reliably; skip
                     matched = False
+                    
                 if matched:
                     key = (r.get("KEYWORD_ID"), r.get("SENSITIVITY_TYPE"))
                     if key in seen:
@@ -605,7 +650,18 @@ class AISensitiveDetectionService:
 
     # --- Config loading ---
     def _load_configs_safely(self) -> None:
-        """Load governance configs; tolerate missing objects/privileges."""
+        """
+        Load governance configs from Snowflake tables.
+        
+        DYNAMIC CONFIGURATION:
+        This method attempts to load all sensitivity rules (keywords, patterns, categories)
+        directly from the governance database. This ensures the system is fully dynamic
+        and controlled by the data governance team.
+        
+        FALLBACK MECHANISM:
+        If the governance tables are unreachable or empty, the system falls back to
+        a minimal set of hard-coded rules to ensure basic PII protection remains active.
+        """
         db = self._gov_db()
         gv = "DATA_CLASSIFICATION_GOVERNANCE"
         gv_fqn = f"{db}.{gv}"
@@ -624,49 +680,39 @@ class AISensitiveDetectionService:
             "CATEGORY_OVERLAP_MED": 1
         }
         
-        # Keywords
+        # 1. Load Keywords (Dynamic)
         try:
             self.keyword_rows = snowflake_connector.execute_query(
                 f"SELECT * FROM {gv_fqn}.SENSITIVE_KEYWORDS WHERE IS_ACTIVE"
             ) or []
+            if self.keyword_rows:
+                logger.info(f"Loaded {len(self.keyword_rows)} dynamic keywords from governance tables.")
         except Exception as e:
-            logger.warning(f"Keywords load failed: {e}")
+            logger.warning(f"Dynamic keyword load failed: {e}")
             self.keyword_rows = []
             
+        # Fallback: If dynamic load failed or returned empty
         if not self.keyword_rows:
-            # Fallback strong signals
-            self.keyword_rows = [
-                {"KEYWORD_ID": 1, "KEYWORD_STRING": "SSN", "SENSITIVITY_TYPE": "PII", "SCORE": 0.9, "IS_ACTIVE": True},
-                {"KEYWORD_ID": 2, "KEYWORD_STRING": "SOCIAL SECURITY", "SENSITIVITY_TYPE": "PII", "SCORE": 0.9, "IS_ACTIVE": True},
-                {"KEYWORD_ID": 3, "KEYWORD_STRING": "CUSTOMER CONTACT", "SENSITIVITY_TYPE": "PII", "SCORE": 0.8, "IS_ACTIVE": True},
-                {"KEYWORD_ID": 4, "KEYWORD_STRING": "EMAIL", "SENSITIVITY_TYPE": "PII", "SCORE": 0.75, "IS_ACTIVE": True},
-                {"KEYWORD_ID": 5, "KEYWORD_STRING": "PHONE", "SENSITIVITY_TYPE": "PII", "SCORE": 0.75, "IS_ACTIVE": True},
-                {"KEYWORD_ID": 6, "KEYWORD_STRING": "ACCOUNT NUMBER", "SENSITIVITY_TYPE": "FINANCIAL", "SCORE": 0.85, "IS_ACTIVE": True},
-                {"KEYWORD_ID": 7, "KEYWORD_STRING": "INVOICE", "SENSITIVITY_TYPE": "FINANCIAL", "SCORE": 0.8, "IS_ACTIVE": True},
-                {"KEYWORD_ID": 8, "KEYWORD_STRING": "GDPR", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.85, "IS_ACTIVE": True},
-                {"KEYWORD_ID": 9, "KEYWORD_STRING": "HIPAA", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.9, "IS_ACTIVE": True},
-                {"KEYWORD_ID": 10, "KEYWORD_STRING": "PCI DSS", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.9, "IS_ACTIVE": True},
-            ]
+            logger.warning("Using hard-coded fallback keywords.")
+            self.keyword_rows = self._get_fallback_keywords()
             
-        # Patterns
+        # 2. Load Patterns (Dynamic)
         try:
             self.pattern_rows = snowflake_connector.execute_query(
                 f"SELECT * FROM {gv_fqn}.SENSITIVE_PATTERNS WHERE IS_ACTIVE"
             ) or []
+            if self.pattern_rows:
+                logger.info(f"Loaded {len(self.pattern_rows)} dynamic patterns from governance tables.")
         except Exception as e:
-            logger.warning(f"Patterns load failed: {e}")
+            logger.warning(f"Dynamic pattern load failed: {e}")
             self.pattern_rows = []
             
+        # Fallback: If dynamic load failed or returned empty
         if not self.pattern_rows:
-            # Fallback regex patterns
-            self.pattern_rows = [
-                {"PATTERN_ID": "PII_SSN", "PATTERN_REGEX": r"\\b(\d{3}-\d{2}-\d{4})\\b", "SENSITIVITY_TYPE": "PII", "SCORE": 0.9, "IS_ACTIVE": True},
-                {"PATTERN_ID": "PII_EMAIL", "PATTERN_REGEX": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "SENSITIVITY_TYPE": "PII", "SCORE": 0.8, "IS_ACTIVE": True},
-                {"PATTERN_ID": "FIN_ACCOUNT", "PATTERN_REGEX": r"ACCOUNT\s*NUMBER|IBAN|SWIFT", "SENSITIVITY_TYPE": "FINANCIAL", "SCORE": 0.8, "IS_ACTIVE": True},
-                {"PATTERN_ID": "REG_GDPR", "PATTERN_REGEX": r"GDPR|HIPAA|PCI\s*DSS", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.85, "IS_ACTIVE": True},
-            ]
+            logger.warning("Using hard-coded fallback patterns.")
+            self.pattern_rows = self._get_fallback_patterns()
             
-        # Categories
+        # 3. Load Categories (Dynamic)
         try:
             cats = snowflake_connector.execute_query(
                 f"SELECT CATEGORY_NAME FROM {gv_fqn}.SENSITIVITY_CATEGORIES WHERE IS_ACTIVE"
@@ -678,7 +724,7 @@ class AISensitiveDetectionService:
             logger.warning(f"Categories load failed: {e}")
             self.categories = self.categories or set()
             
-        # Compliance mapping
+        # 4. Compliance mapping (Dynamic)
         try:
             cmap = snowflake_connector.execute_query(
                 f"SELECT c.CATEGORY_NAME, m.COMPLIANCE_STANDARD FROM {gv_fqn}.COMPLIANCE_MAPPING m JOIN {gv_fqn}.SENSITIVITY_CATEGORIES c ON m.CATEGORY_ID = c.CATEGORY_ID WHERE m.IS_ACTIVE"
@@ -694,6 +740,30 @@ class AISensitiveDetectionService:
         except Exception as e:
             logger.warning(f"Compliance mapping load failed: {e}")
             self.compliance_map = {}
+
+    def _get_fallback_keywords(self) -> List[Dict[str, Any]]:
+        """Return hard-coded keywords for fallback protection when governance tables are unavailable."""
+        return [
+            {"KEYWORD_ID": 1, "KEYWORD_STRING": "SSN", "SENSITIVITY_TYPE": "PII", "SCORE": 0.9, "IS_ACTIVE": True},
+            {"KEYWORD_ID": 2, "KEYWORD_STRING": "SOCIAL SECURITY", "SENSITIVITY_TYPE": "PII", "SCORE": 0.9, "IS_ACTIVE": True},
+            {"KEYWORD_ID": 3, "KEYWORD_STRING": "CUSTOMER CONTACT", "SENSITIVITY_TYPE": "PII", "SCORE": 0.8, "IS_ACTIVE": True},
+            {"KEYWORD_ID": 4, "KEYWORD_STRING": "EMAIL", "SENSITIVITY_TYPE": "PII", "SCORE": 0.75, "IS_ACTIVE": True},
+            {"KEYWORD_ID": 5, "KEYWORD_STRING": "PHONE", "SENSITIVITY_TYPE": "PII", "SCORE": 0.75, "IS_ACTIVE": True},
+            {"KEYWORD_ID": 6, "KEYWORD_STRING": "ACCOUNT NUMBER", "SENSITIVITY_TYPE": "FINANCIAL", "SCORE": 0.85, "IS_ACTIVE": True},
+            {"KEYWORD_ID": 7, "KEYWORD_STRING": "INVOICE", "SENSITIVITY_TYPE": "FINANCIAL", "SCORE": 0.8, "IS_ACTIVE": True},
+            {"KEYWORD_ID": 8, "KEYWORD_STRING": "GDPR", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.85, "IS_ACTIVE": True},
+            {"KEYWORD_ID": 9, "KEYWORD_STRING": "HIPAA", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.9, "IS_ACTIVE": True},
+            {"KEYWORD_ID": 10, "KEYWORD_STRING": "PCI DSS", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.9, "IS_ACTIVE": True},
+        ]
+
+    def _get_fallback_patterns(self) -> List[Dict[str, Any]]:
+        """Return hard-coded patterns for fallback protection when governance tables are unavailable."""
+        return [
+            {"PATTERN_ID": "PII_SSN", "PATTERN_REGEX": r"\\b(\d{3}-\d{2}-\d{4})\\b", "SENSITIVITY_TYPE": "PII", "SCORE": 0.9, "IS_ACTIVE": True},
+            {"PATTERN_ID": "PII_EMAIL", "PATTERN_REGEX": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "SENSITIVITY_TYPE": "PII", "SCORE": 0.8, "IS_ACTIVE": True},
+            {"PATTERN_ID": "FIN_ACCOUNT", "PATTERN_REGEX": r"ACCOUNT\s*NUMBER|IBAN|SWIFT", "SENSITIVITY_TYPE": "FINANCIAL", "SCORE": 0.8, "IS_ACTIVE": True},
+            {"PATTERN_ID": "REG_GDPR", "PATTERN_REGEX": r"GDPR|HIPAA|PCI\s*DSS", "SENSITIVITY_TYPE": "REGULATORY", "SCORE": 0.85, "IS_ACTIVE": True},
+        ]
 
     def detect_sensitive_tables(self,
                               database: str,

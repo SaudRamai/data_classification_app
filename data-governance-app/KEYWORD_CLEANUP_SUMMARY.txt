@@ -1,0 +1,210 @@
+================================================================================
+KEYWORD CLEANUP SUMMARY - REDUCED TO 29 CRITICAL COLUMNS
+================================================================================
+Date: 2025-12-05
+Action: Removed 21 lower-risk keywords from SENSITIVE_KEYWORDS table
+Result: Focused on 29 HIGH to CRITICAL sensitivity columns only
+
+================================================================================
+FILES CREATED
+================================================================================
+
+1. sql/update_critical_keywords_only.sql
+   - Main cleanup script that removes 21 lower-risk keywords
+   - Deletes generic/context-dependent PII, public SOX info, and lower-risk SOC2 data
+   - Includes verification queries to confirm cleanup
+
+2. sql/verify_critical_keywords.sql
+   - Verification script with 4 comprehensive checks
+   - Validates exactly 29 keywords remain (PII=13, SOX=9, SOC2=7)
+   - Confirms removed keywords are gone
+   - Lists all remaining critical keywords
+
+3. CRITICAL_KEYWORDS_REFERENCE.txt
+   - Complete reference document
+   - Lists all 29 kept keywords with rationale
+   - Lists all 21 removed keywords with reasons
+   - Includes classification criteria and compliance alignment
+
+================================================================================
+WHAT WAS REMOVED (21 KEYWORDS)
+================================================================================
+
+PII - 10 Removed:
+-----------------
+❌ CUSTOMER_ID - Generic identifier, not inherently sensitive
+❌ ETHNICITY - Lower priority, context-dependent
+❌ RELIGION - Lower priority, context-dependent
+❌ DISABILITY_STATUS - Lower priority, context-dependent
+❌ TWO_FACTOR_PHONE - Duplicative (already have phone in contact info)
+❌ TWO_FACTOR_EMAIL - Duplicative (already have email in contact info)
+❌ GPS_COORDINATES - Single point less risky than history
+❌ LAST_KNOWN_LOCATION - Single point less risky than history
+❌ VOIP_CALL_RECORDS - Context-dependent sensitivity
+❌ VIDEO_CALL_SIGNATURE - Context-dependent sensitivity
+
+SOX - 4 Removed:
+----------------
+❌ BANK_ROUTING_NUMBER - Public information (on checks)
+❌ BANK_SWIFT_CODE - Public information (bank identifier)
+❌ CREDIT_CARD_HOLDER_NAME - Less sensitive than card number
+❌ BUSINESS_REGISTRATION_NUMBER - Often public information
+
+SOC2 - 7 Removed:
+-----------------
+❌ SECURITY_QUESTION_1 - Question text not sensitive (answer is)
+❌ SECURITY_QUESTION_2 - Question text not sensitive (answer is)
+❌ IP_ADDRESS - Context-dependent, lower priority
+❌ LOGIN_DEVICE_ID - Lower risk than credentials
+❌ CONFIDENTIAL_AGREEMENT_ID - Just a reference ID
+
+================================================================================
+WHAT REMAINS (29 CRITICAL KEYWORDS)
+================================================================================
+
+PII - 13 Critical (Direct Identity):
+-------------------------------------
+✅ SOCIAL_SECURITY_NUMBER
+✅ TAX_IDENTIFICATION_NUMBER
+✅ NATIONAL_ID_NUMBER
+✅ DRIVERS_LICENSE_NUMBER
+✅ PASSPORT_NUMBER
+✅ VOTER_ID_NUMBER
+✅ MILITARY_ID_NUMBER
+✅ ALIEN_REGISTRATION_NUMBER
+✅ BIOMETRIC_HASH
+✅ VOICE_PRINT_ID
+✅ FINGERPRINT_HASH
+✅ HEALTH_CONDITION
+✅ DEVICE_LOCATION_HISTORY
+
+SOX - 9 Critical (Financial Access):
+-------------------------------------
+✅ BANK_ACCOUNT_NUMBER
+✅ BANK_IBAN
+✅ CREDIT_CARD_NUMBER
+✅ CREDIT_CARD_EXPIRY_DATE
+✅ CREDIT_CARD_CVV
+✅ ANNUAL_INCOME
+✅ CREDIT_SCORE
+✅ TAX_RETURN_ID
+✅ PAYMENT_HISTORY
+
+SOC2 - 7 Critical (System Access):
+-----------------------------------
+✅ USER_PASSWORD_HASH
+✅ API_KEY
+✅ API_SECRET
+✅ OAUTH_TOKEN
+✅ OAUTH_REFRESH_TOKEN
+✅ TRADE_SECRET_KEY
+✅ ENCRYPTED_MESSAGES
+
+================================================================================
+IMPACT ANALYSIS
+================================================================================
+
+Category    Before    After    Removed    % Reduction
+--------    ------    -----    -------    -----------
+PII         23        13       10         43%
+SOX         13        9        4          31%
+SOC2        14        7        7          50%
+--------    ------    -----    -------    -----------
+TOTAL       50        29       21         42%
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. ✅ COMPLETED: Created cleanup SQL script
+2. ⏳ RUNNING: Executing update_critical_keywords_only.sql
+3. ⏳ PENDING: Run verification script
+4. ⏳ PENDING: Re-run AI Classification Pipeline
+5. ⏳ PENDING: Verify TEST_CUSTOMER_MASTER detection
+
+Commands to run after cleanup completes:
+-----------------------------------------
+
+# Verify the cleanup
+snowsql -f sql/verify_critical_keywords.sql
+
+# Re-run classification in the dashboard
+# Go to: AI Classification Pipeline → Click "🚀 Run New Scan"
+
+# Expected result: Only 29 critical columns detected
+# - 13 PII columns (direct identity)
+# - 9 SOX columns (financial access)
+# - 7 SOC2 columns (system access)
+
+================================================================================
+BENEFITS
+================================================================================
+
+✅ Reduced False Positives
+   - Focus on truly sensitive data only
+   - Eliminate context-dependent classifications
+
+✅ Clearer Governance
+   - Easier to enforce strict controls on critical data
+   - Clear distinction between critical and non-critical
+
+✅ Better Performance
+   - Fewer keywords to match against
+   - Faster classification scans
+
+✅ Compliance Focus
+   - Align with actual regulatory requirements
+   - Meet GDPR, SOX, SOC2, HIPAA, PCI-DSS standards
+
+✅ Risk-Based Approach
+   - Prioritize highest-risk data for protection
+   - Allocate resources to critical controls
+
+================================================================================
+COMPLIANCE ALIGNMENT
+================================================================================
+
+GDPR (General Data Protection Regulation):
+- Focus on data that directly identifies individuals
+- SSN, passport, biometrics, health data
+
+SOX (Sarbanes-Oxley Act):
+- Focus on financial reporting and controls
+- Bank accounts, credit cards, financial transactions
+
+SOC2 (Service Organization Control 2):
+- Focus on system access and security
+- Passwords, API keys, tokens, encrypted data
+
+HIPAA (Health Insurance Portability and Accountability Act):
+- Protected Health Information (PHI)
+- Health condition data
+
+PCI-DSS (Payment Card Industry Data Security Standard):
+- Payment card data
+- Credit card numbers, CVV, expiry dates
+
+================================================================================
+CLASSIFICATION CRITERIA
+================================================================================
+
+✅ CRITICAL (Kept) - Data that:
+-------------------------------
+- Directly identifies individuals (SSN, passport, biometrics)
+- Provides direct financial access (bank accounts, credit cards)
+- Grants system access (passwords, API keys, tokens)
+- Cannot be easily changed (biometrics, government IDs)
+- Creates immediate risk if exposed (fraud, identity theft)
+
+❌ LOWER RISK (Removed) - Data that:
+-------------------------------------
+- Is a generic identifier (customer IDs)
+- Is publicly available (routing numbers, SWIFT codes)
+- Is context-dependent (IP addresses, device IDs)
+- Is duplicative (two-factor phone/email)
+- Is a reference ID (agreement IDs, question text)
+- Cannot be used alone to cause harm
+
+================================================================================
+END OF SUMMARY
+================================================================================

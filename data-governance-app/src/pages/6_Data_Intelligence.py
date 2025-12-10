@@ -23,12 +23,56 @@ if _project_root not in sys.path:
 from src.ui.theme import apply_global_theme
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
+from src.services.asset_utils import get_asset_counts
 
 # ------------- Page Setup -------------
 st.set_page_config(page_title="Data Intelligence", page_icon="🧠", layout="wide")
 apply_global_theme()
 st.title("Data Intelligence")
 st.caption("Unified Quality and Lineage powered by Snowflake metadata and account usage views")
+
+# ------------- Asset Metrics Section -------------
+with st.container():
+    st.markdown("### 🎯 Data Classification Overview")
+    
+    try:
+        active_db = (
+            st.session_state.get("sf_database")
+            or getattr(settings, "SNOWFLAKE_DATABASE", None)
+            or "DATA_CLASSIFICATION_DB"
+        )
+        _SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
+        T_ASSETS = f"{active_db}.{_SCHEMA}.ASSETS"
+
+        counts = get_asset_counts(
+            assets_table=T_ASSETS,
+            where_clause="",
+            snowflake_connector=snowflake_connector
+        )
+        
+        # Display metrics in columns
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Assets", f"{int(counts.get('total_assets', 0)):,}")
+            
+        with col2:
+            st.metric("Classified", f"{int(counts.get('classified_count', 0)):,}")
+            
+        with col3:
+            st.metric("Unclassified", f"{int(counts.get('unclassified_count', 0)):,}")
+            
+        with col4:
+            cov = counts.get('coverage_pct', 0)
+            cov_int = min(100, max(0, int(round(cov))))
+            st.metric("Classification Coverage", f"{cov_int}%")
+            
+    except Exception as e:
+        st.error(f"Error loading asset metrics: {str(e)}")
+        import traceback
+        st.error(f"Details: {traceback.format_exc()}")
+    
+    st.markdown("---")
 
 # Require Snowflake credentials before running any queries on this page
 _has_user = bool(st.session_state.get("sf_user") or getattr(settings, "SNOWFLAKE_USER", None))
@@ -1556,7 +1600,6 @@ with q_tab:
 
             with col1:
                 st.metric(label="Overall Health Score", value=f"{health_metrics.get('health_score', 0):.1f}%")
-                st.metric(label="SLA Compliance", value=f"{health_metrics.get('sla_compliance', 0):.1f}%")
                 st.metric(label="Credits Used (Today)", value=f"{health_metrics.get('credits_used_today', 0):.2f}")
 
             with col2:
@@ -1947,44 +1990,7 @@ with q_tab:
         health_trend = "+2%"
         sla_trend = "+5%"
 
-        # Rule Status
-        st.markdown("#### Rule Status")
-        
-        # Calculate percentages for the progress bars
-        total_rules = sum(metrics['rule_status'].values())
-        if total_rules > 0:
-            passing_pct = (metrics['rule_status']['passing'] / total_rules) * 100
-            warning_pct = (metrics['rule_status']['warning'] / total_rules) * 100
-            failing_pct = (metrics['rule_status']['failing'] / total_rules) * 100
-        else:
-            passing_pct = warning_pct = failing_pct = 0
-        
-        # Display rule status with progress bars
-        st.progress(0)  # Placeholder for the combined progress bar
-        
-        # Custom progress bars for each status
-        def status_bar(label, value, total, color):
-            pct = (value / total) * 100 if total > 0 else 0
-            cols = st.columns([1, 4])
-            with cols[0]:
-                st.metric(label, value)
-            with cols[1]:
-                st.progress(
-                    pct / 100,  
-                    text=f"{pct:.1f}%"
-                )
-            return f"""
-            <style>
-                .stProgress > div > div > div > div {{
-                    background-color: {color};
-                }}
-            </style>
-            """
-        
-        # Display each status bar
-        st.markdown(status_bar("✅ Passing", metrics['rule_status']['passing'], total_rules, "#2ecc71"), unsafe_allow_html=True)
-        st.markdown(status_bar("⚠️ Warning", metrics['rule_status']['warning'], total_rules, "#f39c12"), unsafe_allow_html=True)
-        st.markdown(status_bar("❌ Failing", metrics['rule_status']['failing'], total_rules, "#e74c3c"), unsafe_allow_html=True)
+        # Rule Status section removed per request
         
         # Top Failing Rules
         st.markdown("#### Top Failing Rules")
@@ -1999,13 +2005,43 @@ with q_tab:
         
         # Recent Incidents
         st.markdown("#### Recent Incidents")
-        incident_data = {
-            "Time": ["2h ago", "5h ago", "1d ago"],
-            "Severity": ["High", "Medium", "Low"],
-            "Description": ["Data pipeline delay", "Schema validation failed", "Increased null rates detected"],
-            "Status": ["Investigating", "Resolved", "Monitoring"]
-        }
-        st.dataframe(pd.DataFrame(incident_data), width='stretch')
+        try:
+            # Build ASSETS FQN
+            active_db_q = (
+                st.session_state.get("sf_database")
+                or getattr(settings, "SNOWFLAKE_DATABASE", None)
+                or "DATA_CLASSIFICATION_DB"
+            )
+            _SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
+            T_ASSETS = f"{active_db_q}.{_SCHEMA}.ASSETS"
+
+            # WHERE clause (schema filter if selected)
+            where_parts = []
+            params_inc = {}
+            if sel_schema and sel_schema != "All":
+                where_parts.append("SCHEMA_NAME = %(schema)s")
+                params_inc["schema"] = sel_schema
+            where_cls = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+            # Query per request
+            query_inc = f"""
+                select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, ASSET_TYPE as ASSET_TYPE,
+                       CLASSIFICATION_LABEL as CLASSIFICATION_LEVEL,
+                       CLASSIFICATION_DATE as LAST_CLASSIFIED_AT
+                from {T_ASSETS}
+                {where_cls}
+                order by LAST_CLASSIFIED_AT desc
+                limit 200
+            """
+
+            rows_inc = snowflake_connector.execute_query(query_inc, params_inc)
+            if rows_inc:
+                df_inc = pd.DataFrame(rows_inc)
+                st.dataframe(df_inc, width='stretch', use_container_width=True, hide_index=True)
+            else:
+                st.info("No recent incidents found for the current selection.")
+        except Exception as e:
+            st.warning(f"Failed to load Recent Incidents: {e}")
         
         st.markdown("---")
         

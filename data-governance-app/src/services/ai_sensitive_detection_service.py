@@ -15,9 +15,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import numpy as np
 from collections import defaultdict
+from src.services.sensitive_detection import SensitiveDataDetector
 
 from src.connectors.snowflake_connector import snowflake_connector
-from src.services.sensitive_detection import SensitiveDataDetector
 from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -69,15 +69,9 @@ class AISensitiveDetectionService:
         
         # Initialize base detector
         self.detector = SensitiveDataDetector()
-        # Lazy import to avoid circular dependency with ai_classification_service
+        self.ai_service = None
         if use_ai:
-            try:
-                from src.services.ai_classification_pipeline_service import ai_classification_pipeline_service
-                self.ai_service = ai_classification_pipeline_service
-            except Exception:
-                self.ai_service = None
-        else:
-            self.ai_service = None
+            self._lazy_load_ai_service()
 
         # Config caches loaded from governance views
         self.weights = {"AI": 0.35, "REGEX": 0.30, "KEYWORD": 0.35}
@@ -911,8 +905,15 @@ class AISensitiveDetectionService:
         except Exception as e:
             logger.warning(f"Governance table setup failed: {e}")
 
-# Singleton instance
-ai_sensitive_detection_service = AISensitiveDetectionService()
+    def _lazy_load_ai_service(self):
+        """Lazy load the AI service to prevent circular imports."""
+        if self.ai_service is None:
+            try:
+                from src.services.ai_classification_pipeline_service import ai_classification_pipeline_service
+                self.ai_service = ai_classification_pipeline_service
+            except ImportError as e:
+                logger.warning(f"Could not import AI Classification Pipeline Service: {e}")
+                self.ai_service = None
 
-# Create singleton instance
+# Singleton instance
 ai_sensitive_detection_service = AISensitiveDetectionService()

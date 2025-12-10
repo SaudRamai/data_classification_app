@@ -743,6 +743,11 @@ class AIClassificationPipelineService:
         logger.info(f"  Backend: {self._embed_backend}, Ready: {self._embed_ready}")
         logger.info(f"  Categories with centroids: {[k for k, v in centroids.items() if v is not None]}")
         logger.info(f"  Categories with tokens: {list(tokens_out.keys())}")
+        try:
+            # Align thresholds/weights after centroids are available
+            self._setup_threshold_alignment()
+        except Exception as _e:
+            logger.warning(f"Threshold alignment failed: {_e}")
         
         try:
             st.session_state["_pipe_cat_count"] = valid_centroids
@@ -1496,6 +1501,28 @@ class AIClassificationPipelineService:
                 continue
         return rows
 
+    def _setup_threshold_alignment(self) -> None:
+        """Unify thresholds and weights across detection paths (service-level)."""
+        try:
+            if not hasattr(self, "_category_thresholds") or not isinstance(self._category_thresholds, dict):
+                self._category_thresholds = {}
+            if not hasattr(self, "_category_scoring_weights") or not isinstance(self._category_scoring_weights, dict):
+                self._category_scoring_weights = {}
+
+            cats = list((getattr(self, "_category_centroids", {}) or {}).keys())
+            for cat in cats:
+                # Default threshold 0.35 unless externally provided via governance settings
+                self._category_thresholds.setdefault(cat, 0.35)
+                # Default weights for legacy paths (semantic+keyword only here)
+                self._category_scoring_weights.setdefault(cat, {"w_sem": 0.7, "w_kw": 0.3})
+
+            logger.info(
+                f"Service threshold alignment: {len(cats)} categories; default threshold=0.35; "
+                f"weights set where missing."
+            )
+        except Exception as e:
+            logger.warning(f"_setup_threshold_alignment (service) error: {e}")
+
     def _classify_assets_local(self, db: str, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Classify assets using local MiniLM + keyword fallback and produce results compatible with UI."""
         results: List[Dict[str, Any]] = []
@@ -1853,35 +1880,78 @@ class AIClassificationPipelineService:
                     except Exception:
                         c, i, a = (1, 1, 1)
 
-                    # Derive a display category strictly limited to PII, SOX, SOC2
+                    # Derive a display category using DATA taxonomy (not compliance frameworks)
+                    # Target categories: PII, FINANCIAL, CREDENTIALS, HEALTH, INTERNAL
                     display_cat = None
                     try:
-                        legacy_map = {
-                            'PERSONAL_DATA': 'PII',
-                            'PERSONAL DATA': 'PII',
-                            'PERSONAL': 'PII',
-                            'PII': 'PII',
-                            'PERSONAL FINANCIAL DATA': 'SOX',
-                            'FINANCIAL_DATA': 'SOX',
-                            'FINANCIAL DATA': 'SOX',
-                            'FINANCIAL': 'SOX',
-                            'PROPRIETARY_DATA': 'SOX',
-                            'PROPRIETARY DATA': 'SOX',
-                            'REGULATORY_DATA': 'SOC2',
-                            'REGULATORY DATA': 'SOC2',
-                            'REGULATORY': 'SOC2',
-                            'INTERNAL_DATA': 'SOC2',
-                            'INTERNAL DATA': 'SOC2',
-                            'SOC2': 'SOC2',
-                            'SOX': 'SOX',
-                        }
-                        if best_cat:
-                            key = str(best_cat).strip().upper()
-                            normalized = legacy_map.get(key)
-                            if normalized in {'PII', 'SOX', 'SOC2'}:
-                                display_cat = normalized
+                        name_lc = (col_name or '').lower()
+                        # Heuristics for credentials/auth secrets
+                        cred_tokens = [
+                            'password', 'passwd', 'pass_', 'pwd', 'api_key', 'apikey', 'api-key', 'secret',
+                            'client_secret', 'token', 'bearer', 'oauth', 'auth', 'login', 'credential'
+                        ]
+                        health_tokens = [
+                            'health', 'diagnosis', 'medical', 'patient', 'hipaa', 'icd', 'hl7'
+                        ]
+                        financial_tokens = [
+                            'account', 'acct', 'iban', 'swift', 'bank', 'payment', 'credit', 'debit', 'card', 'invoice', 'ledger', 'gl'
+                        ]
+                        pii_tokens = [
+                            'email', 'phone', 'mobile', 'address', 'addr', 'street', 'city', 'state', 'zip', 'postal', 'country',
+                            'name', 'first_name', 'last_name', 'fname', 'lname', 'dob', 'birth', 'ssn', 'social', 'passport',
+                            'driver', 'voter', 'biometric', 'fingerprint', 'gps', 'lat', 'lon', 'ethnicity', 'religion'
+                        ]
+
+                        def any_tok(tokens):
+                            return any(t in name_lc for t in tokens)
+
+                        # 1) Strong heuristics first
+                        if any_tok(cred_tokens):
+                            display_cat = 'CREDENTIALS'
+                        elif any_tok(health_tokens):
+                            display_cat = 'HEALTH'
+                        elif any_tok(financial_tokens):
+                            display_cat = 'FINANCIAL'
+                        elif any_tok(pii_tokens):
+                            display_cat = 'PII'
+                        else:
+                            # 2) Map known semantic categories to data taxonomy
+                            legacy_map = {
+                                'PERSONAL_DATA': 'PII',
+                                'PERSONAL DATA': 'PII',
+                                'PERSONAL': 'PII',
+                                'PII': 'PII',
+                                'FINANCIAL_DATA': 'FINANCIAL',
+                                'FINANCIAL DATA': 'FINANCIAL',
+                                'FINANCIAL': 'FINANCIAL',
+                                'TRADESECRET': 'INTERNAL',
+                                'PROPRIETARY_DATA': 'INTERNAL',
+                                'PROPRIETARY DATA': 'INTERNAL',
+                                'REGULATORY_DATA': 'PII',  # regulatory hints should not become a category; default to PII unless heuristics say otherwise
+                                'REGULATORY DATA': 'PII',
+                                'REGULATORY': 'PII',
+                                'INTERNAL_DATA': 'INTERNAL',
+                                'INTERNAL DATA': 'INTERNAL',
+                                'INTERNAL': 'INTERNAL',
+                            }
+                            if best_cat:
+                                key = str(best_cat).strip().upper()
+                                display_cat = legacy_map.get(key)
+                        # Final fallback
+                        if not display_cat:
+                            display_cat = 'INTERNAL'
                     except Exception:
-                        display_cat = None
+                        display_cat = display_cat or 'INTERNAL'
+
+                    # Extract compliance frameworks separately for display/analytics
+                    try:
+                        ctx_upper = (col_context or '').upper()
+                        frameworks = []
+                        for fw in ['GDPR', 'CCPA', 'HIPAA', 'PCI', 'SOX', 'SOC2']:
+                            if fw in ctx_upper:
+                                frameworks.append(fw)
+                    except Exception:
+                        frameworks = []
                     
                     # Assign label based on confidence and CIA levels
                     # Lower threshold to 0.20 to catch more sensitive columns
@@ -1912,6 +1982,7 @@ class AIClassificationPipelineService:
                             'i': i,
                             'a': a,
                             'scores': combined,
+                            'frameworks': frameworks,
                         })
                     else:
                         logger.info(f"    ✗ FILTERED OUT: {col_name} (best_cat={best_cat}, confidence={confidence:.3f})")

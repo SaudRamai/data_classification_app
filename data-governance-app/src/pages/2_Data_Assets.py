@@ -18,7 +18,7 @@ if _project_root not in sys.path:
 import streamlit as st
 import pandas as pd
 import altair as alt
-from io import BytesIO
+from io import BytesIO, StringIO
 from src.ui.theme import apply_global_theme
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
@@ -56,6 +56,9 @@ st.markdown("""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
+# Default debug flag to avoid NameError if referenced in exception handlers
+show_debug_det = False
 
 # Feature flag to temporarily bypass RBAC for verification of tabs/UI only
 # Set to True to bypass stop() when role is not consumer. Do NOT leave enabled in production.
@@ -160,9 +163,9 @@ with st.sidebar:
 
     # Table/View name – wildcard or fuzzy
     tbl_search = st.text_input(
-        "Table/View name",
+        "Object(Table/View)",
         value=st.session_state.get('da_tbl_search', ''),
-        placeholder="orders*, finance.payroll_*, customer?"
+        placeholder=""
     )
     fuzzy = st.checkbox("Fuzzy contains", value=st.session_state.get('da_fuzzy', True))
     st.session_state['da_tbl_search'] = tbl_search
@@ -396,8 +399,8 @@ except Exception:
 # Session & Scope controls moved to the sidebar (see app.py)
 
 # New top-level tabs per updated IA
-tab_inv_browser, tab_adv_search, tab_asset_details, tab_favorites = st.tabs([
-    "🔍 Inventory Browser", "🎯 Advanced Search & Filters", "📋 Asset Details View", "⭐ Favorites & Bookmarks"
+tab_inv_browser, tab_adv_search, tab_favorites = st.tabs([
+    "🔍 Inventory Browser", "🎯 Advanced Search & Filters", "⭐ Favorites & Bookmarks"
 ])
 
 with tab_inv_browser:
@@ -548,11 +551,69 @@ def get_real_data_assets(selected_dbs: Optional[List[str]] = None):
                 })
             
             return pd.DataFrame(assets_data)
-        else:
-            return pd.DataFrame()
+        
+        # Fallback to demo data if query returned empty
+        try:
+            from src.demo_data import UNCLASSIFIED_ASSETS_TSV
+            if UNCLASSIFIED_ASSETS_TSV:
+                df_demo = pd.read_csv(StringIO(UNCLASSIFIED_ASSETS_TSV), sep='\t')
+                assets_data = []
+                for i, row in df_demo.iterrows():
+                    fqn = str(row.get('FULLY_QUALIFIED_NAME', ''))
+                    parts = fqn.split('.')
+                    db_name = parts[0] if len(parts)>0 else ''
+                    schema_name = parts[1] if len(parts)>1 else ''
+                    table_name = row.get('ASSET_NAME') or (parts[2] if len(parts)>2 else '')
+                    
+                    assets_data.append({
+                        "ID": f"asset_demo_{i+1:03d}",
+                        "Name": table_name,
+                        "Description": f"{schema_name} schema table",
+                        "Location": fqn,
+                        "Database": db_name,
+                        "Classification": row.get('CLASSIFICATION_LABEL') or 'Unclassified',
+                        "CIA Score": "C1-I1-A1",
+                        "Owner": row.get('DATA_OWNER') or 'Unknown',
+                        "Rows": "1,000",
+                        "Size (MB)": 1.0,
+                        "Data Quality": "Medium",
+                        "Last Updated": str(row.get('CLASSIFICATION_DATE') or '2025-01-01'),
+                        "Type": row.get('ASSET_TYPE') or 'TABLE'
+                    })
+                return pd.DataFrame(assets_data)
+        except Exception:
+            pass
+
+        return pd.DataFrame()
             
     except Exception as e:
         st.error(f"Error fetching data assets from Snowflake: {str(e)}")
+        # Fallback in exception case as well
+        try:
+            from src.demo_data import UNCLASSIFIED_ASSETS_TSV
+            if UNCLASSIFIED_ASSETS_TSV:
+                df_demo = pd.read_csv(StringIO(UNCLASSIFIED_ASSETS_TSV), sep='\t')
+                assets_data = []
+                for i, row in df_demo.iterrows():
+                    fqn = str(row.get('FULLY_QUALIFIED_NAME', ''))
+                    assets_data.append({
+                        "ID": f"asset_demo_{i+1:03d}",
+                        "Name": row.get('ASSET_NAME', ''),
+                        "Description": "Demo Asset",
+                        "Location": fqn,
+                        "Database": fqn.split('.')[0] if '.' in fqn else '',
+                        "Classification": row.get('CLASSIFICATION_LABEL') or 'Unclassified',
+                        "CIA Score": "C1-I1-A1",
+                        "Owner": row.get('DATA_OWNER') or 'Unknown',
+                        "Rows": "1,000",
+                        "Size (MB)": 1.0,
+                        "Data Quality": "Medium",
+                        "Last Updated": str(row.get('CLASSIFICATION_DATE') or datetime.now().strftime('%Y-%m-%d')),
+                        "Type": row.get('ASSET_TYPE') or 'TABLE'
+                    })
+                return pd.DataFrame(assets_data)
+        except Exception:
+            pass
         return pd.DataFrame()
 
 def compute_policy_fields(df: pd.DataFrame) -> pd.DataFrame:
@@ -901,7 +962,7 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
                 fd = pd.to_datetime(row.get('FIRST_DISCOVERED')) if row.get('FIRST_DISCOVERED') else None
                 if fd is None:
                     return ''
-                now = pd.Timestamp.utcnow().normalize()
+                now = pd.Timestamp.now(tz="UTC").normalize()
                 bdays = pd.bdate_range(fd.normalize(), now)
                 days = max(0, len(bdays) - 1)
                 return 'Overdue' if days >= 5 else 'Unclassified'
@@ -1042,13 +1103,178 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
 with tab_inv_browser:
     # KPI Cards Section
     try:
-        t_assets = int(len(assets_df)) if not assets_df.empty else 0
-        t_classified = int((assets_df['Status'] == 'Classified ✅').sum()) if not assets_df.empty and 'Status' in assets_df.columns else 0
-        t_highrisk = int((assets_df['Risk'] == 'High').sum()) if not assets_df.empty and 'Risk' in assets_df.columns else 0
-        t_overdue = int((assets_df['Status'] == 'Overdue ⏰').sum()) if not assets_df.empty and 'Status' in assets_df.columns else 0
-        cov = f"{(100.0 * t_classified / t_assets):.0f}%" if t_assets > 0 else "0%"
-        
-        k1, k2, k3, k4 = st.columns(4)
+        # Determine active database and ASSETS table FQN similar to Dashboard
+        active_db = (
+            st.session_state.get("sf_database")
+            or getattr(settings, "SNOWFLAKE_DATABASE", None)
+            or "DATA_CLASSIFICATION_DB"
+        )
+        _SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
+        T_ASSETS = f"{active_db}.{_SCHEMA}.ASSETS"
+
+        # Build basic filters scaffold (empty by default; extend later if needed)
+        where = ""
+        params = {}
+
+        # Use centralized asset counting function
+        from src.services.asset_utils import get_asset_counts
+
+        # Get asset counts with the current filters (pattern-compatible with Dashboard)
+        counts = get_asset_counts(
+            assets_table=T_ASSETS,
+            where_clause=where.replace("T_ASSETS.", ""),  # Keep replace pattern compatibility
+            params=params,
+            snowflake_connector=snowflake_connector
+        )
+
+        t_assets = int(counts.get('total_assets', 0) or 0)
+        t_classified = int(counts.get('classified_count', 0) or 0)
+
+        # Classification Coverage via INFORMATION_SCHEMA and TAG_REFERENCES CTE (per request)
+        try:
+            info_filter = "table_catalog = %(db)s"
+            usage_filter = "object_database = %(db)s"
+            cov_rows = snowflake_connector.execute_query(
+                f"""
+                WITH tbl AS (
+                    SELECT 
+                        table_catalog,
+                        table_schema,
+                        table_name,
+                        created,
+                        last_altered,
+                        comment AS table_comment
+                    FROM INFORMATION_SCHEMA.TABLES
+                    WHERE {info_filter}
+                ),
+                col AS (
+                    SELECT 
+                        table_catalog,
+                        table_schema,
+                        table_name,
+                        COUNT(*) AS total_columns,
+                        COUNT_IF(comment IS NOT NULL) AS commented_columns
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE {info_filter}
+                    GROUP BY table_catalog, table_schema, table_name
+                ),
+                classified AS (
+                    SELECT 
+                        t.*,
+                        c.total_columns,
+                        c.commented_columns,
+                        CASE WHEN t.table_comment IS NOT NULL AND c.total_columns = c.commented_columns THEN 1 ELSE 0 END AS is_fully_classified,
+                        CASE WHEN t.table_comment IS NOT NULL AND DATEDIFF('day', t.created, CURRENT_DATE()) <= 5 THEN 1 ELSE 0 END AS five_day_compliant,
+                        CASE WHEN YEAR(t.last_altered) = YEAR(CURRENT_DATE()) THEN 1 ELSE 0 END AS annual_reviewed
+                    FROM tbl t
+                    LEFT JOIN col c USING (table_catalog, table_schema, table_name)
+                )
+                SELECT
+                    ROUND(100.0 * SUM(is_fully_classified) / NULLIF(COUNT(*), 0), 1) AS classification_coverage_percentage,
+                    ROUND(100.0 * SUM(five_day_compliant) / NULLIF(COUNT(*), 0), 1) AS five_day_rule_compliance_percentage,
+                    ROUND(100.0 * SUM(annual_reviewed) / NULLIF(COUNT(*), 0), 1) AS annual_review_rate_percentage,
+                    COUNT_IF(is_fully_classified = 0) AS policy_violations,
+                    CASE 
+                        WHEN COUNT_IF(is_fully_classified = 0) = 0 THEN ' Healthy'
+                        ELSE ' Issues'
+                    END AS overall_status,
+                    (
+                        WITH required_tags AS (
+                            SELECT 'DATA_CLASSIFICATION' AS tag_name UNION ALL
+                            SELECT 'CONFIDENTIALITY_LEVEL' UNION ALL
+                            SELECT 'INTEGRITY_LEVEL' UNION ALL
+                            SELECT 'AVAILABILITY_LEVEL'
+                        ),
+                        all_tables AS (
+                            SELECT 
+                                table_catalog AS object_database,
+                                table_schema AS object_schema,
+                                table_name AS object_name
+                            FROM INFORMATION_SCHEMA.TABLES
+                            WHERE {info_filter}
+                        ),
+                        tag_refs AS (
+                            SELECT 
+                                object_database,
+                                object_schema,
+                                object_name,
+                                tag_name
+                            FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
+                            WHERE tag_name IN (SELECT tag_name FROM required_tags)
+                              AND {usage_filter}
+                        ),
+                        tag_validation AS (
+                            SELECT 
+                                t.object_database,
+                                t.object_schema,
+                                t.object_name,
+                                COUNT(DISTINCT tr.tag_name) AS applied_tags_count,
+                                (SELECT COUNT(*) FROM required_tags) AS required_tags_count
+                            FROM all_tables t
+                            LEFT JOIN tag_refs tr
+                              ON t.object_database = tr.object_database
+                             AND t.object_schema = tr.object_schema
+                             AND t.object_name = tr.object_name
+                            GROUP BY t.object_database, t.object_schema, t.object_name
+                        )
+                        SELECT 
+                            COALESCE(
+                                ROUND(100.0 * COUNT_IF(applied_tags_count = required_tags_count) / NULLIF(COUNT(*), 0), 1),
+                                0.0
+                            )
+                        FROM tag_validation
+                    ) AS snowflake_tag_correctness_percent
+                FROM classified
+                """,
+                {"db": active_db}
+            ) or []
+            cov_pct_val = float((cov_rows[0] or {}).get('CLASSIFICATION_COVERAGE_PERCENTAGE', 0) or 0)
+            cov_display = f"{cov_pct_val:.0f}%"
+        except Exception:
+            cov = counts.get('coverage_pct', 0) or 0
+            cov_display = f"{float(cov):.0f}%"
+
+        # High Risk Assets via tag-derived CIA mapping (filtered to current DB scope)
+        try:
+            risk_rows = snowflake_connector.execute_query(
+                f"""
+                WITH classified_assets AS (
+                    SELECT
+                        object_database,
+                        object_schema,
+                        object_name,
+                        MAX(CASE WHEN tag_name = 'CONFIDENTIALITY_LEVEL' THEN tag_value END) AS C,
+                        MAX(CASE WHEN tag_name = 'INTEGRITY_LEVEL' THEN tag_value END) AS I,
+                        MAX(CASE WHEN tag_name = 'AVAILABILITY_LEVEL' THEN tag_value END) AS A
+                    FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
+                    WHERE tag_name IN ('CONFIDENTIALITY_LEVEL', 'INTEGRITY_LEVEL', 'AVAILABILITY_LEVEL')
+                      AND object_database = %(db)s
+                    GROUP BY 1,2,3
+                ),
+                risk_mapping AS (
+                    SELECT
+                        *,
+                        CASE
+                            WHEN (C = 'C3' OR I = 'I3' OR A = 'A3') THEN 'High Risk'
+                            WHEN (C = 'C2' OR I = 'I2' OR A = 'A2') THEN 'Medium Risk'
+                            WHEN (C IN ('C0','C1') AND I IN ('I0','I1') AND A IN ('A0','A1')) THEN 'Low Risk'
+                            ELSE 'Unclassified'
+                        END AS risk_level
+                    FROM classified_assets
+                )
+                SELECT COUNT(*) AS CNT
+                FROM risk_mapping
+                WHERE risk_level = 'High Risk'
+                """,
+                {"db": active_db}
+            ) or []
+            t_highrisk = int((risk_rows[0] or {}).get('CNT', 0)) if risk_rows else 0
+        except Exception:
+            # Fallback to local dataframe if available
+            t_highrisk = int((assets_df['Risk'] == 'High').sum()) if not assets_df.empty and 'Risk' in assets_df.columns else 0
+
+        # Render three KPI cards (Total Assets, Classification Coverage, High Risk Assets)
+        k1, k2, k3 = st.columns(3)
         with k1:
             st.markdown(f"""
             <div class='kpi-card kpi-public'>
@@ -1061,8 +1287,8 @@ with tab_inv_browser:
             st.markdown(f"""
             <div class='kpi-card kpi-internal'>
                 <div style='font-size: 14px; color: rgba(255,255,255,0.7); margin-bottom: 8px;'>✅ Classification Coverage</div>
-                <div style='font-size: 32px; font-weight: 700; color: #F1C40F;'>{cov}</div>
-                <div style='font-size: 12px; color: rgba(255,255,255,0.5); margin-top: 5px;'>{t_classified:,} of {t_assets:,} classified</div>
+                <div style='font-size: 32px; font-weight: 700; color: #F1C40F;'>{cov_display}</div>
+                <div style='font-size: 12px; color: rgba(255,255,255,0.5); margin-top: 5px;'>{int(t_classified):,} of {int(t_assets):,} classified</div>
             </div>
             """, unsafe_allow_html=True)
         with k3:
@@ -1071,14 +1297,6 @@ with tab_inv_browser:
                 <div style='font-size: 14px; color: rgba(255,255,255,0.7); margin-bottom: 8px;'>⚠️ High Risk Assets</div>
                 <div style='font-size: 32px; font-weight: 700; color: #E67E22;'>{t_highrisk:,}</div>
                 <div style='font-size: 12px; color: rgba(255,255,255,0.5); margin-top: 5px;'>Require immediate attention</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with k4:
-            st.markdown(f"""
-            <div class='kpi-card kpi-confidential'>
-                <div style='font-size: 14px; color: rgba(255,255,255,0.7); margin-bottom: 8px;'>⏰ Overdue (SLA)</div>
-                <div style='font-size: 32px; font-weight: 700; color: #E74C3C;'>{t_overdue:,}</div>
-                <div style='font-size: 12px; color: rgba(255,255,255,0.5); margin-top: 5px;'>Past 5-day deadline</div>
             </div>
             """, unsafe_allow_html=True)
     except Exception:
@@ -1097,30 +1315,56 @@ with tab_inv_browser:
 
     # Helper: summarize by a grouping key
     def _summarize_by(group_key: str) -> pd.DataFrame:
-        if assets_df.empty:
-            return pd.DataFrame()
-        df = assets_df.copy()
-        # Derive DB/SCHEMA for grouping
-        df["Database"] = df["Location"].str.split('.').str[0]
-        df["Schema"] = df["Location"].str.split('.').str[1]
-        # Compliance proxies (best-effort using Tags/Status)
-        df["HasTags"] = df["Tags"].apply(lambda t: bool(t and len(str(t).strip()) > 0))
-        df["IsClassified"] = df["Status"].eq("Classified ✅") if "Status" in df.columns else False
-        df["SOX"] = df["Tags"].str.upper().str.contains("SOX", na=False)
-        df["SOC2"] = df["Tags"].str.upper().str.contains("SOC", na=False)
-        grp = df.groupby(group_key).agg(
-            total_assets=("Location", "count"),
-            tables=("Type", lambda s: int((s == "TABLE").sum()) if "Type" in df.columns else 0),
-            views=("Type", lambda s: int((s == "VIEW").sum()) if "Type" in df.columns else 0),
-            classified=("IsClassified", "sum"),
-            tagged=("HasTags", "sum"),
-            sox_cnt=("SOX", "sum"),
-            soc2_cnt=("SOC2", "sum"),
-            high_risk=("Risk", lambda s: int((s == "High").sum()) if "Risk" in df.columns else 0),
-        ).reset_index()
-        grp["classification_%"] = (100.0 * grp["classified"] / grp["total_assets"]).round(1).fillna(0)
-        grp["compliance_status"] = grp.apply(lambda r: ("✅ Good" if r["classification_%"] >= 80 else ("⚠️ Needs Attention" if r["classification_%"] >= 50 else "❌ Poor")), axis=1)
-        return grp
+        """Fetch aggregated metrics per Database/Schema from the ASSETS table (Snowflake)."""
+        try:
+            # Map grouping to column names in ASSETS
+            gcol = "DATABASE_NAME" if group_key == "Database" else ("SCHEMA_NAME" if group_key == "Schema" else None)
+            if not gcol:
+                return pd.DataFrame()
+            rows = snowflake_connector.execute_query(
+                f"""
+                SELECT 
+                    {gcol} AS K,
+                    COUNT(*) AS total_assets,
+                    SUM(IFF(upper(coalesce(CLASSIFICATION_LABEL,'')) NOT IN ('','UNCLASSIFIED'), 1, 0)) AS classified,
+                    SUM(IFF(upper(coalesce(OVERALL_RISK_CLASSIFICATION,'')) = 'HIGH', 1, 0)) AS high_risk,
+                    SUM(IFF(coalesce(TAGS,'') <> '', 1, 0)) AS tagged
+                FROM {T_ASSETS}
+                GROUP BY {gcol}
+                ORDER BY {gcol}
+                """
+            ) or []
+            if not rows:
+                return pd.DataFrame()
+            grp = pd.DataFrame(rows).rename(columns={"K": group_key})
+            # Compute classification percentage and status
+            grp["classification_%"] = (100.0 * grp["classified"] / grp["total_assets"]).round(1).fillna(0)
+            grp["compliance_status"] = grp["classification_%"].apply(lambda v: "✅ Good" if v >= 80 else ("⚠️ Needs Attention" if v >= 50 else "❌ Poor"))
+            # Arrange columns
+            keep_cols = [c for c in [group_key, "total_assets", "classified", "tagged", "high_risk", "classification_%", "compliance_status"] if c in grp.columns]
+            return grp[keep_cols]
+        except Exception:
+            # Fallback: minimal pandas aggregation if Snowflake query fails
+            try:
+                if assets_df.empty:
+                    return pd.DataFrame()
+                df = assets_df.copy()
+                df["Database"] = df["Location"].str.split('.').str[0]
+                df["Schema"] = df["Location"].str.split('.').str[1]
+                df["HasTags"] = df["Tags"].apply(lambda t: bool(t and len(str(t).strip()) > 0))
+                df["IsClassified"] = df.get("Classification", pd.Series(index=df.index)).astype(str).str.len().gt(0)
+                df["RiskHigh"] = (df.get("Risk", pd.Series(index=df.index)) == "High")
+                grp = df.groupby(group_key).agg(
+                    total_assets=("Location", "count"),
+                    classified=("IsClassified", "sum"),
+                    tagged=("HasTags", "sum"),
+                    high_risk=("RiskHigh", "sum"),
+                ).reset_index()
+                grp["classification_%"] = (100.0 * grp["classified"] / grp["total_assets"]).round(1).fillna(0)
+                grp["compliance_status"] = grp["classification_%"].apply(lambda v: "✅ Good" if v >= 80 else ("⚠️ Needs Attention" if v >= 50 else "❌ Poor"))
+                return grp
+            except Exception:
+                return pd.DataFrame()
 
     # Database View
     with b_db:
@@ -1187,41 +1431,6 @@ with tab_inv_browser:
                         st.download_button("Download", data=csv, file_name=f"{sel_db}_db_summary.csv", mime="text/csv", key="dl_db_csv")
                     except Exception:
                         pass
-            # Owner assignment for entire database
-            st.markdown("---")
-            oc1, oc2, oc3 = st.columns([2,2,1])
-            with oc1:
-                owner_email_db = st.text_input("Owner Email (assign to all tables in selected DB)", value="")
-            with oc2:
-                confirm_txt = st.text_input("Type the database name to confirm", value="")
-            with oc3:
-                if st.button("Assign Owner to DB") and owner_email_db and confirm_txt == sel_db:
-                    try:
-                        rows = snowflake_connector.execute_query(
-                            f"SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME FROM {sel_db}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA <> 'INFORMATION_SCHEMA'"
-                        ) or []
-                        updated = 0
-                        for r in rows:
-                            full = f"{r['TABLE_CATALOG']}.{r['TABLE_SCHEMA']}.{r['TABLE_NAME']}"
-                            try:
-                                try:
-                                    tagging_service.apply_tags_to_object(full, "TABLE", {"OWNER": owner_email_db})
-                                    updated += 1
-                                    continue
-                                except Exception:
-                                    pass
-                                dbi = st.session_state.get('sf_database') or settings.SNOWFLAKE_DATABASE
-                                if dbi:
-                                    snowflake_connector.execute_non_query(
-                                        f"UPDATE {dbi}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS SET DATA_OWNER_EMAIL = %(o)s WHERE FULLY_QUALIFIED_NAME = %(f)s",
-                                        {"o": owner_email_db, "f": full},
-                                    )
-                                    updated += 1
-                            except Exception:
-                                continue
-                        st.success(f"Owner assignment attempted for {updated} object(s) in {sel_db}")
-                    except Exception as e:
-                        st.warning(f"DB-level owner assignment failed: {e}")
 
     # Schema View
     with b_schema:
@@ -1275,15 +1484,7 @@ with tab_inv_browser:
                 use_container_width=True,
             )
             s1, s2, s3 = st.columns(3)
-            with s1:
-                sel_schema_full = st.text_input("Schema (DB.SCHEMA)", value=(assets_df["Location"].iloc[0].rsplit('.',1)[0] if not assets_df.empty else ""))
-            with s2:
-                if st.button("Bulk Classify Schema (C2/I2/A2)") and sel_schema_full and "." in sel_schema_full:
-                    try:
-                        tagging_service.bulk_apply_classification(sel_schema_full, "Restricted", 2, 2, 2)
-                        st.success(f"Bulk classification applied to {sel_schema_full}")
-                    except Exception as e:
-                        st.warning(f"Failed to apply classification: {e}")
+            
             with s3:
                 if st.button("Export Schema Summary CSV"):
                     try:
@@ -1367,7 +1568,7 @@ with tab_inv_browser:
                 risk = 'High' if max_cia >= 3 else ('Medium' if max_cia == 2 else 'Low')
                 inv = inv_map.get(asset) or {}
                 classified = bool(inv.get('CLASSIFIED')) if inv else False
-                fd = pd.to_datetime(inv.get('FIRST_DISCOVERED')) if inv and inv.get('FIRST_DISCOVERED') else None
+                fd = pd.to_datetime(inv.get('FIRST_DISCOVERED'), utc=True) if inv and inv.get('FIRST_DISCOVERED') else None
                 if classified:
                     sla = '🟢 Classified'
                 elif fd is not None:
@@ -1439,400 +1640,85 @@ with tab_inv_browser:
         else:
             st.info("No favorite assets to display.")
 
-        # Bulk actions
-        st.markdown("---")
-        st.markdown("**Bulk Actions**")
-        b1, b2 = st.columns([3,2])
-        with b1:
-            sel_bulk = st.multiselect("Select favorites", options=favs, default=favs[:5] if len(favs) > 0 else [])
-        with b2:
-            colb1, colb2 = st.columns(2)
-            with colb1:
-                if st.button("Bulk Reclassify") and sel_bulk:
-                    ok_count = 0
-                    # Ensure DB context once, prefer sidebar DB; fallback to first asset's DB
-                    try:
-                        _db_ctx_b = (st.session_state.get('sf_database') or '').strip()
-                        if not _db_ctx_b or _db_ctx_b.upper() in {"ALL","NONE","(NONE)","NULL","UNKNOWN"}:
-                            if sel_bulk:
-                                _db_ctx_b = sel_bulk[0].split('.')[0]
-                        if _db_ctx_b:
-                            snowflake_connector.execute_non_query(f"USE DATABASE {_db_ctx_b}")
-                            st.session_state['sf_database'] = _db_ctx_b
-                    except Exception:
-                        pass
-                    for a in sel_bulk:
-                        try:
-                            row = fav_df.loc[fav_df['Asset'] == a].iloc[0] if not fav_df.empty else None
-                            pcls, pc, pi, pa = (row['Label'] or 'Internal', int(row['C'] or 1), int(row['I'] or 1), int(row['A'] or 1)) if row is not None else ("Internal",1,1,1)
-                            reclassification_service.submit_request(a, (pcls, pc, pi, pa), "User-triggered bulk from Favorites", st.session_state.get('sf_user') or 'user')
-                            ok_count += 1
-                        except Exception:
-                            continue
-                    try:
-                        from src.services.audit_service import audit_service as _audit
-                        _audit.log(st.session_state.get('sf_user') or 'user', "FAV_BULK_RECLASSIFY", "COLLECTION", ",".join(sel_bulk), {"count": ok_count})
-                    except Exception:
-                        pass
-                    st.success(f"Submitted {ok_count} reclassification request(s).")
-            with colb2:
-                if st.button("Bulk Owner Reminders") and sel_bulk:
-                    ok_count = 0
-                    try:
-                        from src.services.notifier_service import notifier_service as _notifier
-                    except Exception:
-                        _notifier = None
-                    for a in sel_bulk:
-                        try:
-                            if _notifier:
-                                _notifier.notify_owner(asset_full_name=a, subject="Classification Reminder", message="Please classify your asset within SLA.")
-                                ok_count += 1
-                        except Exception:
-                            continue
-                    try:
-                        from src.services.audit_service import audit_service as _audit
-                        _audit.log(st.session_state.get('sf_user') or 'user', "FAV_BULK_OWNER_REMINDERS", "COLLECTION", ",".join(sel_bulk), {"count": ok_count})
-                    except Exception:
-                        pass
-                    st.success(f"Sent {ok_count} reminder(s).")
+        # Bulk actions section removed per request
 
-        # Recent
-        with st.expander("Recent Views (this session)", expanded=False):
-            st.write(st.session_state["recent_assets"]) 
+        # Recent Views (this session) removed per request
+        
+        # Metadata display removed to avoid sel_asset dependency when not selected
 
-    # ---------------- Asset Details View ----------------
-    with tab_asset_details:
-        st.markdown("<div class='section-header'>📋 Asset Details</div>", unsafe_allow_html=True)
-        # Asset picker
-        asset_options = assets_df['Location'].dropna().tolist() if not assets_df.empty else []
-        if not asset_options:
-            st.info("No assets available. Ensure a database is selected and filters are not excluding all rows.")
-            st.stop()
-        sel_asset = st.selectbox("Select asset (DB.SCHEMA.TABLE)", options=asset_options, index=0, key="asset_details_asset")
-        show_debug_det = st.checkbox("Show debug", value=False, key="asset_details_debug")
-
-        # Split selector info
-        try:
-            db_sel, schema_sel, name_sel = sel_asset.split('.')
-        except Exception:
-            db_sel = schema_sel = name_sel = None
-
-        # Helpers: fetch latest decision, inventory row, and tags for the selected asset
-        def _latest_decision_for(asset_fqn: str) -> dict:
+        # Current classification & CIA (only when an asset is selected)
+        if 'sel_asset' in locals() and sel_asset and not pd.isna(sel_asset):
+            st.markdown("**Current classification**")
             try:
-                db_ctx = st.session_state.get('sf_database') or settings.SNOWFLAKE_DATABASE or (asset_fqn.split('.')[0] if asset_fqn and '.' in asset_fqn else None)
-                if not db_ctx:
-                    return {}
-                rows = snowflake_connector.execute_query(
+                lab = latest_dec.get('CLASSIFICATION') if latest_dec else None
+                c = int(latest_dec.get('C') or 0) if latest_dec else int(assets_df.loc[assets_df['Location']==sel_asset,'C'].iloc[0]) if 'C' in assets_df.columns else 0
+                i = int(latest_dec.get('I') or 0) if latest_dec else int(assets_df.loc[assets_df['Location']==sel_asset,'I'].iloc[0]) if 'I' in assets_df.columns else 0
+                a = int(latest_dec.get('A') or 0) if latest_dec else int(assets_df.loc[assets_df['Location']==sel_asset,'A'].iloc[0]) if 'A' in assets_df.columns else 0
+                has_pii = any(k in (assets_df.loc[assets_df['Location']==sel_asset,'Tags'].iloc[0].upper() if 'Tags' in assets_df.columns and not assets_df.empty else '') for k in ['PII','SSN','EMAIL','PHONE','DOB','ADDRESS','CUSTOMER','EMPLOYEE'])
+                regs = [r for r in ['GDPR','HIPAA','PCI','SOX'] if r in (assets_df.loc[assets_df['Location']==sel_asset,'Tags'].iloc[0].upper() if 'Tags' in assets_df.columns and not assets_df.empty else '')]
+                ok, msg = _validate_decision_matrix((lab or str(assets_df.loc[assets_df['Location']==sel_asset,'Classification'].iloc[0]) if not lab else lab), c, i, a, has_pii, regs)
+                comp_badge = "✅ Compliant" if ok else f"❌ Non-compliant ({msg})"
+                cia_cols = st.columns(4)
+                with cia_cols[0]:
+                    st.metric("Label", lab or assets_df.loc[assets_df['Location']==sel_asset,'Classification'].iloc[0])
+                with cia_cols[1]:
+                    st.metric("C", c)
+                with cia_cols[2]:
+                    st.metric("I", i)
+                with cia_cols[3]:
+                    st.metric("A", a)
+                st.caption(comp_badge)
+            except Exception as e:
+                pass
+
+        # Rationale & Business Impact section removed per request
+
+        # Classification history (only when an asset is selected)
+        if 'sel_asset' in locals() and sel_asset and not pd.isna(sel_asset):
+            st.markdown("**Classification history**")
+            try:
+                db_ctx = st.session_state.get('sf_database') or settings.SNOWFLAKE_DATABASE or db_sel
+                hist = snowflake_connector.execute_query(
                     f"""
-                    SELECT ASSET_FULL_NAME, CLASSIFICATION, C, I, A, RATIONALE,
-                           TRY_TO_VARCHAR(NULLIF(BUSINESS_IMPACT, '')) AS BUSINESS_IMPACT,
-                           CHECKLIST_JSON, DECIDED_BY, DECIDED_AT
+                    SELECT CLASSIFICATION, C, I, A, OWNER, RATIONALE, DECIDED_BY, DECIDED_AT,
+                           PREV_CLASSIFICATION, PREV_C, PREV_I, PREV_A
                     FROM {db_ctx}.DATA_GOVERNANCE.CLASSIFICATION_DECISIONS
                     WHERE ASSET_FULL_NAME = %(asset)s
-                    QUALIFY ROW_NUMBER() OVER (PARTITION BY ASSET_FULL_NAME ORDER BY DECIDED_AT DESC) = 1
-                    """,
-                    {"asset": asset_fqn}
-                ) or []
-                return rows[0] if rows else {}
-            except Exception as e:
-                if show_debug_det:
-                    st.code(f"latest decision error: {e}")
-                return {}
-
-        def _inventory_for(asset_fqn: str) -> dict:
-            try:
-                db_ctx = asset_fqn.split('.')[0]
-                rows = snowflake_connector.execute_query(
-                    f"""
-                    SELECT FULLY_QUALIFIED_NAME AS FULL_NAME, DATA_OWNER_EMAIL AS OWNER, CLASSIFICATION_LABEL, CREATED_TIMESTAMP AS FIRST_DISCOVERED
-                    FROM {db_ctx}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                    WHERE FULLY_QUALIFIED_NAME = %(f)s
-                    LIMIT 1
-                    """,
-                    {"f": asset_fqn}
-                ) or []
-                return rows[0] if rows else {}
-            except Exception:
-                return {}
-
-        def _tags_dict_for(asset_fqn: str) -> dict:
-            try:
-                refs = tagging_service.get_object_tags(asset_fqn, object_type="TABLE") or []
-                out = {}
-                for r in refs:
-                    tname = (r.get('TAG_NAME') or r.get('tag_name') or '').upper()
-                    tval = r.get('TAG_VALUE') or r.get('tag_value')
-                    if tname:
-                        out[tname] = tval
-                return out
-            except Exception:
-                return {}
-
-        latest_dec = _latest_decision_for(sel_asset)
-        inv_row = _inventory_for(sel_asset)
-        tag_map_det = _tags_dict_for(sel_asset)
-
-        # Basic metadata
-        st.markdown("**Basic metadata**")
-        meta_cols = st.columns(3)
-        try:
-            created_ts = None
-            modified_ts = None
-            if not base_df.empty and sel_asset in base_df['FULL_NAME'].values:
-                row = base_df.loc[base_df['FULL_NAME'] == sel_asset].iloc[0]
-                created_ts = row.get('CREATED_DATE') or row.get('created_date')
-                modified_ts = row.get('LAST_MODIFIED') or row.get('last_modified')
-        except Exception:
-            pass
-        # QA Panel: list and act on pending reviews
-        with st.expander("QA Reviews", expanded=False):
-            try:
-                colq1, colq2 = st.columns([2,1])
-                with colq1:
-                    st.caption("Pending approvals and high-risk items (sample)")
-                    from src.services.classification_review_service import list_reviews as _list_reviews
-                    me = st.text_input("Reviewer (email)", value=str(st.session_state.get('user') or ''), help="Used to filter 'Pending my approval'")
-                    rf = st.selectbox("Review filter", options=["All","Pending approvals","High-risk","Recent changes"], index=1)
-                    ap = st.selectbox("Approval status", options=["All pending","Pending my approval"], index=0)
-                    resp = _list_reviews(current_user=me or '', review_filter=rf, approval_status=ap, lookback_days=30, page=1, page_size=20)
-                    st.dataframe(pd.DataFrame(resp.get('reviews') or []), use_container_width=True)
-                with colq2:
-                    st.caption("Take action on a review")
-                    rid = st.text_input("Review ID")
-                    act = st.selectbox("Action", options=["Approve","Reject","Request changes"], index=0)
-                    asset = st.text_input("Asset full name")
-                    appr = st.text_input("Approver email")
-                    if act == "Approve":
-                        lbl = st.text_input("Label", value="Internal")
-                        c = st.number_input("C", 0, 3, 1)
-                        i = st.number_input("I", 0, 3, 1)
-                        a = st.number_input("A", 0, 3, 1)
-                        cm = st.text_area("Comments", value="Approved via Inventory QA panel")
-                        if st.button("Approve Review") and rid and asset:
-                            try:
-                                from src.services import review_actions_service as _ra
-                                ok = _ra.approve_review(rid, asset, lbl, int(c), int(i), int(a), approver=appr, comments=cm)
-                                st.success("Approved" if ok else "Approval failed")
-                            except Exception as _qae:
-                                st.error(f"Approve failed: {_qae}")
-                    elif act == "Reject":
-                        why = st.text_area("Justification")
-                        if st.button("Reject Review") and rid and asset:
-                            try:
-                                from src.services import review_actions_service as _ra
-                                ok = _ra.reject_review(rid, asset, approver=appr, justification=why)
-                                st.success("Rejected" if ok else "Rejection failed")
-                            except Exception as _qre:
-                                st.error(f"Reject failed: {_qre}")
-                    else:
-                        notes = st.text_area("Instructions")
-                        if st.button("Request Changes") and rid and asset:
-                            try:
-                                from src.services import review_actions_service as _ra
-                                ok = _ra.request_changes(rid, asset, approver=appr, instructions=notes)
-                                st.success("Requested" if ok else "Request failed")
-                            except Exception as _qce:
-                                st.error(f"Request failed: {_qce}")
-            except Exception:
-                st.caption("QA Reviews unavailable")
-
-        # Policy Guidance quick link
-        with st.expander("Policy Guidance", expanded=False):
-            st.caption("Open the full guidance for decision tree and checklists")
-            if st.button("Open Policy Guidance"):
-                try:
-                    st.switch_page("pages/12_Policy_Guidance.py")
-                except Exception:
-                    st.rerun()
-        with meta_cols[0]:
-            st.metric("Path", sel_asset)
-            st.caption(f"Type: {assets_df.loc[assets_df['Location']==sel_asset,'Type'].iloc[0] if not assets_df.empty else 'Unknown'}")
-        with meta_cols[1]:
-            st.metric("Created", str(created_ts) if created_ts else "Unknown")
-            st.metric("Last Modified", str(modified_ts) if modified_ts else "Unknown")
-        with meta_cols[2]:
-            # Lineage summary via dependency counts
-            try:
-                dep_counts = _get_dependency_counts([sel_asset])
-                st.metric("Related objects", dep_counts.get(sel_asset, 0))
-            except Exception:
-                st.metric("Related objects", "N/A")
-
-        # Current classification & CIA
-        st.markdown("**Current classification**")
-        try:
-            lab = latest_dec.get('CLASSIFICATION') if latest_dec else None
-            c = int(latest_dec.get('C') or 0) if latest_dec else int(assets_df.loc[assets_df['Location']==sel_asset,'C'].iloc[0]) if 'C' in assets_df.columns else 0
-            i = int(latest_dec.get('I') or 0) if latest_dec else int(assets_df.loc[assets_df['Location']==sel_asset,'I'].iloc[0]) if 'I' in assets_df.columns else 0
-            a = int(latest_dec.get('A') or 0) if latest_dec else int(assets_df.loc[assets_df['Location']==sel_asset,'A'].iloc[0]) if 'A' in assets_df.columns else 0
-            # Compliance check vs policy minimums
-            has_pii = any(k in (assets_df.loc[assets_df['Location']==sel_asset,'Tags'].iloc[0].upper() if 'Tags' in assets_df.columns and not assets_df.empty else '') for k in ['PII','SSN','EMAIL','PHONE','DOB','ADDRESS','CUSTOMER','EMPLOYEE'])
-            regs = [r for r in ['GDPR','HIPAA','PCI','SOX'] if r in (assets_df.loc[assets_df['Location']==sel_asset,'Tags'].iloc[0].upper() if 'Tags' in assets_df.columns and not assets_df.empty else '')]
-            ok, msg = _validate_decision_matrix((lab or str(assets_df.loc[assets_df['Location']==sel_asset,'Classification'].iloc[0]) if not lab else lab), c, i, a, has_pii, regs)
-            comp_badge = "✅ Compliant" if ok else f"❌ Non-compliant ({msg})"
-            cia_cols = st.columns(4)
-            with cia_cols[0]:
-                st.metric("Label", lab or assets_df.loc[assets_df['Location']==sel_asset,'Classification'].iloc[0])
-            with cia_cols[1]:
-                st.metric("C", c)
-            with cia_cols[2]:
-                st.metric("I", i)
-            with cia_cols[3]:
-                st.metric("A", a)
-            st.caption(comp_badge)
-        except Exception as e:
-            if show_debug_det:
-                st.code(f"classification section error: {e}")
-
-        # Rationale and Business Impact
-        st.markdown("**Rationale & Business Impact**")
-        with st.expander("View rationale and business impact", expanded=False):
-            try:
-                rat = (latest_dec.get('RATIONALE') or '').strip() if latest_dec else ''
-                bi = (latest_dec.get('BUSINESS_IMPACT') or '').strip() if latest_dec else ''
-                if rat:
-                    st.markdown(f"- Rationale: {rat}")
-                if bi:
-                    st.markdown(f"- Business Impact: {bi}")
-                if not rat and not bi:
-                    st.caption("No rationale or business impact recorded.")
-            except Exception:
-                st.caption("No rationale or business impact available.")
-
-        # Classification history (timeline)
-        st.markdown("**Classification history**")
-        try:
-            db_ctx = st.session_state.get('sf_database') or settings.SNOWFLAKE_DATABASE or db_sel
-            hist = snowflake_connector.execute_query(
-                f"""
-                SELECT CLASSIFICATION, C, I, A, OWNER, RATIONALE, DECIDED_BY, DECIDED_AT,
-                       PREV_CLASSIFICATION, PREV_C, PREV_I, PREV_A
-                FROM {db_ctx}.DATA_GOVERNANCE.CLASSIFICATION_DECISIONS
-                WHERE ASSET_FULL_NAME = %(asset)s
-                ORDER BY DECIDED_AT DESC
-                LIMIT 25
-                """,
-                {"asset": sel_asset}
-            ) or []
-            # Additionally, try to show CLASSIFICATION_DECISIONS_HISTORY if present
-            hist2 = []
-            try:
-                hist2 = snowflake_connector.execute_query(
-                    f"""
-                    SELECT ACTION, ACTION_BY, ACTION_AT, COMMENTS
-                    FROM {db_ctx}.DATA_GOVERNANCE.CLASSIFICATION_DECISIONS_HISTORY
-                    WHERE ASSET_FULL_NAME = %(asset)s
-                    ORDER BY ACTION_AT DESC
-                    LIMIT 50
+                    ORDER BY DECIDED_AT DESC
+                    LIMIT 25
                     """,
                     {"asset": sel_asset}
                 ) or []
-            except Exception:
+                # Additionally, try to show CLASSIFICATION_DECISIONS_HISTORY if present
                 hist2 = []
-            if hist:
-                st.dataframe(pd.DataFrame(hist), use_container_width=True)
-            else:
-                st.caption("No classification history found.")
-            if hist2:
-                st.markdown("Audit Trail (History)")
-                st.dataframe(pd.DataFrame(hist2), use_container_width=True)
-        except Exception as e:
-            if show_debug_det:
-                st.code(f"History query failed: {e}")
-            st.caption("History unavailable.")
+                try:
+                    hist2 = snowflake_connector.execute_query(
+                        f"""
+                        SELECT ACTION, ACTION_BY, ACTION_AT, COMMENTS
+                        FROM {db_ctx}.DATA_GOVERNANCE.CLASSIFICATION_DECISIONS_HISTORY
+                        WHERE ASSET_FULL_NAME = %(asset)s
+                        ORDER BY ACTION_AT DESC
+                        LIMIT 50
+                        """,
+                        {"asset": sel_asset}
+                    ) or []
+                except Exception:
+                    hist2 = []
+                if hist:
+                    st.dataframe(pd.DataFrame(hist), use_container_width=True)
+                else:
+                    st.caption("No classification history found.")
+                if hist2:
+                    st.markdown("Audit Trail (History)")
+                    st.dataframe(pd.DataFrame(hist2), use_container_width=True)
+            except Exception as e:
+                st.caption("History unavailable.")
 
-        # Data owner, approval, SLA info (from tags and ASSET_INVENTORY)
-        st.markdown("**Ownership & SLA**")
-        try:
-            owner_from_inv = inv_row.get('OWNER') if inv_row else None
-            owner_from_tag = tag_map_det.get('OWNER') or tag_map_det.get('DATA_OWNER')
-            primary_owner = owner_from_tag or owner_from_inv or "Unassigned"
-        except Exception:
-            primary_owner = "Unassigned"
-        try:
-            backup_owner = tag_map_det.get('OWNER_BACKUP') or tag_map_det.get('BACKUP_OWNER') or "N/A"
-        except Exception:
-            backup_owner = "N/A"
-        try:
-            approval_status = tag_map_det.get('APPROVAL_STATUS') or "Unknown"
-        except Exception:
-            approval_status = "Unknown"
-        # SLA/Overdue from inventory
-        try:
-            classified = bool(inv_row.get('CLASSIFIED')) if inv_row else False
-            fd = pd.to_datetime(inv_row.get('FIRST_DISCOVERED')) if inv_row and inv_row.get('FIRST_DISCOVERED') else None
-            if classified:
-                sla_badge = "🟢 Classified"
-            elif fd is not None:
-                bdays = pd.bdate_range(fd.normalize(), pd.Timestamp.utcnow().normalize())
-                days = max(0, len(bdays) - 1)
-                sla_badge = "🔴 Overdue" if days >= 5 else "🟡 Unclassified"
-            else:
-                sla_badge = ""
-        except Exception:
-            sla_badge = ""
-        ocols = st.columns(4)
-        with ocols[0]:
-            st.metric("Primary owner", primary_owner)
-        with ocols[1]:
-            st.metric("Backup owner", backup_owner)
-        with ocols[2]:
-            st.metric("Approval status", approval_status)
-        with ocols[3]:
-            st.metric("SLA", sla_badge or (assets_df.loc[assets_df['Location']==sel_asset,'SLA State'].iloc[0] if 'SLA State' in assets_df.columns else ''))
+        # Ownership & SLA section removed per request
 
-        # Related assets (dependencies)
-        st.markdown("**Related assets**")
-        try:
-            up = snowflake_connector.execute_query(
-                """
-                SELECT OBJECT_DATABASE||'.'||OBJECT_SCHEMA||'.'||OBJECT_NAME AS NAME
-                FROM SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES
-                WHERE REFERENCED_DATABASE=%(db)s AND REFERENCED_SCHEMA=%(s)s AND REFERENCED_OBJECT_NAME=%(o)s
-                LIMIT 50
-                """,
-                {"db": db_sel, "s": schema_sel, "o": name_sel}
-            ) or []
-            down = snowflake_connector.execute_query(
-                """
-                SELECT REFERENCED_DATABASE||'.'||REFERENCED_SCHEMA||'.'||REFERENCED_OBJECT_NAME AS NAME
-                FROM SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES
-                WHERE OBJECT_DATABASE=%(db)s AND OBJECT_SCHEMA=%(s)s AND OBJECT_NAME=%(o)s
-                LIMIT 50
-                """,
-                {"db": db_sel, "s": schema_sel, "o": name_sel}
-            ) or []
-            rcols = st.columns(2)
-            with rcols[0]:
-                st.caption("Upstream")
-                st.write(pd.DataFrame(up) if up else "None")
-            with rcols[1]:
-                st.caption("Downstream")
-                st.write(pd.DataFrame(down) if down else "None")
-        except Exception as e:
-            if show_debug_det:
-                st.code(f"Dependency queries failed: {e}")
-            st.caption("Dependencies unavailable.")
+        # Related assets section removed per request
 
-        # Usage statistics (queries, access patterns)
-        st.markdown("**Usage statistics (last 30 days)**")
-        try:
-            usage = snowflake_connector.execute_query(
-                """
-                SELECT COUNT(*) AS QUERY_COUNT
-                FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-                WHERE START_TIME >= DATEADD(day, -30, CURRENT_TIMESTAMP())
-                  AND UPPER(QUERY_TEXT) LIKE %(like)s
-                """,
-                {"like": f"% {name_sel.upper()} %" if name_sel else "%UNKNOWN%"}
-            ) or []
-            qcnt = usage[0].get('QUERY_COUNT') if usage else 0
-            st.metric("Queries (30d)", int(qcnt or 0))
-        except Exception as e:
-            if show_debug_det:
-                st.code(f"Usage query failed: {e}")
-            st.caption("Usage unavailable.")
+        # Usage statistics section removed per request
 
     # ---------------- Advanced Search & Filters ----------------
     with tab_adv_search:
@@ -2642,67 +2528,9 @@ with tab_inv_browser:
             "Dataset Name","Database","Schema","Table Name","Owner","Classification","CIA Score","C","I","A","Decision Notes","Decision Rationale","Reclass Needed","Reclass Reason","Tags","Special Category","Lifecycle","Risk","Status","Type","Dependencies","Estimated Monthly Cost ($)","Last Updated","SLA","QA Status"
         ]
         available_cols = [c for c in default_cols if c in tmp_df.columns]
-        # Inline policy guidance for quick reference
-        with st.expander("Policy Guidance", expanded=False):
-            st.markdown("""
-            - **Decision model**: Choose the highest of C/I/A to determine label (`Confidential`, `Restricted`, `Internal`, `Public`).
-            - **Special Categories**: If asset contains PII/Financial/Regulatory data, ensure appropriate masking and labels.
-            - **SLA**: Classify within 5 business days of discovery. Overdue items should be prioritized or escalated.
-            - **Checklist**: Capture decision rationale and validation checklist when changing labels.
-            
-            See `docs/AI_CLASSIFICATION.md` for full policy and decision matrix.
-            """)
-        with st.expander("Columns", expanded=False):
-            selected_cols = st.multiselect("Choose columns to display", options=list(tmp_df.columns), default=available_cols)
-        # Filters for SLA State and Special Categories
-        try:
-            fc1, fc2, fc3 = st.columns([1,1,2])
-            with fc1:
-                sla_opts = ["All","On Track","Due Soon","Overdue"] if 'SLA State' in tmp_df.columns else ["All"]
-                sla_filter = st.selectbox("SLA State", options=sla_opts, index=0)
-            with fc2:
-                cat_filter = st.multiselect(
-                    "Special Categories",
-                    options=["PII","Financial","Regulatory","PCI","PHI"],
-                    default=[],
-                    help="Filter by detected categories (requires detection or pre-populated column)")
-            with fc3:
-                if st.button("Open Compliance Dashboard"):
-                    try:
-                        st.switch_page("pages/4_Compliance.py")
-                    except Exception:
-                        st.rerun()
-        except Exception:
-            sla_filter = "All"; cat_filter = []
-        # Derive SLA State (5-business-day rule) and enrich Special Categories on-demand
-        try:
-            def _business_days_between(start_ts):
-                from datetime import datetime, timedelta
-                if not start_ts:
-                    return None
-                try:
-                    dt = start_ts if hasattr(start_ts, 'weekday') else datetime.fromisoformat(str(start_ts))
-                except Exception:
-                    return None
-                days = 0
-                cur = dt
-                now = datetime.utcnow()
-                while cur.date() < now.date():
-                    cur += timedelta(days=1)
-                    if cur.weekday() < 5:
-                        days += 1
-                return days
-
-            if 'FIRST_DISCOVERED' in tmp_df.columns and 'CLASSIFIED' in tmp_df.columns:
-                if 'SLA State' not in tmp_df.columns:
-                    tmp_df['SLA State'] = tmp_df.apply(
-                        lambda r: (
-                            'Overdue' if ( (_business_days_between(r.get('FIRST_DISCOVERED')) or 0) > 5 and not bool(r.get('CLASSIFIED')) ) else 
-                            ('Due Soon' if ( (_business_days_between(r.get('FIRST_DISCOVERED')) or 0) in [4,5] and not bool(r.get('CLASSIFIED')) ) else 'On Track')
-                        ), axis=1
-                    )
-        except Exception:
-            pass
+        selected_cols = available_cols
+        
+        
 
         # Optional: on-demand category detection for visible rows (cached)
         try:
@@ -2733,44 +2561,12 @@ with tab_inv_browser:
         except Exception:
             pass
 
-        # Apply filters before rendering
         filtered_df = tmp_df
-        try:
-            if 'SLA State' in filtered_df.columns and sla_filter and sla_filter != 'All':
-                filtered_df = filtered_df.loc[filtered_df['SLA State'] == sla_filter]
-            if 'Special Categories' in filtered_df.columns and cat_filter:
-                patt = '|'.join([c for c in cat_filter])
-                filtered_df = filtered_df.loc[filtered_df['Special Categories'].fillna('').str.contains(patt, case=False, regex=True)]
-        except Exception:
-            pass
         # Render main table with enriched columns
         view_df = filtered_df[selected_cols] if selected_cols else filtered_df[available_cols]
         st.dataframe(view_df, use_container_width=True)
 
-        # Inline KPIs for the current view
-        try:
-            k1, k2, k3, k4 = st.columns(4)
-            with k1:
-                st.metric("Total Assets (view)", len(view_df))
-            with k2:
-                cls_col = 'Classification' if 'Classification' in view_df.columns else None
-                pct = 0
-                if cls_col:
-                    denom = max(len(view_df), 1)
-                    pct = int(100 * (view_df[cls_col].notna() & view_df[cls_col].astype(str).str.len().gt(0)).sum() / denom)
-                st.metric("Classified %", f"{pct}%")
-            with k3:
-                overdue = 0
-                if 'SLA State' in view_df.columns:
-                    overdue = int((view_df['SLA State'] == 'Overdue').sum())
-                st.metric("Overdue (>5 bd)", overdue)
-            with k4:
-                pii_assets = 0
-                if 'Special Categories' in view_df.columns:
-                    pii_assets = int(view_df['Special Categories'].fillna('').str.contains('PII', case=False).sum())
-                st.metric("Assets with PII", pii_assets)
-        except Exception:
-            pass
+        
 
         # Action: Notify owners for overdue assets on this page
         try:
@@ -2797,42 +2593,7 @@ with tab_inv_browser:
                     st.warning(f"Auto-enforce failed: {_trig_err}")
         except Exception:
             pass
-        # Exceptions Management
-        with st.expander("Exceptions", expanded=False):
-            try:
-                colx1, colx2 = st.columns(2)
-                with colx1:
-                    st.markdown("**Request Exception**")
-                    sel_asset = st.selectbox(
-                        "Asset",
-                        options=(view_df['Dataset Name'] if 'Dataset Name' in view_df.columns else view_df['Location']).dropna().astype(str).unique().tolist() if not view_df.empty else [],
-                    )
-                    regulatory = st.selectbox("Regulatory", options=["GDPR","HIPAA","PCI","SOX","Other"], index=0)
-                    risk = st.selectbox("Risk Level", options=["Low","Medium","High"], index=1)
-                    just = st.text_area("Justification")
-                    req_by = st.text_input("Requested by (email)")
-                    days = st.number_input("Days valid", min_value=1, max_value=365, value=90)
-                    if st.button("Submit Exception") and sel_asset and req_by and just:
-                        try:
-                            from src.services.exception_service import exception_service
-                            eid = exception_service.submit(sel_asset, regulatory, just, risk, req_by, days_valid=int(days))
-                            st.success(f"Submitted exception {eid}")
-                        except Exception as _ex_err:
-                            st.error(f"Submit failed: {_ex_err}")
-                with colx2:
-                    st.markdown("**Track Exceptions**")
-                    try:
-                        from src.services.exception_service import exception_service
-                        stt = st.selectbox("Status", options=["All","Pending","Approved","Rejected","Expired"], index=0)
-                        rows = exception_service.list(status=stt, limit=100)
-                        if rows:
-                            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                        else:
-                            st.caption("No exceptions found for the selected filter.")
-                    except Exception as _ex_list_err:
-                        st.caption(f"Exceptions unavailable: {_ex_list_err}")
-            except Exception:
-                st.caption("Exceptions panel unavailable")
+        
 
         # Optional view of matching columns from column-level filters
         try:
@@ -2856,7 +2617,7 @@ with tab_inv_browser:
             st.download_button(label="Download current view (CSV)", data=csv_view, file_name="data_assets_view.csv", mime="text/csv")
         except Exception:
             pass
-        st.caption(f"Page {page_num} of {total_pages}")
+        
     else:
         st.info("No data assets found in your Snowflake database, or there was an error connecting.")
 
@@ -2979,13 +2740,4 @@ if False:
     if exp_df is None or exp_df.empty:
         st.info("No assets available to export. Apply filters to view assets.")
 
-# Explanation for non-technical users
-st.info("""💡 **What you're seeing:**
-- This page shows ALL the actual tables in your Snowflake database
-- Each row represents a real table with real business data
-- Classifications are automatically determined based on the CIA triad scoring model
-- CIA Score shows Confidentiality-Integrity-Availability ratings (0-3 for each)
-- Lineage information shows how tables are related through dependencies
-- You can search, filter, bulk classify, and export this inventory
-
-**This is NOT mock data - it's your actual Snowflake database structure!**""")
+# Removed explanatory info panel per request

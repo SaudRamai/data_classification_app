@@ -1,0 +1,183 @@
+================================================================================
+SCHEMA FIX SUMMARY - HARDCODED TO SINGLE LOCATION
+================================================================================
+Date: 2025-12-05
+Action: Fixed all upsert/insert operations to ALWAYS use the same schema
+
+================================================================================
+WHAT WAS CHANGED
+================================================================================
+
+Modified 4 methods in ai_classification_pipeline_service.py to ALWAYS use:
+  📍 DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE
+
+Methods Updated:
+  1. get_category_id_by_name() - Line ~1823
+  2. _log_keyword_audit() - Line ~1845  
+  3. add_sensitive_keyword() - Line ~1869
+  4. upsert_sensitive_keyword() - Line ~1927
+
+BEFORE (Dynamic/Variable):
+--------------------------
+schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
+gov_db = resolve_governance_db()
+if gov_db:
+    schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+
+AFTER (Hardcoded/Fixed):
+------------------------
+# ALWAYS use DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE
+schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE"
+
+================================================================================
+WHY THIS FIX MATTERS
+================================================================================
+
+✅ CONSISTENCY: All keywords now save to ONE location
+✅ PREDICTABILITY: You always know where to query
+✅ NO CONFUSION: No more database mismatch issues
+✅ SIMPLE QUERIES: Just use the same path every time
+
+================================================================================
+HOW TO QUERY YOUR DATA NOW
+================================================================================
+
+ALWAYS use this full path:
+
+  SELECT * 
+  FROM DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+  WHERE KEYWORD_STRING = 'SOCIAL_SECURITY_NUMBER';
+
+Or set your context first:
+
+  USE DATABASE DATA_CLASSIFICATION_GOVERNANCE;
+  USE SCHEMA DATA_CLASSIFICATION_GOVERNANCE;
+  
+  SELECT * FROM SENSITIVE_KEYWORDS
+  WHERE KEYWORD_STRING = 'SOCIAL_SECURITY_NUMBER';
+
+================================================================================
+FILES CREATED
+================================================================================
+
+1. sql/cleanup_keywords_FINAL.sql
+   - Cleanup script that targets the CORRECT location
+   - Removes 21 lower-risk keywords
+   - Keeps 29 critical keywords
+   - Includes comprehensive verification queries
+
+2. SCHEMA_FIX_SUMMARY.txt (this file)
+   - Summary of all changes made
+   - Query examples
+   - Next steps
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. ⏳ WAIT for the current cleanup script to finish or terminate it:
+   - Current: sql/update_critical_keywords_only.sql (running 31+ minutes)
+   - This targets the WRONG location, so it won't affect your data
+
+2. ✅ RUN the CORRECT cleanup script:
+   snowsql -f sql/cleanup_keywords_FINAL.sql
+
+3. ✅ VERIFY the results:
+   - Check that 29 critical keywords remain
+   - Verify SOCIAL_SECURITY_NUMBER exists
+   - Confirm removed keywords are gone
+
+4. ✅ TEST inline edits:
+   - Make a keyword change in the dashboard
+   - Query: SELECT * FROM DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+   - Verify the change appears
+
+================================================================================
+TESTING THE FIX
+================================================================================
+
+Test Query #1: Check if SOCIAL_SECURITY_NUMBER exists
+------------------------------------------------------
+SELECT * 
+FROM DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+WHERE KEYWORD_STRING = 'SOCIAL_SECURITY_NUMBER';
+
+Expected: 1 row with CATEGORY = 'PII'
+
+Test Query #2: Count all keywords
+----------------------------------
+SELECT COUNT(*) AS TOTAL_KEYWORDS
+FROM DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS;
+
+Expected: Some reasonable number (depends on what's already there)
+
+Test Query #3: Count by category
+---------------------------------
+SELECT 
+    sc.CATEGORY_NAME,
+    COUNT(*) AS KEYWORD_COUNT
+FROM DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS sk
+JOIN DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES sc 
+  ON sk.CATEGORY_ID = sc.CATEGORY_ID
+GROUP BY sc.CATEGORY_NAME
+ORDER BY sc.CATEGORY_NAME;
+
+Expected: See distribution across PII, SOX, SOC2
+
+================================================================================
+INLINE EDIT TEST
+================================================================================
+
+To verify inline edits work:
+
+1. Go to AI Classification Dashboard
+2. Find a keyword you want to edit
+3. Click the edit icon (✏️)
+4. Make a change (e.g., change MATCH_TYPE or SENSITIVITY_WEIGHT)
+5. Save
+6. Run this query to verify:
+
+   SELECT * 
+   FROM DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+   WHERE KEYWORD_STRING = 'your_keyword_here';
+
+7. You should see your changes reflected!
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+Problem: Query returns 0 rows
+Solution: Make sure you're using the FULL path:
+          DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+
+Problem: Inline edit says "success" but data not saved
+Solution: This should now be FIXED! All saves go to the same location.
+          If still not working, check the logs for the actual schema used.
+
+Problem: Getting "object does not exist" error
+Solution: Verify the database and schema exist:
+          SHOW DATABASES LIKE 'DATA_CLASSIFICATION_GOVERNANCE';
+          SHOW SCHEMAS IN DATABASE DATA_CLASSIFICATION_GOVERNANCE;
+
+================================================================================
+SUMMARY
+================================================================================
+
+✅ Code is now HARDCODED to always use same location
+✅ No more database/schema confusion
+✅ All operations (INSERT, UPDATE, SELECT) use same path
+✅ Cleanup script updated to target correct location
+✅ Ready to test inline edits
+
+The fix ensures that:
+  - get_category_id_by_name() ← uses correct schema
+  - _log_keyword_audit() ← uses correct schema
+  - add_sensitive_keyword() ← uses correct schema
+  - upsert_sensitive_keyword() ← uses correct schema
+
+Everything points to: DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE
+
+================================================================================
+END OF SUMMARY
+================================================================================

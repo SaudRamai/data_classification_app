@@ -1,0 +1,143 @@
+-- ============================================================================
+-- FIX ALL MISCATEGORIZED PII KEYWORDS
+-- ============================================================================
+-- This script ensures all PII-related keywords are in the PII category
+-- ============================================================================
+
+USE DATABASE DATA_CLASSIFICATION_DB;
+USE SCHEMA DATA_CLASSIFICATION_GOVERNANCE;
+
+-- Step 1: Show current miscategorizations
+SELECT 
+    '❌ MISCATEGORIZED PII KEYWORDS' AS STATUS,
+    sk.KEYWORD_STRING,
+    sc.CATEGORY_NAME AS WRONG_CATEGORY
+FROM SENSITIVE_KEYWORDS sk
+JOIN SENSITIVITY_CATEGORIES sc ON sk.CATEGORY_ID = sc.CATEGORY_ID
+WHERE sk.KEYWORD_STRING IN (
+    -- These should ALL be PII
+    'SOCIAL_SECURITY_NUMBER',
+    'TAX_IDENTIFICATION_NUMBER',
+    'NATIONAL_ID_NUMBER',
+    'DRIVERS_LICENSE_NUMBER',
+    'PASSPORT_NUMBER',
+    'VOTER_ID_NUMBER',
+    'MILITARY_ID_NUMBER',
+    'ALIEN_REGISTRATION_NUMBER',
+    'BIOMETRIC_HASH',
+    'VOICE_PRINT_ID',
+    'FINGERPRINT_HASH',
+    'HEALTH_CONDITION',
+    'DEVICE_LOCATION_HISTORY'
+)
+AND sc.CATEGORY_NAME != 'PII';
+
+-- Step 2: Fix ALL PII keywords
+UPDATE SENSITIVE_KEYWORDS
+SET 
+    CATEGORY_ID = (SELECT CATEGORY_ID FROM SENSITIVITY_CATEGORIES WHERE CATEGORY_NAME = 'PII'),
+    UPDATED_BY = CURRENT_USER(),
+    UPDATED_AT = CURRENT_TIMESTAMP(),
+    VERSION_NUMBER = COALESCE(VERSION_NUMBER, 1) + 1
+WHERE KEYWORD_STRING IN (
+    'SOCIAL_SECURITY_NUMBER',
+    'TAX_IDENTIFICATION_NUMBER',
+    'NATIONAL_ID_NUMBER',
+    'DRIVERS_LICENSE_NUMBER',
+    'PASSPORT_NUMBER',
+    'VOTER_ID_NUMBER',
+    'MILITARY_ID_NUMBER',
+    'ALIEN_REGISTRATION_NUMBER',
+    'BIOMETRIC_HASH',
+    'VOICE_PRINT_ID',
+    'FINGERPRINT_HASH',
+    'HEALTH_CONDITION',
+    'DEVICE_LOCATION_HISTORY'
+)
+AND CATEGORY_ID != (SELECT CATEGORY_ID FROM SENSITIVITY_CATEGORIES WHERE CATEGORY_NAME = 'PII');
+
+-- Step 3: Verify all PII keywords are correct
+SELECT 
+    '✅ ALL PII KEYWORDS (SHOULD BE 13)' AS STATUS,
+    sk.KEYWORD_STRING,
+    sc.CATEGORY_NAME,
+    sk.SENSITIVITY_WEIGHT
+FROM SENSITIVE_KEYWORDS sk
+JOIN SENSITIVITY_CATEGORIES sc ON sk.CATEGORY_ID = sc.CATEGORY_ID
+WHERE sk.KEYWORD_STRING IN (
+    'SOCIAL_SECURITY_NUMBER',
+    'TAX_IDENTIFICATION_NUMBER',
+    'NATIONAL_ID_NUMBER',
+    'DRIVERS_LICENSE_NUMBER',
+    'PASSPORT_NUMBER',
+    'VOTER_ID_NUMBER',
+    'MILITARY_ID_NUMBER',
+    'ALIEN_REGISTRATION_NUMBER',
+    'BIOMETRIC_HASH',
+    'VOICE_PRINT_ID',
+    'FINGERPRINT_HASH',
+    'HEALTH_CONDITION',
+    'DEVICE_LOCATION_HISTORY'
+)
+ORDER BY sk.KEYWORD_STRING;
+
+-- Step 4: Count by category
+SELECT 
+    '📊 KEYWORD COUNT BY CATEGORY' AS STATUS,
+    sc.CATEGORY_NAME,
+    COUNT(*) AS KEYWORD_COUNT
+FROM SENSITIVE_KEYWORDS sk
+JOIN SENSITIVITY_CATEGORIES sc ON sk.CATEGORY_ID = sc.CATEGORY_ID
+GROUP BY sc.CATEGORY_NAME
+ORDER BY sc.CATEGORY_NAME;
+
+-- Expected counts after fix:
+-- PII: 13
+-- SOX: 9
+-- SOC2: 7
+
+-- ============================================================================
+-- CATEGORY DEFINITIONS
+-- ============================================================================
+--
+-- PII (Personally Identifiable Information) - 13 keywords:
+--   Identity Documents:
+--     - SOCIAL_SECURITY_NUMBER ← Was incorrectly SOC2!
+--     - TAX_IDENTIFICATION_NUMBER
+--     - NATIONAL_ID_NUMBER
+--     - DRIVERS_LICENSE_NUMBER
+--     - PASSPORT_NUMBER
+--     - VOTER_ID_NUMBER
+--     - MILITARY_ID_NUMBER
+--     - ALIEN_REGISTRATION_NUMBER
+--   
+--   Biometric Data:
+--     - BIOMETRIC_HASH
+--     - VOICE_PRINT_ID
+--     - FINGERPRINT_HASH
+--   
+--   Sensitive Personal Data:
+--     - HEALTH_CONDITION
+--     - DEVICE_LOCATION_HISTORY
+--
+-- SOX (Financial Data) - 9 keywords:
+--     - BANK_ACCOUNT_NUMBER
+--     - BANK_IBAN
+--     - CREDIT_CARD_NUMBER
+--     - CREDIT_CARD_EXPIRY_DATE
+--     - CREDIT_CARD_CVV
+--     - ANNUAL_INCOME
+--     - CREDIT_SCORE
+--     - TAX_RETURN_ID
+--     - PAYMENT_HISTORY
+--
+-- SOC2 (Security Controls) - 7 keywords:
+--     - USER_PASSWORD_HASH
+--     - API_KEY
+--     - API_SECRET
+--     - OAUTH_TOKEN
+--     - OAUTH_REFRESH_TOKEN
+--     - TRADE_SECRET_KEY
+--     - ENCRYPTED_MESSAGES
+--
+-- ============================================================================

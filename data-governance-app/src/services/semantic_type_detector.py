@@ -11,9 +11,10 @@ from typing import List, Any, Optional
 class SemanticTypeDetector:
     """Detects semantic types from sample values and SQL data types."""
     
-    # Pattern definitions
+    # Pattern definitions (compiled with re.IGNORECASE where applicable)
     EMAIL_PATTERN = re.compile(r'^[\w\.-]+@[\w\.-]+\.\w+$', re.IGNORECASE)
-    SSN_PATTERN = re.compile(r'^\d{3}-?\d{2}-?\d{4}$')
+    # Enhanced SSN pattern to match various formats including masked/obfuscated
+    SSN_PATTERN = re.compile(r'^(\d{3}[- ]?\d{2}[- ]?\d{4}|XXX[- ]?XX[- ]?XXXX|###[- ]?##[- ]?####|\*{3}[- ]?\*{2}[- ]?\d{4}|SSN[#:;\s]*\d{3}[- ]?\d{2}[- ]?\d{4})$', re.IGNORECASE)
     PHONE_PATTERN = re.compile(r'^[\+\(]?[\d\s\-\(\)]{10,}$')
     CREDIT_CARD_PATTERN = re.compile(r'^\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}$')
     ZIP_PATTERN = re.compile(r'^\d{5}(-\d{4})?$')
@@ -85,6 +86,10 @@ class SemanticTypeDetector:
         """Infer semantic type from SQL data type and column name."""
         dt_upper = data_type.upper()
         cn_lower = column_name.lower()
+        
+        # Check for SSN in column name (case insensitive)
+        if any(term in cn_lower for term in ['ssn', 'social', 'security', 'taxid', 'tax_id', 'taxid']):
+            return 'social security number'
         
         # Date/Time types
         if any(t in dt_upper for t in ['DATE', 'TIME', 'TIMESTAMP']):

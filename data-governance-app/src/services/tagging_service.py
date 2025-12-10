@@ -56,8 +56,11 @@ def _load_allowed_values(connector, value_type: str) -> List[str]:
         }
         return defaults.get(value_type, [])
 
-TAG_DB = settings.SNOWFLAKE_DATABASE
-TAG_SCHEMA = "DATA_GOVERNANCE"
+from src.services.governance_db_resolver import resolve_governance_db
+
+# Default fallback values
+DEFAULT_TAG_DB = "DATA_CLASSIFICATION_DB"
+DEFAULT_TAG_SCHEMA = "DATA_GOVERNANCE"
 
 def get_tag_definitions() -> Dict[str, Any]:
     """Load all tag definitions from the database with fallback to defaults."""
@@ -103,6 +106,29 @@ class TaggingService:
     def __init__(self):
         self.connector = snowflake_connector
 
+    @property
+    def tag_db(self) -> str:
+        """Resolve the database where tags are stored."""
+        try:
+            # Dynamically resolve governance DB (handles UI filters/session state)
+            config_db = resolve_governance_db()
+            if config_db and str(config_db).upper() not in ('NONE', 'NULL', '', 'UNKNOWN'):
+                return config_db
+            
+            # Fallback to settings
+            setting_db = getattr(settings, "SNOWFLAKE_DATABASE", None)
+            if setting_db and str(setting_db).upper() not in ('NONE', 'NULL', '', 'UNKNOWN'):
+                return setting_db
+        except Exception:
+            pass
+        return DEFAULT_TAG_DB
+
+    @property
+    def tag_schema(self) -> str:
+        """Resolve the schema where tags are stored."""
+        # Could be dynamic, but defaulting to fixed schema for now
+        return DEFAULT_TAG_SCHEMA
+
     # --- Identifier helpers ---
     def _split_fqn(self, fq: str) -> Tuple[str, str, str]:
         s = str(fq or "")
@@ -139,7 +165,15 @@ class TaggingService:
 
     def _load_sensitivity_patterns(self) -> Dict[str, Dict]:
         """Load sensitivity patterns and categories from database"""
-        active_db = getattr(settings, "SNOWFLAKE_DATABASE", None)
+        try:
+            active_db = self.tag_db
+        except Exception:
+            active_db = None
+            
+        if not active_db or str(active_db).strip().upper() in {"", "NONE", "(NONE)", "NULL", "UNKNOWN", "DATA_CLASSIFICATION_DB"}:  
+             # Check if we have a valid default via resolve_governance_db even if tag_db fallback logic returned default
+             pass 
+
         if not active_db or str(active_db).strip().upper() in {"", "NONE", "(NONE)", "NULL", "UNKNOWN"}:
             # No valid DB context; return defaults to avoid noisy errors
             return {
@@ -325,18 +359,21 @@ class TaggingService:
     def initialize_tagging(self) -> None:
         """Create schema and tag objects if missing."""
         # Create schema for governance artifacts (idempotent)
+        current_db = self.tag_db
+        current_schema = self.tag_schema
+        
         try:
             self.connector.execute_non_query(
-                f"CREATE SCHEMA IF NOT EXISTS {TAG_DB}.{TAG_SCHEMA}"
+                f"CREATE SCHEMA IF NOT EXISTS {current_db}.{current_schema}"
             )
         except Exception as e:
-            logger.warning(f"Error ensuring schema {TAG_DB}.{TAG_SCHEMA}: {e}")
+            logger.warning(f"Error ensuring schema {current_db}.{current_schema}: {e}")
 
         # Ensure each tag exists
         for tag_name in TAG_DEFINITIONS.keys():
-            fq_tag = f"{TAG_DB}.{TAG_SCHEMA}.{tag_name}"
+            fq_tag = f"{current_db}.{current_schema}.{tag_name}"
             try:
-                exists = self._tag_exists(TAG_DB, TAG_SCHEMA, tag_name)
+                exists = self._tag_exists(current_db, current_schema, tag_name)
                 if not exists:
                     self.connector.execute_non_query(f"CREATE TAG {fq_tag}")
                     logger.info(f"Created tag {fq_tag}")
@@ -419,9 +456,13 @@ class TaggingService:
         self.initialize_tagging()
 
         db, schema, obj = self._split_fqn(full_name)
+        
+        current_tag_db = self.tag_db
+        current_tag_schema = self.tag_schema
+        
         assignments = ", ".join(
             [
-                f"{TAG_DB}.{TAG_SCHEMA}.{k} = '{v}'"
+                f"{current_tag_db}.{current_tag_schema}.{k} = '{v}'"
                 for k, v in augmented.items()
             ]
         )
@@ -445,9 +486,13 @@ class TaggingService:
         self._enforce_policy_minimums(full_table_name, augmented)
         self.initialize_tagging()
         db, schema, table = self._split_fqn(full_table_name)
+        
+        current_tag_db = self.tag_db
+        current_tag_schema = self.tag_schema
+
         assignments = ", ".join(
             [
-                f"{TAG_DB}.{TAG_SCHEMA}.{k} = '{v}'"
+                f"{current_tag_db}.{current_tag_schema}.{k} = '{v}'"
                 for k, v in augmented.items()
             ]
         )
@@ -539,12 +584,16 @@ class TaggingService:
 
     def generate_tag_sql_for_object(self, full_name: str, object_type: str, tags: Dict[str, str]) -> str:
         db, schema, obj = self._split_fqn(full_name)
-        assignments = ", ".join([f"{TAG_DB}.{TAG_SCHEMA}.{k} = '{v}'" for k, v in tags.items()])
+        tag_db = self.tag_db
+        tag_schema = self.tag_schema
+        assignments = ", ".join([f"{tag_db}.{tag_schema}.{k} = '{v}'" for k, v in tags.items()])
         return f"ALTER {object_type} {self._q(db)}.{self._q(schema)}.{self._q(obj)} SET TAG {assignments}"
 
     def generate_tag_sql_for_column(self, full_table_name: str, column_name: str, tags: Dict[str, str]) -> str:
         db, schema, table = self._split_fqn(full_table_name)
-        assignments = ", ".join([f"{TAG_DB}.{TAG_SCHEMA}.{k} = '{v}'" for k, v in tags.items()])
+        tag_db = self.tag_db
+        tag_schema = self.tag_schema
+        assignments = ", ".join([f"{tag_db}.{tag_schema}.{k} = '{v}'" for k, v in tags.items()])
         return (
             f"ALTER TABLE {self._q(db)}.{self._q(schema)}.{self._q(table)} "
             f"MODIFY COLUMN {self._q(column_name)} SET TAG {assignments}"
@@ -613,9 +662,11 @@ class TaggingService:
                 suggestions.append("Verify DB.SCHEMA.OBJECT and case/quoting; ensure object exists in current account")
             if "tag" in m and "does not exist" in m:
                 if tags:
+                    current_db = self.tag_db
+                    current_schema = self.tag_schema
                     for k in tags.keys():
-                        if not self._tag_exists(TAG_DB, TAG_SCHEMA, k):
-                            suggestions.append(f"Tag {TAG_DB}.{TAG_SCHEMA}.{k} is missing; initialize tagging or create tag")
+                        if not self._tag_exists(current_db, current_schema, k):
+                            suggestions.append(f"Tag {current_db}.{current_schema}.{k} is missing; initialize tagging or create tag")
             if "invalid identifier" in m:
                 suggestions.append("Quote identifiers with double quotes if mixed-case or special chars")
             if "cannot modify" in m and "column" in m:

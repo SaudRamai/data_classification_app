@@ -11,7 +11,9 @@ from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-DB = settings.SNOWFLAKE_DATABASE
+# Resolve DB with fallback
+_db_setting = settings.SNOWFLAKE_DATABASE
+DB = _db_setting if _db_setting and str(_db_setting).upper() != "NONE" else "DATA_CLASSIFICATION_DB"
 SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 TABLE = "LABEL_REGISTRY"
 

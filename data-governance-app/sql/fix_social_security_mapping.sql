@@ -1,0 +1,101 @@
+-- Fix SOCIAL_SECURITY_NUMBER Classification Issue
+-- This script ensures that social_security keywords are correctly mapped to PII category
+
+-- Step 1: First, let's see what we have
+SELECT 
+    'BEFORE FIX - Current Mappings' as STATUS,
+    sk.KEYWORD_STRING,
+    sc.CATEGORY_NAME,
+    sc.POLICY_GROUP,
+    sk.MATCH_TYPE,
+    sk.SCORE,
+    sk.IS_ACTIVE
+FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS sk
+JOIN DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES sc
+    ON sk.CATEGORY_ID = sc.CATEGORY_ID
+WHERE LOWER(sk.KEYWORD_STRING) LIKE '%social%'
+   OR LOWER(sk.KEYWORD_STRING) LIKE '%ssn%'
+ORDER BY sc.POLICY_GROUP, sk.KEYWORD_STRING;
+
+-- Step 2: Get the PII category ID
+SET pii_category_id = (
+    SELECT CATEGORY_ID 
+    FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES 
+    WHERE POLICY_GROUP = 'PII' 
+    LIMIT 1
+);
+
+-- Step 3: Delete any incorrect mappings of social_security keywords to non-PII categories
+DELETE FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+WHERE (LOWER(KEYWORD_STRING) LIKE '%social_security%' OR LOWER(KEYWORD_STRING) = 'ssn')
+  AND CATEGORY_ID NOT IN (
+      SELECT CATEGORY_ID 
+      FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES 
+      WHERE POLICY_GROUP = 'PII'
+  );
+
+-- Step 4: Ensure social_security keywords exist in PII category
+MERGE INTO DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS AS target
+USING (
+    SELECT 
+        $pii_category_id as CATEGORY_ID,
+        keyword as KEYWORD_STRING,
+        'EXACT' as MATCH_TYPE,
+        10.0 as SCORE,
+        TRUE as IS_ACTIVE,
+        CURRENT_USER() as CREATED_BY,
+        CURRENT_TIMESTAMP() as CREATED_AT,
+        1 as VERSION
+    FROM (
+        SELECT 'ssn' as keyword
+        UNION ALL SELECT 'social_security'
+        UNION ALL SELECT 'social_security_number'
+        UNION ALL SELECT 'socialsecurity'
+        UNION ALL SELECT 'socialsecuritynumber'
+        UNION ALL SELECT 'social_security_no'
+        UNION ALL SELECT 'ssn_number'
+        UNION ALL SELECT 'ssn_num'
+    )
+) AS source
+ON target.KEYWORD_STRING = source.KEYWORD_STRING 
+   AND target.CATEGORY_ID = source.CATEGORY_ID
+WHEN NOT MATCHED THEN
+    INSERT (KEYWORD_ID, CATEGORY_ID, KEYWORD_STRING, MATCH_TYPE, SCORE, IS_ACTIVE, CREATED_BY, CREATED_AT, VERSION)
+    VALUES (UUID_STRING(), source.CATEGORY_ID, source.KEYWORD_STRING, source.MATCH_TYPE, source.SCORE, source.IS_ACTIVE, source.CREATED_BY, source.CREATED_AT, source.VERSION)
+WHEN MATCHED THEN
+    UPDATE SET 
+        SCORE = source.SCORE,
+        MATCH_TYPE = source.MATCH_TYPE,
+        IS_ACTIVE = source.IS_ACTIVE,
+        UPDATED_BY = CURRENT_USER(),
+        UPDATED_AT = CURRENT_TIMESTAMP();
+
+-- Step 5: Verify the fix
+SELECT 
+    'AFTER FIX - Updated Mappings' as STATUS,
+    sk.KEYWORD_STRING,
+    sc.CATEGORY_NAME,
+    sc.POLICY_GROUP,
+    sk.MATCH_TYPE,
+    sk.SCORE,
+    sk.IS_ACTIVE
+FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS sk
+JOIN DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES sc
+    ON sk.CATEGORY_ID = sc.CATEGORY_ID
+WHERE LOWER(sk.KEYWORD_STRING) LIKE '%social%'
+   OR LOWER(sk.KEYWORD_STRING) LIKE '%ssn%'
+ORDER BY sc.POLICY_GROUP, sk.KEYWORD_STRING;
+
+-- Step 6: Check if there are any SOC2 keywords that might conflict
+SELECT 
+    'SOC2 Keywords Check' as STATUS,
+    sk.KEYWORD_STRING,
+    sc.POLICY_GROUP
+FROM DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS sk
+JOIN DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES sc
+    ON sk.CATEGORY_ID = sc.CATEGORY_ID
+WHERE sc.POLICY_GROUP = 'SOC2'
+  AND sk.IS_ACTIVE = TRUE
+  AND (LOWER(sk.KEYWORD_STRING) LIKE '%social%' 
+       OR LOWER(sk.KEYWORD_STRING) = 'security')
+ORDER BY sk.KEYWORD_STRING;

@@ -62,9 +62,9 @@ class ai_assistant_service:
 
     # Category priority for tie-breaks: higher index = higher priority
     CATEGORY_PRIORITY = {
+        'PERSONAL_DATA': 7,      # PII is the highest priority
         'REGULATORY_DATA': 6,
         'FINANCIAL_DATA': 5,
-        'PERSONAL_DATA': 4,
         'PROPRIETARY_DATA': 3,
         'INTERNAL': 2,
         'PUBLIC_DATA': 1,

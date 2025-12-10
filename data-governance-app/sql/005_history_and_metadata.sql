@@ -182,7 +182,7 @@ SELECT * FROM VALUES
   ('Auth','Security','Security'),
   ('Email','Confidentiality','Financial Reporting'),
   ('Phone','Confidentiality','Financial Reporting'),
-  ('SSN_US','Confidentiality','Financial Reporting')
+  ('SSN_US','Confidentiality', NULL)
 WHERE NOT EXISTS (
   SELECT 1 FROM CLASSIFICATION_METADATA.TYPE_TO_COMPLIANCE
 );

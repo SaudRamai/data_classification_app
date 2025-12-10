@@ -1,0 +1,213 @@
+================================================================================
+✅ SCHEMA FIXED - FINAL VERSION
+================================================================================
+Date: 2025-12-05 14:29
+Schema: DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE
+
+================================================================================
+WHAT WAS CHANGED
+================================================================================
+
+All upsert/insert operations now ALWAYS use:
+  📍 DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+
+Methods Updated (4 total):
+  ✅ get_category_id_by_name() - Line ~1823
+  ✅ _log_keyword_audit() - Line ~1845  
+  ✅ add_sensitive_keyword() - Line ~1869
+  ✅ upsert_sensitive_keyword() - Line ~1927
+
+Changed From:
+  ❌ DATA_CLASSIFICATION_GOVERNANCE.DATA_CLASSIFICATION_GOVERNANCE
+
+Changed To:
+  ✅ DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE
+
+================================================================================
+HOW TO QUERY YOUR DATA
+================================================================================
+
+Option 1: Full Path (Recommended)
+----------------------------------
+SELECT * 
+FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+WHERE KEYWORD_STRING = 'SOCIAL_SECURITY_NUMBER';
+
+Option 2: Set Context First
+---------------------------
+USE DATABASE DATA_CLASSIFICATION_DB;
+USE SCHEMA DATA_CLASSIFICATION_GOVERNANCE;
+
+SELECT * FROM SENSITIVE_KEYWORDS
+WHERE KEYWORD_STRING = 'SOCIAL_SECURITY_NUMBER';
+
+================================================================================
+FILES CREATED
+================================================================================
+
+✅ sql/cleanup_29_critical_keywords.sql
+   - Removes 21 lower-risk keywords
+   - Keeps 29 critical keywords (PII=13, SOX=9, SOC2=7)
+   - Targets: DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE
+
+✅ SCHEMA_FIXED_FINAL.txt (this file)
+   - Complete documentation of the fix
+   - Query examples
+   - Testing instructions
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. ✅ CODE IS FIXED - All 4 methods updated
+
+2. ⏳ RUN THE CLEANUP SCRIPT:
+   snowsql -f sql/cleanup_29_critical_keywords.sql
+
+3. ✅ VERIFY:
+   SELECT * FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+   WHERE KEYWORD_STRING = 'SOCIAL_SECURITY_NUMBER';
+
+4. ✅ TEST INLINE EDITS:
+   - Make a change in the dashboard
+   - Query the table to verify it saved
+
+================================================================================
+TESTING QUERIES
+================================================================================
+
+Test 1: Check SOCIAL_SECURITY_NUMBER exists
+--------------------------------------------
+SELECT * 
+FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+WHERE KEYWORD_STRING = 'SOCIAL_SECURITY_NUMBER';
+
+Expected: 1 row
+
+Test 2: Count all keywords
+----------------------------
+SELECT COUNT(*) AS TOTAL
+FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS;
+
+Test 3: Count by category
+--------------------------
+SELECT 
+    sc.CATEGORY_NAME,
+    COUNT(*) AS COUNT
+FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS sk
+JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES sc 
+  ON sk.CATEGORY_ID = sc.CATEGORY_ID
+GROUP BY sc.CATEGORY_NAME
+ORDER BY sc.CATEGORY_NAME;
+
+================================================================================
+INLINE EDIT TEST PROCEDURE
+================================================================================
+
+1. Go to AI Classification Dashboard
+2. Find any keyword in the table
+3. Click edit (✏️) icon
+4. Change SENSITIVITY_WEIGHT (e.g., from 0.8 to 0.9)
+5. Save
+6. Run this query:
+
+   SELECT KEYWORD_STRING, SENSITIVITY_WEIGHT, UPDATED_AT
+   FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+   WHERE KEYWORD_STRING = 'your_keyword';
+
+7. Verify:
+   - SENSITIVITY_WEIGHT shows new value (0.9)
+   - UPDATED_AT shows recent timestamp
+
+If this works, inline edits are FIXED! ✅
+
+================================================================================
+29 CRITICAL KEYWORDS TO KEEP
+================================================================================
+
+PII (13 keywords):
+  - SOCIAL_SECURITY_NUMBER
+  - TAX_IDENTIFICATION_NUMBER
+  - NATIONAL_ID_NUMBER
+  - DRIVERS_LICENSE_NUMBER
+  - PASSPORT_NUMBER
+  - VOTER_ID_NUMBER
+  - MILITARY_ID_NUMBER
+  - ALIEN_REGISTRATION_NUMBER
+  - BIOMETRIC_HASH
+  - VOICE_PRINT_ID
+  - FINGERPRINT_HASH
+  - HEALTH_CONDITION
+  - DEVICE_LOCATION_HISTORY
+
+SOX (9 keywords):
+  - BANK_ACCOUNT_NUMBER
+  - BANK_IBAN
+  - CREDIT_CARD_NUMBER
+  - CREDIT_CARD_EXPIRY_DATE
+  - CREDIT_CARD_CVV
+  - ANNUAL_INCOME
+  - CREDIT_SCORE
+  - TAX_RETURN_ID
+  - PAYMENT_HISTORY
+
+SOC2 (7 keywords):
+  - USER_PASSWORD_HASH
+  - API_KEY
+  - API_SECRET
+  - OAUTH_TOKEN
+  - OAUTH_REFRESH_TOKEN
+  - TRADE_SECRET_KEY
+  - ENCRYPTED_MESSAGES
+
+================================================================================
+21 KEYWORDS TO REMOVE (Lower Risk)
+================================================================================
+
+PII (10 removed):
+  ❌ CUSTOMER_ID - Generic identifier
+  ❌ ETHNICITY - Context-dependent
+  ❌ RELIGION - Context-dependent
+  ❌ DISABILITY_STATUS - Context-dependent
+  ❌ TWO_FACTOR_PHONE - Duplicative
+  ❌ TWO_FACTOR_EMAIL - Duplicative
+  ❌ GPS_COORDINATES - Single point
+  ❌ LAST_KNOWN_LOCATION - Single point
+  ❌ VOIP_CALL_RECORDS - Context-dependent
+  ❌ VIDEO_CALL_SIGNATURE - Context-dependent
+
+SOX (4 removed):
+  ❌ BANK_ROUTING_NUMBER - Public information
+  ❌ BANK_SWIFT_CODE - Public information
+  ❌ CREDIT_CARD_HOLDER_NAME - Less sensitive
+  ❌ BUSINESS_REGISTRATION_NUMBER - Often public
+
+SOC2 (5 removed):
+  ❌ SECURITY_QUESTION_1 - Question text not sensitive
+  ❌ SECURITY_QUESTION_2 - Question text not sensitive
+  ❌ IP_ADDRESS - Context-dependent
+  ❌ LOGIN_DEVICE_ID - Lower risk
+  ❌ CONFIDENTIAL_AGREEMENT_ID - Reference ID only
+
+================================================================================
+SUMMARY
+================================================================================
+
+✅ All 4 methods now hardcoded to use same schema
+✅ Schema: DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE
+✅ Cleanup script ready to run
+✅ All inline edits will save to correct location
+✅ Ready to test!
+
+The fix ensures complete consistency across:
+  - Category lookups
+  - Audit logging
+  - Keyword additions
+  - Keyword upserts
+
+Everything points to the same location: 
+  DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE
+
+================================================================================
+END
+================================================================================

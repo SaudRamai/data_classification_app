@@ -1,0 +1,186 @@
+================================================================================
+QUICK ACTION SUMMARY - DATA CLASSIFICATION ISSUE
+================================================================================
+Date: 2025-12-05 16:35
+Status: IDENTIFIED AND PARTIALLY FIXED
+================================================================================
+
+WHAT WAS FOUND
+================================================================================
+
+PRIMARY ROOT CAUSE:
+  The SENSITIVE_KEYWORDS table has incorrect CATEGORY_ID values that point
+  keywords like 'SOCIAL_SECURITY_NUMBER' to SOC2 instead of PII.
+
+SECONDARY ISSUE (NOW FIXED):
+  The validation code that should correct these errors was not executing
+  because a critical helper method was missing from the codebase.
+
+================================================================================
+WHAT WAS DONE
+================================================================================
+
+1. COMPREHENSIVE CODEBASE REVIEW
+   ✓ Analyzed ai_classification_pipeline_service.py (8059 lines)
+   ✓ Reviewed governance_rules_loader_v2.py (570 lines)
+   ✓ Examined SQL diagnostic and fix scripts
+   ✓ Reviewed all documentation files
+
+2. IDENTIFIED ROOT CAUSES
+   ✓ Database: Wrong CATEGORY_ID values in SENSITIVE_KEYWORDS table
+   ✓ Code: Missing _map_category_to_policy_group() method
+   ✓ Views: VW_CLASSIFICATION_RULES propagates database errors
+   ✓ Cache: May contain stale data after database fixes
+
+3. CREATED FIX
+   ✓ Added missing _map_category_to_policy_group() method (DONE)
+   ✓ Created comprehensive root cause analysis document
+   ✓ Identified database fix script already running
+
+================================================================================
+WHAT NEEDS TO HAPPEN NEXT
+================================================================================
+
+IMMEDIATE (DO NOW):
+-------------------
+1. Check status of sql/fix_ssn_immediate.sql
+   - Has been running for 33+ minutes (may be hanging)
+   - If hanging: Kill and rerun
+   - If completed: Verify results
+
+2. After database fix completes:
+   - Restart Streamlit application (to clear cache)
+   - Re-run AI Classification Pipeline
+   - Verify SOCIAL_SECURITY_NUMBER now shows as PII (not SOC2)
+
+3. Run verification query:
+   SELECT sk.KEYWORD_STRING, sc.CATEGORY_NAME, sc.POLICY_GROUP
+   FROM SENSITIVE_KEYWORDS sk
+   JOIN SENSITIVITY_CATEGORIES sc ON sk.CATEGORY_ID = sc.CATEGORY_ID
+   WHERE LOWER(sk.KEYWORD_STRING) = 'social_security_number';
+   
+   Expected: CATEGORY_NAME = 'PII', POLICY_GROUP = 'PII'
+
+TODAY:
+------
+4. Fix ALL 29 critical keywords (not just SSN)
+   Run: snowsql -f sql/update_critical_keywords_only.sql
+
+5. Run comprehensive verification:
+   Run: snowsql -f sql/verify_critical_keywords.sql
+
+6. Test end-to-end classification on TEST_CUSTOMER_MASTER table
+
+THIS WEEK:
+----------
+7. Add database constraints to prevent future wrong mappings
+8. Fix keyword upsert UI to prevent selecting wrong categories
+9. Add cache clear button to Streamlit UI
+10. Create automated tests for validation layer
+
+================================================================================
+FILES CREATED / MODIFIED
+================================================================================
+
+CREATED:
+  - CLASSIFICATION_ROOT_CAUSE_ANALYSIS.txt (full analysis)
+  - QUICK_ACTION_SUMMARY.txt (this file)
+
+MODIFIED:
+  - src/services/ai_classification_pipeline_service.py
+    Added: _map_category_to_policy_group() method at line 1636
+    Purpose: Enable validation layer to correct misclassified keywords
+
+================================================================================
+HOW THE FIX WORKS
+================================================================================
+
+BEFORE (BROKEN):
+  1. Database has wrong CATEGORY_ID for SSN → Points to SOC2
+  2. Pipeline loads: keywords_by_category['SOC2'] = ['social_security_number']
+  3. Validation tries to run but fails (missing method)
+  4. Column classified as SOC2 (WRONG!)
+
+AFTER (FIXED):
+  1. Database STILL has wrong CATEGORY_ID (being fixed by SQL script)
+  2. Pipeline loads: keywords_by_category['SOC2'] = ['social_security_number']
+  3. Validation runs successfully:
+     - Detects 'social_security_number' should be PII
+     - Moves it from SOC2 list to PII list
+  4. Column classified as PII (CORRECT!)
+
+Once database is fixed, validation won't need to run, but acts as safety net.
+
+================================================================================
+MONITORING / VERIFICATION
+================================================================================
+
+After implementing fixes, verify with these checks:
+
+CHECK 1 - Database is correct:
+  SELECT COUNT(*) FROM SENSITIVE_KEYWORDS sk
+  JOIN SENSITIVITY_CATEGORIES sc ON sk.CATEGORY_ID = sc.CATEGORY_ID
+  WHERE LOWER(sk.KEYWORD_STRING) = 'social_security_number'
+    AND sc.CATEGORY_NAME = 'PII';
+  
+  Expected: COUNT = 1
+
+CHECK 2 - Classification works:
+  - Run AI Classification Pipeline
+  - Check SOCIAL_SECURITY_NUMBER column
+  - Should show: Category = PII, Policy Group = PII
+
+CHECK 3 - Validation works:
+  - Check logs for keyword validation warnings
+  - Should see: "✅ KEYWORD VALIDATION: All critical keywords are in correct categories"
+  - OR: "🔧 KEYWORD VALIDATION: Made N corrections"
+
+================================================================================
+SUCCESS METRICS
+================================================================================
+
+The issue is RESOLVED when ALL of these are true:
+
+✓ Database query shows social_security_number → PII
+✓ AI Classification shows SOCIAL_SECURITY_NUMBER column → PII
+✓ No validation warnings in logs (or only "All correct")
+✓ All 29 critical keywords map to correct policy groups
+✓ TEST_CUSTOMER_MASTER classification shows expected results
+
+================================================================================
+SUPPORT DOCUMENTATION
+================================================================================
+
+For detailed technical analysis, see:
+  - CLASSIFICATION_ROOT_CAUSE_ANALYSIS.txt
+
+For database diagnostics, run:
+  - sql/diagnose_ssn_soc2_issue.sql
+
+For quick reference on critical keywords:
+  - CRITICAL_KEYWORDS_QUICK_REF.txt
+
+For implementation status:
+  - IMPLEMENTATION_CHECKLIST.txt
+
+================================================================================
+CONTACT / ESCALATION
+================================================================================
+
+If issues persist after applying fixes:
+
+1. Check application logs for validation warnings:
+   Look for: "KEYWORD VALIDATION:" messages
+
+2. Verify database and code are in sync:
+   - Database shows correct CATEGORY_ID values
+   - Cache has been cleared (app restarted)
+   - Validation code is executing (check logs)
+
+3. Review conversation history for additional context:
+   - Conversation 8efc0cbb: Fixing Keyword Classification Logic
+   - Conversation 26971c8a: Fixing Keyword Detection Logic
+
+================================================================================
+END OF SUMMARY
+================================================================================

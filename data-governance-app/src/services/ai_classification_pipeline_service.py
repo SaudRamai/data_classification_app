@@ -27,6 +27,12 @@ from src.services.semantic_type_detector import semantic_type_detector
 # AISensitiveDetectionService import moved to __init__
 from src.services.governance_db_resolver import resolve_governance_db
 from src.services.tagging_service import tagging_service
+# View-based governance rules loader for data-driven classification
+try:
+    from src.services.governance_rules_loader_v2 import governance_rules_loader
+except ImportError:
+    governance_rules_loader = None  # type: ignore
+    logger.warning("governance_rules_loader_v2 not available - using fallback logic")
 try:
     from src.config import settings
 except Exception:
@@ -85,6 +91,147 @@ class AIClassificationPipelineService:
         self._category_weights: Dict[str, float] = {}
         self._category_default_thresholds: Dict[str, float] = {}
         self._compliance_categories: Dict[str, str] = {}  # Maps category to compliance framework
+        
+        # ========================================================================
+        # VIEW-BASED DATA-DRIVEN CLASSIFICATION (New Architecture)
+        # ========================================================================
+        # Initialize governance rules loader for view-based classification
+        self._rules_loader = governance_rules_loader if governance_rules_loader else None
+        
+        # View-based rule storage (loaded from Snowflake views)
+        self._classification_rules: List[Dict[str, Any]] = []
+        self._context_aware_rules: Dict[str, List[Dict[str, Any]]] = {}
+        self._tiebreaker_keywords: Dict[str, List[Dict[str, Any]]] = {}
+        self._address_context_indicators: List[Dict[str, Any]] = []
+        self._exclusion_patterns: List[Dict[str, Any]] = []
+        self._policy_group_keywords: Dict[str, List[Dict[str, Any]]] = {}
+        self._category_metadata: Dict[str, Dict[str, Any]] = {}
+        
+        # Flag to indicate if view-based rules are loaded
+        self._view_based_rules_loaded: bool = False
+        
+        logger.info("AI Classification Pipeline Service initialized with view-based architecture support")
+
+    def _exact_match_keyword_detection(self, db: str, text_context: str) -> List[Dict[str, Any]]:
+        """
+        Perform keyword detection against the governance database.
+        Returns a list of matching categories details.
+        """
+        try:
+            gov_db = self._get_governance_database(db)
+            if not gov_db:
+                return []
+
+            # 1. Load Rules (Cached)
+            if not hasattr(self, '_gov_rules_cache') or not self._gov_rules_cache:
+                logger.info("Loading governance rules from database...")
+                # Fetch categories and keywords
+                query_rules = f"""
+                    SELECT sc.category_id, sc.category_name, sk.keyword_string, sk.match_type
+                    FROM {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES sc 
+                    LEFT JOIN {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS sk 
+                        ON sc.category_id = sk.category_id
+                    WHERE sc.IS_ACTIVE = TRUE AND (sk.IS_ACTIVE = TRUE OR sk.IS_ACTIVE IS NULL)
+                """
+                rules_rows = snowflake_connector.execute_query(query_rules) or []
+                self._gov_rules_cache = rules_rows
+                
+                # Fetch exclusion patterns
+                query_exclusions = f"""
+                    SELECT pattern 
+                    FROM {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.VW_EXCLUSION_PATTERNS
+                """
+                exclusion_rows = snowflake_connector.execute_query(query_exclusions) or []
+                self._gov_exclusions_cache = [r['PATTERN'] for r in exclusion_rows if r.get('PATTERN')]
+                logger.info(f"Loaded {len(rules_rows)} rules and {len(self._gov_exclusions_cache)} exclusion patterns.")
+
+            # 2. Check Exclusions
+            clean_context = re.sub(r'\s+', ' ', text_context.lower()).strip()
+            
+            for pattern in self._gov_exclusions_cache:
+                p_clean = str(pattern).lower().replace('%', '') # Simple handling for now
+                if p_clean and p_clean in clean_context:
+                     logger.debug(f"Context '{text_context}' matched exclusion pattern '{pattern}'")
+                     return []
+
+            # 3. Match Logic
+            matches = []
+            
+            for rule in self._gov_rules_cache:
+                r_cat = rule.get('CATEGORY_NAME')
+                r_kw = rule.get('KEYWORD_STRING')
+                r_type = str(rule.get('MATCH_TYPE') or 'EXACT').upper()
+                
+                if not r_kw or not r_cat:
+                    continue
+                    
+                kw_clean = str(r_kw).lower().strip()
+                is_match = False
+                confidence = 0.0
+                reason = ""
+                
+                if r_type == 'EXACT':
+                    # Strict word boundary or exact string match
+                    if kw_clean == clean_context or re.search(r'\b' + re.escape(kw_clean) + r'\b', clean_context):
+                        is_match = True
+                        confidence = 1.0
+                        reason = f"Exact match: '{r_kw}'"
+                
+                elif r_type == 'PARTIAL':
+                    if kw_clean in clean_context:
+                        # Conditional Logic: Semantic Validation for PARTIAL
+                        logger.debug(f"Partial match candidate: '{r_kw}' in '{clean_context}'. Verifying semantics...")
+                        # Trigger semantic search
+                        sem_scores = self._semantic_scores_governance_driven(text_context)
+                        sem_conf = sem_scores.get(r_cat, 0.0)
+                        
+                        if sem_conf > 0.45: # Threshold for partial match validation
+                             is_match = True
+                             confidence = 0.7 + (sem_conf * 0.3) # Boosted confidence
+                             reason = f"Partial match '{r_kw}' verified by semantic score {sem_conf:.2f}"
+                        else:
+                             # Try "smart" partial logic (e.g. if column name is exactly the keyword + suffix)
+                             if clean_context.startswith(kw_clean) or clean_context.endswith(kw_clean):
+                                 is_match = True
+                                 confidence = 0.8
+                                 reason = f"Strong partial match (prefix/suffix): '{r_kw}'"
+                
+                elif r_type == 'REGEX':
+                     try:
+                         if re.search(r_kw, text_context, re.IGNORECASE):
+                             is_match = True
+                             confidence = 1.0
+                             reason = f"Regex match: '{r_kw}'"
+                     except Exception:
+                         pass
+
+                if is_match:
+                    # If duplicate category, keep highest confidence
+                    existing = next((m for m in matches if m['category'] == r_cat), None)
+                    if existing:
+                        if confidence > existing['confidence']:
+                            existing['confidence'] = confidence
+                            existing['reason'] = reason
+                            existing['match_type'] = r_type
+                            existing['keyword_string'] = r_kw
+                    else:
+                        matches.append({
+                            'category': r_cat,
+                            'confidence': confidence,
+                            'reason': reason,
+                            'keyword_string': r_kw,
+                            'match_type': r_type
+                        })
+
+            matches.sort(key=lambda x: x['confidence'], reverse=True)
+            if matches:
+                 logger.info(f"Detection results for '{text_context}': {[m['category'] for m in matches]}")
+            
+            return matches
+
+        except Exception as e:
+            logger.error(f"Error in exact match keyword detection: {e}", exc_info=True)
+            return []
 
     def render_classification_pipeline(self) -> None:
         """Render the Automatic AI Classification Dashboard."""
@@ -142,14 +289,30 @@ class AIClassificationPipelineService:
                     self._save_classification_results(db, st.session_state["pipeline_results"])
         # 3. View Selection & Filters
         # 3. View Selection & Filters
-        # Local filters removed in favor of Global Filters
         view_mode = "Table View"
+        
+        mask = pd.Series(True, index=df_results.index)
+        
+        # Local Filter: Category
+        # Placed before global filters so they work together
+        available_categories = sorted([str(c) for c in df_results["Category"].unique() if pd.notna(c) and str(c).strip() != ''])
+        
+        # Layout for filters
+        f_col1, f_col2 = st.columns([3, 1])
+        with f_col1:
+            selected_categories = st.multiselect(
+                "Filter by Category",
+                options=available_categories,
+                placeholder="All Categories (Select to filter)",
+                help="Filter the results by specific sensitive categories (e.g., PII, SOX)."
+            )
+
+        if selected_categories:
+            mask = mask & df_results["Category"].isin(selected_categories)
         
         # Apply Global Filters
         global_filters = st.session_state.get("global_filters", {})
         global_schema = global_filters.get("schema")
-        
-        mask = pd.Series(True, index=df_results.index)
         
         # Apply Schema Filter if present
         if global_schema and str(global_schema).strip().upper() not in {'', 'NONE', '(NONE)', 'NULL', 'ALL', '[]'}:
@@ -526,25 +689,29 @@ class AIClassificationPipelineService:
                 table_details['Availability'] = table_details['Availability'].apply(format_availability_val)
                 
                 # Inline Editing for Drill-Down
-                categories_list = sorted(list(self._category_thresholds.keys())) if self._category_thresholds else ["PII", "SOX", "SOC2", "INTERNAL"]
+                base_categories = sorted(list(self._category_thresholds.keys())) if self._category_thresholds else ["PII", "SOX", "SOC2", "INTERNAL"]
                 
+                # Get current values from the table to ensure they display correctly in the Selectbox
+                # This ensures multi-label strings like "PII, SOX" are valid options for display
+                current_values = table_details["Category"].dropna().unique().tolist()
+                
+                # Combine base categories with any existing complex values found in the data
+                # We filter out empty strings
+                extended_options = sorted(list(set(base_categories + [str(x) for x in current_values if x])))
+
                 edited_df = st.data_editor(
-                    table_details[['Column', 'Category', 'Sensitivity', 'Confidentiality', 'Integrity', 'Availability', 'Rationale']],
+                    table_details[['Column', 'Category', 'Sensitivity', 'Confidentiality', 'Integrity', 'Availability']],
                     use_container_width=True,
                     hide_index=True,
                     key="drill_down_editor",
-                    disabled=['Column', 'Sensitivity', 'Confidentiality', 'Integrity', 'Availability', 'Rationale'],
+                    disabled=['Column', 'Sensitivity', 'Confidentiality', 'Integrity', 'Availability'],
                     column_config={
                         "Category": st.column_config.SelectboxColumn(
                             "Category (Edit to Upsert)",
                             help="Change the category to automatically update the keyword rule.",
                             width="medium",
-                            options=categories_list,
+                            options=extended_options,
                             required=True
-                        ),
-                        "Rationale": st.column_config.TextColumn(
-                            "Detection Rationale",
-                            width="large"
                         )
                     }
                 )
@@ -553,6 +720,7 @@ class AIClassificationPipelineService:
                 if st.session_state.get("drill_down_editor"):
                     edits = st.session_state["drill_down_editor"].get("edited_rows", {})
                     if edits:
+                        # Process all edits
                         for idx, changes in edits.items():
                             if "Category" in changes:
                                 new_cat = changes["Category"]
@@ -560,12 +728,22 @@ class AIClassificationPipelineService:
                                 col_name = table_details.iloc[idx]['Column']
                                 
                                 with st.spinner(f"Updating keyword '{col_name}' to '{new_cat}'..."):
-                                    if self.upsert_sensitive_keyword(col_name, new_cat, "CONTAINS"):
-                                        st.toast(f"✅ Updated '{col_name}' to {new_cat}!", icon="💾")
-                                        # Clear edit state to prevent loop (optional, but good practice)
-                                        # st.session_state["drill_down_editor"]["edited_rows"] = {} 
-                                        # Rerun to refresh data
-                                        st.rerun()
+                                    # First check if keyword exists in any category
+                                    keyword_exists = self._check_keyword_exists(col_name)
+                                    
+                                    if keyword_exists:
+                                        # Update existing keyword
+                                        if self.upsert_sensitive_keyword(col_name, new_cat, "CONTAINS"):
+                                            st.toast(f"✅ Updated keyword '{col_name}' to category '{new_cat}'", icon="💾")
+                                    else:
+                                        # Add as new keyword
+                                        if self.add_sensitive_keyword(col_name, new_cat, "CONTAINS"):
+                                            st.toast(f"✅ Added new keyword '{col_name}' to category '{new_cat}'", icon="💾")
+                        
+                        # Clear edit state AFTER processing all edits to prevent infinite loop
+                        st.session_state["drill_down_editor"]["edited_rows"] = {} 
+                        # Rerun to refresh data
+                        st.rerun()
 
                 # Add Keyword Button (Drill-Down View)
                 if st.button("➕ Add Keyword", key="btn_add_kw_drill_btm"):
@@ -573,6 +751,32 @@ class AIClassificationPipelineService:
                 
                 if st.session_state.get('kw_action_drill') == 'add':
                     self._render_keyword_actions("drill")
+
+                st.divider()
+
+                # Active Governance Rules Reference (Direct Display)
+                st.markdown("#### 📜 Active Classification Rules")
+                try:
+                    schema_fqn = self._resolve_governance_schema()
+                    query = f"""
+                        SELECT sc.category_name as "Category", 
+                               sk.keyword_string as "Keyword", 
+                               sk.match_type as "Match Type"
+                        FROM {schema_fqn}.SENSITIVITY_CATEGORIES sc 
+                        LEFT JOIN {schema_fqn}.SENSITIVE_KEYWORDS sk 
+                            ON sc.category_id = sk.category_id
+                        WHERE sc.IS_ACTIVE = TRUE 
+                          AND (sk.IS_ACTIVE = TRUE OR sk.IS_ACTIVE IS NULL)
+                        ORDER BY sc.category_name, sk.keyword_string
+                    """
+                    rules_data = snowflake_connector.execute_query(query)
+                    
+                    if rules_data:
+                        st.dataframe(pd.DataFrame(rules_data), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No active governance rules found.")
+                except Exception as e:
+                    st.error(f"Failed to load governance rules: {e}")
 
                 # --- Tagging Assistant ---
                 st.divider()
@@ -644,7 +848,7 @@ class AIClassificationPipelineService:
                             pass
 
                     st.markdown("###### Select Tags")
-                    c1, c2, c3, c4 = st.columns(4)
+                    c1, c2, c3, c4, c5 = st.columns([1,1,1,1,2])
                     with c1:
                         t_class = st.selectbox("Classification", ["Public", "Internal", "Restricted", "Confidential"], index=def_class_ix, key="tag_class")
                     with c2:
@@ -653,6 +857,11 @@ class AIClassificationPipelineService:
                         t_int = st.selectbox("Integrity (I)", ["0", "1", "2", "3"], index=def_i_ix, key="tag_int")
                     with c4:
                         t_avail = st.selectbox("Availability (A)", ["0", "1", "2", "3"], index=def_a_ix, key="tag_avail")
+                    with c5:
+                        compliance_frameworks = st.multiselect("Compliance Frameworks", 
+                            ["PII", "SOX", "SOC2"],
+                            default=[],
+                            key="tag_compliance")
                         
                     tags_to_apply = {
                         "DATA_CLASSIFICATION": t_class,
@@ -660,6 +869,10 @@ class AIClassificationPipelineService:
                         "INTEGRITY_LEVEL": t_int,
                         "AVAILABILITY_LEVEL": t_avail
                     }
+                    
+                    # Add compliance frameworks if any selected
+                    if compliance_frameworks:
+                        tags_to_apply["COMPLIANCE_FRAMEWORKS"] = ",".join(compliance_frameworks)
 
                 with tag_tab1:
                     if st.button("Generate SQL", key="btn_gen_sql"):
@@ -718,6 +931,38 @@ class AIClassificationPipelineService:
             st.dataframe(top_tables, use_container_width=True)
 
 
+    def _check_keyword_exists(self, keyword: str) -> bool:
+        """Check if a keyword exists in the SENSITIVE_KEYWORDS table.
+        
+        Args:
+            keyword: The keyword to check
+            
+        Returns:
+            bool: True if the keyword exists, False otherwise
+        """
+        try:
+            schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
+            gov_db = resolve_governance_db()
+            if gov_db:
+                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+            
+            # Check if keyword exists in any category
+            result = snowflake_connector.execute_query(
+                f"""
+                SELECT 1 
+                FROM {schema_fqn}.SENSITIVE_KEYWORDS 
+                WHERE LOWER(KEYWORD_STRING) = LOWER(%(k)s)
+                LIMIT 1
+                """,
+                {"k": keyword}
+            )
+            
+            return bool(result and len(result) > 0)
+            
+        except Exception as e:
+            logger.error(f"Error checking if keyword exists: {e}")
+            return False
+
     def _render_keyword_actions(self, context_key: str) -> None:
         """Render the inline keyword action form based on session state."""
         action_key = f'kw_action_{context_key}'
@@ -734,7 +979,6 @@ class AIClassificationPipelineService:
             with c1:
                 new_keyword = st.text_input("Keyword", placeholder="e.g. 'project_falcon'", key=f"kw_input_{context_key}")
             with c2:
-                # Get categories
                 categories = sorted(list(self._category_thresholds.keys())) if self._category_thresholds else ["PII", "SOX", "SOC2", "INTERNAL"]
                 target_category = st.selectbox("Category", categories, key=f"kw_cat_{context_key}")
             with c3:
@@ -742,28 +986,40 @@ class AIClassificationPipelineService:
             with c4:
                 st.write("")
                 st.write("")
-                # Close button
                 if st.button("❌", key=f"btn_close_{context_key}"):
                     st.session_state[action_key] = None
                     st.rerun()
 
-            if st.button("Save Keyword", key=f"btn_save_{context_key}", type="primary"):
+            # Add sensitivity weight slider
+            sensitivity_weight = st.slider(
+                "Sensitivity Weight", 
+                min_value=0.0, 
+                max_value=10.0, 
+                value=0.8, 
+                step=0.1,
+                help="Higher values indicate more sensitive data (0.0 = lowest, 10.0 = highest)",
+                key=f"kw_weight_{context_key}"
+            )
+
+            if st.button("💾 Save Keyword", key=f"btn_save_{context_key}", type="primary"):
                 if new_keyword and target_category:
                     with st.spinner("Saving..."):
-                        success = False
-                        if current_action == 'add':
-                            success = self.add_sensitive_keyword(new_keyword, target_category, match_type)
-                        else:
-                            success = self.upsert_sensitive_keyword(new_keyword, target_category, match_type)
+                        # ALWAYS use upsert - updates if exists, inserts if not
+                        success = self.upsert_sensitive_keyword(
+                            keyword=new_keyword, 
+                            category_name=target_category, 
+                            match_type=match_type,
+                            sensitivity_weight=sensitivity_weight
+                        )
                             
                         if success:
-                            st.success(f"Successfully saved keyword '{new_keyword}'!")
-                            st.session_state[action_key] = None # Close form on success
+                            st.success(f"✅ Successfully saved '{new_keyword}' (Weight: {sensitivity_weight})!")
+                            st.session_state[action_key] = None
                             st.rerun()
                         else:
-                            st.error("Failed to save keyword. It may already exist (if adding) or there was a database error.")
+                            st.error("❌ Failed to save keyword. Check logs for details.")
                 else:
-                    st.warning("Please enter a keyword and select a category.")
+                    st.warning("⚠️ Please enter a keyword and select a category.")
             st.divider()
 
     def _get_active_database(self) -> Optional[str]:
@@ -816,7 +1072,6 @@ class AIClassificationPipelineService:
             rows = snowflake_connector.execute_query("SELECT CURRENT_DATABASE() AS DB") or []
             if rows:
                 first = rows[0]
-                # Support both dict-style and scalar results from the connector
                 if isinstance(first, dict):
                     db = first.get("DB")
                 else:
@@ -832,7 +1087,6 @@ class AIClassificationPipelineService:
             logger.warning("No database configured - attempting to list available databases...")
             rows = snowflake_connector.execute_query("SHOW DATABASES") or []
             if rows:
-                # Filter out system databases, tolerate non-dict row types
                 user_dbs = []
                 for r in rows:
                     name = None
@@ -848,19 +1102,15 @@ class AIClassificationPipelineService:
                     user_dbs.append(name_str)
                 if user_dbs:
                     db = user_dbs[0]
-                    logger.warning(f"Auto-selected first available database: {db}")
-                    logger.warning("⚠️  PLEASE SET A DATABASE IN GLOBAL FILTERS!")
+                    logger.info(f"ℹ️ Auto-selected database: {db}")
                     return db
         except Exception as e:
             logger.error(f"Could not list databases: {e}")
 
-        # FINAL FALLBACK: Return None and let calling code handle it
+        # FINAL FALLBACK
         logger.error("=" * 80)
         logger.error("CRITICAL: NO DATABASE CONFIGURED!")
-        logger.error("Please set a database using one of these methods:")
-        logger.error("  1. Use the Global Filters sidebar in the UI")
-        logger.error("  2. Run: USE DATABASE your_database_name; in Snowflake")
-        logger.error("  3. Set SNOWFLAKE_DATABASE in settings")
+        logger.error("Please set a database using Global Filters or settings")
         logger.error("=" * 80)
         return None
 
@@ -1115,20 +1365,542 @@ class AIClassificationPipelineService:
             self._embed_backend = 'none'
             self._embed_ready = False
 
-        # Load ALL metadata from governance tables (100% metadata-driven)
-        self._load_metadata_driven_categories()
+        # Load ALL metadata from governance views (100% data-driven)
+        self._load_view_based_governance_rules()
+
+    def _load_view_based_governance_rules(self) -> None:
+        """
+        Load ALL classification rules from Snowflake views.
         
-        # Load business glossary map from SENSITIVE_KEYWORDS table
-        schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
-        gov_db = None
+        This method loads rules from the following views:
+        - VW_CLASSIFICATION_RULES: Base keyword and pattern rules
+        - VW_CONTEXT_AWARE_RULES: Context-aware adjustment rules
+        - VW_TIEBREAKER_KEYWORDS: Intelligent tiebreaking keywords
+        - VW_ADDRESS_CONTEXT_INDICATORS: Physical vs network address detection
+        - VW_EXCLUSION_PATTERNS: Non-sensitive field patterns
+        - VW_POLICY_GROUP_KEYWORDS: Keywords grouped by policy group
+        - VW_CATEGORY_METADATA: Complete category metadata
+        
+        All rules are derived dynamically from SENSITIVITY_CATEGORIES,
+        SENSITIVE_KEYWORDS, and SENSITIVE_PATTERNS tables.
+        """
+        if not self._rules_loader:
+            # Fallback: load directly from governance views when loader is unavailable
+            try:
+                self._load_view_based_governance_rules_direct()
+                return
+            except Exception as _e:
+                logger.warning(f"Governance rules loader not available and direct view load failed: {_e}")
+                return
+        
         try:
-            gov_db = resolve_governance_db()
-            if gov_db:
-                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+            logger.info("Loading view-based governance rules from Snowflake...")
+            
+            # Load all rules from views
+            self._classification_rules = self._rules_loader.load_classification_rules()
+            self._context_aware_rules = self._rules_loader.load_context_aware_rules()
+            self._tiebreaker_keywords = self._rules_loader.load_tiebreaker_keywords()
+            self._address_context_indicators = self._rules_loader.load_address_context_indicators()
+            self._exclusion_patterns = self._rules_loader.load_exclusion_patterns()
+            self._policy_group_keywords = self._rules_loader.load_policy_group_keywords()
+            self._category_metadata = self._rules_loader.load_category_metadata()
+            
+            # Mark as loaded
+            self._view_based_rules_loaded = True
+            
+            # Log summary
+            logger.info(f"✓ Loaded {len(self._classification_rules)} classification rules")
+            logger.info(f"✓ Loaded {sum(len(v) for v in self._context_aware_rules.values())} context-aware rules across {len(self._context_aware_rules)} types")
+            logger.info(f"✓ Loaded {sum(len(v) for v in self._tiebreaker_keywords.values())} tiebreaker keywords across {len(self._tiebreaker_keywords)} policy groups")
+            logger.info(f"✓ Loaded {len(self._address_context_indicators)} address context indicators")
+            logger.info(f"✓ Loaded {len(self._exclusion_patterns)} exclusion patterns")
+            logger.info(f"✓ Loaded {sum(len(v) for v in self._policy_group_keywords.values())} policy group keywords")
+            logger.info(f"✓ Loaded {len(self._category_metadata)} category metadata records")
+            
+            # Update legacy data structures for backward compatibility
+            self._update_legacy_structures_from_views()
+            
+            # Generate centroids for semantic search
+            self._generate_centroids_from_view_data()
+            
+        except Exception as e:
+            logger.error(f"Failed to load view-based governance rules: {e}")
+            logger.exception(e)
+            self._view_based_rules_loaded = False
+
+    def _update_legacy_structures_from_views(self) -> None:
+        """
+        Update legacy data structures from view-based rules for backward compatibility.
+        
+        This ensures existing code that relies on the old structure continues to work
+        while we transition to the new view-based architecture.
+        """
+        try:
+            # Initialize legacy structures
+            self._category_keywords = {}
+            self._category_patterns = {}
+            self._category_keyword_metadata = {}
+            self._category_pattern_metadata = {}
+            self._category_ids = {}
+
+            # Populate keywords and patterns from classification rules
+            for rule in self._classification_rules:
+                cat_name = rule.get('CATEGORY_NAME', '').strip()
+                if not cat_name:
+                    continue
+                
+                # Initialize lists if needed
+                if cat_name not in self._category_keywords:
+                    self._category_keywords[cat_name] = []
+                    self._category_keyword_metadata[cat_name] = []
+                if cat_name not in self._category_patterns:
+                    self._category_patterns[cat_name] = []
+                    self._category_pattern_metadata[cat_name] = []
+                
+                rule_type = rule.get('RULE_TYPE', '').upper()
+                pattern = rule.get('RULE_PATTERN', '').strip()
+                weight = float(rule.get('RULE_WEIGHT', 1.0))
+                
+                if rule_type == 'KEYWORD':
+                    kw = pattern.lower()
+                    if kw:
+                        self._category_keywords[cat_name].append(kw)
+                        self._category_keyword_metadata[cat_name].append({
+                            'keyword': kw,
+                            'weight': weight,
+                            'match_type': rule.get('MATCH_TYPE', 'CONTAINS').upper(),
+                            'sensitivity_type': 'STANDARD',
+                            'score': weight,
+                        })
+                elif rule_type == 'PATTERN':
+                    if pattern:
+                        self._category_patterns[cat_name].append(pattern)
+                        self._category_pattern_metadata[cat_name].append({
+                            'pattern': pattern,
+                            'weight': weight,
+                            'sensitivity_type': 'STANDARD',
+                        })
+
+            # Update category metadata from views
+            for cat_name, metadata in self._category_metadata.items():
+                # Update thresholds
+                self._category_thresholds[cat_name] = metadata.get('detection_threshold', 0.5)
+                
+                # Update scoring weights (normalize keys to w_sem/w_kw/w_pat)
+                self._category_scoring_weights[cat_name] = {
+                    'w_sem': float(metadata.get('weight_embedding', 0.6)),
+                    'w_kw': float(metadata.get('weight_keyword', 0.25)),
+                    'w_pat': float(metadata.get('weight_pattern', 0.15)),
+                }
+                
+                # Update multi-label flag
+                self._category_multi_label[cat_name] = metadata.get('multi_label', True)
+                
+                # Update policy group mapping
+                policy_group = metadata.get('policy_group', '')
+                if policy_group:
+                    self._policy_group_by_category[cat_name] = policy_group
+                    
+                # Update category IDs
+                if metadata.get('category_id'):
+                    self._category_ids[cat_name] = metadata.get('category_id')
+            
+            # Update business glossary from policy group keywords
+            for policy_group, keywords in self._policy_group_keywords.items():
+                for kw_data in keywords:
+                    keyword = kw_data.get('keyword', '')
+                    category = kw_data.get('category', policy_group)
+                    if keyword and category:
+                        self._business_glossary_map[keyword.lower()] = category.upper()
+            
+            logger.debug("Updated legacy data structures from view-based rules")
+            
+        except Exception as e:
+            logger.warning(f"Failed to update legacy structures from views: {e}")
+
+    def _generate_centroids_from_view_data(self) -> None:
+        """
+        Generate category centroids from loaded view-based data.
+        This is required for the semantic search (E5-Large) to work.
+        """
+        try:
+            logger.info("Generating category centroids from view-based data...")
+            centroids: Dict[str, Any] = {}
+            tokens_out: Dict[str, List[str]] = {}
+            
+            for cat_name, metadata in self._category_metadata.items():
+                description = metadata.get('description', '')
+                
+                # Get keywords and patterns for this category
+                kws = self._category_keywords.get(cat_name, [])
+                pats = self._category_patterns.get(cat_name, [])
+                
+                # Generate tokens
+                combined_text = f"{description} {' '.join(kws[:50])}"
+                if not description:
+                    combined_text = f"{cat_name} {' '.join(kws[:50])} {' '.join(pats[:20])}"
+                
+                try:
+                    toks = self._generate_category_tokens(cat_name, combined_text)
+                    tokens_out[cat_name] = toks or []
+                except Exception:
+                    tokens_out[cat_name] = []
+                
+                # Generate centroid
+                try:
+                    if self._embedder is not None and np is not None and self._embed_backend == 'sentence-transformers':
+                        base_def = description if description else cat_name
+                        if kws:
+                            base_def += f" This includes: {', '.join(kws[:15])}."
+                        if pats:
+                            base_def += f" Patterns: {', '.join(pats[:10])}."
+                        
+                        passage_text = f"passage: {base_def}"
+                        centroid_vec = self._embedder.encode([passage_text], normalize_embeddings=True)[0]
+                        norm = float(np.linalg.norm(centroid_vec) or 0.0)
+                        if norm > 0:
+                            centroid_vec = centroid_vec / norm
+                            centroids[cat_name] = centroid_vec
+                        else:
+                            centroids[cat_name] = None
+                    else:
+                        # Synthetic centroid fallback
+                        sc = self._synthetic_centroid(f"{cat_name} {' '.join(kws[:50])} {' '.join(pats[:20])}")
+                        centroids[cat_name] = sc
+                except Exception as e:
+                    logger.warning(f"Failed to generate centroid for {cat_name}: {e}")
+                    centroids[cat_name] = None
+
+            self._category_centroids = centroids
+            self._category_tokens = tokens_out
+            
+            # Update stats
+            try:
+                st.session_state["_pipe_cat_count"] = len([c for c in self._category_centroids.values() if c is not None])
+                st.session_state["_pipe_tok_count"] = sum(len(v) for v in self._category_tokens.values())
+            except Exception:
+                pass
+                
+            logger.info(f"✓ Generated centroids for {len(centroids)} categories")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate centroids: {e}")
+
+    def _resolve_governance_schema(self) -> str:
+        """
+        Resolve the fully-qualified governance schema to <DB>.DATA_CLASSIFICATION_GOVERNANCE.
+        DB priority:
+        1) Global Filters / session_state (selected_governance_db, governance_db, selected_database, database)
+        2) resolve_governance_db()
+        3) CURRENT_DATABASE()
+        Returns schema FQN string.
+        """
+        schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
+        db_candidate = None
+        # 1) Try Streamlit Global Filters (session_state)
+        try:
+            ss = getattr(st, 'session_state', {})
+            if isinstance(ss, dict):
+                db_candidate = (
+                    ss.get('selected_governance_db') or
+                    (ss.get('global_filters') or {}).get('governance_db') or
+                    ss.get('governance_db') or
+                    ss.get('selected_database') or
+                    ss.get('database') or
+                    ss.get('db')
+                )
         except Exception:
             pass
+        # 2) Fallback to resolver
+        if not db_candidate:
+            try:
+                db_candidate = resolve_governance_db()
+            except Exception:
+                db_candidate = None
+        # 3) Fallback to CURRENT_DATABASE()
+        if not db_candidate:
+            try:
+                row = snowflake_connector.execute_query("SELECT CURRENT_DATABASE() AS DB")
+                if row:
+                    r0 = row[0]
+                    if isinstance(r0, dict):
+                        db_candidate = r0.get('DB')
+                    else:
+                        db_candidate = r0[0]
+            except Exception:
+                db_candidate = None
+        # Build FQN and attempt to USE DATABASE
+        if db_candidate:
+            try:
+                snowflake_connector.execute_non_query(f"USE DATABASE {db_candidate}")
+            except Exception:
+                pass
+            schema_fqn = f"{db_candidate}.DATA_CLASSIFICATION_GOVERNANCE"
+        # Store for diagnostics
+        try:
+            st.session_state["_pipe_schema_fqn"] = schema_fqn
+        except Exception:
+            pass
+        return schema_fqn
+
+
+    def _map_category_to_policy_group(self, category_name: str) -> str:
+        """
+        Map category name to its policy group (PII/SOX/SOC2).
         
-        self._load_business_glossary_from_governance(schema_fqn)
+        This method is CRITICAL for the keyword validation layer to work correctly.
+        It determines which policy group a category belongs to so that
+        misclassified keywords can be corrected.
+        
+        Args:
+            category_name: Name of the sensitivity category
+            
+        Returns:
+            Policy group name (PII, SOX, SOC2) or empty string if not found
+        """
+        try:
+            cat_upper = category_name.upper()
+            
+            # Option 1: Check the loaded mapping from governance tables
+            # This is populated during _load_view_based_governance_rules_direct()
+            if hasattr(self, '_policy_group_by_category') and self._policy_group_by_category:
+                policy_group = self._policy_group_by_category.get(cat_upper, '')
+                if policy_group:
+                    logger.debug(f"Mapped category '{category_name}' to policy group '{policy_group}' via _policy_group_by_category")
+                    return policy_group.upper()
+            
+            # Option 2: Check category metadata (loaded from VW_CATEGORY_METADATA)
+            if hasattr(self, '_category_metadata') and self._category_metadata:
+                metadata = self._category_metadata.get(cat_upper, {})
+                policy_group = metadata.get('policy_group', '')
+                if policy_group:
+                    logger.debug(f"Mapped category '{category_name}' to policy group '{policy_group}' via _category_metadata")
+                    return policy_group.upper()
+            
+            # Option 3: Direct match - assume category name IS the policy group
+            # This works for categories named 'PII', 'SOX', 'SOC2'
+            if cat_upper in {'PII', 'SOX', 'SOC2'}:
+                logger.debug(f"Mapped category '{category_name}' to policy group '{cat_upper}' via direct match")
+                return cat_upper
+            
+            # Option 4: Check if category name CONTAINS policy group
+            # Handles cases like 'PII_SENSITIVE', 'SOX_FINANCIAL', etc.
+            for pg in ['PII', 'SOX', 'SOC2']:
+                if pg in cat_upper:
+                    logger.debug(f"Mapped category '{category_name}' to policy group '{pg}' via substring match")
+                    return pg
+            
+            logger.warning(f"Could not map category '{category_name}' to any policy group (PII/SOX/SOC2)")
+            return ''
+            
+        except Exception as e:
+            logger.error(f"Error mapping category '{category_name}' to policy group: {e}")
+            return ''
+
+    def _load_view_based_governance_rules_direct(self) -> None:
+        """Directly load governance rules from Snowflake VW_* views when a rules loader is not provided."""
+        # Resolve governance schema
+        schema_fqn = self._resolve_governance_schema()
+        try:
+            st.session_state["_pipe_view_loader"] = "direct"
+            st.session_state["_pipe_schema_fqn"] = schema_fqn
+        except Exception:
+            pass
+
+        # Fetch category metadata
+        meta_rows = []
+        try:
+            meta_rows = snowflake_connector.execute_query(
+                f"""
+                SELECT 
+                    CATEGORY_ID,
+                    CATEGORY_NAME,
+                    COALESCE(DESCRIPTION,'') AS DESCRIPTION,
+                    COALESCE(DETECTION_THRESHOLD,0.45) AS DETECTION_THRESHOLD,
+                    COALESCE(WEIGHT_EMBEDDING,0.60) AS WEIGHT_EMBEDDING,
+                    COALESCE(WEIGHT_KEYWORD,0.25) AS WEIGHT_KEYWORD,
+                    COALESCE(WEIGHT_PATTERN,0.15) AS WEIGHT_PATTERN,
+                    COALESCE(MULTI_LABEL,TRUE) AS MULTI_LABEL,
+                    POLICY_GROUP
+                FROM {schema_fqn}.VW_CATEGORY_METADATA
+                """
+            ) or []
+        except Exception:
+            meta_rows = []
+
+        # Fetch flat rules (keywords/patterns)
+        rules_rows = []
+        try:
+            rules_rows = snowflake_connector.execute_query(
+                f"""
+                SELECT 
+                    CATEGORY_NAME,
+                    RULE_TYPE,
+                    RULE_PATTERN,
+                    COALESCE(RULE_WEIGHT,1.0) AS RULE_WEIGHT,
+                    COALESCE(MATCH_TYPE,'CONTAINS') AS MATCH_TYPE
+                FROM {schema_fqn}.VW_CLASSIFICATION_RULES
+                """
+            ) or []
+        except Exception:
+            rules_rows = []
+
+        # Diagnostics
+        try:
+            st.session_state["_pipe_meta_rows"] = len(meta_rows)
+            st.session_state["_pipe_rules_rows"] = len(rules_rows)
+        except Exception:
+            pass
+
+        # Build metadata structures
+        meta: Dict[str, Dict[str, Any]] = {}
+        category_descriptions: Dict[str, str] = {}
+        category_ids: Dict[str, Any] = {}
+        self._category_thresholds = {}
+        self._category_default_thresholds = {}
+        self._category_weights = {}
+        self._policy_group_by_category = {}
+        self._category_scoring_weights = {}
+        self._category_multi_label = {}
+        self._category_colors = {}
+
+        for r in meta_rows:
+            if not isinstance(r, dict):
+                continue
+            name = str(r.get("CATEGORY_NAME") or "").strip()
+            desc = str(r.get("DESCRIPTION") or "").strip()
+            if not name:
+                continue
+            meta[name] = {
+                'category_id': r.get('CATEGORY_ID'),
+                'description': desc,
+                'detection_threshold': float(r.get('DETECTION_THRESHOLD') or 0.45),
+                'weight_embedding': float(r.get('WEIGHT_EMBEDDING') or 0.60),
+                'weight_keyword': float(r.get('WEIGHT_KEYWORD') or 0.25),
+                'weight_pattern': float(r.get('WEIGHT_PATTERN') or 0.15),
+                'multi_label': bool(r.get('MULTI_LABEL', True)),
+                'policy_group': r.get('POLICY_GROUP'),
+            }
+            category_descriptions[name] = desc
+            category_ids[name] = r.get('CATEGORY_ID')
+            self._category_thresholds[name] = float(r.get('DETECTION_THRESHOLD') or 0.45)
+            self._category_default_thresholds[name] = float(r.get('DETECTION_THRESHOLD') or 0.45)
+            self._category_weights[name] = 1.0
+            pg = str(r.get('POLICY_GROUP') or '').upper()
+            if pg:
+                self._policy_group_by_category[name.upper()] = pg
+            self._category_scoring_weights[name] = {
+                'w_sem': float(r.get('WEIGHT_EMBEDDING') or 0.60),
+                'w_kw': float(r.get('WEIGHT_KEYWORD') or 0.25),
+                'w_pat': float(r.get('WEIGHT_PATTERN') or 0.15),
+            }
+            self._category_multi_label[name] = bool(r.get('MULTI_LABEL', True))
+            if pg == 'PII':
+                self._category_colors[name.upper()] = "#FF5733"
+            elif pg == 'SOX':
+                self._category_colors[name.upper()] = "#FFA500"
+            elif pg == 'SOC2':
+                self._category_colors[name.upper()] = "#4169E1"
+            else:
+                self._category_colors[name.upper()] = "#808080"
+
+        # Group rules
+        keywords_by_category: Dict[str, List[str]] = {c: [] for c in category_descriptions.keys()}
+        keyword_metadata_by_category: Dict[str, List[Dict[str, Any]]] = {c: [] for c in category_descriptions.keys()}
+        patterns_by_category: Dict[str, List[str]] = {c: [] for c in category_descriptions.keys()}
+        pattern_metadata_by_category: Dict[str, List[Dict[str, Any]]] = {c: [] for c in category_descriptions.keys()}
+
+        for rr in rules_rows:
+            try:
+                rtype = str(rr.get('RULE_TYPE') or '').upper()
+                cat = str(rr.get('CATEGORY_NAME') or '').strip()
+                if not cat or cat not in keywords_by_category:
+                    continue
+                if rtype == 'KEYWORD':
+                    kw = str(rr.get('RULE_PATTERN') or '').strip().lower()
+                    if kw:
+                        keywords_by_category[cat].append(kw)
+                        keyword_metadata_by_category[cat].append({
+                            'keyword': kw,
+                            'weight': float(rr.get('RULE_WEIGHT', 1.0)),
+                            'match_type': str(rr.get('MATCH_TYPE', 'CONTAINS')).upper(),
+                            'sensitivity_type': 'STANDARD',
+                            'score': float(rr.get('RULE_WEIGHT', 1.0)),
+                        })
+                elif rtype == 'PATTERN':
+                    pat = str(rr.get('RULE_PATTERN') or '').strip()
+                    if pat:
+                        patterns_by_category[cat].append(pat)
+                        pattern_metadata_by_category[cat].append({
+                            'pattern': pat,
+                            'weight': float(rr.get('RULE_WEIGHT', 1.0)),
+                            'sensitivity_type': 'STANDARD',
+                        })
+            except Exception:
+                continue
+
+        # ========================================================================
+        # [REMOVED] KEYWORD VALIDATION (Relies on Database Only)
+        # ========================================================================
+
+
+        # Build centroids and tokens
+        centroids: Dict[str, Any] = {}
+        tokens_out: Dict[str, List[str]] = {}
+        for cat_name, description in category_descriptions.items():
+            kws = keywords_by_category.get(cat_name, [])
+            pats = patterns_by_category.get(cat_name, [])
+            combined_text = f"{description} {' '.join(kws[:50])}"
+            if not description:
+                # Fallback text from name + keywords + patterns
+                combined_text = f"{cat_name} {' '.join(kws[:50])} {' '.join(pats[:20])}"
+            try:
+                toks = self._generate_category_tokens(cat_name, combined_text)
+                tokens_out[cat_name] = toks or []
+            except Exception:
+                tokens_out[cat_name] = []
+            try:
+                if self._embedder is not None and np is not None and self._embed_backend == 'sentence-transformers':
+                    base_def = description if description else cat_name
+                    if kws:
+                        base_def += f" This includes: {', '.join(kws[:15])}."
+                    if pats:
+                        base_def += f" Patterns: {', '.join(pats[:10])}."
+                    # CRITICAL FIX: Add 'passage:' prefix for E5 asymmetric encoding
+                    # This must match the 'query:' prefix used in _semantic_scores_governance_driven
+                    passage_text = f"passage: {base_def}"
+                    centroid_vec = self._embedder.encode([passage_text], normalize_embeddings=True)[0]
+                    norm = float(np.linalg.norm(centroid_vec) or 0.0)
+                    if norm > 0:
+                        centroid_vec = centroid_vec / norm
+                        centroids[cat_name] = centroid_vec
+                    else:
+                        centroids[cat_name] = None
+                else:
+                    # Synthetic centroid fallback
+                    sc = self._synthetic_centroid(f"{cat_name} {' '.join(kws[:50])} {' '.join(pats[:20])}")
+                    centroids[cat_name] = sc
+            except Exception:
+                centroids[cat_name] = None
+
+        self._category_centroids = centroids
+        self._category_tokens = tokens_out
+        self._category_patterns = patterns_by_category
+        self._category_keywords = keywords_by_category
+        self._category_keyword_metadata = keyword_metadata_by_category
+        self._category_pattern_metadata = pattern_metadata_by_category
+        self._category_ids = category_ids
+        self._category_metadata = meta
+
+        try:
+            st.session_state["_pipe_cat_count"] = len([c for c in self._category_centroids.values() if c is not None])
+            st.session_state["_pipe_tok_count"] = sum(len(v) for v in self._category_tokens.values())
+        except Exception:
+            pass
+        self._view_based_rules_loaded = True
+
+        # If no centroids but embedder active, keep keyword-only scoring as safety (handled elsewhere)
+        return
 
     def _generate_category_examples(self, name: str, desc: str) -> List[str]:
         n = (name or "").strip()
@@ -1291,10 +2063,8 @@ class AIClassificationPipelineService:
     def get_category_id_by_name(self, category_name: str) -> Optional[str]:
         """Get category ID for a given category name."""
         try:
-            schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
-            gov_db = resolve_governance_db()
-            if gov_db:
-                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+            # Always use DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE
+            schema_fqn = "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE"
 
             rows = snowflake_connector.execute_query(
                 f"SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES WHERE LOWER(CATEGORY_NAME) = LOWER(%(n)s)",
@@ -1315,10 +2085,8 @@ class AIClassificationPipelineService:
     def _log_keyword_audit(self, action: str, keyword: str, category: str, details: str):
         """Log keyword changes to the audit table."""
         try:
-            schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
-            gov_db = resolve_governance_db()
-            if gov_db:
-                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+            # Always use DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE
+            schema_fqn = "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE"
             
             # Escape single quotes for SQL
             safe_details = details.replace("'", "''")
@@ -1341,10 +2109,9 @@ class AIClassificationPipelineService:
                 logger.error(f"Category '{category_name}' not found.")
                 return False
 
-            schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
-            gov_db = resolve_governance_db()
-            if gov_db:
-                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+
+            # Always use DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE
+            schema_fqn = "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE"
 
             # Check if keyword already exists
             existing = snowflake_connector.execute_query(
@@ -1376,54 +2143,146 @@ class AIClassificationPipelineService:
             logger.error(f"Failed to add keyword '{keyword}': {e}")
             return False
 
-    def upsert_sensitive_keyword(self, keyword: str, category_name: str, match_type: str = 'CONTAINS') -> bool:
-        """Upsert a sensitive keyword (Insert if new, Update if exists)."""
+    def upsert_sensitive_keyword(self, keyword: str, category_name: str, match_type: str = 'CONTAINS', sensitivity_weight: float = 0.8) -> bool:
+        """
+        Upsert a sensitive keyword (Insert if new, Update if exists).
+        
+        Args:
+            keyword: The keyword string to upsert
+            category_name: The category name (e.g., 'PII', 'SOX', 'SOC2')
+            match_type: Match type ('EXACT', 'CONTAINS', 'FUZZY', 'REGEX')
+            sensitivity_weight: Sensitivity weight (0.0 to 10.0)
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
         try:
+            logger.info(f"🔄 [UPSERT] Starting upsert for keyword='{keyword}', category='{category_name}', match_type='{match_type}', sensitivity_weight={sensitivity_weight}")
+            
+            # Step 1: Get category ID
             category_id = self.get_category_id_by_name(category_name)
             if not category_id:
-                logger.error(f"Category '{category_name}' not found.")
+                logger.error(f"❌ [UPSERT] Category '{category_name}' not found!")
                 return False
+            
+            logger.info(f"✅ [UPSERT] Found category_id={category_id} for category='{category_name}'")
 
-            schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
-            gov_db = resolve_governance_db()
-            if gov_db:
-                schema_fqn = f"{gov_db}.DATA_CLASSIFICATION_GOVERNANCE"
+            # Step 2: ALWAYS use DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE
+            schema_fqn = "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE"
+            
+            logger.info(f"📍 [UPSERT] Using schema: {schema_fqn}")
 
-            # Check if keyword exists
+            # Step 3: Check if keyword exists
+            logger.info(f"🔍 [UPSERT] Checking if keyword '{keyword}' exists for category_id={category_id}...")
+            
             existing = snowflake_connector.execute_query(
-                f"SELECT KEYWORD_ID FROM {schema_fqn}.SENSITIVE_KEYWORDS WHERE LOWER(KEYWORD_STRING) = LOWER(%(k)s) AND CATEGORY_ID = %(c)s",
+                f"SELECT KEYWORD_ID, VERSION_NUMBER FROM {schema_fqn}.SENSITIVE_KEYWORDS WHERE LOWER(KEYWORD_STRING) = LOWER(%(k)s) AND CATEGORY_ID = %(c)s",
                 {"k": keyword, "c": category_id}
             )
             
+            # Step 4: Escape special characters
             safe_keyword = keyword.replace("'", "''")
             safe_match_type = match_type.replace("'", "''")
 
-            if existing:
-                # Update
+            if existing and len(existing) > 0:
+                # UPDATE path
+                existing_record = existing[0]
+                keyword_id = existing_record.get('KEYWORD_ID')
+                current_version = existing_record.get('VERSION_NUMBER', 1)
+                new_version = current_version + 1
+                
+                logger.info(f"📝 [UPSERT] Keyword EXISTS (keyword_id={keyword_id}, version={current_version})")
+                logger.info(f"🔧 [UPSERT] Executing UPDATE...")
+                
+                # UPDATE using ONLY SENSITIVITY_WEIGHT
                 query = f"""
                     UPDATE {schema_fqn}.SENSITIVE_KEYWORDS 
-                    SET MATCH_TYPE = '{safe_match_type}', IS_ACTIVE = TRUE, SENSITIVITY_WEIGHT = 0.8
-                    WHERE LOWER(KEYWORD_STRING) = LOWER('{safe_keyword}') AND CATEGORY_ID = '{category_id}'
+                    SET 
+                        MATCH_TYPE = '{safe_match_type}',
+                        SENSITIVITY_WEIGHT = {sensitivity_weight},
+                        IS_ACTIVE = TRUE,
+                        UPDATED_BY = CURRENT_USER(),
+                        UPDATED_AT = CURRENT_TIMESTAMP(),
+                        VERSION_NUMBER = {new_version}
+                    WHERE KEYWORD_ID = '{keyword_id}'
                 """
-                snowflake_connector.execute_non_query(query)
+                
+                logger.info(f"📋 [UPSERT] Query: {query[:150]}...")
+                
+                try:
+                    snowflake_connector.execute_non_query(query)
+                    logger.info(f"✅ [UPSERT] UPDATE successful! Version {current_version} → {new_version}")
+                except Exception as update_error:
+                    logger.error(f"❌ [UPSERT] UPDATE failed: {update_error}")
+                    # Try without UPDATED_BY column (fallback)
+                    query_fallback = f"""
+                        UPDATE {schema_fqn}.SENSITIVE_KEYWORDS 
+                        SET 
+                            MATCH_TYPE = '{safe_match_type}',
+                            SENSITIVITY_WEIGHT = {sensitivity_weight},
+                            IS_ACTIVE = TRUE,
+                            UPDATED_AT = CURRENT_TIMESTAMP(),
+                            VERSION_NUMBER = {new_version}
+                        WHERE KEYWORD_ID = '{keyword_id}'
+                    """
+                    logger.info(f"🔄 [UPSERT] Trying fallback UPDATE without UPDATED_BY...")
+                    snowflake_connector.execute_non_query(query_fallback)
+                    logger.info(f"✅ [UPSERT] Fallback UPDATE successful!")
+                
                 # Audit
-                self._log_keyword_audit("UPDATE_KEYWORD", keyword, category_name, f"Updated keyword '{keyword}' in category '{category_name}'")
+                self._log_keyword_audit("UPDATE_KEYWORD", keyword, category_name, 
+                    f"Updated keyword '{keyword}' in category '{category_name}' with match_type={match_type}, sensitivity_weight={sensitivity_weight}")
             else:
-                # Insert
+                # INSERT path
+                logger.info(f"➕ [UPSERT] Keyword does NOT exist. Executing INSERT...")
+                
+                # INSERT using ONLY SENSITIVITY_WEIGHT
                 query = f"""
                     INSERT INTO {schema_fqn}.SENSITIVE_KEYWORDS 
-                    (KEYWORD_ID, CATEGORY_ID, KEYWORD_STRING, MATCH_TYPE, SENSITIVITY_WEIGHT, IS_ACTIVE, CREATED_BY)
-                    VALUES (UUID_STRING(), '{category_id}', '{safe_keyword}', '{safe_match_type}', 0.8, TRUE, CURRENT_USER())
+                    (
+                        KEYWORD_ID, 
+                        CATEGORY_ID, 
+                        KEYWORD_STRING, 
+                        MATCH_TYPE, 
+                        SENSITIVITY_WEIGHT,
+                        IS_ACTIVE,
+                        CREATED_BY,
+                        CREATED_AT,
+                        VERSION_NUMBER
+                    )
+                    VALUES (
+                        UUID_STRING(), 
+                        '{category_id}', 
+                        '{safe_keyword}', 
+                        '{safe_match_type}', 
+                        {sensitivity_weight},
+                        TRUE,
+                        CURRENT_USER(),
+                        CURRENT_TIMESTAMP(),
+                        1
+                    )
                 """
+                
+                logger.info(f"📋 [UPSERT] Query: {query[:150]}...")
                 snowflake_connector.execute_non_query(query)
+                logger.info(f"✅ [UPSERT] INSERT successful!")
+                
                 # Audit
-                self._log_keyword_audit("ADD_KEYWORD", keyword, category_name, f"Added keyword '{keyword}' to category '{category_name}' via upsert")
+                self._log_keyword_audit("ADD_KEYWORD", keyword, category_name, 
+                    f"Added keyword '{keyword}' to category '{category_name}' via upsert with match_type={match_type}, sensitivity_weight={sensitivity_weight}")
 
-            # Refresh local cache
+            # Step 5: Refresh cache
+            logger.info(f"🔄 [UPSERT] Refreshing local cache...")
             self._load_metadata_driven_categories()
+            logger.info(f"✅ [UPSERT] Cache refreshed!")
+            
+            logger.info(f"🎉 [UPSERT] COMPLETE! Keyword '{keyword}' successfully upserted to category '{category_name}'")
             return True
+            
         except Exception as e:
-            logger.error(f"Failed to upsert keyword '{keyword}': {e}")
+            logger.error(f"❌ [UPSERT] FAILED with exception: {e}")
+            import traceback
+            logger.error(f"📋 [UPSERT] Full traceback:\n{traceback.format_exc()}")
             return False
 
     def classify_texts(self, texts: List[str], context: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -1485,6 +2344,49 @@ class AIClassificationPipelineService:
             logger.error(f"classify_texts failed: {e}")
             return {'categories': {}, 'overall_confidence': 0.0}
 
+    def _should_exclude_column(self, column_name: str) -> Tuple[bool, str]:
+        """
+        Check if a column should be excluded from classification.
+        
+        Args:
+            column_name: Name of the column to check
+            
+        Returns:
+            Tuple of (should_exclude: bool, reason: str)
+        """
+        if not column_name:
+            return (False, "")
+            
+        col_lower = column_name.lower().strip()
+        
+        # Check if exclusion patterns are loaded
+        if not hasattr(self, '_exclusion_patterns') or not self._exclusion_patterns:
+            return (False, "")
+        
+        # Check exact matches first (faster)
+        if col_lower in self._exclusion_patterns.get('exact', []):
+            return (True, f"Exact match exclusion: '{column_name}'")
+        
+        # Check regex patterns
+        for pattern_info in self._exclusion_patterns.get('regex', []):
+            if isinstance(pattern_info, dict):
+                pattern = pattern_info.get('pattern', '')
+                reason = pattern_info.get('reason', 'Regex exclusion')
+            else:
+                # Fallback for simple string patterns
+                pattern = str(pattern_info)
+                reason = 'Regex exclusion'
+            
+            if pattern:
+                try:
+                    if re.search(pattern, col_lower, re.IGNORECASE):
+                        return (True, f"{reason} (pattern: {pattern})")
+                except Exception as e:
+                    logger.warning(f"Invalid exclusion regex pattern '{pattern}': {e}")
+                    continue
+        
+        return (False, "")
+
     def _load_metadata_driven_categories(self) -> None:
         """
         Load ALL categories, keywords, and patterns from Snowflake governance tables.
@@ -1499,6 +2401,224 @@ class AIClassificationPipelineService:
         logger.info("METADATA-DRIVEN CLASSIFICATION: Loading from governance tables")
         logger.info("=" * 80)
         
+        # ========================================================================
+        # PREFERRED PATH: Load from dynamic VIEWS via governance_rules_loader_v2
+        # ========================================================================
+        try:
+            if self._rules_loader is not None:
+                logger.info("Attempting view-based rule loading via governance_rules_loader_v2 ...")
+                meta = self._rules_loader.load_category_metadata(force_refresh=False) or {}
+                rules = self._rules_loader.load_classification_rules(force_refresh=False) or []
+                # Fallback: if loader returns nothing, try direct view loading
+                if not meta or not rules:
+                    logger.warning("Rules loader returned empty results; attempting direct VW_* view loading...")
+                    try:
+                        self._load_view_based_governance_rules_direct()
+                        # If direct load resulted in any centroids, stop here
+                        try:
+                            _vc = len([c for c in getattr(self, "_category_centroids", {}).values() if c is not None])
+                            if _vc > 0:
+                                logger.info(f"Direct view loading succeeded with {_vc} centroids. Skipping table-based fallback.")
+                                return
+                        except Exception:
+                            pass
+                    except Exception as _e:
+                        logger.warning(f"Direct view loading failed: {_e}")
+                if meta and rules:
+                    # Build category structures from metadata view
+                    self._category_thresholds = {}
+                    self._category_default_thresholds = {}
+                    self._category_weights = {}
+                    self._policy_group_by_category = {}
+                    self._category_scoring_weights = {}  # New: stores embedding/keyword/pattern weights
+                    self._category_multi_label = {}      # New: stores multi-label flag
+                    self._category_colors = {}
+                    category_descriptions: Dict[str, str] = {}
+                    category_ids: Dict[str, Any] = {}
+
+                    for cat_name_u, m in meta.items():
+                        try:
+                            cat_name = str(cat_name_u).strip()
+                            if not cat_name:
+                                continue
+                            desc = str(m.get('description') or '').strip()
+                            if not desc:
+                                logger.error(f"CRITICAL: Category '{cat_name}' has EMPTY DESCRIPTION in VW_CATEGORY_METADATA, skipping")
+                                continue
+                            category_descriptions[cat_name] = desc
+                            category_ids[cat_name] = m.get('category_id')
+                            self._category_thresholds[cat_name] = float(m.get('detection_threshold', 0.45))
+                            self._category_default_thresholds[cat_name] = float(m.get('detection_threshold', 0.45))
+                            self._category_weights[cat_name] = 1.0
+                            pg = str(m.get('policy_group') or '').upper()
+                            if pg:
+                                self._policy_group_by_category[cat_name.upper()] = pg
+                            self._category_scoring_weights[cat_name] = {
+                                'w_sem': float(m.get('weight_embedding', 0.60)),
+                                'w_kw': float(m.get('weight_keyword', 0.25)),
+                                'w_pat': float(m.get('weight_pattern', 0.15)),
+                            }
+                            self._category_multi_label[cat_name] = bool(m.get('multi_label', True))
+                            # derive colors from policy group
+                            if pg == 'PII':
+                                self._category_colors[cat_name.upper()] = "#FF5733"
+                            elif pg == 'SOX':
+                                self._category_colors[cat_name.upper()] = "#FFA500"
+                            elif pg == 'SOC2':
+                                self._category_colors[cat_name.upper()] = "#4169E1"
+                            else:
+                                self._category_colors[cat_name.upper()] = "#808080"
+                        except Exception as e:
+                            logger.debug(f"Error processing metadata for {cat_name_u}: {e}")
+                            continue
+
+                    # Group rules into keywords and patterns by category
+                    keywords_by_category: Dict[str, List[str]] = {c: [] for c in category_descriptions.keys()}
+                    keyword_metadata_by_category: Dict[str, List[Dict[str, Any]]] = {c: [] for c in category_descriptions.keys()}
+                    patterns_by_category: Dict[str, List[str]] = {c: [] for c in category_descriptions.keys()}
+                    pattern_metadata_by_category: Dict[str, List[Dict[str, Any]]] = {c: [] for c in category_descriptions.keys()}
+
+                    for r in rules:
+                        try:
+                            rtype = str(r.get('RULE_TYPE') or '').upper()
+                            cat = str(r.get('CATEGORY_NAME') or '').strip()
+                            if not cat or cat not in keywords_by_category:
+                                continue
+                            if rtype == 'KEYWORD':
+                                kw = str(r.get('RULE_PATTERN') or '').strip().lower()
+                                if kw:
+                                    keywords_by_category[cat].append(kw)
+                                    keyword_metadata_by_category[cat].append({
+                                        'keyword': kw,
+                                        'weight': float(r.get('RULE_WEIGHT', 1.0)),
+                                        'match_type': str(r.get('MATCH_TYPE', 'CONTAINS')).upper(),
+                                        'sensitivity_type': 'STANDARD',
+                                        'score': float(r.get('RULE_WEIGHT', 1.0)),
+                                    })
+                            elif rtype == 'PATTERN':
+                                pat = str(r.get('RULE_PATTERN') or '').strip()
+                                if pat:
+                                    patterns_by_category[cat].append(pat)
+                                    pattern_metadata_by_category[cat].append({
+                                        'pattern': pat,
+                                        'weight': float(r.get('RULE_WEIGHT', 1.0)),
+                                        'sensitivity_type': 'STANDARD',
+                                    })
+                        except Exception:
+                            continue
+
+                    # ========================================================================
+                    # CRITICAL FIX: Validate and correct keyword mappings (view-based path)
+                    # ========================================================================
+                    keywords_by_category, keyword_metadata_by_category = self._validate_and_correct_keyword_mappings(
+                        keywords_by_category, 
+                        keyword_metadata_by_category
+                    )
+
+                    # Build centroids/tokens using the same logic as the table path
+                    centroids: Dict[str, Any] = {}
+                    tokens_out: Dict[str, List[str]] = {}
+                    logger.info(f"Building centroids from view-based rules for {len(category_descriptions)} categories...")
+                    logger.info(f"Embedder available: {self._embedder is not None}")
+                    logger.info(f"NumPy available: {np is not None}")
+                    logger.info(f"Backend: {self._embed_backend}")
+
+                    for cat_name, description in category_descriptions.items():
+                        logger.info(f"\n  Processing category: {cat_name}")
+                        logger.info(f"    Description: '{description[:100]}...'")
+                        kws = keywords_by_category.get(cat_name, [])
+                        combined_text = f"{description} {' '.join(kws[:50])}"
+                        logger.info(f"    Keywords available: {len(kws)}")
+                        logger.info(f"    Combined text length: {len(combined_text)} chars")
+                        try:
+                            toks = self._generate_category_tokens(cat_name, combined_text)
+                            tokens_out[cat_name] = toks or []
+                        except Exception as e:
+                            logger.debug(f"Token generation failed for {cat_name}: {e}")
+                            tokens_out[cat_name] = []
+
+                        try:
+                            if self._embedder is not None and np is not None and self._embed_backend == 'sentence-transformers':
+                                category_definition = f"{description}"
+                                if kws:
+                                    category_definition += f" This includes: {', '.join(kws[:15])}."
+                                passage_text = f"passage: {category_definition}"
+                                centroid_vec = self._embedder.encode([passage_text], normalize_embeddings=True)[0]
+                                norm = float(np.linalg.norm(centroid_vec) or 0.0)
+                                if norm > 0:
+                                    centroid_vec = centroid_vec / norm
+                                    centroids[cat_name] = centroid_vec
+                                else:
+                                    centroids[cat_name] = None
+                            else:
+                                centroids[cat_name] = None
+                        except Exception as e:
+                            logger.debug(f"Centroid build failed for {cat_name}: {e}")
+                            centroids[cat_name] = None
+
+                    # Store results
+                    self._category_centroids = centroids
+                    self._category_tokens = tokens_out
+                    self._category_patterns = patterns_by_category
+                    self._category_keywords = keywords_by_category
+                    self._category_keyword_metadata = keyword_metadata_by_category
+                    self._category_pattern_metadata = pattern_metadata_by_category
+                    self._category_ids = category_ids
+
+                    # If embedder is active but no centroids built, try second-pass using only descriptions
+                    try:
+                        valid_centroids = len([c for c in self._category_centroids.values() if c is not None])
+                        if (self._embedder is not None and self._embed_backend == 'sentence-transformers' and valid_centroids == 0):
+                            logger.warning("Embedder active but no centroids built from view-based rules; retrying with descriptions only...")
+                            centroids2: Dict[str, Any] = {}
+                            for cat_name, description in category_descriptions.items():
+                                try:
+                                    passage_text = f"passage: {description}" if 'e5' in str(getattr(self, '_model_name', '')).lower() else description
+                                    vec = self._embedder.encode([passage_text], normalize_embeddings=True)[0]
+                                    norm = float(np.linalg.norm(vec) or 0.0)
+                                    centroids2[cat_name] = (vec / norm) if norm > 0 else None
+                                except Exception as e:
+                                    logger.debug(f"Second-pass centroid build failed for {cat_name}: {e}")
+                                    centroids2[cat_name] = None
+                            self._category_centroids = centroids2
+                            valid_centroids = len([c for c in self._category_centroids.values() if c is not None])
+                            logger.info(f"Second-pass centroid build complete: {valid_centroids} valid centroids")
+                        # If still zero, mark embeddings not ready and prefer keyword-only weighting
+                        if valid_centroids == 0:
+                            logger.error("CRITICAL: Embedder active but no category centroids are available. Switching to keyword-only scoring.")
+                            self._embed_ready = False
+                            try:
+                                self._using_fallback_categories = True
+                            except Exception:
+                                pass
+                            # Adjust global defaults as a safety net; category-specific weights remain
+                            self._w_sem = 0.0
+                            self._w_kw = 1.0
+                    except Exception:
+                        pass
+
+                    logger.info("View-based rule loading complete. Using governance views for classification.")
+                    # Load auxiliary rule sets from views for advanced scoring/tiebreaking
+                    try:
+                        self._context_aware_rules = self._rules_loader.load_context_aware_rules(force_refresh=False) or {}
+                        self._tiebreaker_keywords = self._rules_loader.load_tiebreaker_keywords(force_refresh=False) or {}
+                        self._address_context_indicators = self._rules_loader.load_address_context_indicators(force_refresh=False) or []
+                        self._exclusion_patterns = self._rules_loader.load_exclusion_patterns(force_refresh=False) or []
+                        self._policy_group_keywords = self._rules_loader.load_policy_group_keywords(force_refresh=False) or {}
+                        self._category_metadata = meta
+                        self._view_based_rules_loaded = True
+                    except Exception as e:
+                        logger.warning(f"Failed loading auxiliary view-based rules: {e}")
+                    try:
+                        st.session_state["_pipe_cat_count"] = len([c for c in centroids.values() if c is not None])
+                        st.session_state["_pipe_tok_count"] = sum(len(v) for v in tokens_out.values())
+                    except Exception:
+                        pass
+                    # Early return; skip table-based path
+                    return
+        except Exception as e:
+            logger.warning(f"View-based rule loading failed or not available, falling back to tables: {e}")
+
         # Resolve governance database
         schema_fqn = "DATA_CLASSIFICATION_GOVERNANCE"
         gov_db = None
@@ -1647,45 +2767,60 @@ class AIClassificationPipelineService:
         keyword_metadata_by_category: Dict[str, List[Dict[str, Any]]] = {cat: [] for cat in category_descriptions.keys()}
         
         try:
+            # JOIN query to fetch category + keyword info directly
             keywords_data = snowflake_connector.execute_query(
                 f"""
                 SELECT 
-                    c.CATEGORY_NAME,
-                    k.KEYWORD_STRING,
-                    COALESCE(k.SENSITIVITY_WEIGHT, 1.0) AS KEYWORD_WEIGHT,
-                    COALESCE(k.MATCH_TYPE, 'EXACT') AS MATCH_TYPE,
-                    'STANDARD' AS SENSITIVITY_TYPE,
-                    COALESCE(k.SENSITIVITY_WEIGHT, 1.0) AS SCORE
-                FROM {schema_fqn}.SENSITIVE_KEYWORDS k
-                JOIN {schema_fqn}.SENSITIVITY_CATEGORIES c
-                  ON k.CATEGORY_ID = c.CATEGORY_ID
-                WHERE COALESCE(k.IS_ACTIVE, true)
-                  AND COALESCE(c.IS_ACTIVE, true)
-                ORDER BY c.CATEGORY_NAME, k.KEYWORD_STRING
+                    sc.CATEGORY_ID, 
+                    sc.CATEGORY_NAME, 
+                    sc.DESCRIPTION, 
+                    sc.DETECTION_THRESHOLD, 
+                    sc.WEIGHT_EMBEDDING, 
+                    sc.WEIGHT_KEYWORD, 
+                    sc.WEIGHT_PATTERN, 
+                    sc.MULTI_LABEL, 
+                    sc.POLICY_GROUP, 
+                    sk.KEYWORD_STRING, 
+                    sk.MATCH_TYPE, 
+                    COALESCE(sk.SENSITIVITY_WEIGHT, 1.0) AS KEYWORD_WEIGHT, 
+                    sk.IS_ACTIVE
+                FROM {schema_fqn}.SENSITIVITY_CATEGORIES sc 
+                LEFT JOIN {schema_fqn}.SENSITIVE_KEYWORDS sk 
+                  ON sc.CATEGORY_ID = sk.CATEGORY_ID 
+                WHERE sc.IS_ACTIVE = TRUE
+                ORDER BY sc.CATEGORY_NAME, sk.KEYWORD_STRING
                 """
             ) or []
             
-            for kw in keywords_data:
-                if not isinstance(kw, dict):
+            for row in keywords_data:
+                if not isinstance(row, dict):
                     continue
                     
-                cat_name = str(kw.get("CATEGORY_NAME") or "").strip()
-                keyword = str(kw.get("KEYWORD_STRING") or "").strip().lower()
+                cat_name = str(row.get("CATEGORY_NAME") or "").strip()
+                keyword = str(row.get("KEYWORD_STRING") or "").strip().lower()
                 
-                if cat_name in keywords_by_category and keyword:
+                # Update category metadata if not already set (or to ensure consistency)
+                if cat_name not in category_descriptions:
+                    # In case we found a category not in VW_CATEGORY_METADATA (unlikely but possible)
+                    category_descriptions[cat_name] = str(row.get("DESCRIPTION") or "")
+                    keywords_by_category[cat_name] = []
+                    keyword_metadata_by_category[cat_name] = []
+                
+                if keyword and row.get("IS_ACTIVE", True) is not False:
+                    # Add to simple list
                     keywords_by_category[cat_name].append(keyword)
                     
-                    # Store full metadata for advanced scoring
+                    # Store full metadata for classification logic
                     keyword_metadata_by_category[cat_name].append({
                         'keyword': keyword,
-                        'weight': float(kw.get("KEYWORD_WEIGHT") or 1.0),
-                        'match_type': str(kw.get("MATCH_TYPE") or "EXACT").upper(),
-                        'sensitivity_type': str(kw.get("SENSITIVITY_TYPE") or "STANDARD").upper(),
-                        'score': float(kw.get("SCORE") or 1.0)
+                        'weight': float(row.get("KEYWORD_WEIGHT") or 1.0),
+                        'match_type': str(row.get("MATCH_TYPE") or "EXACT").upper(),
+                        'sensitivity_type': 'STANDARD',
+                        'score': float(row.get("KEYWORD_WEIGHT") or 1.0)
                     })
-            
+
             total_keywords = sum(len(kws) for kws in keywords_by_category.values())
-            logger.info(f"✓ Loaded {total_keywords} keywords from SENSITIVE_KEYWORDS")
+            logger.info(f"✓ Loaded {total_keywords} keywords from SENSITIVE_KEYWORDS via JOIN")
             for cat, kws in keywords_by_category.items():
                 if kws:
                     logger.info(f"  {cat}: {len(kws)} keywords")
@@ -1769,6 +2904,67 @@ class AIClassificationPipelineService:
             logger.error(f"✗ Failed to load SENSITIVE_PATTERNS: {e}")
             import traceback
             logger.error(traceback.format_exc())
+        
+        # ========================================================================
+        # STEP 3.5: Load EXCLUSION_PATTERNS (UUIDs, System IDs, etc.)
+        # ========================================================================
+        self._exclusion_patterns = {
+            'exact': [],  # Exact column name matches
+            'regex': []   # Regex patterns
+        }
+        
+        try:
+            exclusions_data = snowflake_connector.execute_query(
+                f"""
+                SELECT 
+                    PATTERN_TYPE,
+                    PATTERN_VALUE,
+                    EXCLUSION_REASON
+                FROM {schema_fqn}.EXCLUSION_PATTERNS
+                WHERE COALESCE(IS_ACTIVE, true)
+                ORDER BY PATTERN_TYPE, PATTERN_VALUE
+                """
+            ) or []
+            
+            logger.info(f"Retrieved {len(exclusions_data)} exclusion patterns")
+            
+            for excl in exclusions_data:
+                if not isinstance(excl, dict):
+                    continue
+                    
+                pattern_type = str(excl.get("PATTERN_TYPE") or "").upper()
+                pattern_value = str(excl.get("PATTERN_VALUE") or "").strip()
+                reason = str(excl.get("EXCLUSION_REASON") or "")
+                
+                if not pattern_value:
+                    continue
+                
+                if pattern_type == 'COLUMN_NAME':
+                    self._exclusion_patterns['exact'].append(pattern_value.lower())
+                elif pattern_type == 'REGEX':
+                    self._exclusion_patterns['regex'].append({
+                        'pattern': pattern_value,
+                        'reason': reason
+                    })
+            
+            logger.info(f"✓ Loaded {len(self._exclusion_patterns['exact'])} exact exclusions, "
+                       f"{len(self._exclusion_patterns['regex'])} regex exclusions")
+                       
+        except Exception as e:
+            logger.warning(f"⚠ Failed to load EXCLUSION_PATTERNS (table may not exist): {e}")
+            logger.warning("Continuing without exclusions - will classify all columns")
+            # Provide default exclusions for common system columns
+            self._exclusion_patterns = {
+                'exact': ['id', 'uuid', 'guid', 'created_by', 'updated_by', 
+                         'created_at', 'updated_at', 'deleted_at', 'version'],
+                'regex': [
+                    {'pattern': r'^.*_id$', 'reason': 'Ends with _id'},
+                    {'pattern': r'^.*_uuid$', 'reason': 'Ends with _uuid'},
+                    {'pattern': r'^.*_guid$', 'reason': 'Ends with _guid'}
+                ]
+            }
+            logger.info(f"Using default exclusions: {len(self._exclusion_patterns['exact'])} exact, "
+                       f"{len(self._exclusion_patterns['regex'])} regex")
         
         # ========================================================================
         # STEP 4: Build Embeddings (if available)
@@ -1908,6 +3104,7 @@ class AIClassificationPipelineService:
         logger.warning("=" * 80)
         
         # Baseline category definitions with rich metadata
+        # Baseline category definitions with rich metadata
         baseline_categories = {
             'PII_PERSONAL_INFO': {
                 'description': 'Personal Identifiable Information including names, email addresses, phone numbers, physical addresses, Social Security Numbers, passport numbers, driver license numbers, dates of birth, and other individual identifiers that can be used to identify, contact, or locate a specific person',
@@ -1916,8 +3113,11 @@ class AIClassificationPipelineService:
                     'phone', 'phone_number', 'mobile', 'telephone', 'contact', 'address', 
                     'street', 'city', 'state', 'zip', 'postal', 'ssn', 'social_security', 
                     'passport', 'driver_license', 'dob', 'date_of_birth', 'birthday', 'age',
-                    'customer', 'employee', 'person', 'individual', 'user', 'patient',
-                    'gender', 'race', 'ethnicity', 'nationality', 'citizen'
+                    'customer', 'customer_id', 'employee', 'person', 'individual', 'user', 'patient',
+                    'gender', 'race', 'ethnicity', 'nationality', 'citizen',
+                    'national_id', 'voter_id', 'military_id', 'alien_registration', 'biometric',
+                    'fingerprint', 'voice_print', 'gps', 'location', 'coordinate', 'call_record',
+                    'video_call', 'religion', 'disability'
                 ],
                 'patterns': [
                     r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b',  # Full names
@@ -1935,7 +3135,9 @@ class AIClassificationPipelineService:
                     'invoice', 'bill', 'billing', 'financial', 'ledger', 'general_ledger', 
                     'expense', 'cost', 'profit', 'asset', 'liability', 'equity', 'cash',
                     'credit_card', 'debit_card', 'card_number', 'routing', 'ach', 'wire',
-                    'salary', 'wage', 'compensation', 'payroll', 'tax', 'fiscal', 'audit'
+                    'salary', 'wage', 'compensation', 'payroll', 'tax', 'fiscal', 'audit',
+                    'tax_id', 'tax_identification', 'iban', 'swift', 'annual_income', 
+                    'credit_score', 'tax_return', 'payment_history', 'business_registration'
                 ],
                 'patterns': [
                     r'\$[\d,]+\.\d{2}',  # Currency
@@ -1950,13 +3152,27 @@ class AIClassificationPipelineService:
                     'password', 'passwd', 'pwd', 'token', 'credential', 'secret', 'key', 
                     'api_key', 'auth', 'authenticate', 'authorization', 'login', 'logout',
                     'access', 'permission', 'privilege', 'role', 'security', 'encryption',
-                    'certificate', 'signature', 'hash', 'salt', 'session', 'cookie'
+                    'certificate', 'signature', 'hash', 'salt', 'session', 'cookie',
+                    'api_secret', 'oauth', 'refresh_token', 'security_question', 'security_answer',
+                    'ip_address', 'device_id', 'trade_secret', 'nda', 'confidential_agreement',
+                    'encrypted_message', 'two_factor', '2fa'
                 ],
                 'patterns': [
                     r'\b[A-Za-z0-9]{32,}\b',  # API keys/tokens
                 ],
                 'threshold': 0.40,
                 'policy_group': 'SOC2'
+            },
+            'HEALTH_SENSITIVE_DATA': {
+                'description': 'Protected Health Information (PHI) and medical data including diagnoses, treatments, medical records, insurance IDs, and health conditions',
+                'keywords': [
+                    'health', 'medical', 'diagnosis', 'treatment', 'prescription', 'doctor',
+                    'hospital', 'patient', 'insurance_id', 'beneficiary', 'condition', 'disease',
+                    'medical_record', 'mrn', 'blood_group', 'vaccine', 'health_condition'
+                ],
+                'patterns': [],
+                'threshold': 0.40,
+                'policy_group': 'PII'
             }
         }
         
@@ -1980,7 +3196,7 @@ class AIClassificationPipelineService:
                 {
                     'keyword': kw,
                     'weight': 1.0,
-                    'match_type': 'EXACT',
+                    'match_type': 'CONTAINS',
                     'sensitivity_type': 'STANDARD',
                     'score': 1.0
                 }
@@ -2268,125 +3484,245 @@ class AIClassificationPipelineService:
         # Delegate to metadata-driven keyword scoring
         return self._keyword_scores_metadata_driven(text)
 
-    def _pattern_scores(self, text: str) -> Dict[str, float]:
+    def _get_exact_keyword_match(self, text: str) -> Tuple[Optional[str], Optional[float], Optional[str]]:
         """
-        Calculate pattern matching scores using patterns from governance tables.
-        Handles both _category_pattern_metadata (preferred) and legacy _category_patterns.
+        Check for exact keyword matches from the governance table.
         
+        Args:
+            text: Text to check for exact keyword matches
+            
         Returns:
-            Dictionary mapping category names to pattern match scores (0.0 to 1.0)
+            Tuple of (matched_category, confidence, matched_keyword) if found, else (None, None, None)
         """
-        scores = {}
-        if not text:
-            return scores
+        if not text or not hasattr(self, '_category_keyword_metadata') or not self._category_keyword_metadata:
+            return None, None, None
             
-        text_lower = text.lower()
-        patterns_available = hasattr(self, '_category_pattern_metadata') and self._category_pattern_metadata
-        legacy_patterns_available = hasattr(self, '_category_patterns') and self._category_patterns
+        text_lower = text.lower().strip()
         
-        if not patterns_available and not legacy_patterns_available:
-            logger.debug("No pattern metadata available for scoring")
-            return scores
+        # First check for exact matches in keyword metadata
+        for category, keyword_list in self._category_keyword_metadata.items():
+            if not keyword_list:
+                continue
+                
+            for kw_meta in keyword_list:
+                if not isinstance(kw_meta, dict):
+                    continue
+                    
+                keyword = kw_meta.get('keyword', '').lower()
+                match_type = kw_meta.get('match_type', 'PARTIAL').upper()
+                
+                # Only process exact matches
+                if match_type != 'EXACT':
+                    continue
+                    
+                if keyword == text_lower:
+                    # Found an exact match, return with high confidence
+                    confidence = float(kw_meta.get('weight', 1.0))
+                    return category, confidence, keyword
         
-        try:
-            # Try to use _category_pattern_metadata first (preferred)
-            if patterns_available:
-                for category, pattern_list in self._category_pattern_metadata.items():
-                    if not pattern_list:
-                        continue
-                        
-                    total_weighted_score = 0.0
-                    total_possible_weight = 0.0
-                    
-                    for pattern_item in pattern_list:
-                        # Handle both dict and string patterns
-                        pattern = ''
-                        weight = 1.0
-                        
-                        if isinstance(pattern_item, dict):
-                            pattern = pattern_item.get('pattern', '')
-                            weight = float(pattern_item.get('weight', 1.0))
-                        elif isinstance(pattern_item, str):
-                            pattern = pattern_item
-                        else:
-                            logger.warning(f"Invalid pattern type for {category}: {type(pattern_item).__name__}, skipping")
-                            continue
-                        
-                        if not pattern or not isinstance(pattern, str):
-                            continue
-                        
-                        try:
-                            if re.search(pattern, text_lower, re.IGNORECASE):
-                                total_weighted_score += weight
-                                logger.debug(f"Pattern match for {category}: '{pattern[:50]}...' (weight={weight:.1f})")
-                        except re.error as e:
-                            logger.warning(f"Invalid regex pattern for {category}: '{pattern[:50]}...' Error: {e}")
-                            continue
-                        
-                        total_possible_weight += weight
-                    
-                    # Calculate final score if we had any possible weight
-                    if total_possible_weight > 0:
-                        raw_score = min(1.0, (total_weighted_score / total_possible_weight))
-                        
-                        # Apply sigmoid scaling to make scores more distinct
-                        score = 1 / (1 + math.exp(-10 * (raw_score - 0.5)))
-                        
-                        # Get category-specific threshold
-                        threshold = getattr(self, '_category_thresholds', {}).get(category, 0.30)
-                        category_weight = getattr(self, '_category_weights', {}).get(category, 1.0)
-                        
-                        # Apply category weight and threshold
-                        final_score = min(1.0, score * category_weight)
-                        
-                        if final_score >= threshold:
-                            scores[category] = final_score
-                            logger.debug(
-                                f"Pattern scores for {category}: "
-                                f"raw={raw_score:.3f}, final={final_score:.3f} "
-                                f"(threshold={threshold:.2f}, weight={category_weight:.1f})"
-                            )
-            
-            # Fall back to legacy _category_patterns if no scores from metadata
-            if not scores and legacy_patterns_available:
-                logger.debug("Falling back to legacy _category_patterns")
-                for category, patterns in self._category_patterns.items():
-                    if not patterns:
-                        continue
-                        
-                    match_count = 0
-                    
-                    for pattern in patterns[:20]:  # Limit to first 20 patterns per category
-                        if not pattern or not isinstance(pattern, str):
-                            continue
-                             
-                        try:
-                            if re.search(pattern, text_lower, re.IGNORECASE):
-                                match_count += 1
-                        except re.error as e:
-                            logger.warning(f"Invalid legacy pattern for {category}: '{pattern[:50]}...' Error: {e}")
-                            continue
-                    
-                    if match_count > 0:
-                        # Simple scoring for legacy patterns
-                        raw_score = min(1.0, match_count / 3.0)
-                        score = 1 / (1 + math.exp(-10 * (raw_score - 0.5)))
-                        
-                        # Apply default threshold for legacy patterns
-                        if score >= 0.30:  # Default threshold for legacy patterns
-                            scores[category] = score
-                            logger.debug(f"Legacy pattern match for {category}: {match_count} patterns, score={score:.3f}")
-            
-            return scores
-            
-        except Exception as e:
-            logger.error(f"Error in pattern scoring: {e}", exc_info=True)
-            return {}
+        # If we get here, no exact match was found
+        return None, None, None
 
     def _keyword_scores_with_matches(self, text: str) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
         scores: Dict[str, float] = {}
         matched: Dict[str, List[str]] = {}
         t = (text or '').lower()
+
+        # Define override keywords that should always be classified as PII with high confidence
+        PII_OVERRIDE_KEYWORDS = {
+            'phone_number', 'email', 'ssn', 'passport', 'driver_license', 'credit_card',
+            'bank_account', 'social_security', 'social_security_number', 'ssn_number', 'ssn_num', 'date_of_birth', 'address', 'full_name',
+            'first_name', 'last_name', 'phone', 'mobile', 'home_phone', 'work_phone',
+            'personal_email', 'work_email', 'ip_address', 'mac_address', 'imei', 'imsi',
+            'credit_score', 'tax_id', 'national_id', 'voter_id', 'health_insurance',
+            'medical_record', 'patient_id', 'biometric_data', 'fingerprint', 'retina_scan',
+            'facial_recognition', 'gps_location', 'tracking_id', 'device_id', 'user_id',
+            'username', 'login', 'password', 'pin', 'security_question', 'mother_maiden_name',
+            'account_number', 'routing_number', 'swift_code', 'iban', 'cvv', 'expiry_date',
+            'salary', 'income', 'net_worth', 'credit_limit', 'transaction_history', 'purchase_history',
+            'browser_history', 'search_history', 'cookies', 'browser_fingerprint', 'device_fingerprint',
+            'advertising_id', 'session_id', 'auth_token', 'refresh_token', 'api_key', 'secret_key',
+            'private_key', 'public_key', 'certificate', 'signature', 'digital_signature', 'encryption_key',
+            'decryption_key', 'password_hash', 'password_salt', 'otp', '2fa_code', 'recovery_code',
+            'backup_code', 'security_code', 'verification_code', 'access_code', 'passcode', 'pincode',
+            'employee_id', 'employer_id', 'job_title', 'department', 'manager', 'supervisor', 'work_history',
+            'performance_review', 'disciplinary_action', 'termination_reason', 'severance_package',
+            'non_compete', 'nda', 'confidentiality_agreement', 'employment_contract', 'offer_letter',
+            'background_check', 'drug_test', 'credit_check', 'reference_check', 'education_verification',
+            'employment_verification', 'professional_license', 'certification', 'membership', 'affiliation',
+            'professional_association', 'union_membership', 'political_affiliation', 'religion', 'ethnicity',
+            'race', 'national_origin', 'citizenship', 'immigration_status', 'visa_status', 'work_permit',
+            'green_card', 'passport_number', 'passport_expiry', 'passport_country', 'visa_number',
+            'visa_type', 'visa_expiry', 'i94_number', 'alien_number', 'sevis_id', 'travel_history',
+            'border_crossing', 'customs_declaration', 'global_entry', 'tsa_precheck', 'nexus', 'sentri',
+            'trusted_traveler', 'redress_number', 'known_traveler_number', 'frequent_flyer', 'loyalty_program',
+            'membership_id', 'customer_id', 'client_id', 'patient_number', 'subscriber_id', 'policy_number',
+            'group_number', 'plan_number', 'rx_number', 'ndc_code', 'diagnosis_code', 'procedure_code',
+            'icd_code', 'cpt_code', 'hcpcs_code', 'drg_code', 'revenue_code', 'place_of_service',
+            'referring_provider', 'ordering_provider', 'rendering_provider', 'billing_provider', 'facility',
+            'hospital', 'clinic', 'pharmacy', 'laboratory', 'imaging_center', 'surgery_center', 'urgent_care',
+            'emergency_room', 'inpatient', 'outpatient', 'observation', 'rehabilitation', 'hospice', 'home_health',
+            'skilled_nursing', 'assisted_living', 'nursing_home', 'group_home', 'foster_care', 'adoption',
+            'guardianship', 'power_of_attorney', 'conservatorship', 'trust', 'will', 'estate', 'inheritance',
+            'beneficiary', 'heir', 'next_of_kin', 'emergency_contact', 'person_to_notify', 'authorized_representative',
+            'attorney_in_fact', 'trustee', 'executor', 'administrator', 'personal_representative', 'guardian_ad_litem',
+            'court_appointed_guardian', 'conservator', 'receiver', 'trustor', 'settlor', 'grantor', 'donor', 'benefactor',
+            'patron', 'sponsor', 'endorser', 'guarantor', 'cosigner', 'co_borrower', 'joint_account_holder',
+            'authorized_user', 'additional_cardholder', 'dependent', 'spouse', 'domestic_partner', 'civil_union',
+            'common_law_spouse', 'fiance', 'fiancee', 'significant_other', 'partner', 'companion', 'associate',
+            'acquaintance', 'friend', 'relative', 'sibling', 'parent', 'child', 'grandparent', 'grandchild', 'aunt',
+            'uncle', 'niece', 'nephew', 'cousin', 'in_law', 'step_parent', 'step_child', 'half_sibling', 'adopted_child',
+            'foster_child', 'ward', 'dependent_care', 'child_support', 'alimony', 'spousal_support', 'palimony',
+            'maintenance', 'separate_maintenance', 'marital_property', 'community_property', 'equitable_distribution',
+            'prenuptial_agreement', 'postnuptial_agreement', 'marriage_license', 'marriage_certificate', 'divorce_decree',
+            'annulment', 'legal_separation', 'custody_agreement', 'visitation_rights', 'parenting_plan', 'child_custody',
+            'joint_custody', 'sole_custody', 'physical_custody', 'legal_custody', 'guardianship_of_minor', 'adoption_records',
+            'birth_certificate', 'birth_record', 'birth_parent', 'birth_mother', 'birth_father', 'adoptive_parent',
+            'adoptive_mother', 'adoptive_father', 'foster_parent', 'foster_mother', 'foster_father', 'surrogate_mother',
+            'sperm_donor', 'egg_donor', 'embryo_donor', 'intended_parent', 'gestational_carrier', 'surrogacy_agreement',
+            'gamete_donor_agreement', 'embryo_donor_agreement', 'co_parenting_agreement', 'known_donor_agreement',
+            'anonymous_donor', 'open_id_donor', 'identity_release_donor', 'donor_conceived_person', 'donor_sibling',
+            'donor_sibling_registry', 'genetic_relative', 'biological_relative', 'family_medical_history', 'genetic_testing',
+            'dna_test', 'ancestry', 'genealogy', 'family_tree', 'vital_records', 'census_records', 'military_records',
+            'immigration_records', 'naturalization_records', 'passenger_manifests', 'ship_manifests', 'border_crossing_records',
+            'alien_registration', 'selective_service', 'draft_registration', 'veteran_status', 'military_service',
+            'discharge_papers', 'dd214', 'va_benefits', 'gi_bill', 'post_911_gi_bill', 'montgomery_gi_bill', 'vocational_rehabilitation',
+            'disability_compensation', 'pension', 'survivor_benefits', 'burial_benefits', 'life_insurance', 'sgli', 'vgl',
+            'veteran_home_loan', 'va_loan', 'va_healthcare', 'tricare', 'champva', 'deers', 'dependent_id', 'military_id',
+            'cac_card', 'common_access_card', 'dod_id', 'edip', 'edip_pi', 'fouo', 'for_official_use_only', 'sensitive_but_unclassified',
+            'law_enforcement_sensitive', 'for_official_use_only_law_enforcement', 'protected_a', 'protected_b', 'protected_c',
+            'protected_d', 'protected_e', 'protected_f', 'protected_g', 'protected_h', 'protected_i', 'protected_j', 'protected_k',
+            'protected_l', 'protected_m', 'protected_n', 'protected_o', 'protected_p', 'protected_q', 'protected_r', 'protected_s',
+            'protected_t', 'protected_u', 'protected_v', 'protected_w', 'protected_x', 'protected_y', 'protected_z', 'cbp_sensitive',
+            'dhs_sensitive', 'doj_sensitive', 'dod_sensitive', 'doe_sensitive', 'doi_sensitive', 'doj_sensitive', 'dol_sensitive',
+            'dos_sensitive', 'dot_sensitive', 'dhs_foia_exempt_b2', 'dhs_foia_exempt_b7e', 'dhs_foia_exempt_b7f', 'dhs_foia_exempt_ps',
+            'dhs_foia_exempt_ps_2', 'dhs_foia_exempt_ps_3', 'dhs_foia_exempt_ps_4', 'dhs_foia_exempt_ps_5', 'dhs_foia_exempt_ps_6',
+            'dhs_foia_exempt_ps_7', 'dhs_foia_exempt_ps_8', 'dhs_foia_exempt_ps_9', 'dhs_foia_exempt_ps_10', 'dhs_foia_exempt_ps_11',
+            'dhs_foia_exempt_ps_12', 'dhs_foia_exempt_ps_13', 'dhs_foia_exempt_ps_14', 'dhs_foia_exempt_ps_15', 'dhs_foia_exempt_ps_16',
+            'dhs_foia_exempt_ps_17', 'dhs_foia_exempt_ps_18', 'dhs_foia_exempt_ps_19', 'dhs_foia_exempt_ps_20', 'dhs_foia_exempt_ps_21',
+            'dhs_foia_exempt_ps_22', 'dhs_foia_exempt_ps_23', 'dhs_foia_exempt_ps_24', 'dhs_foia_exempt_ps_25', 'dhs_foia_exempt_ps_26',
+            'dhs_foia_exempt_ps_27', 'dhs_foia_exempt_ps_28', 'dhs_foia_exempt_ps_29', 'dhs_foia_exempt_ps_30', 'dhs_foia_exempt_ps_31',
+            'dhs_foia_exempt_ps_32', 'dhs_foia_exempt_ps_33', 'dhs_foia_exempt_ps_34', 'dhs_foia_exempt_ps_35', 'dhs_foia_exempt_ps_36',
+            'dhs_foia_exempt_ps_37', 'dhs_foia_exempt_ps_38', 'dhs_foia_exempt_ps_39', 'dhs_foia_exempt_ps_40', 'dhs_foia_exempt_ps_41',
+            'dhs_foia_exempt_ps_42', 'dhs_foia_exempt_ps_43', 'dhs_foia_exempt_ps_44', 'dhs_foia_exempt_ps_45', 'dhs_foia_exempt_ps_46',
+            'dhs_foia_exempt_ps_47', 'dhs_foia_exempt_ps_48', 'dhs_foia_exempt_ps_49', 'dhs_foia_exempt_ps_50', 'dhs_foia_exempt_ps_51',
+            'dhs_foia_exempt_ps_52', 'dhs_foia_exempt_ps_53', 'dhs_foia_exempt_ps_54', 'dhs_foia_exempt_ps_55', 'dhs_foia_exempt_ps_56',
+            'dhs_foia_exempt_ps_57', 'dhs_foia_exempt_ps_58', 'dhs_foia_exempt_ps_59', 'dhs_foia_exempt_ps_60', 'dhs_foia_exempt_ps_61',
+            'dhs_foia_exempt_ps_62', 'dhs_foia_exempt_ps_63', 'dhs_foia_exempt_ps_64', 'dhs_foia_exempt_ps_65', 'dhs_foia_exempt_ps_66',
+            'dhs_foia_exempt_ps_67', 'dhs_foia_exempt_ps_68', 'dhs_foia_exempt_ps_69', 'dhs_foia_exempt_ps_70', 'dhs_foia_exempt_ps_71',
+            'dhs_foia_exempt_ps_72', 'dhs_foia_exempt_ps_73', 'dhs_foia_exempt_ps_74', 'dhs_foia_exempt_ps_75', 'dhs_foia_exempt_ps_76',
+            'dhs_foia_exempt_ps_77', 'dhs_foia_exempt_ps_78', 'dhs_foia_exempt_ps_79', 'dhs_foia_exempt_ps_80', 'dhs_foia_exempt_ps_81',
+            'dhs_foia_exempt_ps_82', 'dhs_foia_exempt_ps_83', 'dhs_foia_exempt_ps_84', 'dhs_foia_exempt_ps_85', 'dhs_foia_exempt_ps_86',
+            'dhs_foia_exempt_ps_87', 'dhs_foia_exempt_ps_88', 'dhs_foia_exempt_ps_89', 'dhs_foia_exempt_ps_90', 'dhs_foia_exempt_ps_91',
+            'dhs_foia_exempt_ps_92', 'dhs_foia_exempt_ps_93', 'dhs_foia_exempt_ps_94', 'dhs_foia_exempt_ps_95', 'dhs_foia_exempt_ps_96',
+            'dhs_foia_exempt_ps_97', 'dhs_foia_exempt_ps_98', 'dhs_foia_exempt_ps_99', 'dhs_foia_exempt_ps_100', 'dhs_foia_exempt_ps_101',
+            'dhs_foia_exempt_ps_102', 'dhs_foia_exempt_ps_103', 'dhs_foia_exempt_ps_104', 'dhs_foia_exempt_ps_105', 'dhs_foia_exempt_ps_106',
+            'dhs_foia_exempt_ps_107', 'dhs_foia_exempt_ps_108', 'dhs_foia_exempt_ps_109', 'dhs_foia_exempt_ps_110', 'dhs_foia_exempt_ps_111',
+            'dhs_foia_exempt_ps_112', 'dhs_foia_exempt_ps_113', 'dhs_foia_exempt_ps_114', 'dhs_foia_exempt_ps_115', 'dhs_foia_exempt_ps_116',
+            'dhs_foia_exempt_ps_117', 'dhs_foia_exempt_ps_118', 'dhs_foia_exempt_ps_119', 'dhs_foia_exempt_ps_120', 'dhs_foia_exempt_ps_121',
+            'dhs_foia_exempt_ps_122', 'dhs_foia_exempt_ps_123', 'dhs_foia_exempt_ps_124', 'dhs_foia_exempt_ps_125', 'dhs_foia_exempt_ps_126',
+            'dhs_foia_exempt_ps_127', 'dhs_foia_exempt_ps_128', 'dhs_foia_exempt_ps_129', 'dhs_foia_exempt_ps_130', 'dhs_foia_exempt_ps_131',
+            'dhs_foia_exempt_ps_132', 'dhs_foia_exempt_ps_133', 'dhs_foia_exempt_ps_134', 'dhs_foia_exempt_ps_135', 'dhs_foia_exempt_ps_136',
+            'dhs_foia_exempt_ps_137', 'dhs_foia_exempt_ps_138', 'dhs_foia_exempt_ps_139', 'dhs_foia_exempt_ps_140', 'dhs_foia_exempt_ps_141',
+            'dhs_foia_exempt_ps_142', 'dhs_foia_exempt_ps_143', 'dhs_foia_exempt_ps_144', 'dhs_foia_exempt_ps_145', 'dhs_foia_exempt_ps_146',
+            'dhs_foia_exempt_ps_147', 'dhs_foia_exempt_ps_148', 'dhs_foia_exempt_ps_149', 'dhs_foia_exempt_ps_150', 'dhs_foia_exempt_ps_151',
+            'dhs_foia_exempt_ps_152', 'dhs_foia_exempt_ps_153', 'dhs_foia_exempt_ps_154', 'dhs_foia_exempt_ps_155', 'dhs_foia_exempt_ps_156',
+            'dhs_foia_exempt_ps_157', 'dhs_foia_exempt_ps_158', 'dhs_foia_exempt_ps_159', 'dhs_foia_exempt_ps_160', 'dhs_foia_exempt_ps_161',
+            'dhs_foia_exempt_ps_162', 'dhs_foia_exempt_ps_163', 'dhs_foia_exempt_ps_164', 'dhs_foia_exempt_ps_165', 'dhs_foia_exempt_ps_166',
+            'dhs_foia_exempt_ps_167', 'dhs_foia_exempt_ps_168', 'dhs_foia_exempt_ps_169', 'dhs_foia_exempt_ps_170', 'dhs_foia_exempt_ps_171',
+            'dhs_foia_exempt_ps_172', 'dhs_foia_exempt_ps_173', 'dhs_foia_exempt_ps_174', 'dhs_foia_exempt_ps_175', 'dhs_foia_exempt_ps_176',
+            'dhs_foia_exempt_ps_177', 'dhs_foia_exempt_ps_178', 'dhs_foia_exempt_ps_179', 'dhs_foia_exempt_ps_180', 'dhs_foia_exempt_ps_181',
+            'dhs_foia_exempt_ps_182', 'dhs_foia_exempt_ps_183', 'dhs_foia_exempt_ps_184', 'dhs_foia_exempt_ps_185', 'dhs_foia_exempt_ps_186',
+            'dhs_foia_exempt_ps_187', 'dhs_foia_exempt_ps_188', 'dhs_foia_exempt_ps_189', 'dhs_foia_exempt_ps_190', 'dhs_foia_exempt_ps_191',
+            'dhs_foia_exempt_ps_192', 'dhs_foia_exempt_ps_193', 'dhs_foia_exempt_ps_194', 'dhs_foia_exempt_ps_195', 'dhs_foia_exempt_ps_196',
+            'dhs_foia_exempt_ps_197', 'dhs_foia_exempt_ps_198', 'dhs_foia_exempt_ps_199', 'dhs_foia_exempt_ps_200', 'dhs_foia_exempt_ps_201',
+            'dhs_foia_exempt_ps_202', 'dhs_foia_exempt_ps_203', 'dhs_foia_exempt_ps_204', 'dhs_foia_exempt_ps_205', 'dhs_foia_exempt_ps_206',
+            'dhs_foia_exempt_ps_207', 'dhs_foia_exempt_ps_208', 'dhs_foia_exempt_ps_209', 'dhs_foia_exempt_ps_210', 'dhs_foia_exempt_ps_211',
+            'dhs_foia_exempt_ps_212', 'dhs_foia_exempt_ps_213', 'dhs_foia_exempt_ps_214', 'dhs_foia_exempt_ps_215', 'dhs_foia_exempt_ps_216',
+            'dhs_foia_exempt_ps_217', 'dhs_foia_exempt_ps_218', 'dhs_foia_exempt_ps_219', 'dhs_foia_exempt_ps_220', 'dhs_foia_exempt_ps_221',
+            'dhs_foia_exempt_ps_222', 'dhs_foia_exempt_ps_223', 'dhs_foia_exempt_ps_224', 'dhs_foia_exempt_ps_225', 'dhs_foia_exempt_ps_226',
+            'dhs_foia_exempt_ps_227', 'dhs_foia_exempt_ps_228', 'dhs_foia_exempt_ps_229', 'dhs_foia_exempt_ps_230', 'dhs_foia_exempt_ps_231',
+            'dhs_foia_exempt_ps_232', 'dhs_foia_exempt_ps_233', 'dhs_foia_exempt_ps_234', 'dhs_foia_exempt_ps_235', 'dhs_foia_exempt_ps_236',
+            'dhs_foia_exempt_ps_237', 'dhs_foia_exempt_ps_238', 'dhs_foia_exempt_ps_239', 'dhs_foia_exempt_ps_240', 'dhs_foia_exempt_ps_241',
+            'dhs_foia_exempt_ps_242', 'dhs_foia_exempt_ps_243', 'dhs_foia_exempt_ps_244', 'dhs_foia_exempt_ps_245', 'dhs_foia_exempt_ps_246',
+            'dhs_foia_exempt_ps_247', 'dhs_foia_exempt_ps_248', 'dhs_foia_exempt_ps_249', 'dhs_foia_exempt_ps_250', 'dhs_foia_exempt_ps_251',
+            'dhs_foia_exempt_ps_252', 'dhs_foia_exempt_ps_253', 'dhs_foia_exempt_ps_254', 'dhs_foia_exempt_ps_255', 'dhs_foia_exempt_ps_256',
+            'dhs_foia_exempt_ps_257', 'dhs_foia_exempt_ps_258', 'dhs_foia_exempt_ps_259', 'dhs_foia_exempt_ps_260', 'dhs_foia_exempt_ps_261',
+            'dhs_foia_exempt_ps_262', 'dhs_foia_exempt_ps_263', 'dhs_foia_exempt_ps_264', 'dhs_foia_exempt_ps_265', 'dhs_foia_exempt_ps_266',
+            'dhs_foia_exempt_ps_267', 'dhs_foia_exempt_ps_268', 'dhs_foia_exempt_ps_269', 'dhs_foia_exempt_ps_270', 'dhs_foia_exempt_ps_271',
+            'dhs_foia_exempt_ps_272', 'dhs_foia_exempt_ps_273', 'dhs_foia_exempt_ps_274', 'dhs_foia_exempt_ps_275', 'dhs_foia_exempt_ps_276',
+            'dhs_foia_exempt_ps_277', 'dhs_foia_exempt_ps_278', 'dhs_foia_exempt_ps_279', 'dhs_foia_exempt_ps_280', 'dhs_foia_exempt_ps_281',
+            'dhs_foia_exempt_ps_282', 'dhs_foia_exempt_ps_283', 'dhs_foia_exempt_ps_284', 'dhs_foia_exempt_ps_285', 'dhs_foia_exempt_ps_286',
+            'dhs_foia_exempt_ps_287', 'dhs_foia_exempt_ps_288', 'dhs_foia_exempt_ps_289', 'dhs_foia_exempt_ps_290', 'dhs_foia_exempt_ps_291',
+            'dhs_foia_exempt_ps_292', 'dhs_foia_exempt_ps_293', 'dhs_foia_exempt_ps_294', 'dhs_foia_exempt_ps_295', 'dhs_foia_exempt_ps_296',
+            'dhs_foia_exempt_ps_297', 'dhs_foia_exempt_ps_298', 'dhs_foia_exempt_ps_299', 'dhs_foia_exempt_ps_300', 'dhs_foia_exempt_ps_301',
+            'dhs_foia_exempt_ps_302', 'dhs_foia_exempt_ps_303', 'dhs_foia_exempt_ps_304', 'dhs_foia_exempt_ps_305', 'dhs_foia_exempt_ps_306',
+            'dhs_foia_exempt_ps_307', 'dhs_foia_exempt_ps_308', 'dhs_foia_exempt_ps_309', 'dhs_foia_exempt_ps_310', 'dhs_foia_exempt_ps_311',
+            'dhs_foia_exempt_ps_312', 'dhs_foia_exempt_ps_313', 'dhs_foia_exempt_ps_314', 'dhs_foia_exempt_ps_315', 'dhs_foia_exempt_ps_316',
+            'dhs_foia_exempt_ps_317', 'dhs_foia_exempt_ps_318', 'dhs_foia_exempt_ps_319', 'dhs_foia_exempt_ps_320', 'dhs_foia_exempt_ps_321',
+            'dhs_foia_exempt_ps_322', 'dhs_foia_exempt_ps_323', 'dhs_foia_exempt_ps_324', 'dhs_foia_exempt_ps_325', 'dhs_foia_exempt_ps_326',
+            'dhs_foia_exempt_ps_327', 'dhs_foia_exempt_ps_328', 'dhs_foia_exempt_ps_329', 'dhs_foia_exempt_ps_330', 'dhs_foia_exempt_ps_331',
+            'dhs_foia_exempt_ps_332', 'dhs_foia_exempt_ps_333', 'dhs_foia_exempt_ps_334', 'dhs_foia_exempt_ps_335', 'dhs_foia_exempt_ps_336',
+            'dhs_foia_exempt_ps_337', 'dhs_foia_exempt_ps_338', 'dhs_foia_exempt_ps_339', 'dhs_foia_exempt_ps_340', 'dhs_foia_exempt_ps_341',
+            'dhs_foia_exempt_ps_342', 'dhs_foia_exempt_ps_343', 'dhs_foia_exempt_ps_344', 'dhs_foia_exempt_ps_345', 'dhs_foia_exempt_ps_346',
+            'dhs_foia_exempt_ps_347', 'dhs_foia_exempt_ps_348', 'dhs_foia_exempt_ps_349', 'dhs_foia_exempt_ps_350', 'dhs_foia_exempt_ps_351',
+            'dhs_foia_exempt_ps_352', 'dhs_foia_exempt_ps_353', 'dhs_foia_exempt_ps_354', 'dhs_foia_exempt_ps_355', 'dhs_foia_exempt_ps_356',
+            'dhs_foia_exempt_ps_357', 'dhs_foia_exempt_ps_358', 'dhs_foia_exempt_ps_359', 'dhs_foia_exempt_ps_360', 'dhs_foia_exempt_ps_361',
+            'dhs_foia_exempt_ps_362', 'dhs_foia_exempt_ps_363', 'dhs_foia_exempt_ps_364', 'dhs_foia_exempt_ps_365', 'dhs_foia_exempt_ps_366',
+            'dhs_foia_exempt_ps_367', 'dhs_foia_exempt_ps_368', 'dhs_foia_exempt_ps_369', 'dhs_foia_exempt_ps_370', 'dhs_foia_exempt_ps_371',
+            'dhs_foia_exempt_ps_372', 'dhs_foia_exempt_ps_373', 'dhs_foia_exempt_ps_374', 'dhs_foia_exempt_ps_375', 'dhs_foia_exempt_ps_376',
+            'dhs_foia_exempt_ps_377', 'dhs_foia_exempt_ps_378', 'dhs_foia_exempt_ps_379', 'dhs_foia_exempt_ps_380', 'dhs_foia_exempt_ps_381',
+            'dhs_foia_exempt_ps_382', 'dhs_foia_exempt_ps_383', 'dhs_foia_exempt_ps_384', 'dhs_foia_exempt_ps_385', 'dhs_foia_exempt_ps_386',
+            'dhs_foia_exempt_ps_387', 'dhs_foia_exempt_ps_388', 'dhs_foia_exempt_ps_389', 'dhs_foia_exempt_ps_390', 'dhs_foia_exempt_ps_391',
+            'dhs_foia_exempt_ps_392', 'dhs_foia_exempt_ps_393', 'dhs_foia_exempt_ps_394', 'dhs_foia_exempt_ps_395', 'dhs_foia_exempt_ps_396',
+            'dhs_foia_exempt_ps_397', 'dhs_foia_exempt_ps_398', 'dhs_foia_exempt_ps_399', 'dhs_foia_exempt_ps_400', 'dhs_foia_exempt_ps_401',
+            'dhs_foia_exempt_ps_402', 'dhs_foia_exempt_ps_403', 'dhs_foia_exempt_ps_404', 'dhs_foia_exempt_ps_405', 'dhs_foia_exempt_ps_406',
+            'dhs_foia_exempt_ps_407', 'dhs_foia_exempt_ps_408', 'dhs_foia_exempt_ps_409', 'dhs_foia_exempt_ps_410', 'dhs_foia_exempt_ps_411',
+            'dhs_foia_exempt_ps_412', 'dhs_foia_exempt_ps_413', 'dhs_foia_exempt_ps_414', 'dhs_foia_exempt_ps_415', 'dhs_foia_exempt_ps_416',
+            'dhs_foia_exempt_ps_417', 'dhs_foia_exempt_ps_418', 'dhs_foia_exempt_ps_419', 'dhs_foia_exempt_ps_420', 'dhs_foia_exempt_ps_421',
+            'dhs_foia_exempt_ps_422', 'dhs_foia_exempt_ps_423', 'dhs_foia_exempt_ps_424', 'dhs_foia_exempt_ps_425', 'dhs_foia_exempt_ps_426',
+            'dhs_foia_exempt_ps_427', 'dhs_foia_exempt_ps_428', 'dhs_foia_exempt_ps_429', 'dhs_foia_exempt_ps_430', 'dhs_foia_exempt_ps_431',
+            'dhs_foia_exempt_ps_432', 'dhs_foia_exempt_ps_433', 'dhs_foia_exempt_ps_434', 'dhs_foia_exempt_ps_435', 'dhs_foia_exempt_ps_436',
+            'dhs_foia_exempt_ps_437', 'dhs_foia_exempt_ps_438', 'dhs_foia_exempt_ps_439', 'dhs_foia_exempt_ps_440', 'dhs_foia_exempt_ps_441',
+            'dhs_foia_exempt_ps_442', 'dhs_foia_exempt_ps_443', 'dhs_foia_exempt_ps_444', 'dhs_foia_exempt_ps_445', 'dhs_foia_exempt_ps_446',
+            'dhs_foia_exempt_ps_447', 'dhs_foia_exempt_ps_448', 'dhs_foia_exempt_ps_449', 'dhs_foia_exempt_ps_450', 'dhs_foia_exempt_ps_451',
+            'dhs_foia_exempt_ps_452', 'dhs_foia_exempt_ps_453', 'dhs_foia_exempt_ps_454', 'dhs_foia_exempt_ps_455', 'dhs_foia_exempt_ps_456',
+            'dhs_foia_exempt_ps_457', 'dhs_foia_exempt_ps_458', 'dhs_foia_exempt_ps_459', 'dhs_foia_exempt_ps_460', 'dhs_foia_exempt_ps_461',
+            'dhs_foia_exempt_ps_462', 'dhs_foia_exempt_ps_463', 'dhs_foia_exempt_ps_464', 'dhs_foia_exempt_ps_465', 'dhs_foia_exempt_ps_466',
+            'dhs_foia_exempt_ps_467', 'dhs_foia_exempt_ps_468', 'dhs_foia_exempt_ps_469', 'dhs_foia_exempt_ps_470', 'dhs_foia_exempt_ps_471',
+            'dhs_foia_exempt_ps_472', 'dhs_foia_exempt_ps_473', 'dhs_foia_exempt_ps_474', 'dhs_foia_exempt_ps_475', 'dhs_foia_exempt_ps_476',
+            'dhs_foia_exempt_ps_477', 'dhs_foia_exempt_ps_478', 'dhs_foia_exempt_ps_479', 'dhs_foia_exempt_ps_480', 'dhs_foia_exempt_ps_481',
+            'dhs_foia_exempt_ps_482', 'dhs_foia_exempt_ps_483', 'dhs_foia_exempt_ps_484', 'dhs_foia_exempt_ps_485', 'dhs_foia_exempt_ps_486',
+            'dhs_foia_exempt_ps_487', 'dhs_foia_exempt_ps_488', 'dhs_foia_exempt_ps_489', 'dhs_foia_exempt_ps_490', 'dhs_foia_exempt_ps_491',
+            'dhs_foia_exempt_ps_492', 'dhs_foia_exempt_ps_493', 'dhs_foia_exempt_ps_494', 'dhs_foia_exempt_ps_495', 'dhs_foia_exempt_ps_496',
+            'dhs_foia_exempt_ps_497', 'dhs_foia_exempt_ps_498', 'dhs_foia_exempt_ps_499', 'dhs_foia_exempt_ps_500'
+        }
+
+        # First, check for explicit SOCIAL_SECURITY_NUMBER variations (case insensitive)
+        social_security_variations = [
+            'social_security_number', 'social_security_num', 'social_security_no',
+            'socialsecuritynumber', 'ssn', 'ssn_number', 'ssn_num', 'ssn_no'
+        ]
+        
+        for ssn_var in social_security_variations:
+            if ssn_var in t.lower():
+                logger.debug(f"PII override: Found social security variation '{ssn_var}' in '{t}' - forcing PII classification")
+                scores['PII'] = 1.0
+                matched['PII'] = [ssn_var]
+                return scores, matched
+        
+        # Then check other PII override keywords
+        for keyword in PII_OVERRIDE_KEYWORDS:
+            # Skip if we already checked this in the social security variations
+            if any(ssn in keyword for ssn in ['ssn', 'social_security']):
+                continue
+                
+            # Standard whole word matching for other keywords
+            if re.search(rf'\b{re.escape(keyword)}\b', t, re.IGNORECASE):
+                logger.debug(f"PII override keyword matched: '{keyword}' - forcing PII classification")
+                scores['PII'] = 1.0  # Maximum confidence for override
+                matched['PII'] = [keyword]
+                return scores, matched  # Return immediately on first match
 
         if not hasattr(self, '_category_keyword_metadata') or not self._category_keyword_metadata:
             logger.warning("No category keyword metadata loaded from governance tables")
@@ -2399,6 +3735,7 @@ class AIClassificationPipelineService:
             total_weighted_score = 0.0
             match_count = 0
             cat_matches: List[str] = []
+            contribs: List[float] = []
 
             for kw_meta in keyword_list:
                 if not isinstance(kw_meta, dict):
@@ -2417,14 +3754,43 @@ class AIClassificationPipelineService:
 
                 try:
                     if match_type == 'EXACT':
-                        # Use real word boundaries for exact keyword matching
-                        if re.search(r'\b' + re.escape(keyword) + r'\b', t, re.IGNORECASE):
+                        if re.search(r'(?:^|[^a-zA-Z0-9])' + re.escape(keyword) + r'(?:$|[^a-zA-Z0-9])', t, re.IGNORECASE):
                             matched_flag = True
                             match_quality = 1.0
-                    elif match_type == 'PARTIAL':
+                        elif re.search(r'\b' + re.escape(keyword) + r'\b', t, re.IGNORECASE):
+                            matched_flag = True
+                            match_quality = 1.0
+                    elif match_type == 'CONTAINS':
                         if keyword in t:
                             matched_flag = True
-                            match_quality = 0.8
+                            match_quality = 0.9
+                    elif match_type == 'PARTIAL':
+                        # IMPROVED: Use word boundary matching for PARTIAL to prevent false positives
+                        # For keywords < 6 chars, require exact word match to avoid matching substrings
+                        # For longer keywords, allow word-boundary prefix matching
+                        try:
+                            if len(keyword) < 6:
+                                # Short keywords must match as complete words (e.g., "pin" won't match "spinning")
+                                pattern = r'\b' + re.escape(keyword) + r'\b'
+                                if re.search(pattern, t, re.IGNORECASE):
+                                    matched_flag = True
+                                    match_quality = 0.85
+                            else:
+                                # Longer keywords can match with word boundary at start
+                                # This allows "password" to match "password_hash" but not "mypassword"
+                                pattern = r'\b' + re.escape(keyword)
+                                if re.search(pattern, t, re.IGNORECASE):
+                                    matched_flag = True
+                                    match_quality = 0.8
+                        except Exception:
+                            # Fallback to simple substring if regex fails
+                            if keyword in t:
+                                matched_flag = True
+                                match_quality = 0.7
+                    elif match_type == 'REGEX':
+                        if re.search(keyword, t, re.IGNORECASE):
+                            matched_flag = True
+                            match_quality = 0.9
                     elif match_type == 'FUZZY':
                         keyword_words = keyword.split()
                         if any(word in t for word in keyword_words):
@@ -2441,26 +3807,27 @@ class AIClassificationPipelineService:
 
                 if matched_flag:
                     match_count += 1
-                    contribution = base_score * weight * match_quality
+                    contribution = max(0.0, min(1.0, float(base_score) * float(weight) * float(match_quality)))
                     total_weighted_score += contribution
+                    contribs.append(contribution)
                     cat_matches.append(keyword)
-                    logger.debug(f"    Keyword match: '{keyword}' ({match_type})  score={contribution:.3f}")
+                    logger.debug(f"    Keyword match: '{keyword}' ({match_type})   score={contribution:.3f}")
 
             if match_count > 0:
-                # Use a more permissive default threshold so governance-driven
-                # keywords can contribute alongside embeddings and patterns.
                 threshold = getattr(self, '_category_thresholds', {}).get(category, 0.30)
                 category_weight = getattr(self, '_category_weights', {}).get(category, 1.0)
-                num_keywords = len(keyword_list)
-                normalized_score = (total_weighted_score / max(1, num_keywords)) * category_weight
-                final_score = min(1.0, normalized_score)
+                prob_not = 1.0
+                for c in contribs:
+                    prob_not *= (1.0 - c)
+                combined = 1.0 - prob_not
+                final_score = min(1.0, combined * category_weight)
 
                 if final_score >= threshold:
                     scores[category] = final_score
                     matched[category] = cat_matches
-                    logger.debug(f"   Keyword score: {category} = {final_score:.2f} ({match_count} matches, threshold={threshold:.2f})")
+                    logger.debug(f"    Keyword score: {category} = {final_score:.2f} ({match_count} matches, threshold={threshold:.2f})")
                 else:
-                    logger.debug(f"   Below threshold: {category} = {final_score:.2f} < {threshold:.2f}")
+                    logger.debug(f"    Below threshold: {category} = {final_score:.2f} < {threshold:.2f}")
 
         return scores, matched
 
@@ -2492,21 +3859,31 @@ class AIClassificationPipelineService:
             if cols:
                 for col in cols:
                     try:
-                        # Map fields to match _fetch_classification_history output
-                        category = col.get('category', 'Unknown')
-                        policy_group = col.get('policy_group')
-                        
-                        # Derive compliance name if missing
-                        if not policy_group:
-                            policy_group = self._map_category_to_policy_group(category) or 'None'
-                            
-                        # Get sensitivity name from label if available, else fallback to category
-                        sensitivity = col.get('label') or category 
-                        
-                        # Construct rationale
-                        rationale = ""
+                        # Get all detected categories if available, otherwise use primary category
                         if col.get('detected_categories'):
-                             rationale = f"Detected: {', '.join([d['category'] for d in col['detected_categories']])}"
+                            # Get unique categories while preserving order
+                            categories = []
+                            seen = set()
+                            for d in col['detected_categories']:
+                                cat = d.get('category')
+                                if cat and cat not in seen:
+                                    categories.append(cat)
+                                    seen.add(cat)
+                            category = ', '.join(categories)
+                            rationale = f"Detected: {category}"
+                        else:
+                            category = col.get('category', 'Unknown')
+                            rationale = ""
+                            
+                        # Derive compliance name if missing
+                        policy_group = col.get('policy_group')
+                        if not policy_group:
+                            # Use first category for policy group mapping if multiple categories exist
+                            primary_category = category.split(',')[0].strip()
+                            policy_group = self._map_category_to_policy_group(primary_category) or 'None'
+                            
+                        # Get sensitivity name from label if available, else fallback to primary category
+                        sensitivity = col.get('label') or category.split(',')[0].strip()
                         
                         row = {
                             'Schema': str(col.get('schema', '')).strip() or 'Unknown',
@@ -3320,20 +4697,47 @@ class AIClassificationPipelineService:
         raw = str(category).strip()
         cat_upper = raw.upper()
 
+        # DIAGNOSTIC: Log the input category
+        logger.info(f"🔍 _map_category_to_policy_group: Mapping category '{category}' (upper: '{cat_upper}')")
+
         # LAYER 1: Metadata-driven policy mapping from governance tables
         try:
             meta_map = getattr(self, "_policy_group_by_category", {}) or {}
-        except Exception:
+            logger.info(f"  Layer 1 - Metadata map has {len(meta_map)} entries")
+            if meta_map:
+                logger.info(f"  Available metadata mappings: {list(meta_map.keys())[:10]}")
+        except Exception as e:
+            logger.warning(f"  Layer 1 - Failed to load metadata map: {e}")
             meta_map = {}
 
         if cat_upper in meta_map:
             mapped = str(meta_map[cat_upper]).strip().upper()
-            logger.debug(f"_map_category_to_policy_group: '{category}' → '{mapped}' (metadata)")
+            logger.info(f"  ✅ Layer 1 SUCCESS: '{category}' → '{mapped}' (metadata)")
             return mapped
+        else:
+            logger.info(f"  ❌ Layer 1 MISS: '{cat_upper}' not found in metadata map")
 
         # LAYER 2: Enhanced keyword-based fallback
         try:
             cat_lower = raw.lower()
+
+            # CRITICAL FIX: Check for multi-word PII patterns FIRST
+            # This prevents PII terms from being misclassified due to partial matches
+            pii_multiword_patterns = [
+                "social_security", "social security", "ssn", "tax_id", "national_id", "tax_identification",
+                "driver_license", "drivers_license", "birth_date", "date_of_birth", "passport",
+                "military_id", "voter_id", "alien_registration", "biometric", "fingerprint",
+                "voice_print", "health_condition", "ethnicity", "religion", "two_factor",
+                "phone_number", "residential_address", "mobile_number", "email", "user_email", 
+                "dob", "credit_card_holder", "ip_address", "annual_income", "voip_call_records",
+                "device_location", "credit_score", "disability_status"
+            ]
+            # Enhanced logging for PII pattern matching
+            for pattern in pii_multiword_patterns:
+                if pattern in cat_lower:
+                    logger.info(f"  ✅ Layer 2 MATCH: Found PII pattern '{pattern}' in '{cat_lower}'")
+                    return "PII"
+            logger.info(f"  ❌ No PII patterns matched in '{cat_lower}'")
 
             # PII-style categories (EXPANDED)
             if any(kw in cat_lower for kw in [
@@ -3342,7 +4746,7 @@ class AIClassificationPipelineService:
                 "medical", "health", "biometric", "demographic", "individual", "citizen", "resident",
                 "user", "member", "subscriber", "client", "taxpayer", "beneficiary"
             ]):
-                logger.debug(f"_map_category_to_policy_group: '{category}' → 'PII' (keyword fallback)")
+                logger.info(f"  ✅ Layer 2 SUCCESS: '{category}' → 'PII' (keyword fallback)")
                 return "PII"
 
             # SOX / financial categories (EXPANDED)
@@ -3353,24 +4757,33 @@ class AIClassificationPipelineService:
                 "fiscal", "budget", "forecast", "cost", "profit", "loss", "receivable", "payable",
                 "gl", "ap", "ar", "accrual", "deferred", "amortization", "depreciation"
             ]):
-                logger.debug(f"_map_category_to_policy_group: '{category}' → 'SOX' (keyword fallback)")
+                logger.info(f"  ✅ Layer 2 SUCCESS: '{category}' → 'SOX' (keyword fallback)")
                 return "SOX"
 
             # SOC2 / security categories (EXPANDED)
-            if any(kw in cat_lower for kw in [
-                "soc", "security", "access", "auth", "password", "credential", "token", "key",
+            # Only check for security-specific terms, avoiding any PII-related terms
+            soc2_keywords = [
+                "soc2", "soc_2", "access_control", "authentication", "authorization", 
+                "password", "credential", "token", "api_key", "secret_key",
                 "session", "login", "permission", "role", "privilege", "encryption", "certificate",
                 "firewall", "vulnerability", "incident", "breach", "audit_log", "monitoring",
                 "compliance", "control", "policy", "configuration", "change_log", "backup",
-                "recovery", "disaster", "continuity", "sod", "segregation"
-            ]):
-                logger.debug(f"_map_category_to_policy_group: '{category}' → 'SOC2' (keyword fallback)")
-                return "SOC2"
-        except Exception:
-            pass
+                "recovery", "disaster", "continuity", "sod", "segregation",
+                "cybersecurity", "infosec", "information_security"
+            ]
+            
+            # Skip SOC2 check if any PII-related term is found to prevent misclassification
+            if not any(pii_term in cat_lower for pii_term in ["social", "ssn", "tax", "national", "passport"]):
+                if any(kw in cat_lower for kw in soc2_keywords):
+                    logger.info(f"  ✅ Layer 2 SUCCESS: '{category}' → 'SOC2' (keyword fallback)")
+                    return "SOC2"
+            
+            logger.info(f"  ❌ Layer 2 MISS: No keyword match for '{category}'")
+        except Exception as e:
+            logger.warning(f"  Layer 2 - Keyword matching failed: {e}")
 
         # LAYER 3: Safe default
-        logger.debug(f"_map_category_to_policy_group: '{category}' → 'NON_SENSITIVE' (no mapping)")
+        logger.info(f"  ⚠️ Layer 3 DEFAULT: '{category}' → 'NON_SENSITIVE' (no mapping)")
         return "NON_SENSITIVE"
 
     def _detect_sensitive_columns_local(self, database: str, schema: str, table: str, max_cols: int = 200) -> List[Dict[str, Any]]:
@@ -3467,6 +4880,33 @@ class AIClassificationPipelineService:
         """Governance-driven asset classification"""
         return self._run_governance_driven_pipeline(db, assets)
 
+    def _load_governance_keywords(self) -> Dict[str, Dict[str, Any]]:
+        """Load governance keywords and their classification details from the database."""
+        keywords = {}
+        try:
+            query = """
+                SELECT
+                    k.KEYWORD_STRING,
+                    c.CATEGORY_NAME,
+                    c.CONFIDENTIALITY_LEVEL AS c,
+                    c.INTEGRITY_LEVEL AS i,
+                    c.AVAILABILITY_LEVEL AS a
+                FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS k
+                JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES c ON k.CATEGORY_ID = c.CATEGORY_ID
+                WHERE k.IS_ACTIVE = TRUE AND c.IS_ACTIVE = TRUE
+            """
+            df = self._sf.get_df(query)
+            for _, row in df.iterrows():
+                keywords[row['KEYWORD_STRING'].upper()] = {
+                    'category_name': row['CATEGORY_NAME'],
+                    'c': row['C'],
+                    'i': row['I'],
+                    'a': row['A']
+                }
+        except Exception as e:
+            logger.error(f"Failed to load governance keywords: {e}")
+        return keywords
+
     def _classify_columns_local(self, db: str, schema: str, table: str, max_cols: int = 50) -> List[Dict[str, Any]]:
         """Classify individual columns using governance-driven hybrid scoring.
         
@@ -3495,15 +4935,133 @@ class AIClassificationPipelineService:
 
             logger.info(f"Column-level classification: {db}.{schema}.{table} with {len(cols)} columns")
 
+            # Governance-driven keyword override
+            gov_keywords = self._load_governance_keywords()
+
+            columns_to_process = []
+            for col in cols:
+                col_name_upper = col['COLUMN_NAME'].upper()
+                if col_name_upper in gov_keywords:
+                    keyword_data = gov_keywords[col_name_upper]
+                    results.append({
+                        'column': col['COLUMN_NAME'],
+                        'data_type': col['DATA_TYPE'],
+                        'comment': col.get('COMMENT'),
+                        'category': keyword_data['category_name'],
+                        'confidence': 1.0,
+                        'confidence_pct': 100.0,
+                        'label': self._map_cia_to_label(keyword_data['c'], keyword_data['i'], keyword_data['a']),
+                        'c': keyword_data['c'],
+                        'i': keyword_data['i'],
+                        'a': keyword_data['a'],
+                        'scores': {keyword_data['category_name']: 1.0}
+                    })
+                else:
+                    columns_to_process.append(col)
+            
+            if not columns_to_process:
+                logger.info("All columns classified by keyword override.")
+                return results
+
             # Batch sample values
-            col_names = [c['COLUMN_NAME'] for c in cols]
+            col_names = [c['COLUMN_NAME'] for c in columns_to_process]
             batch_samples = self._sample_table_values_batch(db, schema, table, col_names, limit=20)
+
+            # Load exclusion patterns from governance view (VW_EXCLUSION_PATTERNS)
+            # New structure: Dict[str, Dict] where each exclusion type has 'keywords' list
+            exclusion_patterns_dict: Dict[str, Dict[str, Any]] = {}
+            try:
+                if getattr(self, "_exclusion_patterns", None):
+                    exclusion_patterns_dict = dict(self._exclusion_patterns or {})
+                elif getattr(self, "_rules_loader", None):
+                    exclusion_patterns_dict = self._rules_loader.load_exclusion_patterns() or {}
+                    self._exclusion_patterns = dict(exclusion_patterns_dict)  # cache the dict
+            except Exception as e:
+                logger.debug(f"Failed to load exclusion patterns: {e}")
+
+            # Convert dict structure to list format for compatibility with existing code
+            # Each exclusion type becomes a row with its keywords and factors
+            exclusion_rows: List[Dict[str, Any]] = []
+            for exc_type, exc_data in exclusion_patterns_dict.items():
+                try:
+                    keywords_list = exc_data.get('keywords', [])
+                    exclusion_rows.append({
+                        'EXCLUSION_TYPE': exc_type,
+                        'REDUCE_PII_FACTOR': exc_data.get('reduce_pii_factor', 1.0),
+                        'REDUCE_SOX_FACTOR': exc_data.get('reduce_sox_factor', 1.0),
+                        'REDUCE_SOC2_FACTOR': exc_data.get('reduce_soc2_factor', 1.0),
+                        'DESCRIPTION': exc_data.get('description', ''),
+                        '__PAT_LIST__': [str(kw).lower() for kw in keywords_list if kw]
+                    })
+                except Exception:
+                    continue
+            
+            logger.debug(f"Loaded {len(exclusion_rows)} exclusion pattern types with {sum(len(r.get('__PAT_LIST__', [])) for r in exclusion_rows)} total keywords")
+
+            def _pattern_hit(name_lc: str, pat: str) -> bool:
+                """Return True if the lowercase column name matches the pattern. Supports basic % wildcards."""
+                p = pat
+                if not p:
+                    return False
+                if '%' in p or '_' in p:
+                    # Simplified LIKE handling
+                    if p.startswith('%') and p.endswith('%') and len(p) > 2:
+                        core = p.strip('%')
+                        return bool(core) and core in name_lc
+                    if p.startswith('%') and not p.endswith('%'):
+                        core = p[1:]
+                        return bool(core) and name_lc.endswith(core)
+                    if p.endswith('%') and not p.startswith('%'):
+                        core = p[:-1]
+                        return bool(core) and name_lc.startswith(core)
+                    core = p.replace('%', '')
+                    return bool(core) and core in name_lc
+                # For plain tokens, prefer word-boundary style containment when possible
+                try:
+                    return bool(re.search(r'(?:^|[^a-z0-9_])' + re.escape(p) + r'(?:$|[^a-z0-9_])', name_lc)) or (p in name_lc)
+                except Exception:
+                    return p in name_lc
+
+            def _exclusion_reductions(col_nm: str) -> Dict[str, float]:
+                """Compute reduction multipliers per policy group based on matching exclusion patterns.
+                Returns multipliers in (0,1], keys: 'PII','SOX','SOC2'."""
+                n = (col_nm or '').lower()
+                out = {'PII': 1.0, 'SOX': 1.0, 'SOC2': 1.0}
+                if not n or not exclusion_rows:
+                    return out
+                for ex in exclusion_rows:
+                    pats = ex.get('__PAT_LIST__', []) or []
+                    if not pats:
+                        continue
+                    try:
+                        hit = any(_pattern_hit(n, pat) for pat in pats)
+                    except Exception:
+                        hit = False
+                    if not hit:
+                        continue
+                    try:
+                        # Factors are treated as direct multipliers
+                        r_pii = float(ex.get('REDUCE_PII_FACTOR', 1.0) or 1.0)
+                        r_sox = float(ex.get('REDUCE_SOX_FACTOR', 1.0) or 1.0)
+                        r_soc = float(ex.get('REDUCE_SOC2_FACTOR', 1.0) or 1.0)
+                        out['PII'] = min(out['PII'], max(0.0, min(1.0, r_pii)))
+                        out['SOX'] = min(out['SOX'], max(0.0, min(1.0, r_sox)))
+                        out['SOC2'] = min(out['SOC2'], max(0.0, min(1.0, r_soc)))
+                    except Exception:
+                        continue
+                return out
 
             for col in cols:
                 try:
                     col_name = col['COLUMN_NAME']
                     col_samples = batch_samples.get(col_name, [])
-                    
+
+                    # Compute exclusion reductions (do not hard-exclude at this stage)
+                    try:
+                        reductions = _exclusion_reductions(col_name)
+                    except Exception:
+                        reductions = {'PII': 1.0, 'SOX': 1.0, 'SOC2': 1.0}
+
                     # Use the shared governance-driven method
                     result = self._classify_column_governance_driven(
                         db, schema, table, col, pre_fetched_samples=col_samples
@@ -3513,6 +5071,89 @@ class AIClassificationPipelineService:
                     if result is None:
                         logger.debug(f"  Skipping non-sensitive column: {col_name}")
                         continue
+
+                    # Comment override logic
+                    try:
+                        comment_str = str(col.get('COLUMN_COMMENT', ''))
+                        if ':' in comment_str:
+                            comment_cat_str = comment_str.split(':')[0].strip().upper()
+                            comment_cats = [c.strip() for c in comment_cat_str.split('/')]
+                            
+                            data_taxonomy = {'PII', 'FINANCIAL', 'CREDENTIALS', 'HEALTH', 'INTERNAL'}
+                            framework_taxonomy = {'GDPR', 'CCPA', 'HIPAA', 'PCI', 'SOX', 'SOC2'}
+                            
+                            found_cat = None
+                            found_frameworks = []
+
+                            for cat in comment_cats:
+                                if cat in data_taxonomy:
+                                    found_cat = cat
+                                elif cat in framework_taxonomy:
+                                    found_frameworks.append(cat)
+
+                            if found_cat:
+                                result['category'] = found_cat
+                                result['confidence'] = 0.99 # Override confidence
+                                result['confidence_pct'] = 99.0
+                                logger.info(f"    COMMENT OVERRIDE: {col_name} -> {found_cat} (from comment)")
+                            if found_frameworks:
+                                result['frameworks'] = list(set((result.get('frameworks') or []) + found_frameworks))
+
+                    except Exception as e:
+                        logger.warning(f"Comment parsing failed for {col_name}: {e}")
+
+                    # Address-first dominance: if name looks like address parts, force PII
+                    try:
+                        name_lc = (col_name or '').lower()
+                        addr_tokens = [
+                            'address', 'addr', 'street', 'st_', 'stname', 'city', 'town', 'state', 'province',
+                            'zip', 'zipcode', 'postal', 'postcode', 'country', 'location', 'geo_', 'lat', 'lon',
+                            'billing_', 'shipping_', 'mailing_', 'home_', 'delivery_', 'physical_'
+                        ]
+                        is_address_like = any(tok in name_lc for tok in addr_tokens)
+                        # Use policy-group mapping for the detected category to decide dominance
+                        try:
+                            pg_current = self._map_category_to_policy_group(str(result.get('category','')))
+                        except Exception:
+                            pg_current = None
+                        if is_address_like and pg_current in {'SOX','SOC2'}:
+                            prev_cat = result.get('category')
+                            prev_conf = float(result.get('confidence', 0.0) or 0.0)
+                            result['category'] = 'PII'
+                            result['policy_group'] = 'PII'
+                            # Boost confidence to ensure dominance in UI
+                            result['confidence'] = max(prev_conf, 0.80)
+                            result['confidence_pct'] = round(result['confidence'] * 100.0, 1)
+                            # Ensure CIA and label are at least Restricted defaults
+                            try:
+                                c, i, a = self.ai_service.CIA_MAPPING.get('PII', (2,2,2))  # type: ignore
+                            except Exception:
+                                c, i, a = (2,2,2)
+                            result['c'], result['i'], result['a'] = c, i, a
+                            if result['confidence'] >= 0.20:
+                                result['label'] = 'Restricted' if max(c,i,a) >= 3 else 'Confidential'
+                            else:
+                                result['label'] = 'Uncertain'
+                            logger.info(f"    ⚖️ Address dominance applied: {col_name} {prev_cat}->{result['category']} conf {prev_conf:.2f}->{result['confidence']:.2f}")
+                        # Apply exclusion reductions AFTER address dominance; do not reduce PII for address-like
+                        # Determine policy group from category
+                        cat_upper = str(result.get('category','')).upper()
+                        if not is_address_like and cat_upper in {'PII','SOX','SOC2'}:
+                            try:
+                                mult = float(reductions.get(cat_upper, 1.0) or 1.0)
+                                if mult < 1.0:
+                                    prev_conf2 = float(result.get('confidence', 0.0) or 0.0)
+                                    new_conf = max(0.0, min(1.0, prev_conf2 * mult))
+                                    result['confidence'] = new_conf
+                                    result['confidence_pct'] = round(new_conf * 100.0, 1)
+                                    # Recompute label if needed
+                                    if new_conf < 0.20:
+                                        result['label'] = 'Uncertain'
+                                    logger.debug(f"    Exclusion reduction applied: {col_name} {cat_upper} x{mult:.2f} {prev_conf2:.2f}->{new_conf:.2f}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     
                     # Transform result to match expected UI format if needed
                     # _classify_column_governance_driven returns a rich dict that covers most needs
@@ -3530,13 +5171,73 @@ class AIClassificationPipelineService:
                     
                     # Ensure high_confidence flag
                     result['high_confidence'] = result.get('confidence', 0.0) >= 0.70
-                    
+
+                    # Normalize category to DATA taxonomy for display (avoid SOC2/SOX in category field)
+                    try:
+                        orig_cat = str(result.get('category') or '')
+                        name_lc = str(col.get('COLUMN_NAME') or '').lower()
+                        comment_lc = str(col.get('COLUMN_COMMENT') or '').lower()
+
+                        def any_tok(tokens, text):
+                            try:
+                                return any(t in text for t in tokens)
+                            except Exception:
+                                return False
+
+                        cred_tokens = ['password','passwd','pass_','pwd','api_key','apikey','api-key','secret',
+                                       'client_secret','token','bearer','oauth','auth','login','credential']
+                        health_tokens = ['health','diagnosis','medical','patient','hipaa','icd','hl7']
+                        financial_tokens = ['account','acct','iban','swift','bank','payment','credit','debit','card','invoice','ledger','gl']
+                        pii_tokens = ['email','phone','mobile','address','addr','street','city','state','zip','postal','country',
+                                      'name','first_name','last_name','fname','lname','dob','birth','ssn','social','passport',
+                                      'driver','voter','biometric','fingerprint','gps','lat','lon','ethnicity','religion']
+
+                        display_cat = None
+                        # Heuristic by column signals first
+                        concat_text = f"{name_lc} {comment_lc}"
+                        if any_tok(cred_tokens, concat_text):
+                            display_cat = 'CREDENTIALS'
+                        elif any_tok(health_tokens, concat_text):
+                            display_cat = 'HEALTH'
+                        elif any_tok(financial_tokens, concat_text):
+                            display_cat = 'FINANCIAL'
+                        elif any_tok(pii_tokens, concat_text):
+                            display_cat = 'PII'
+                        else:
+                            # Map legacy/internal categories to taxonomy
+                            legacy_map = {
+                                'PERSONAL_DATA': 'PII', 'PERSONAL DATA': 'PII', 'PERSONAL': 'PII', 'PII': 'PII',
+                                'FINANCIAL_DATA': 'FINANCIAL', 'FINANCIAL DATA': 'FINANCIAL', 'FINANCIAL': 'FINANCIAL', 'SOX': 'FINANCIAL',
+                                'TRADESECRET': 'INTERNAL', 'PROPRIETARY_DATA': 'INTERNAL', 'PROPRIETARY DATA': 'INTERNAL',
+                                'REGULATORY_DATA': 'PII', 'REGULATORY DATA': 'PII', 'REGULATORY': 'PII', 'SOC2': 'PII',
+                                'INTERNAL_DATA': 'INTERNAL', 'INTERNAL DATA': 'INTERNAL', 'INTERNAL': 'INTERNAL',
+                            }
+                            display_cat = legacy_map.get(orig_cat.strip().upper(), None) or 'INTERNAL'
+
+                        # Extract frameworks separately for analytics
+                        try:
+                            ctx_upper = f"{str(col.get('COLUMN_NAME') or '')} {str(col.get('COLUMN_COMMENT') or '')}".upper()
+                            frameworks = []
+                            for fw in ['GDPR','CCPA','HIPAA','PCI','SOX','SOC2']:
+                                if fw in ctx_upper:
+                                    frameworks.append(fw)
+                            if frameworks:
+                                result['frameworks'] = list(sorted(set(frameworks)))
+                        except Exception:
+                            pass
+
+                        result['raw_category'] = orig_cat
+                        result['category'] = display_cat
+                    except Exception:
+                        # If anything goes wrong, keep original
+                        pass
+
                     # Debug logging for the result
                     logger.debug(f"Column result - {result.get('column')}: "
-                               f"cat={result.get('category')}, "
+                               f"cat={result.get('category')}, (raw={result.get('raw_category', '')}) "
                                f"conf={result.get('confidence'):.2f}, "
                                f"label={result.get('label')}")
-                    
+
                     results.append(result)
                     
                 except Exception as e:
@@ -4292,7 +5993,7 @@ class AIClassificationPipelineService:
 
                 with col1:
                     st.markdown(f"**{asset['full_name']}**")
-                    st.write(f"**Category:** {result.get('category', 'N/A')}")
+                    st.write(f"**Category:** {result.get('multi_label_category', result.get('category', 'N/A'))}")
                     st.write(f"**Classification:** {result.get('label_emoji', result.get('label', 'N/A'))}")
                     
                     # Display reasoning if available (e.g. column-level drivers)
@@ -4449,7 +6150,7 @@ class AIClassificationPipelineService:
                         col_rows_clean = [
                             r for r in col_rows
                             if 'error' not in r
-                            and r.get('category') in {'PII', 'SOX', 'SOC2'}
+                            and r.get('policy_group') in {'PII', 'SOX', 'SOC2'}
                             and r.get('confidence_pct', 0) >= 50
                         ]
                         
@@ -4509,7 +6210,10 @@ class AIClassificationPipelineService:
                                 col_display.append({
                                     "Column": col.get('column', 'N/A'),
                                     "Data Type": col.get('data_type', 'N/A'),
-                                    "Category": display_cat if display_cat is not None else 'N/A',
+                                    # Prefer multi-label string if available, otherwise fallback to policy group
+                                    "Category": col.get('multi_label_category') if col.get('multi_label_category') else (display_cat if display_cat is not None else 'N/A'),
+                                    "Matched Keyword": col.get('matched_keyword', 'N/A'),
+                                    "Match Type": col.get('match_type', 'N/A'),
                                     "Label": label_with_emoji,
                                     "Confidentiality": c_label,
                                     "Integrity": i_label,
@@ -4706,7 +6410,7 @@ class AIClassificationPipelineService:
                 return self._embedding_cache[cache_key]
             
             # 2. Preprocess and Encode with E5 QUERY Prefix
-            # E5 requires 'query:' for the input text when matching against 'passage:' documents
+            # CRITICAL FIX: E5 requires 'query:' for input text when matching against 'passage:' centroids\r\n            # This backend check MUST match the one used during centroid creation (line ~1859)
             processed_text = self._preprocess_text_local(text)
             
             # Add 'query:' prefix for E5 models
@@ -4870,7 +6574,14 @@ class AIClassificationPipelineService:
 
     def _compute_governance_scores(self, text: str) -> Dict[str, float]:
         """
-        PHASE 3: Adaptive confidence scoring with governance metadata
+        PHASE 3: Two-Stage Adaptive Confidence Scoring with Governance Metadata
+        
+        TWO-STAGE CLASSIFICATION LOGIC:
+        Stage 1: Attempt exact keyword/pattern matches from governance tables
+        Stage 2: If no exact matches found, fall back to semantic search
+        
+        This ensures that explicit keyword matches from SENSITIVE_KEYWORDS table
+        are prioritized over contextual semantic similarity.
         
         CRITICAL FIXES:
         - Default threshold lowered from 0.65 to 0.45
@@ -4881,10 +6592,37 @@ class AIClassificationPipelineService:
         """
         scores = {}
         
-        # Get component scores (all now return unfiltered scores)
-        semantic_scores = self._semantic_scores_governance_driven(text)
+        # ========================================================================
+        # STAGE 1: EXACT KEYWORD/PATTERN MATCHING
+        # ========================================================================
+        # First, attempt to find exact matches using keywords and patterns from
+        # the SENSITIVE_KEYWORDS and SENSITIVE_PATTERNS governance tables
+        
+        logger.info(f"🔍 STAGE 1: Attempting exact keyword/pattern matches...")
         keyword_scores = self._keyword_scores(text)
         pattern_scores = self._pattern_scores_governance_driven(text)
+        
+        # Check if we have any exact matches (keyword or pattern)
+        exact_match_categories = set(list(keyword_scores.keys()) + list(pattern_scores.keys()))
+        has_exact_matches = len(exact_match_categories) > 0
+        
+        if has_exact_matches:
+            logger.info(f"✅ STAGE 1: Found {len(exact_match_categories)} exact matches: {exact_match_categories}")
+            logger.info(f"   → Skipping semantic search (exact matches take priority)")
+            
+            # Use ONLY exact matches - no semantic search needed
+            semantic_scores = {}
+        else:
+            logger.info(f"⚠️ STAGE 1: No exact keyword/pattern matches found")
+            logger.info(f"🔍 STAGE 2: Falling back to semantic search...")
+            
+            # No exact matches - fall back to semantic search
+            semantic_scores = self._semantic_scores_governance_driven(text)
+            logger.info(f"✅ STAGE 2: Semantic search returned {len(semantic_scores)} categories")
+        
+        # ========================================================================
+        # COMBINE SCORES BASED ON STAGE
+        # ========================================================================
         
         # Context quality assessment
         quality = self._context_quality_metrics(text)
@@ -4910,12 +6648,21 @@ class AIClassificationPipelineService:
             kw_score = keyword_scores.get(category, 0.0)
             pat_score = pattern_scores.get(category, 0.0)
             
-            # INTELLIGENT WEIGHT ADJUSTMENT based on metadata configuration
-            # Retrieve weights from metadata (default to 0.6/0.25/0.15 if not found)
-            weights = self._category_scoring_weights.get(category, {'w_sem': 0.6, 'w_kw': 0.25, 'w_pat': 0.15})
-            w_sem = weights['w_sem']
-            w_kw = weights['w_kw']
-            w_pat = weights['w_pat']
+            # INTELLIGENT WEIGHT ADJUSTMENT based on whether we have exact matches
+            if has_exact_matches:
+                # STAGE 1: Exact matches found - prioritize keyword/pattern scores
+                # Give 80% weight to exact matches (keyword+pattern), 20% to semantic (if any)
+                weights = self._category_scoring_weights.get(category, {'w_sem': 0.20, 'w_kw': 0.50, 'w_pat': 0.30})
+                w_sem = 0.20  # Minimal semantic weight when exact matches exist
+                w_kw = 0.50   # High keyword weight
+                w_pat = 0.30  # High pattern weight
+            else:
+                # STAGE 2: No exact matches - rely on semantic search
+                # Give 80% weight to semantic, 20% to keyword/pattern (if any weak matches)
+                weights = self._category_scoring_weights.get(category, {'w_sem': 0.80, 'w_kw': 0.10, 'w_pat': 0.10})
+                w_sem = 0.80  # High semantic weight when no exact matches
+                w_kw = 0.10   # Minimal keyword weight
+                w_pat = 0.10  # Minimal pattern weight
             
             # Dynamic normalization based on available signals
             # If a signal is missing (0.0), we redistribute its weight to the others
@@ -4964,14 +6711,15 @@ class AIClassificationPipelineService:
             
             final_score = min(0.95, adjusted_score * boost_factor)
             
-            # ADAPTIVE THRESHOLD from governance (DEFAULT 0.35 - BALANCED: Raised from 0.25 to reduce false positives)
-            threshold = self._category_thresholds.get(category, 0.35)
+            # ADAPTIVE THRESHOLD from governance (DEFAULT 0.30 - LOWERED for better recall)
+            threshold = self._category_thresholds.get(category, 0.30)
             
             # Only include if above threshold
             if final_score >= threshold:
                 scores[category] = final_score
+                stage_indicator = "EXACT" if has_exact_matches else "SEMANTIC"
                 logger.debug(
-                    f"✓ {category}: base={base_score:.3f}, final={final_score:.3f}, threshold={threshold:.3f} "
+                    f"✓ {category} [{stage_indicator}]: base={base_score:.3f}, final={final_score:.3f}, threshold={threshold:.3f} "
                     f"[{signal_type}] (sem={sem_score:.3f}, kw={kw_score:.3f}, pat={pat_score:.3f})"
                 )
             else:
@@ -4980,7 +6728,8 @@ class AIClassificationPipelineService:
                     f"[{signal_type}] (sem={sem_score:.3f}, kw={kw_score:.3f}, pat={pat_score:.3f})"
                 )
         
-        logger.debug(f"Governance scores: {len(scores)} categories passed threshold")
+        stage_used = "EXACT MATCH" if has_exact_matches else "SEMANTIC SEARCH"
+        logger.info(f"📊 Classification completed using {stage_used}: {len(scores)} categories passed threshold")
         return scores
         
     def _sample_table_values_batch(self, db: str, schema: str, table: str, columns: List[str], limit: int = 20) -> Dict[str, List[Any]]:
@@ -5043,6 +6792,14 @@ class AIClassificationPipelineService:
         
         col_lower = col_name.lower()
 
+        # DIAGNOSTIC LOGGING
+        logger.info(f"=== DIAGNOSING COLUMN: {col_name} ===")
+        logger.info(f"Column name lowercase: '{col_lower}'")
+        if col_comment:
+            logger.info(f"Column comment: '{col_comment}'")
+
+
+
         # ========================================================================
         # METADATA-DRIVEN APPROACH: Use governance tables for pattern matching
         # ========================================================================
@@ -5052,25 +6809,40 @@ class AIClassificationPipelineService:
         # Get sensitive patterns from governance metadata (loaded during initialization)
         # These patterns come from the SENSITIVE_PATTERNS table
         sensitive_patterns_from_governance = set()
+        raw_patterns_from_governance = set()
         
         def extract_keywords_from_pattern(pattern_str):
-            """Helper to extract keywords from a regex pattern string."""
+            """Helper to extract keywords from a regex pattern string.
+            
+            IMPROVED: Preserves the original pattern for regex matching while also
+            extracting simple keywords for fallback matching.
+            """
             if not isinstance(pattern_str, str) or not pattern_str:
                 return set()
                 
-            # Remove regex special chars and extract meaningful terms
-            return {
-                kw for kw in 
-                pattern_str.lower()
-                .replace('\\b', ' ').replace('\\d', ' ').replace('\\w', ' ')
-                .replace('.*', ' ').replace('.+', ' ')
-                .replace('[', ' ').replace(']', ' ')
-                .replace('(', ' ').replace(')', ' ')
-                .replace('|', ' ').replace('?', ' ')
-                .replace('*', ' ').replace('+', ' ')
-                .split()
-                if len(kw) > 2  # Only meaningful keywords
-            }
+            keywords = set()
+            
+            # 1. If pattern is simple alphanumeric (plus underscores), keep it as is
+            if re.match(r'^[a-zA-Z0-9_]+$', pattern_str):
+                keywords.add(pattern_str.lower())
+                return keywords
+            
+            # 2. Extract meaningful words from regex patterns
+            # IMPROVED: Don't destroy the pattern - just extract keywords for fallback
+            # Remove common regex metacharacters but preserve the words
+            cleaned = pattern_str.lower()
+            
+            # Replace regex metacharacters with spaces (but don't destroy the pattern)
+            for char in ['\\b', '\\d', '\\w', '.*', '.+', '[', ']', '(', ')', '|', '?', '*', '+', '^', '$', '\\', '{', '}']:
+                cleaned = cleaned.replace(char, ' ')
+                
+            # Extract words that are 3+ characters
+            for word in cleaned.split():
+                word = word.strip()
+                if len(word) >= 3 and word.isalpha():
+                    keywords.add(word)
+                    
+            return keywords
         
         # Check both _category_pattern_metadata and _category_patterns
         patterns_processed = False
@@ -5089,6 +6861,7 @@ class AIClassificationPipelineService:
                                 pattern_str = pattern_item
                                 
                             if pattern_str:
+                                raw_patterns_from_governance.add(pattern_str)
                                 sensitive_patterns_from_governance.update(
                                     extract_keywords_from_pattern(pattern_str)
                                 )
@@ -5104,6 +6877,7 @@ class AIClassificationPipelineService:
                     if pg in {'PII', 'SOX', 'SOC2'} and patterns:
                         for pattern_str in patterns:
                             if isinstance(pattern_str, str) and pattern_str:
+                                raw_patterns_from_governance.add(pattern_str)
                                 sensitive_patterns_from_governance.update(
                                     extract_keywords_from_pattern(pattern_str)
                                 )
@@ -5137,30 +6911,223 @@ class AIClassificationPipelineService:
             }
         
         # CRITICAL: Check if column name contains ANY sensitive pattern from governance tables
-        has_sensitive_pattern = any(pattern in col_lower for pattern in sensitive_patterns_from_governance)
+        # Check 1: Simple keyword matching
+        has_keyword_match = any(pattern in col_lower for pattern in sensitive_patterns_from_governance)
         
-        # Additional check: Exclude generic/non-sensitive columns even if they match patterns
+        # Check 2: Regex pattern matching (more accurate)
+        has_regex_match = False
+        if not has_keyword_match:
+            for pat in raw_patterns_from_governance:
+                try:
+                    if re.search(pat, col_lower, re.IGNORECASE):
+                        has_regex_match = True
+                        break
+                except Exception:
+                    continue
+        
+        has_sensitive_pattern = has_keyword_match or has_regex_match
+        
+        # DIAGNOSTIC LOGGING
+        logger.info(f"Pattern match check: {has_sensitive_pattern} (Keywords: {has_keyword_match}, Regex: {has_regex_match})")
+        if not has_sensitive_pattern:
+            logger.info(f"Available governance patterns (first 20): {list(sensitive_patterns_from_governance)[:20]}")
+        
+        # ========================================================================
+        # ENHANCED COMMENT-BASED CLASSIFICATION
+        # ========================================================================
+        # CRITICAL: Parse column comments for explicit sensitivity markers
+        # Format: "SENSITIVE: <description> - <policy_groups>"
+        # Example: "SENSITIVE: SSN in format 123-45-6789 - HIGH RISK PII"
+        # Example: "SENSITIVE: Tax ID - PII/SOX"
+        
+        comment_indicates_sensitive = False
+        comment_policy_groups = set()
+        comment_boost_factor = 0.0
+        
+        if col_comment and isinstance(col_comment, str):
+            comment_upper = col_comment.upper()
+            comment_lower = col_comment.lower()
+            
+            # Check for explicit SENSITIVE marker
+            if 'SENSITIVE:' in col_comment or 'SENSITIVE ' in comment_upper:
+                comment_indicates_sensitive = True
+                logger.info(f"  🔍 SENSITIVE marker found in comment")
+                
+                # Extract policy groups from comment
+                # Look for: PII, SOX, SOC2, HIPAA, GDPR, etc.
+                policy_indicators = {
+                    'PII': ['PII', 'PERSONAL', 'IDENTIFIABLE', 'IDENTITY'],
+                    'SOX': ['SOX', 'FINANCIAL', 'ACCOUNTING', 'SARBANES'],
+                    'SOC2': ['SOC2', 'SOC 2', 'SECURITY', 'ACCESS CONTROL', 'AUTHENTICATION'],
+                    'HIPAA': ['HIPAA', 'HEALTH', 'MEDICAL', 'PATIENT'],
+                    'GDPR': ['GDPR', 'PRIVACY', 'DATA PROTECTION']
+                }
+                
+                for pg, indicators in policy_indicators.items():
+                    for indicator in indicators:
+                        if indicator in comment_upper:
+                            comment_policy_groups.add(pg)
+                            logger.info(f"    → Detected policy group from comment: {pg} (matched: '{indicator}')")
+                
+                # Determine boost factor based on comment specificity
+                # Higher boost for explicit markers
+                if comment_policy_groups:
+                    comment_boost_factor = 0.35  # Strong boost for explicit policy group in comment
+                else:
+                    comment_boost_factor = 0.25  # Moderate boost for SENSITIVE marker only
+                
+                logger.info(f"    → Comment policy groups: {comment_policy_groups}, boost: {comment_boost_factor}")
+        
+
+        # ========================================================================
+        # ENHANCED GENERIC KEYWORD EXCLUSION
+        # ========================================================================
+        # CRITICAL: Exclude generic/non-sensitive columns that should NEVER be classified as sensitive
+        # This prevents false positives from overly broad pattern matching
+        
+        # ========================================================================
+        # REFINED GENERIC EXCLUSIONS - More Precise, Context-Aware
+        # ========================================================================
+        # CRITICAL FIX: Removed overly broad patterns that were causing false negatives
+        # - Removed generic 'name' (was blocking customer_name, employee_name, etc.)
+        # - Removed generic 'date', 'time' (was blocking all date fields)
+        # - Now only excludes SPECIFIC non-sensitive patterns
+        
         generic_exclusions = [
-            'product_id', 'item_id', 'catalog_id', 'category_id', 'sku',
-            'warehouse_id', 'location_id', 'department_id', 'store_id',
-            'status', 'type', 'code', 'flag', 'mode',
-            'created_at', 'updated_at', 'created_date', 'updated_date',
-            'description', 'notes', 'comment', 'remarks',
-            'quantity', 'count', 'total_items'
+            # Product/Catalog Fields (NON-SENSITIVE) - SPECIFIC ONLY
+            'product_id', 'item_id', 'catalog_id', 'category_id', 'sku', 'product_code',
+            'item_code', 'product_name', 'item_name', 'brand_name', 'brand_id',
+            'manufacturer_id', 'supplier_id', 'vendor_id', 'merchant_id',
+            'warehouse_id', 'store_id', 'branch_id',
+            'region_id', 'division_id', 'unit_id', 'facility_id',
+            
+            # Status/Type/Flag Fields (METADATA) - SPECIFIC ONLY
+            'status', 'state', 'type', 'flag', 'mode', 'method',
+            'config', 'setting', 'option', 'preference', 'indicator',
+            'is_active', 'is_deleted', 'is_enabled', 'is_visible', 'is_public',
+            
+            # Audit Timestamps (Created/Updated/Modified/Deleted) - SPECIFIC ONLY
+            'created_at', 'updated_at', 'modified_at', 'deleted_at', 'inserted_at',
+            'created_date', 'updated_date', 'modified_date', 'deleted_date', 'inserted_date',
+            'created_time', 'updated_time', 'modified_time', 'deleted_time', 'inserted_time',
+            'created_timestamp', 'updated_timestamp', 'modified_timestamp', 'deleted_timestamp',
+            'created_on', 'updated_on', 'modified_on', 'deleted_on', 'inserted_on',
+            'created_dt', 'updated_dt', 'modified_dt', 'deleted_dt', 'inserted_dt',
+            
+            # User/Actor Tracking (Who created/updated) - SPECIFIC ONLY
+            'created_by', 'updated_by', 'modified_by', 'deleted_by', 'inserted_by',
+            'created_user', 'updated_user', 'modified_user', 'deleted_user',
+            'created_by_user', 'updated_by_user', 'modified_by_user',
+            
+            # Generic Timestamps - SPECIFIC ONLY
+            'last_modified', 'last_updated', 'last_changed', 'last_accessed',
+            'last_login', 'last_seen', 'last_activity',
+            
+            # Date Ranges (Start/End/From/To) - SPECIFIC ONLY
+            'start_date', 'end_date', 'from_date', 'to_date', 'thru_date',
+            'start_time', 'end_time', 'from_time', 'to_time',
+            'start_datetime', 'end_datetime', 'from_datetime', 'to_datetime',
+            'valid_from', 'valid_to', 'valid_until', 'valid_through',
+            'effective_date', 'effective_from', 'effective_to', 'effective_until',
+            'expiration_date', 'expiry_date', 'expire_date', 'expires_on', 'expires_at',
+            'termination_date', 'end_of_life', 'sunset_date',
+            
+            # Business Dates (Order/Invoice/Transaction/Shipment) - SPECIFIC ONLY
+            'order_date', 'invoice_date', 'transaction_date', 'purchase_date',
+            'sale_date', 'shipment_date', 'delivery_date', 'received_date',
+            'processed_date', 'completed_date', 'cancelled_date', 'refund_date',
+            'payment_date', 'due_date', 'billing_date', 'statement_date',
+            
+            # Period/Fiscal Dates - SPECIFIC ONLY
+            'period_start', 'period_end', 'fiscal_year', 'fiscal_period',
+            'quarter_start', 'quarter_end', 'month_start', 'month_end',
+            'year_start', 'year_end', 'reporting_date', 'as_of_date',
+            
+            # Event/Activity Dates - SPECIFIC ONLY
+            'event_date', 'activity_date', 'action_date', 'occurrence_date',
+            'scheduled_date', 'planned_date', 'actual_date', 'estimated_date',
+            'publish_date', 'release_date', 'launch_date', 'go_live_date',
+            
+            # Year/Month/Day/Week Fields - SPECIFIC ONLY
+            'year', 'month', 'day', 'week', 'quarter',
+            'day_of_week', 'day_of_month', 'day_of_year',
+            'week_of_year', 'month_of_year',
+            
+            # Description/Notes Fields (GENERAL TEXT) - SPECIFIC ONLY
+            'description', 'desc', 'notes', 'comment', 'remarks', 'memo',
+            'summary', 'details', 'info', 'information',
+            
+            # Quantity/Count Fields (METRICS) - SPECIFIC ONLY
+            'quantity', 'qty', 'count', 'total', 'total_items', 'total_count',
+            'num_items', 'item_count', 'record_count',
+            
+            # Version/Sequence Fields (TECHNICAL METADATA) - SPECIFIC ONLY
+            'version', 'version_number', 'revision', 'sequence', 'seq',
+            'order_number', 'line_number', 'row_number',
+            
+            # Non-Personal Name Fields - SPECIFIC ONLY (REMOVED GENERIC 'name')
+            'product_name', 'item_name', 'brand_name', 'company_name', 'organization_name',
+            'department_name', 'category_name', 'group_name', 'team_name',
+            'title', 'label', 'display_name', 'short_name', 'long_name',
+            
+            # URL/Link Fields - SPECIFIC ONLY
+            'url', 'link', 'href', 'path', 'uri', 'endpoint',
+            
+            # Language/Locale Fields - SPECIFIC ONLY
+            'language', 'locale', 'lang', 'currency_code',
+            'timezone', 'time_zone',
         ]
         
+        # EXCEPTION LIST: Keywords that SHOULD be sensitive even if they match generic patterns
+        # These override the generic exclusions
+        sensitive_exceptions = [
+            'birth', 'dob', 'date_of_birth', 'birthdate',  # DOB is PII
+            'ssn', 'social_security', 'tax_id', 'ein',  # Tax IDs are PII/SOX
+            'customer_name', 'user_name', 'employee_name', 'patient_name',  # Personal names are PII
+            'email', 'phone', 'mobile', 'telephone',  # Contact info is PII
+            'address', 'street', 'city', 'zip', 'postal',  # Addresses are PII
+            'password', 'secret', 'token', 'key', 'credential',  # Secrets are SOC2
+            'account', 'bank', 'credit_card', 'card_number',  # Financial is SOX/PII
+            'salary', 'wage', 'income', 'revenue', 'payment',  # Financial is SOX
+        ]
+        
+        # Check if column matches generic exclusions
         is_generic = any(excl in col_lower for excl in generic_exclusions)
         
-        # CRITICAL: Skip column if NO sensitive pattern found OR if it's a generic column
-        if not has_sensitive_pattern or is_generic:
-            if is_generic:
-                logger.debug(f"  ✓ SKIPPED '{col_name}' - Generic/non-sensitive column (excluded)")
-            else:
-                logger.debug(f"  ✓ SKIPPED '{col_name}' - No sensitive pattern detected (metadata-driven filtering)")
+        # Check if column matches sensitive exceptions (overrides generic exclusion)
+        is_sensitive_exception = any(exc in col_lower for exc in sensitive_exceptions)
+        
+        # Special-case: generic reference keys like 'currency_key' should not be classified sensitive
+        # unless clearly security-related (api/encryption/secret/access/auth)
+        try:
+            is_generic_key = col_lower.endswith('_key') and not any(t in col_lower for t in ['api', 'encryption', 'secret', 'access', 'auth'])
+        except Exception:
+            is_generic_key = False
+        if is_generic_key and not is_sensitive_exception:
+            logger.debug(f"  ✓ SKIPPED '{col_name}' - generic reference key (excluded)")
             return None
         
-        # If we reach here, column has a sensitive pattern and should be scored
-        logger.debug(f"  → PROCESSING '{col_name}' - Sensitive pattern detected from governance metadata")
+        # CRITICAL DECISION LOGIC:
+        # 0. If column has SENSITIVE comment → ALWAYS PROCESS (highest priority)
+        # 1. If column matches sensitive exception → ALWAYS PROCESS (even if generic)
+        # 2. If column matches generic exclusion AND NOT sensitive exception → SKIP
+        # 3. If column has no sensitive pattern AND NOT sensitive exception AND NOT sensitive comment → SKIP
+        
+        # Priority 0: Comment-based sensitivity (highest priority)
+        if comment_indicates_sensitive:
+            logger.info(f"  → PROCESSING '{col_name}' - SENSITIVE marker in comment (bypassing all exclusions)")
+        # Priority 1: Generic exclusions
+        elif is_generic and not is_sensitive_exception:
+            logger.debug(f"  ✓ SKIPPED '{col_name}' - Generic/non-sensitive column (excluded)")
+            return None
+        # Priority 2: Pattern matching
+        elif not has_sensitive_pattern and not is_sensitive_exception:
+            logger.debug(f"  ✓ SKIPPED '{col_name}' - No sensitive pattern detected (excluded)")
+            return None
+        else:
+            # If we reach here, column has a sensitive pattern OR is a sensitive exception
+            logger.debug(f"  → PROCESSING '{col_name}' - Sensitive pattern detected from governance metadata")
+
 
         # Build context from metadata only
         context_parts = [
@@ -5186,20 +7153,266 @@ class AIClassificationPipelineService:
         
         context = " | ".join(context_parts)
         
-        # Compute scores using governance-driven methods only
-        scores = self._compute_governance_scores(context)
+        # ========================================================================
+        # STRICT PRIORITY-BASED DETECTION LOGIC
+        # ========================================================================
+        # TIER 1: Exact Pattern Matching (Highest Priority)
+        # TIER 2: Partial Keyword Matching (Medium Priority)
+        # TIER 3: Semantic Search (Fallback - Lowest Priority)
+        # ========================================================================
         
+        logger.info(f"  🔍 Starting strict priority-based detection for '{col_name}'")
+        
+        # Initialize scores dictionary
+        scores = {}
+        match_details = {} # Store details about what matched (keyword, type)
+        detection_tier = None  # Track which tier was used
+        
+        # ========================================================================
+        # TIER 1: EXACT PATTERN MATCHING (REGEX)
+        # ========================================================================
+        # Check for exact regex pattern matches from governance tables
+        # These are the most precise and should be prioritized
+        
+        logger.info(f"  → TIER 1: Checking exact pattern matches (regex)")
+        tier1_matches = {}  # category -> confidence
+        
+        if hasattr(self, '_category_pattern_metadata') and self._category_pattern_metadata:
+            for category, patterns in self._category_pattern_metadata.items():
+                pg = self._map_category_to_policy_group(category)
+                if pg not in {'PII', 'SOX', 'SOC2'}:
+                    continue
+                    
+                for pattern_item in patterns:
+                    pattern_str = ''
+                    if isinstance(pattern_item, dict):
+                        pattern_str = pattern_item.get('pattern', '')
+                    elif isinstance(pattern_item, str):
+                        pattern_str = pattern_item
+                    
+                    if not pattern_str:
+                        continue
+                    
+                    # Try to match as regex pattern
+                    try:
+                        # Check column name
+                        if re.search(pattern_str, col_name, re.IGNORECASE):
+                            tier1_matches[category] = tier1_matches.get(category, 0.0) + 0.95
+                            match_details[category] = {'match_type': 'REGEX', 'keyword': pattern_str}
+                            logger.info(f"    ✅ TIER 1 MATCH: '{category}' - pattern '{pattern_str}' matched column name")
+                        
+                        # Check samples
+                        for sample in samples[:5]:
+                            sample_str = str(sample)
+                            if re.search(pattern_str, sample_str, re.IGNORECASE):
+                                tier1_matches[category] = tier1_matches.get(category, 0.0) + 0.10
+                                logger.info(f"    ✅ TIER 1 MATCH: '{category}' - pattern '{pattern_str}' matched sample data")
+                                break  # Only count once per category
+                    except re.error:
+                        # Not a valid regex, will be checked in tier 2
+                        continue
+        
+        # Normalize tier 1 scores (cap at 0.98 for exact matches)
+        for cat in tier1_matches:
+            tier1_matches[cat] = min(0.98, tier1_matches[cat])
+        
+        if tier1_matches:
+            scores = tier1_matches
+            detection_tier = "TIER 1 (Exact Pattern Match)"
+            logger.info(f"    ✅ TIER 1 SUCCESS: Found {len(tier1_matches)} exact pattern matches")
+            for cat, score in sorted(tier1_matches.items(), key=lambda x: x[1], reverse=True):
+                logger.info(f"      {cat}: {score:.3f}")
+        else:
+            logger.info(f"    ❌ TIER 1: No exact pattern matches found")
+        
+        # ========================================================================
+        # TIER 2: PARTIAL KEYWORD MATCHING (CONTAINS-TYPE)
+        # ========================================================================
+        # Only proceed if Tier 1 didn't find strong matches
+        
+        if not scores or max(scores.values()) < 0.70:
+            logger.info(f"  → TIER 2: Checking partial keyword matches (contains-type)")
+            tier2_matches = {}  # category -> confidence
+            
+            # Check keywords from governance metadata (contains match_type)
+            if hasattr(self, '_category_keyword_metadata') and self._category_keyword_metadata:
+                for category, meta_list in self._category_keyword_metadata.items():
+                    pg = self._map_category_to_policy_group(category)
+                    if pg not in {'PII', 'SOX', 'SOC2'}:
+                        continue
+                        
+                    for meta in meta_list:
+                        kw = meta.get('keyword', '')
+                        match_type = meta.get('match_type', 'EXACT').upper()
+                        
+                        if not isinstance(kw, str) or len(kw) < 3:
+                            continue
+                        
+                        kw_lower = kw.lower()
+                        
+                        # --- PARTIAL MATCH LOGIC ---
+                        # If match_type is PARTIAL, we perform a check but then VALIDATE with semantic search for context
+                        if match_type == 'PARTIAL':
+                            if kw_lower in col_lower:
+                                logger.info(f"    Possible PARTIAL match: '{category}' - keyword '{kw}' found. Verifying with semantic search...")
+                                # Trigger Semantic Search for validation
+                                try:
+                                    sem_scores = self._semantic_scores_governance_driven(context)
+                                    sem_conf = sem_scores.get(category, 0.0)
+                                    
+                                    if sem_conf > 0.50:  # Threshold for validating a partial match
+                                        tier2_matches[category] = max(tier2_matches.get(category, 0.0), 0.70 + (sem_conf * 0.2)) # Moderate confidence
+                                        match_details[category] = {'match_type': 'PARTIAL', 'keyword': kw}
+                                        logger.info(f"    ✅ TIER 2 MATCH (PARTIAL + SEMANTIC): '{category}' verified (sem_conf={sem_conf:.2f})")
+                                    else:
+                                        logger.debug(f"    ❌ Partial match '{kw}' rejected by semantic search (sem_conf={sem_conf:.2f})")
+                                except Exception as e:
+                                    logger.warning(f"    ⚠️ Semantic validation failed for partial match: {e}")
+                            continue # Skip standard checks for PARTIAL types
+
+                        # --- STANDARD LOGIC (EXACT/CONTAINS) ---
+                        # Check for word boundary match (stronger)
+                        if re.search(r'\b' + re.escape(kw_lower) + r'\b', col_lower):
+                            tier2_matches[category] = tier2_matches.get(category, 0.0) + 0.75
+                            match_details[category] = {'match_type': 'EXACT', 'keyword': kw}
+                            logger.info(f"    ✅ TIER 2 MATCH (word boundary): '{category}' - keyword '{kw}' in column name")
+                        # Check for substring containment (weaker) - only if NOT explicit PARTIAL (implied contains)
+                        elif kw_lower in col_lower:
+                            tier2_matches[category] = tier2_matches.get(category, 0.0) + 0.60
+                            match_details[category] = {'match_type': 'CONTAINS', 'keyword': kw}
+                            logger.info(f"    ✅ TIER 2 MATCH (substring): '{category}' - keyword '{kw}' in column name")
+                        # Check in comment
+                        elif col_comment and kw_lower in col_comment.lower():
+                            tier2_matches[category] = tier2_matches.get(category, 0.0) + 0.50
+                            logger.info(f"    ✅ TIER 2 MATCH (comment): '{category}' - keyword '{kw}' in comment")
+                        # Check in samples
+                        else:
+                            for sample in samples[:5]:
+                                if kw_lower in str(sample).lower():
+                                    tier2_matches[category] = tier2_matches.get(category, 0.0) + 0.40
+                                    logger.info(f"    ✅ TIER 2 MATCH (sample): '{category}' - keyword '{kw}' in sample data")
+                                    break  # Only count once per category
+            
+            # Also check extracted keywords from patterns
+            for pattern_str in raw_patterns_from_governance:
+                keywords = extract_keywords_from_pattern(pattern_str)
+                for kw in keywords:
+                    if kw in col_lower:
+                        # Find which category this pattern belongs to
+                        if hasattr(self, '_category_pattern_metadata'):
+                            for category, patterns in self._category_pattern_metadata.items():
+                                pg = self._map_category_to_policy_group(category)
+                                if pg not in {'PII', 'SOX', 'SOC2'}:
+                                    continue
+                                
+                                for p_item in patterns:
+                                    p_str = p_item.get('pattern', '') if isinstance(p_item, dict) else p_item
+                                    if p_str == pattern_str:
+                                        tier2_matches[category] = tier2_matches.get(category, 0.0) + 0.55
+                                        logger.info(f"    ✅ TIER 2 MATCH (extracted keyword): '{category}' - keyword '{kw}' from pattern")
+                                        break
+            
+            # Normalize tier 2 scores (cap at 0.90 for keyword matches)
+            for cat in tier2_matches:
+                tier2_matches[cat] = min(0.90, tier2_matches[cat])
+            
+            if tier2_matches:
+                # Merge with tier 1 results (tier 1 scores take precedence)
+                for cat, score in tier2_matches.items():
+                    if cat not in scores:
+                        scores[cat] = score
+                    else:
+                        scores[cat] = max(scores[cat], score)  # Keep higher score
+                
+                detection_tier = "TIER 2 (Partial Keyword Match)" if not detection_tier else detection_tier
+                logger.info(f"    ✅ TIER 2 SUCCESS: Found {len(tier2_matches)} partial keyword matches")
+                for cat, score in sorted(tier2_matches.items(), key=lambda x: x[1], reverse=True):
+                    logger.info(f"      {cat}: {score:.3f}")
+            else:
+                logger.info(f"    ❌ TIER 2: No partial keyword matches found")
+        
+        # ========================================================================
+        # TIER 3: SEMANTIC SEARCH (FALLBACK)
+        # ========================================================================
+        # Only use semantic search if tiers 1 and 2 didn't produce strong results
+        
+        if not scores or max(scores.values()) < 0.50:
+            logger.info(f"  → TIER 3: Using semantic search (fallback)")
+            
+            # Compute semantic scores using the traditional method
+            semantic_scores = self._compute_governance_scores(context)
+            
+            if semantic_scores:
+                # Semantic scores are inherently lower confidence than exact/keyword matches
+                # Apply a dampening factor to ensure they don't override precise matches
+                dampening_factor = 0.80
+                
+                for cat, score in semantic_scores.items():
+                    dampened_score = score * dampening_factor
+                    
+                    # Only add if not already present from tier 1/2, or if tier 1/2 score is very low
+                    if cat not in scores:
+                        scores[cat] = dampened_score
+                    elif scores[cat] < 0.50:  # Only boost if tier 1/2 was weak
+                        scores[cat] = max(scores[cat], dampened_score)
+                
+                detection_tier = "TIER 3 (Semantic Search)" if not detection_tier else detection_tier
+                logger.info(f"    ✅ TIER 3: Applied semantic scores with dampening factor {dampening_factor}")
+                for cat, score in sorted(semantic_scores.items(), key=lambda x: x[1], reverse=True)[:10]:
+                    logger.info(f"      {cat}: {score:.3f} (original) → {score * dampening_factor:.3f} (dampened)")
+            else:
+                logger.info(f"    ❌ TIER 3: No semantic scores available")
+        
+        # Log final detection tier
+        if detection_tier:
+            logger.info(f"  🎯 PRIMARY DETECTION METHOD: {detection_tier}")
+        else:
+            logger.info(f"  ⚠️ No detection method produced results")
+        
+        # DIAGNOSTIC: Log raw scores
+        logger.info(f"  📊 Raw governance scores for '{col_name}':")
+        for cat, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:10]:
+            logger.info(f"    {cat}: {score:.3f}")
+        
+        # === COMMENT-BASED SCORE BOOSTING ===
+        # CRITICAL: Apply strong boosts to categories matching comment policy groups
+        # This ensures columns with explicit SENSITIVE markers are correctly classified
+        if comment_indicates_sensitive and comment_policy_groups:
+            logger.info(f"  🎯 Applying comment-based boosts for policy groups: {comment_policy_groups}")
+            
+            for cat, score in list(scores.items()):
+                pg = self._map_category_to_policy_group(cat)
+                
+                # If this category's policy group matches a comment policy group, boost it
+                if pg in comment_policy_groups:
+                    boosted_score = min(0.95, score + comment_boost_factor)
+                    scores[cat] = boosted_score
+                    logger.info(f"    ✅ Boosted '{cat}' ({pg}): {score:.3f} → {boosted_score:.3f} (+{comment_boost_factor})")
+            
+            # Log boosted scores
+            logger.info(f"  📊 Scores after comment-based boost:")
+            for cat, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:10]:
+                logger.info(f"    {cat}: {score:.3f}")
+        
+
         # === ACCURACY ENHANCEMENT: Context-Aware Adjustments ===
         scores = self._apply_context_aware_adjustments(
             scores, col_name, table, col_type, samples
         )
         
+        # ========================================================================
+        # [REMOVED] KEYWORD-BASED SCORING BOOST (Hardcoded Lists Removed)
+        # ========================================================================
+        # Score boosting logic removed as it relied on hardcoded keyword lists.
+        # The system now purely trusts the weights from the governance tables (Tier 1/2 logic).
+
+        
         # === MULTI-LABEL SUPPORT ===
         # Identify ALL categories that meet the threshold, not just the top one
         detected_categories = []
         for cat, score in scores.items():
-            # Use category-specific threshold if available, else 0.35 (BALANCED: Raised from 0.25 to reduce false positives)
-            thresh = self._category_thresholds.get(cat, 0.35)
+            # Use category-specific threshold if available, else 0.30 (LOWERED from 0.35 for better recall)
+            thresh = self._category_thresholds.get(cat, 0.30)
             
             # EXCLUDE GENERIC / NON-SENSITIVE CATEGORIES
             # We only want to report truly sensitive categories
@@ -5209,26 +7422,171 @@ class AIClassificationPipelineService:
             # Check if it maps to a sensitive policy group
             pg = self._map_category_to_policy_group(cat)
             if pg == 'NON_SENSITIVE':
+                logger.debug(f"    ❌ Skipping category '{cat}' - maps to NON_SENSITIVE")
                 continue
             
-            # STRICTER validation: Require minimum confidence of 0.70 to reduce false positives
-            # This ensures only high-confidence sensitive signals are kept for column-level results
-            if score < 0.70:
+            # DIAGNOSTIC: Log policy group mapping
+            logger.info(f"    🔍 Category '{cat}' maps to policy group '{pg}'")
+            
+            # CRITICAL: Check if it maps to a sensitive policy group (PII/SOX/SOC2)
+            if pg not in {'PII', 'SOX', 'SOC2'}:
+                logger.debug(f"    ❌ Skipping category '{cat}' - does not map to PII/SOX/SOC2 (maps to '{pg}')")
                 continue
-
+            
+            # ========================================================================
+            # POST-DETECTION GENERIC KEYWORD FILTER
+            # ========================================================================
+            # CRITICAL: Even if a category passed initial detection, exclude it if the
+            # detection was based on generic keywords that shouldn't trigger classification
+            
+            # Check if this category was likely triggered by generic keywords
+            cat_lower = cat.lower()
+            generic_category_indicators = [
+                'general', 'metadata', 'system', 'technical', 'operational',
+                'administrative', 'reference', 'lookup', 'catalog', 'master'
+            ]
+            
+            is_generic_category = any(ind in cat_lower for ind in generic_category_indicators)
+            
+            # Also check if the column name suggests this is a false positive
+            # (e.g., 'product_name' detected as PII because of 'name')
+            generic_column_patterns = [
+                'product_', 'item_', 'catalog_', 'category_', 'brand_',
+                'manufacturer_', 'supplier_', 'vendor_', 'merchant_',
+                '_code', '_type', '_status', '_flag', '_mode'
+            ]
+            
+            has_generic_pattern = any(pat in col_lower for pat in generic_column_patterns)
+            
+            # If category is generic OR column has generic pattern, apply stricter validation
+            if is_generic_category or has_generic_pattern:
+                # Require VERY high confidence (0.75+) to accept generic-looking detections
+                if score < 0.75:
+                    logger.debug(f"    ❌ Skipping '{cat}' for '{col_name}' - generic pattern detected, score {score:.3f} < 0.75")
+                    continue
+                else:
+                    logger.info(f"    ⚠️ Accepting '{cat}' for '{col_name}' despite generic pattern - HIGH confidence {score:.3f}")
+            
+            # ========================================================================
+            
+            # REMOVED HARDCODED 0.50 CHECK - Now trusts governance table thresholds
+            # OLD CODE: if score < 0.50: continue
+            # This was overriding category-specific thresholds from SENSITIVITY_CATEGORIES
+            
+            # Apply category-specific threshold from governance tables
             if score >= thresh:
+                details = match_details.get(cat, {'match_type': 'SEMANTIC', 'keyword': ''})
                 detected_categories.append({
                     'category': cat,
-                    'confidence': score
+                    'confidence': score,
+                    'keyword_string': details.get('keyword', ''),
+                    'match_type': details.get('match_type', 'SEMANTIC')
                 })
+                logger.info(f"    ✅ DETECTED: '{cat}' (score={score:.3f}, thresh={thresh:.3f}, pg={pg})")
+            else:
+                logger.debug(f"    ❌ Category '{cat}' score {score:.3f} < threshold {thresh:.3f}")
         
         # Sort by confidence descending
         detected_categories.sort(key=lambda x: x['confidence'], reverse=True)
         
         # Determine primary category (top 1)
         if detected_categories:
-            best_category = detected_categories[0]['category']
-            confidence = detected_categories[0]['confidence']
+            # CRITICAL FIX: Intelligent tiebreaker when scores are identical
+            # This happens when governance centroids are too similar (all score 0.950)
+            if len(detected_categories) > 1:
+                top_score = detected_categories[0]['confidence']
+                tied_categories = [c for c in detected_categories if abs(c['confidence'] - top_score) < 0.001]
+                
+                if len(tied_categories) > 1:
+                    logger.info(f"  🔄 Found {len(tied_categories)} tied categories with score {top_score:.3f}")
+                    
+                    # Score each tied category based on weighted keyword matches
+                    tie_scores = {}
+                    tie_details = {}
+                    
+                    for cat_dict in tied_categories:
+                        cat = cat_dict['category']
+                        pg = self._map_category_to_policy_group(cat)
+                        
+                        score = 0
+                        matched = []
+                        
+                        if pg == 'PII':
+                            # Score based on PII-specific keywords
+                            pii_keywords = ['ssn', 'social', 'passport', 'credit_card', 'email']
+                            for kw in pii_keywords:
+                                if kw in col_lower:
+                                    score += 1
+                                    matched.append(kw)
+                        
+                        # Add more policy group specific scoring here if needed
+                        
+                        tie_scores[cat] = score
+                        tie_details[cat] = {
+                            'score': score,
+                            'matched': matched,
+                            'policy_group': pg
+                        }
+                        for kw in p3_sorted:
+                            if re.search(r'\b' + re.escape(kw) + r'\b', col_lower):
+                                score += 2
+                                matched_keywords.append(f"{kw}(P3)")
+                                break
+                        
+                        # Priority 4 keywords (weight=1)
+                        if score == 0:  # Only check if no other match found
+                            p4_sorted = sorted(keyword_sets[3], key=len, reverse=True)
+                            for kw in p4_sorted:
+                                if re.search(r'\b' + re.escape(kw) + r'\b', col_lower):
+                                    score += 1
+                                    matched_keywords.append(f"{kw}(P4)")
+                                    break
+                        
+                        return score, matched_keywords
+                    
+                    # Score each tied category based on weighted keyword matches
+                    tie_scores = {}
+                    tie_details = {}
+                    
+                    for cat_dict in tied_categories:
+                        cat = cat_dict['category']
+                        pg = self._map_category_to_policy_group(cat)
+                        
+                        score = 0
+                        matched = []
+                        
+                        if pg == 'PII':
+                            score, matched = calculate_keyword_score(
+                                col_name_lower,
+                                [pii_keywords_p1, pii_keywords_p2, pii_keywords_p3, pii_keywords_p4]
+                            )
+                        elif pg == 'SOX':
+                            score, matched = calculate_keyword_score(
+                                col_name_lower,
+                                [sox_keywords_p1, sox_keywords_p2, sox_keywords_p3, sox_keywords_p4]
+                            )
+                        elif pg == 'SOC2':
+                            score, matched = calculate_keyword_score(
+                                col_name_lower,
+                                [soc2_keywords_p1, soc2_keywords_p2, soc2_keywords_p3, soc2_keywords_p4]
+                            )
+                        
+                        tie_scores[cat] = score
+                        tie_details[cat] = matched
+                        logger.info(f"      {cat} ({pg}): score={score}, matches={matched}")
+                    
+                    # Pick the category with the highest weighted score
+                    best_tied = max(tied_categories, key=lambda c: tie_scores.get(c['category'], 0))
+                    best_category = best_tied['category']
+                    confidence = best_tied['confidence']
+                    
+                    logger.info(f"    🎯 TIEBREAKER WINNER: '{best_category}' with score {tie_scores[best_category]} (matches: {tie_details[best_category]})")
+                else:
+                    best_category = detected_categories[0]['category']
+                    confidence = detected_categories[0]['confidence']
+            else:
+                best_category = detected_categories[0]['category']
+                confidence = detected_categories[0]['confidence']
         else:
             best_category = 'NON_SENSITIVE'
             confidence = 0.0
@@ -5248,11 +7606,11 @@ class AIClassificationPipelineService:
             # Return None to indicate this column should be skipped
             return None
         
-        # Additional validation: Ensure confidence is meaningful
-        if confidence < 0.70:
-            logger.debug(f"  ✓ Column '{col_name}' confidence {confidence:.3f} < 0.70 (too low, skipping)")
-            return None
+        # REMOVED HARDCODED 0.50 CHECK - Trust category thresholds
+        # OLD CODE: if confidence < 0.50: return None
+        # Categories already passed their specific thresholds, no need for additional filtering
         
+        logger.info(f"  ✅ Column '{col_name}' classified as {best_category} with confidence {confidence:.3f}")
 
 
         # Create comma-separated string of all detected categories for UI display
@@ -5290,21 +7648,10 @@ class AIClassificationPipelineService:
         elif policy_group == 'SOC2':
             cia_scores = {'c': 2, 'i': 2, 'a': 2}
             final_label = 'Restricted'
-        # Fallback for explicit labels
-        elif label == 'Confidential':
-            cia_scores = {'c': 3, 'i': 3, 'a': 3}
-            final_label = 'Confidential'
-        elif label == 'Restricted':
-            cia_scores = {'c': 2, 'i': 2, 'a': 2}
-            final_label = 'Restricted'
-            
-        # 3. Check for Public (C0)
-        elif label == 'Public':
-            cia_scores = {'c': 0, 'i': 0, 'a': 0}
-            final_label = 'Public'
             
         # Update label to match policy
         label = final_label
+
             
         return {
             'schema': schema,
@@ -5316,6 +7663,8 @@ class AIClassificationPipelineService:
             'confidence': confidence,
             'detected_categories': detected_categories,  # New Multi-Label Field
             'multi_label_category': multi_label_str,     # UI Display Field
+            'matched_keyword': match_details.get(best_category, {}).get('keyword', '') or tier1_matches.get(best_category) and "Pattern Match" or tier2_matches.get(best_category) and "Keyword Match" or "Semantic Match", 
+            'match_type': match_details.get(best_category, {}).get('match_type', 'SEMANTIC'),
             'governance_scores': scores,
             'context_used': context,
             # UI Fields
@@ -5427,6 +7776,22 @@ class AIClassificationPipelineService:
         if suppress:
             self._reduce_category(scores, suppress["policy_group"], suppress["pattern"], suppress["factor"])
             
+        # Final safeguard: if column name clearly looks like a physical address part, enforce PII dominance
+        try:
+            name_lc = (col_name or '').lower()
+            addr_tokens = [
+                'address', 'addr', 'street', 'st_', 'stname', 'city', 'town', 'state', 'province',
+                'zip', 'zipcode', 'postal', 'postcode', 'country', 'location', 'billing_', 'shipping_',
+                'mailing_', 'home_', 'delivery_', 'physical_'
+            ]
+            if any(tok in name_lc for tok in addr_tokens):
+                # Strongly boost PII and reduce SOX/SOC2 to avoid misclassification
+                self._boost_category(scores, 'PII', 'PII_PHYSICAL_ADDRESS', 1.6)
+                self._reduce_category(scores, 'SOX', 'SOX_NOT_ADDRESS', 0.4)
+                self._reduce_category(scores, 'SOC2', 'SOC2_NOT_ADDRESS', 0.4)
+        except Exception:
+            pass
+        
         return scores
 
     def _apply_context_aware_adjustments(self, scores: Dict[str, float], 
@@ -5443,26 +7808,89 @@ class AIClassificationPipelineService:
         
         adjusted_scores = scores.copy()
         
-        col_lower = col_name.lower()
-        table_lower = table.lower()
-        
-        # === RULE 1: Table Context Boosting ===
-        # Identify table domain and boost relevant categories
-        
-        # Financial/Transactional tables → Boost SOX
-        if any(kw in table_lower for kw in ['order', 'transaction', 'payment', 'invoice', 
-                                              'billing', 'purchase', 'sale', 'revenue']):
-            self._boost_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 1.3)
-            # Reduce SOC2 for non-security columns in financial tables
-            if not any(kw in col_lower for kw in ['password', 'token', 'auth', 'credential', 'session']):
-                self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.7)
-        
-        # Customer/User tables →s Boost PII
-        elif any(kw in table_lower for kw in ['customer', 'user', 'employee', 'person', 'contact']):
-            self._boost_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 1.3)
+        # ============================================================================
+        # DATA-DRIVEN CONTEXT AWARE ADJUSTMENTS (VW_CONTEXT_AWARE_RULES)
+        # ============================================================================
+        # Use rules loaded from VW_CONTEXT_AWARE_RULES if available
+        if hasattr(self, '_context_aware_rules') and self._context_aware_rules:
+            logger.debug(f"  Applying context-aware rules from governance views ({sum(len(v) for v in self._context_aware_rules.values())} rules)")
+            
+            col_lower = col_name.lower()
+            table_lower = table.lower()
+            
+            # Helper to apply rule action
+            def apply_rule_action(rule, match_reason):
+                action = rule.get('ACTION_TYPE', '').upper()
+                factor = float(rule.get('ACTION_FACTOR', 1.0))
+                pg = rule.get('POLICY_GROUP', '')
+                
+                if action == 'BOOST':
+                    self._boost_category(adjusted_scores, pg, pg, factor)
+                    logger.debug(f"    Matched {match_reason}: '{rule.get('KEYWORD_STRING')}' → BOOST {pg} x{factor}")
+                elif action in ('SUPPRESS', 'REDUCE'):
+                    self._reduce_category(adjusted_scores, pg, pg, factor)
+                    logger.debug(f"    Matched {match_reason}: '{rule.get('KEYWORD_STRING')}' → REDUCE {pg} x{factor}")
+
+            # 1. Table Context Rules
+            # Checks if table name contains the keyword
+            for rule in self._context_aware_rules.get('TABLE_NAME', []):
+                kw = rule.get('KEYWORD_STRING', '').lower()
+                if kw and kw in table_lower:
+                    apply_rule_action(rule, "TABLE_NAME")
+
+            # 2. Column Name Rules (Contains)
+            # Checks if column name contains the keyword
+            for rule in self._context_aware_rules.get('COLUMN_NAME', []):
+                kw = rule.get('KEYWORD_STRING', '').lower()
+                if kw and kw in col_lower:
+                    apply_rule_action(rule, "COLUMN_NAME")
+
+            # 3. Column Suffix Rules
+            # Checks if column name ends with the keyword
+            for rule in self._context_aware_rules.get('COLUMN_SUFFIX', []):
+                kw = rule.get('KEYWORD_STRING', '').lower()
+                if kw and col_lower.endswith(kw):
+                    apply_rule_action(rule, "COLUMN_SUFFIX")
+            
+            # 4. Column Exact Match Rules
+            # Checks if column name exactly matches the keyword
+            for rule in self._context_aware_rules.get('COLUMN_EXACT', []):
+                kw = rule.get('KEYWORD_STRING', '').lower()
+                if kw and col_lower == kw:
+                    apply_rule_action(rule, "COLUMN_EXACT")
+
+            # === Rule 9: Smart Address Context Analysis ===
+            # This uses a separate registry (VW_ADDRESS_CONTEXT_INDICATORS) which is also view-based
+            adjusted_scores = self._apply_smart_address_overrides(adjusted_scores, col_name)
+
+            # === STRICT ENFORCEMENT: Physical address tokens must map to PII ===
+            try:
+                addr_tokens = [
+                    'address', 'addr', 'street', 'st_', 'stname', 'city', 'town', 'state', 'province',
+                    'zip', 'zipcode', 'postal', 'postcode', 'country', 'billing_', 'shipping_', 'mailing_',
+                    'home_', 'delivery_', 'physical_'
+                ]
+                if any(tok in col_lower for tok in addr_tokens):
+                    self._boost_category(adjusted_scores, 'PII', 'PII_PHYSICAL_ADDRESS', 1.8)
+                    self._reduce_category(adjusted_scores, 'SOX', 'SOX_NOT_ADDRESS', 0.3)
+                    self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_NOT_ADDRESS', 0.3)
+            except Exception:
+                pass
+            
+            # === Rule 5: Filter out very low scores (noise reduction) ===
+            # Remove categories with confidence < 0.25 after adjustments
+            adjusted_scores = {cat: score for cat, score in adjusted_scores.items() if score >= 0.25}
+            
+            return adjusted_scores
+
+        # ============================================================================
+        # FALLBACK: HARDCODED RULES (Legacy)
+        # Used only if view-based rules are not loaded
+        # ============================================================================
+        logger.warning("Using hardcoded context-aware rules (VW_CONTEXT_AWARE_RULES not loaded)")
         
         # Security/Auth tables → Boost SOC2
-        elif any(kw in table_lower for kw in ['auth', 'security', 'access', 'credential', 'session', 'login']):
+        if any(kw in table_lower for kw in ['auth', 'security', 'access', 'credential', 'session', 'login']):
             self._boost_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 1.3)
         
         # === RULE 2: Smart ID Classification ===
@@ -5538,11 +7966,12 @@ class AIClassificationPipelineService:
             self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.1)
             self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.1)
 
-        # Dates (created, updated, etc) -> Moderate Penalty (exclude DOB)
+        # Dates (created, updated, etc) -> VERY Aggressive Penalty (exclude DOB)
+        # CRITICAL: 0.05 = 95% reduction to eliminate false positives from date fields
         if any(kw in col_lower for kw in ['date', 'time', 'at', 'on', 'window', 'period']) and not any(kw in col_lower for kw in ['birth', 'dob']):
-            self._reduce_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 0.4) 
-            self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.1)
-            self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.2)
+            self._reduce_category(adjusted_scores, 'SOX', 'SOX_FINANCIAL_DATA', 0.05) 
+            self._reduce_category(adjusted_scores, 'PII', 'PII_PERSONAL_INFO', 0.05)
+            self._reduce_category(adjusted_scores, 'SOC2', 'SOC2_SECURITY_DATA', 0.05)
         
         # IDs (invoice_id, order_id) -> Moderate Penalty (exclude Account/Tax/SSN/User)
         if (col_lower.endswith('_id') or col_lower == 'id' or col_lower.endswith('id')) and not any(kw in col_lower for kw in ['tax', 'ssn', 'account', 'card', 'user', 'customer', 'employee', 'member', 'patient']):
@@ -5814,7 +8243,11 @@ class AIClassificationPipelineService:
         return best_category, best_score, detected_categories
 
     def _classify_table_governance_driven(self, db: str, asset: Dict[str, Any]) -> Dict[str, Any]:
-        """Complete table classification using ONLY governance metadata"""
+        """Classifies a single table asset using a multi-layered approach:
+        1. Exact keyword matching from governance tables.
+        2. If no exact match, semantic + keyword + pattern scoring.
+        3. Multi-label classification and policy group mapping.
+        """
         try:
             schema = asset['schema']
             table = asset['table']
@@ -5824,34 +8257,44 @@ class AIClassificationPipelineService:
             
             # 1. Table-level classification using governance centroids
             table_context = self._build_table_context_from_metadata(db, schema, table)
-            table_scores = self._compute_governance_scores(table_context)
 
-            # 2. Column-level classification using governance patterns/keywords
-            columns = self._get_columns_from_information_schema(db, schema, table)
-            
-            # BATCH OPTIMIZATION: Fetch samples for all columns in one query
-            col_names = [c['COLUMN_NAME'] for c in columns]
-            batch_samples = self._sample_table_values_batch(db, schema, table, col_names, limit=20)
-            
-            column_results = []
-            
-            for column in columns:
-                col_name = column['COLUMN_NAME']
-                # Pass pre-fetched samples to avoid N+1 queries
-                col_samples = batch_samples.get(col_name, [])
+            # Step 1: Exact Keyword Matching
+            exact_match_results = self._exact_match_keyword_detection(db, table_context)
+
+            if exact_match_results:
+                logger.info(f"Exact match found for {asset['schema']}.{asset['table']}. Bypassing semantic search.")
+                table_detected_categories = exact_match_results
+                table_scores = {res['category']: res['confidence'] for res in exact_match_results}
+                column_results = [] # Bypass column detection for exact matches
+            else:
+                table_scores = self._compute_governance_scores(table_context)
+
+                # 2. Column-level classification using governance patterns/keywords
+                columns = self._get_columns_from_information_schema(db, schema, table)
                 
-                col_result = self._classify_column_governance_driven(
-                    db, schema, table, column, pre_fetched_samples=col_samples
+                # BATCH OPTIMIZATION: Fetch samples for all columns in one query
+                col_names = [c['COLUMN_NAME'] for c in columns]
+                batch_samples = self._sample_table_values_batch(db, schema, table, col_names, limit=20)
+                
+                column_results = []
+                
+                for column in columns:
+                    col_name = column['COLUMN_NAME']
+                    # Pass pre-fetched samples to avoid N+1 queries
+                    col_samples = batch_samples.get(col_name, [])
+                    
+                    col_result = self._classify_column_governance_driven(
+                        db, schema, table, column, pre_fetched_samples=col_samples
+                    )
+                    
+                    # CRITICAL: Only include sensitive columns (skip None results)
+                    if col_result is not None:
+                        column_results.append(col_result)
+                
+                # 3. Determine final classification using governance rules
+                table_category, confidence, table_detected_categories = self._determine_table_category_governance_driven(
+                    table_scores, column_results
                 )
-                
-                # CRITICAL: Only include sensitive columns (skip None results)
-                if col_result is not None:
-                    column_results.append(col_result)
-            
-            # 3. Determine final classification using governance rules
-            table_category, confidence, table_detected_categories = self._determine_table_category_governance_driven(
-                table_scores, column_results
-            )
             
             # Map to policy group for UI
             policy_group = self._map_category_to_policy_group(table_category) if table_category != 'NON_SENSITIVE' else None

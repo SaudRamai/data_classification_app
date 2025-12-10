@@ -1,0 +1,57 @@
+================================================================================
+✅ FIXED: Missing Methods Restored
+================================================================================
+Date: 2025-12-05 14:52
+Issue: 'AIClassificationPipelineService' object has no attribute '_get_active_database'
+
+ROOT CAUSE:
+-----------
+During earlier automated edits to fix the inline edit functionality, the file
+got corrupted and several critical methods were deleted:
+  ❌ _get_active_database()
+  ❌ _is_valid_database()
+  ❌ _render_keyword_actions() (was broken)
+
+METHODS RESTORED:
+-----------------
+
+1. ✅ _render_keyword_actions(context_key: str) -> None
+   - Renders the inline keyword edit form
+   - NOW INCLUDES: Sensitivity weight slider (0.0-10.0)
+   - ALWAYS uses upsert_sensitive_keyword (update OR insert)
+   - No more "keyword already exists" errors
+
+2. ✅ _get_active_database() -> Optional[str]
+   - Gets active database from multiple sources
+   - Priority: Global filters → Session state → Settings → Snowflake query
+   - Never returns None without trying all options
+
+3. ✅ _is_valid_database(db: str) -> bool
+   - Validates database name
+   - Filters out invalid placeholders like 'NONE', 'NULL', etc.
+
+VERIFICATION:
+-------------
+The AI Classification Pipeline should now load without errors.
+
+Try refreshing the page in your browser.
+
+INLINE EDIT FEATURES:
+---------------------
+✅ Edit existing keywords - Updates them in place
+✅ Add new keywords - Inserts them  
+✅ Sensitivity weight control - Slider from 0.0 to 10.0
+✅ Category selection - PII, SOX, SOC2, etc.
+✅ Match type - CONTAINS or EXACT
+✅ Auto-saves to: DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
+
+NEXT STEPS:
+-----------
+1. Refresh the AI Classification Dashboard
+2. Test inline edit on drill-down table
+3. Run: snowsql -f sql/fix_all_pii_keywords.sql
+   (to fix SOCIAL_SECURITY_NUMBER categorization)
+
+================================================================================
+END
+================================================================================

@@ -1442,15 +1442,19 @@ class SensitiveDataDetector:
             keyword_str = keyword['KEYWORD_STRING'].upper()
             match_type = keyword.get('MATCH_TYPE', '').upper()
             
-            if match_type == 'EXACT' and keyword_str == text_upper:
-                matches.append({
-                    'keyword_id': keyword['KEYWORD_ID'],
-                    'keyword': keyword_str,
-                    'category_id': keyword['CATEGORY_ID'],
-                    'category_name': keyword['CATEGORY_NAME'],
-                    'match_type': 'exact',
-                    'weight': float(keyword['SENSITIVITY_WEIGHT'] or 0)
-                })
+            if match_type == 'EXACT':
+                try:
+                    if re.search(r'(?:^|[^A-Z0-9])' + re.escape(keyword_str) + r'(?:$|[^A-Z0-9])', text_upper, re.IGNORECASE):
+                        matches.append({
+                            'keyword_id': keyword['KEYWORD_ID'],
+                            'keyword': keyword_str,
+                            'category_id': keyword['CATEGORY_ID'],
+                            'category_name': keyword['CATEGORY_NAME'],
+                            'match_type': 'exact',
+                            'weight': float(keyword['SENSITIVITY_WEIGHT'] or 0)
+                        })
+                except re.error:
+                    pass
             elif match_type == 'CONTAINS' and keyword_str in text_upper:
                 matches.append({
                     'keyword_id': keyword['KEYWORD_ID'],
@@ -1458,6 +1462,15 @@ class SensitiveDataDetector:
                     'category_id': keyword['CATEGORY_ID'],
                     'category_name': keyword['CATEGORY_NAME'],
                     'match_type': 'contains',
+                    'weight': float(keyword['SENSITIVITY_WEIGHT'] or 0)
+                })
+            elif match_type == 'PARTIAL' and keyword_str in text_upper:
+                matches.append({
+                    'keyword_id': keyword['KEYWORD_ID'],
+                    'keyword': keyword_str,
+                    'category_id': keyword['CATEGORY_ID'],
+                    'category_name': keyword['CATEGORY_NAME'],
+                    'match_type': 'partial',
                     'weight': float(keyword['SENSITIVITY_WEIGHT'] or 0)
                 })
             elif match_type == 'REGEX':
@@ -1525,7 +1538,9 @@ class SensitiveDataDetector:
         # Use the highest weight match
         max_weight = max(float(match.get('weight', 0)) for match in matches)
         
-        # Normalize to 0-1 range
+        # Normalize to 0-1 range, auto-detect scale (0-1 vs 0-100)
+        if max_weight <= 1.0:
+            return max(0.0, min(1.0, max_weight))
         return min(max_weight / 100.0, 1.0)
     
     def detect_sensitive_columns(

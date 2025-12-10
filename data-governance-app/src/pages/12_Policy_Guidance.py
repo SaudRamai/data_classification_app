@@ -20,530 +20,326 @@ from src.config.settings import settings
 
 st.set_page_config(page_title="Handling Rules & Policy Guidance", page_icon="📘", layout="wide")
 
-# Apply centralized theme (fonts, CSS variables, Plotly template)
+# Apply centralized theme
 apply_global_theme()
 st.title("Handling Rules & Policy Guidance")
 render_quick_links()
 
-# Top-level tabs for policy operations
-tab_lib, tab_ai, tab_gen, tab_rules = st.tabs(["Policy Library", "AI Policy Parser & Diff", "Control/Check Generation", "Handling Rules"])
+# -----------------------------------------------------------------------------
+# DATABASE RESOLUTION
+# -----------------------------------------------------------------------------
+# Resolve database name to handle 'NONE' or missing settings
+db_name = settings.SNOWFLAKE_DATABASE
+if not db_name or str(db_name).upper() == 'NONE':
+    db_name = "DATA_CLASSIFICATION_DB"
 
-with tab_lib:
-    st.subheader("Policy Library")
-    st.caption("Versioned policies with effective dates and next review dates. Stored in DATA_GOVERNANCE.POLICIES.")
+# Ensure Schema exists
+try:
+    snowflake_connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {db_name}.DATA_CLASSIFICATION_GOVERNANCE")
+except Exception:
+    pass
+
+# -----------------------------------------------------------------------------
+# DYNAMIC DATA FETCHING
+# -----------------------------------------------------------------------------
+
+def get_role_counts():
+    """Fetch user counts per role from DATA_GOVERNANCE.ROLE_ASSIGNMENTS"""
+    counts = {
+        "Data Owner": 0,
+        "Data Custodian": 0,
+        "Classification Specialist": 0,
+        "Data Consumer": 0
+    }
+    try:
+        # NOTE: Roles are likely in DATA_GOVERNANCE schema based on other pages, 
+        # but safe to check both or assume DATA_GOVERNANCE per Administration page.
+        # We will use the resolved db_name.
+        snowflake_connector.execute_query(f"SELECT 1 FROM {db_name}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS LIMIT 1")
+        
+        query = f"""
+            SELECT ROLE_NAME, COUNT(DISTINCT USER_EMAIL) as CNT
+            FROM {db_name}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS
+            GROUP BY ROLE_NAME
+        """
+        rows = snowflake_connector.execute_query(query) or []
+        for r in rows:
+            r_name = str(r['ROLE_NAME']).upper()
+            if "OWNER" in r_name:
+                counts["Data Owner"] += r['CNT']
+            elif "CUSTODIAN" in r_name:
+                counts["Data Custodian"] += r['CNT']
+            elif "SPECIALIST" in r_name or "ADMIN" in r_name:
+                counts["Classification Specialist"] += r['CNT']
+            else:
+                counts["Data Consumer"] += r['CNT']
+    except Exception:
+        pass
+    return counts
+
+def get_key_policies():
+    """Fetch latest policies, prioritizing SOX, SOC2, PII using new Schema"""
+    policies = []
+    try:
+        # Check if table exists in new schema
+        snowflake_connector.execute_query(f"SELECT 1 FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES LIMIT 1")
+        
+        query = f"""
+            SELECT POLICY_ID, POLICY_NAME, POLICY_VERSION, LEFT(POLICY_CONTENT, 100) as DESC
+            FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES
+            WHERE POLICY_NAME ILIKE '%SOX%' OR POLICY_NAME ILIKE '%SOC2%' OR POLICY_NAME ILIKE '%PII%' OR POLICY_NAME ILIKE '%CLASSIFICATION%'
+            ORDER BY CREATED_AT DESC
+            LIMIT 4
+        """
+        rows = snowflake_connector.execute_query(query) or []
+        # Normalize keys for UI defaults
+        for r in rows:
+            policies.append({
+                "TITLE": r.get('POLICY_NAME'),
+                "VERSION": r.get('POLICY_VERSION'),
+                "DESC": r.get('DESC')
+            })
+    except Exception:
+        pass
+    
+    # Fallback
+    if not policies:
+        policies = [
+            {"TITLE": "Data Classification Policy", "VERSION": "1.0", "DESC": "Standard classification handling procedures."},
+            {"TITLE": "SOX Compliance Guidelines", "VERSION": "2.1", "DESC": "Financial reporting controls."},
+            {"TITLE": "SOC2 Controls Matrix", "VERSION": "1.0", "DESC": "Security, Availability, and Confidentiality controls."},
+            {"TITLE": "PII Handling Procedures", "VERSION": "1.2", "DESC": "Guidelines for personally identifiable information."}
+        ]
+    return policies
+
+# -----------------------------------------------------------------------------
+# UI LAYOUT
+# -----------------------------------------------------------------------------
+
+tab_dash, tab_manage = st.tabs([
+    "Policy Dashboard", 
+    "Upload & Manage"
+])
+
+# --- DASHBOARD TAB ---
+with tab_dash:
+    st.caption("Access policy documents, guidelines, and governance resources")
+    
+    role_counts = get_role_counts()
+    policies = get_key_policies()
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📄 Policy Hub")
+        for p in policies:
+            label = f"{p.get('TITLE', 'Policy')} (v{p.get('VERSION','1.0')})" 
+            if st.button(label, key=f"pol_btn_{p.get('TITLE')}", use_container_width=True):
+                st.info(f"Summary: {p.get('DESC', 'No preview available.')}")
+
+        if len(policies) < 4:
+             st.button("FAQ & Best Practices", use_container_width=True)
+
+    with col2:
+        st.subheader("👥 Roles & Responsibilities")
+        st.info(f"**Data Owner** - {role_counts['Data Owner']} users")
+        st.info(f"**Data Custodian** - {role_counts['Data Custodian']} users")
+        st.info(f"**Classification Specialist** - {role_counts['Classification Specialist']} users")
+        st.info(f"**Data Consumer** - {role_counts['Data Consumer']} users")
+    
+    st.markdown("---")
+    
+    st.subheader("📐 Classification Framework")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.write("**Confidentiality (C)**")
+        st.success("C0 - Public")
+        st.warning("C1 - Internal")
+        st.error("C2 - Restricted")
+        st.error("C3 - Confidential")
+    
+    with col2:
+        st.write("**Integrity (I)**")
+        st.info("I0 - Low")
+        st.info("I1 - Standard")
+        st.info("I2 - High")
+        st.info("I3 - Critical")
+    
+    with col3:
+        st.write("**Availability (A)**")
+        st.info("A0 - Low")
+        st.info("A1 - Standard")
+        st.info("A2 - High")
+        st.info("A3 - Critical")
+
+# --- UPLOAD & MANAGE TAB ---
+with tab_manage:
+    st.subheader("Upload & Manage Policies")
+    st.caption("Upload new policies or update existing ones. Use the AI Parser to auto-extract details.")
+    
+    # 1. Ensure Table Exists with NEW Schema
     try:
         snowflake_connector.execute_non_query(
             f"""
-            CREATE TABLE IF NOT EXISTS {settings.SNOWFLAKE_DATABASE}.DATA_GOVERNANCE.POLICIES (
-              ID STRING,
-              TITLE STRING,
-              VERSION STRING,
-              EFFECTIVE_DATE DATE,
-              NEXT_REVIEW_DATE DATE,
-              OWNER STRING,
-              CONTENT STRING,
-              CREATED_AT TIMESTAMP_NTZ
+            CREATE TABLE IF NOT EXISTS {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES (
+                POLICY_ID VARCHAR(36) PRIMARY KEY, -- DEFAULT UUID_STRING() not always supported in simple CREATE syntax if implied
+                POLICY_NAME VARCHAR(255) NOT NULL,
+                POLICY_VERSION VARCHAR(20),
+                POLICY_TYPE VARCHAR(100),
+                DOCUMENT_CLASSIFICATION VARCHAR(50),
+                EFFECTIVE_DATE DATE,
+                NEXT_REVIEW_DATE DATE,
+                DOCUMENT_OWNER VARCHAR(255),
+                APPROVAL_AUTHORITY VARCHAR(255),
+                BUSINESS_UNIT VARCHAR(100),
+                POLICY_CONTENT TEXT,
+                FILE_CONTENT VARIANT,
+                FILE_NAME VARCHAR(500),
+                FILE_SIZE NUMBER,
+                MIME_TYPE VARCHAR(100),
+                CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                CREATED_BY VARCHAR(255) DEFAULT CURRENT_USER(),
+                UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                UPDATED_BY VARCHAR(255) DEFAULT CURRENT_USER(),
+                STATUS VARCHAR(50) DEFAULT 'ACTIVE'
             );
             """
         )
+    except Exception as e:
+        # It might fail if table exists with different schema, we'll try to proceed or user might need to drop it.
+        # But IF NOT EXISTS should handle it.
+        pass
+
+    # 2. Fetch existing for dropdown
+    existing_policies = []
+    try:
+        existing_policies = snowflake_connector.execute_query(
+            f"SELECT POLICY_ID, POLICY_NAME, POLICY_VERSION FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES WHERE POLICY_NAME IS NOT NULL ORDER BY POLICY_NAME"
+        ) or []
     except Exception:
         pass
-    try:
-        rows = snowflake_connector.execute_query(
-            f"""
-            SELECT ID, TITLE, VERSION, EFFECTIVE_DATE, NEXT_REVIEW_DATE, OWNER, LEFT(CONTENT, 200) AS PREVIEW, CREATED_AT
-            FROM {settings.SNOWFLAKE_DATABASE}.DATA_GOVERNANCE.POLICIES
-            ORDER BY CREATED_AT DESC
-            LIMIT 500
-            """
-        ) or []
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-        else:
-            st.info("No policies found. Upload a new policy in the AI Parser tab or insert via your ETL.")
-    except Exception as e:
-        st.warning(f"Unable to read policies: {e}")
 
-with tab_ai:
-    st.subheader("AI Policy Parser & Diff")
-    st.caption("Upload a policy document to extract requirements and controls, and compare against previous versions.")
-    up = st.file_uploader("Upload policy file (txt/markdown/pdf)", type=["txt","md","pdf"], key="policy_upload")
-    policy_title = st.text_input("Policy Title")
-    policy_version = st.text_input("Version", value="1.0")
-    owner = st.text_input("Owner (email)")
-    eff = st.date_input("Effective Date")
-    next_rev = st.date_input("Next Review Date")
-    if st.button("Parse & Save") and up and policy_title:
-        try:
-            raw = up.read()
-            # Basic text extraction; PDFs would need extra parsing in nlp_compliance_service if supported
+    action = st.radio("Action", ["Create New Policy", "Update Existing Policy"], horizontal=True)
+
+    selected_policy_id = None
+    default_title = ""
+    default_ver = "1.0"
+    default_owner = ""
+    
+    if action == "Update Existing Policy":
+        if not existing_policies:
+            st.warning("No existing policies found to update.")
+        else:
+            # Create a label map
+            pol_map = {f"{p['POLICY_NAME']} (v{p['POLICY_VERSION']})": p for p in existing_policies}
+            sel_pol_label = st.selectbox("Select Policy to Update", list(pol_map.keys()))
+            if sel_pol_label:
+                sel_pol = pol_map[sel_pol_label]
+                selected_policy_id = sel_pol['POLICY_ID']
+                default_title = sel_pol['POLICY_NAME']
+                try:
+                    v_parts = str(sel_pol['POLICY_VERSION']).split('.')
+                    if len(v_parts) == 2:
+                        default_ver = f"{v_parts[0]}.{int(v_parts[1])+1}"
+                    else:
+                         default_ver = f"{sel_pol['POLICY_VERSION']}.1"
+                except:
+                    default_ver = "1.1"
+
+    st.markdown("#### Policy Details")
+    with st.form("policy_form"):
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            p_name = st.text_input("Policy Name", value=default_title, disabled=(action=="Update Existing Policy"))
+            p_ver = st.text_input("Version", value=default_ver)
+            p_owner = st.text_input("Document Owner")
+            p_type = st.selectbox("Policy Type", ["Standard", "Procedure", "Guideline", "Framework"], index=0)
+        with col_f2:
+            p_eff = st.date_input("Effective Date")
+            p_rev = st.date_input("Next Review Date")
+            p_class = st.selectbox("Document Classification", ["Internal", "Public", "Confidential", "Restricted"])
+        
+        st.markdown("#### Document Content")
+        uploaded_file = st.file_uploader("Upload Policy Document (PDF/TXT/MD)", type=['pdf','txt','md'])
+        
+        p_content = st.text_area("Or Paste Content / Edit Parsed Text", height=200)
+
+        submit = st.form_submit_button("Save Policy")
+    
+    if submit:
+        final_content = p_content
+        fname = None
+        fsize = 0
+        fmime = "text/plain"
+        
+        if uploaded_file:
+            fname = uploaded_file.name
+            fsize = uploaded_file.size
+            fmime = uploaded_file.type
             try:
-                text = raw.decode("utf-8", errors="ignore")
-            except Exception:
-                text = str(raw)
-            parsed = _ncs.parse_policy(text)
-            st.success("Parsed policy successfully.")
-            st.json({k: parsed.get(k) for k in ["requirements","controls","notes"]})
-            # Persist
+                raw = uploaded_file.read()
+                try:
+                    final_content = raw.decode("utf-8", errors="ignore")
+                except Exception:
+                    final_content = str(raw)
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
+                st.stop()
+        
+        if not p_name:
+            st.error("Policy Name is required.")
+        elif not final_content:
+            st.error("Content is required.")
+        else:
             import uuid
-            pid = str(uuid.uuid4())
-            snowflake_connector.execute_non_query(
-                f"""
-                INSERT INTO {settings.SNOWFLAKE_DATABASE}.DATA_GOVERNANCE.POLICIES
-                (ID, TITLE, VERSION, EFFECTIVE_DATE, NEXT_REVIEW_DATE, OWNER, CONTENT, CREATED_AT)
-                SELECT %(id)s, %(t)s, %(v)s, %(e)s, %(n)s, %(o)s, %(c)s, CURRENT_TIMESTAMP
-                """,
-                {"id": pid, "t": policy_title, "v": policy_version, "e": str(eff), "n": str(next_rev), "o": owner, "c": text}
-            )
-            st.success(f"Saved policy '{policy_title}' v{policy_version}.")
-        except Exception as e:
-            st.error(f"Parsing or saving failed: {e}")
-
-with tab_gen:
-    st.subheader("Control/Check Generation")
-    st.caption("Generate or update framework requirements, controls, and automated checks from parsed policy content.")
-    framework = st.text_input("Framework Name (e.g., SOC2, SOX, ISO 27001)", value="SOC2")
-    source_text = st.text_area("Policy Content / Excerpts", height=200, placeholder="Paste relevant sections here or select a policy from the library above.")
-    if st.button("Generate Draft Mappings"):
-        if not source_text.strip():
-            st.warning("Please provide policy content for generation.")
-        else:
             try:
-                gen = _ncs.generate_controls_and_checks(source_text, framework)
-                st.success("Generated draft requirements, controls, and checks.")
-                st.json(gen)
-                st.caption("Review and approve in Compliance → Frameworks & Controls section.")
-                # store in session for publish
-                st.session_state['policy_gen_output'] = gen
-            except Exception as e:
-                st.error(f"Generation failed: {e}")
-
-    st.markdown("---")
-    st.subheader("Publish to Compliance")
-    st.caption("Persist generated Controls and Checks into the Compliance library.")
-    pub_owner = st.text_input("Owner (email) for created records", key="gen_pub_owner")
-    if st.button("Publish Draft to Library"):
-        gen = st.session_state.get('policy_gen_output')
-        if not gen:
-            st.warning("Please generate draft mappings first.")
-        else:
-            try:
-                # Ensure tables exist (CONTROLS already ensured in Compliance page; also ensure CHECKS here)
-                snowflake_connector.execute_non_query(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {settings.SNOWFLAKE_DATABASE}.DATA_GOVERNANCE.CHECKS (
-                      ID STRING,
-                      FRAMEWORK STRING,
-                      CODE STRING,
-                      DESCRIPTION STRING,
-                      RULE STRING,
-                      CREATED_AT TIMESTAMP_NTZ
-                    )
-                    """
-                )
-                import uuid
-                fw = gen.get('framework') or (framework or 'FRAMEWORK').upper()
-                # Insert controls
-                for c in (gen.get('controls') or [])[:200]:
-                    try:
-                        snowflake_connector.execute_non_query(
-                            f"""
-                            INSERT INTO {settings.SNOWFLAKE_DATABASE}.DATA_GOVERNANCE.CONTROLS
-                            (ID, FRAMEWORK, CONTROL_ID, TITLE, DESCRIPTION, STATUS, OWNER, UPDATED_AT)
-                            SELECT %(id)s, %(fw)s, %(cid)s, %(title)s, %(desc)s, 'Draft', %(own)s, CURRENT_TIMESTAMP
-                            """,
-                            {
-                                "id": str(uuid.uuid4()),
-                                "fw": fw,
-                                "cid": c.get('id') or '',
-                                "title": (c.get('text') or '')[:180],
-                                "desc": c.get('text') or '',
-                                "own": pub_owner or '',
-                            }
-                        )
-                    except Exception:
-                        continue
-                # Insert checks
-                for ck in (gen.get('checks') or [])[:200]:
-                    try:
-                        snowflake_connector.execute_non_query(
-                            f"""
-                            INSERT INTO {settings.SNOWFLAKE_DATABASE}.DATA_GOVERNANCE.CHECKS
-                            (ID, FRAMEWORK, CODE, DESCRIPTION, RULE, CREATED_AT)
-                            SELECT %(id)s, %(fw)s, %(code)s, %(desc)s, %(rule)s, CURRENT_TIMESTAMP
-                            """,
-                            {
-                                "id": str(uuid.uuid4()),
-                                "fw": fw,
-                                "code": ck.get('code') or '',
-                                "desc": ck.get('description') or '',
-                                "rule": ck.get('rule') or '',
-                            }
-                        )
-                    except Exception:
-                        continue
-                st.success("Published generated controls and checks to the Compliance library.")
-            except Exception as e:
-                st.error(f"Publishing failed: {e}")
-
-    st.markdown("---")
-    st.subheader("Publish AI Rules to Policies (for Dynamic Compliance)")
-    st.caption("Persist AI-extracted rules into DATA_GOVERNANCE.POLICIES (FRAMEWORK, RULE_CODE, CATEGORY, MIN_CONFIDENTIALITY, REQUIRE_MASKING, REQUIRE_ROW_ACCESS). These policies drive dynamic compliance mapping without hardcoding.")
-    pub_owner2 = st.text_input("Owner (email) for created policies", key="gen_pub_owner2")
-    if st.button("Publish AI Rules to POLICIES"):
-        gen = st.session_state.get('policy_gen_output')
-        if not gen:
-            st.warning("Please generate draft mappings first.")
-        else:
-            try:
-                # Ensure DATA_GOVERNANCE.POLICIES has the expected structure (FRAMEWORK/RULE_CODE/...)
-                snowflake_connector.execute_non_query(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {settings.SNOWFLAKE_DATABASE}.DATA_GOVERNANCE.POLICIES (
-                      ID STRING,
-                      FRAMEWORK STRING,
-                      RULE_CODE STRING,
-                      RULE_TEXT STRING,
-                      CATEGORY STRING,
-                      MIN_CONFIDENTIALITY NUMBER,
-                      REQUIRE_MASKING BOOLEAN,
-                      REQUIRE_ROW_ACCESS BOOLEAN,
-                      CREATED_AT TIMESTAMP_NTZ,
-                      SOURCE STRING,
-                      DETAILS VARIANT
-                    )
-                    """
-                )
-                import uuid, json as _json
-                fw = (gen.get('framework') or (framework or 'FRAMEWORK')).upper()
-                checks = gen.get('checks') or []
-                # Map generated checks to policy rows with inferred category and minimums
-                for ck in checks:
-                    code = ck.get('code') or ''
-                    desc = ck.get('description') or ''
-                    rule_expr = ck.get('rule') or ''
-                    # Infer category and requirements from code/desc heuristically
-                    up = f"{code} {desc} {rule_expr}".upper()
-                    category = 'Other'
-                    min_c = None
-                    req_mask = False
-                    req_row = False
-                    if 'PII' in up:
-                        category = 'PII'
-                        min_c = 2
-                        req_mask = True
-                    if any(k in up for k in ['PHI','HIPAA']):
-                        category = 'PHI'
-                        min_c = max(2, (min_c or 0))
-                        req_mask = True
-                    if any(k in up for k in ['FINANCIAL','SOX','PCI']):
-                        category = 'Financial'
-                        # PCI often needs C3, SOX at least C2; pick higher when ambiguous
-                        min_c = max(3 if 'PCI' in up else 2, (min_c or 0))
-                        req_mask = True
-                        req_row = ('ROW ACCESS' in up or 'ROW_ACCESS' in up or 'ROW' in up)
-                    # Insert policy row
+                if action == "Create New Policy":
+                    new_id = str(uuid.uuid4())
                     snowflake_connector.execute_non_query(
                         f"""
-                        INSERT INTO {settings.SNOWFLAKE_DATABASE}.DATA_GOVERNANCE.POLICIES
-                        (ID, FRAMEWORK, RULE_CODE, RULE_TEXT, CATEGORY, MIN_CONFIDENTIALITY, REQUIRE_MASKING, REQUIRE_ROW_ACCESS, CREATED_AT, SOURCE, DETAILS)
-                        SELECT %(id)s, %(fw)s, %(code)s, %(text)s, %(cat)s, %(minc)s, %(mask)s, %(row)s, CURRENT_TIMESTAMP, 'AI_NLP', TO_VARIANT(PARSE_JSON(%(det)s))
+                        INSERT INTO {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES
+                        (
+                            POLICY_ID, POLICY_NAME, POLICY_VERSION, POLICY_TYPE, DOCUMENT_CLASSIFICATION,
+                            EFFECTIVE_DATE, NEXT_REVIEW_DATE, DOCUMENT_OWNER, POLICY_CONTENT, 
+                            FILE_NAME, FILE_SIZE, MIME_TYPE, CREATED_AT, UPDATED_AT
+                        )
+                        SELECT 
+                            %(id)s, %(name)s, %(ver)s, %(type)s, %(dclass)s,
+                            %(eff)s, %(rev)s, %(own)s, %(cont)s,
+                            %(fn)s, %(fs)s, %(fmt)s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                         """,
                         {
-                            'id': str(uuid.uuid4()),
-                            'fw': fw,
-                            'code': code,
-                            'text': desc or rule_expr,
-                            'cat': category,
-                            'minc': (min_c if min_c is not None else None),
-                            'mask': bool(req_mask),
-                            'row': bool(req_row),
-                            'det': _json.dumps({'source': 'policy_gen', 'rule': rule_expr}),
+                            "id": new_id, "name": p_name, "ver": p_ver, "type": p_type, "dclass": p_class,
+                            "eff": str(p_eff), "rev": str(p_rev), "own": p_owner, "cont": final_content,
+                            "fn": fname, "fs": fsize, "fmt": fmime
                         }
                     )
-                st.success("Published AI rules to DATA_GOVERNANCE.POLICIES.")
+                    st.success(f"Created new policy: {p_name} v{p_ver}")
+                    
+                else: # Update  
+                    if selected_policy_id:
+                        snowflake_connector.execute_non_query(
+                            f"""
+                            UPDATE {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES
+                            SET 
+                                POLICY_NAME=%(name)s, POLICY_VERSION=%(ver)s, POLICY_TYPE=%(type)s, 
+                                DOCUMENT_CLASSIFICATION=%(dclass)s, EFFECTIVE_DATE=%(eff)s, 
+                                NEXT_REVIEW_DATE=%(rev)s, DOCUMENT_OWNER=%(own)s, POLICY_CONTENT=%(cont)s,
+                                FILE_NAME=%(fn)s, FILE_SIZE=%(fs)s, MIME_TYPE=%(fmt)s, UPDATED_AT=CURRENT_TIMESTAMP
+                            WHERE POLICY_ID=%(id)s
+                            """,
+                            {
+                                "id": selected_policy_id, "name": p_name, "ver": p_ver, "type": p_type,
+                                "dclass": p_class, "eff": str(p_eff), "rev": str(p_rev), "own": p_owner, 
+                                "cont": final_content, "fn": fname, "fs": fsize, "fmt": fmime
+                            }
+                        )
+                        st.success(f"Updated policy: {p_name}")
+                    else:
+                        st.error("Policy ID missing for update.")
+                        
             except Exception as e:
-                st.error(f"Publishing to POLICIES failed: {e}")
+                st.error(f"Database Error: {e}")
 
-st.markdown(
-    """
-    ### Classification Decision Tree (Quick Guide)
-    1. Is the data intended for public release or already public?
-       - Yes → Classify as **Public (C0)**
-       - No → Continue
-    2. Does the data contain personal information, proprietary data, or confidential business information?
-       - Yes → Continue
-       - No → **Internal (C1)**
-    3. Would unauthorized disclosure cause severe business harm or regulatory violations?
-       - Yes → **Confidential (C3)**
-       - No → **Restricted (C2)**
-    4. Assess Integrity and Availability (0–3) based on business criticality.
-    """
-)
-
-st.markdown("---")
-
-st.subheader("Classification Checklist")
-st.markdown(
-    """
-    - [ ] Understand business purpose and context of the data
-    - [ ] Identify stakeholders who use/are impacted by the data
-    - [ ] Consider regulatory requirements (PII, Financial/SOX, HIPAA, PCI, GDPR)
-    - [ ] Assess business impact for Confidentiality, Integrity, Availability
-    - [ ] Review similar data classifications for consistency
-    - [ ] Document rationale for the decision
-    - [ ] Apply tags in Snowflake (classification and CIA levels)
-    - [ ] Schedule review/reclassification and communicate to stakeholders
-    """
-)
-
-st.markdown("---")
-
-st.subheader("Special Categories (Minimums)")
-st.info(
-    """
-    Minimum classifications enforced by policy:
-    - Personal Data (PII): at least **Restricted (C2)**
-    - Sensitive Personal Data (e.g., SSN): **Confidential (C3)**
-    - Financial data used for reporting/SOX: at least **Restricted (C2)**; SOX-relevant **Confidential (C3)**
-
-    If you need an exception, provide business justification and submit a request. Approved exceptions are time-bound and reviewed periodically.
-    """
-)
-
-st.markdown("---")
-
-st.subheader("Rationale Templates")
-st.code(
-    """Business Context: <summary of how the data is used and by whom>\n\nImpact Assessment:\n- Confidentiality: <impact of disclosure>\n- Integrity: <impact of incorrect data>\n- Availability: <impact of downtime>\n\nRegulatory Considerations: <PII/Financial/etc.>\n\nDecision & Justification: <final class + CIA with reasons>\n\nStakeholders Notified: <names/roles>\n\nReview Schedule: <date and owner>""",
-    language="markdown",
-)
-
-with tab_rules:
-    st.subheader("🏷️ Data Classification Handling Rules")
-    st.caption("Comprehensive guidance for handling data at each classification level (Policy 4.1.3, 5.4)")
-    
-    # Classification level selector
-    classification = st.selectbox(
-        "Select Classification Level",
-        ["Public", "Internal", "Restricted", "Confidential"],
-        key="classification_selector"
-    )
-    
-    # CIA Level selector
-    cia_level = st.selectbox(
-        "Select CIA Level (0-3)",
-        [0, 1, 2, 3],
-        key="cia_selector"
-    )
-    
-    # Display handling rules based on selection
-    if classification == "Public":
-        st.markdown("### 🌐 Public Data (C0)")
-        st.info("**Business Impact:** No impact from disclosure")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**✅ Allowed Actions:**")
-            st.markdown("- Share freely within organization")
-            st.markdown("- Publish to public websites")
-            st.markdown("- Include in public reports")
-            st.markdown("- Download without restrictions")
-            st.markdown("- Email to external parties")
-        
-        with col2:
-            st.markdown("**❌ Restricted Actions:**")
-            st.markdown("- None - fully open")
-        
-        st.markdown("**💾 Storage & Access:**")
-        st.markdown("- Any storage location acceptable")
-        st.markdown("- No access controls required")
-        st.markdown("- No encryption required")
-        
-    elif classification == "Internal":
-        st.markdown(f"### 🏢 Internal Data (C{cia_level})")
-        st.info("**Business Impact:** Limited impact from disclosure")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**✅ Allowed Actions:**")
-            st.markdown("- Share within organization")
-            st.markdown("- Include in internal reports")
-            st.markdown("- Store in internal systems")
-            if cia_level >= 1:
-                st.markdown("- Email within organization")
-            if cia_level >= 2:
-                st.markdown("- Limited external sharing with NDA")
-        
-        with col2:
-            st.markdown("**❌ Restricted Actions:**")
-            st.markdown("- No public disclosure")
-            st.markdown("- No external sharing without approval")
-            if cia_level >= 1:
-                st.markdown("- No unencrypted external transmission")
-        
-        st.markdown("**💾 Storage & Access:**")
-        if cia_level >= 1:
-            st.markdown("- Basic access controls required")
-        if cia_level >= 2:
-            st.markdown("- Encryption recommended for sensitive data")
-        
-    elif classification == "Restricted":
-        st.markdown(f"### 🔒 Restricted Data (C{cia_level})")
-        st.warning("**Business Impact:** Moderate impact from disclosure")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**✅ Allowed Actions:**")
-            st.markdown("- Access by authorized personnel only")
-            st.markdown("- Share with need-to-know basis")
-            st.markdown("- Store in secure systems")
-            if cia_level >= 2:
-                st.markdown("- Email with encryption")
-        
-        with col2:
-            st.markdown("**❌ Restricted Actions:**")
-            st.markdown("- No external sharing without approval")
-            st.markdown("- No public disclosure")
-            st.markdown("- No unencrypted storage")
-            st.markdown("- No download without authorization")
-            if cia_level >= 1:
-                st.markdown("- No transmission over unsecured networks")
-        
-        st.markdown("**💾 Storage & Access:**")
-        st.markdown("- Strict access controls required")
-        st.markdown("- Encryption at rest required")
-        st.markdown("- Audit logging required")
-        if cia_level >= 2:
-            st.markdown("- Multi-factor authentication required")
-        
-    elif classification == "Confidential":
-        st.markdown(f"### 🔐 Confidential Data (C{cia_level})")
-        st.error("**Business Impact:** Severe impact from disclosure")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**✅ Allowed Actions:**")
-            st.markdown("- Access by authorized personnel only")
-            st.markdown("- Store in highly secure systems")
-            if cia_level >= 3:
-                st.markdown("- Limited sharing with executive approval")
-        
-        with col2:
-            st.markdown("**❌ Restricted Actions:**")
-            st.markdown("- No external sharing")
-            st.markdown("- No public disclosure")
-            st.markdown("- No unencrypted storage")
-            st.markdown("- No download without executive approval")
-            st.markdown("- No email transmission")
-            st.markdown("- No printing")
-            if cia_level >= 2:
-                st.markdown("- No screen sharing")
-        
-        st.markdown("**💾 Storage & Access:**")
-        st.markdown("- Maximum security controls required")
-        st.markdown("- Encryption at rest and in transit")
-        st.markdown("- Comprehensive audit logging")
-        st.markdown("- Data loss prevention (DLP) required")
-        
-    st.markdown("---")
-    st.subheader("🔄 Download & Export Restrictions")
-    
-    # Download/Export gating logic
-    st.markdown("**Current Selection:** {} (C{})".format(classification, cia_level))
-    
-    # Role-based permissions
-    user_role = st.selectbox(
-        "Your Role",
-        ["Viewer", "Analyst", "Data Owner", "Compliance Officer", "Executive"],
-        key="user_role"
-    )
-    
-    can_download = False
-    can_export = False
-    restriction_reason = ""
-    
-    if classification == "Public":
-        can_download = True
-        can_export = True
-    elif classification == "Internal":
-        can_download = user_role in ["Analyst", "Data Owner", "Compliance Officer", "Executive"]
-        can_export = user_role in ["Data Owner", "Compliance Officer", "Executive"]
-        if not can_download:
-            restriction_reason = "Internal data requires Analyst+ role for download"
-    elif classification == "Restricted":
-        can_download = user_role in ["Data Owner", "Compliance Officer", "Executive"]
-        can_export = user_role in ["Compliance Officer", "Executive"]
-        if not can_download:
-            restriction_reason = "Restricted data requires Data Owner+ role for download"
-    elif classification == "Confidential":
-        can_download = user_role in ["Compliance Officer", "Executive"]
-        can_export = user_role == "Executive"
-        if not can_download:
-            restriction_reason = "Confidential data requires Compliance Officer+ role for download"
-    
-    # Display permissions
-    col1, col2 = st.columns(2)
-    with col1:
-        if can_download:
-            st.success("✅ DOWNLOAD ALLOWED")
-        else:
-            st.error("❌ DOWNLOAD BLOCKED")
-            st.warning(restriction_reason)
-    
-    with col2:
-        if can_export:
-            st.success("✅ EXPORT ALLOWED")
-        else:
-            st.error("❌ EXPORT BLOCKED")
-            st.warning(restriction_reason)
-    
-    st.markdown("---")
-    st.subheader("🚨 Visual Indicators for Restricted/Confidential")
-    
-    st.markdown("**Banners and Watermarks:**")
-    if classification in ["Restricted", "Confidential"]:
-        if classification == "Restricted":
-            st.markdown(
-                '''<div style="background-color: #fff3cd; border: 2px solid #ffc107; padding: 10px; border-radius: 5px; margin: 10px 0;">
-                <strong>🔒 RESTRICTED DATA</strong><br>
-                This data requires special handling. Unauthorized access or disclosure is prohibited.
-                </div>''',
-                unsafe_allow_html=True
-            )
-        else:  # Confidential
-            st.markdown(
-                '''<div style="background-color: #f8d7da; border: 2px solid #dc3545; padding: 10px; border-radius: 5px; margin: 10px 0;">
-                <strong>🔐 CONFIDENTIAL DATA</strong><br>
-                This data is highly sensitive. Access and handling are strictly controlled.
-                </div>''',
-                unsafe_allow_html=True
-            )
-        
-        st.markdown("**Watermark Example:**")
-        st.code(
-            f"""-- {classification.upper()} DATA --
--- Classification: {classification} (C{cia_level}) --
--- Unauthorized access prohibited --
--- Last updated: {pd.Timestamp.now().strftime('%Y-%m-%d')} --""",
-            language=None
-        )
-    else:
-        st.info("No special visual indicators required for this classification level.")
-    
-    st.markdown("---")
-    st.subheader("📋 Quick Reference Checklist")
-    
-    st.markdown("**Before Handling Data:**")
-    st.markdown("- [ ] Verify your access permissions")
-    st.markdown("- [ ] Check classification level and CIA requirements")
-    st.markdown("- [ ] Ensure secure transmission method")
-    st.markdown("- [ ] Verify recipient authorization")
-    st.markdown("- [ ] Document access justification")
-    
-    st.markdown("**After Handling Data:**")
-    st.markdown("- [ ] Clear temporary files")
-    st.markdown("- [ ] Log access in audit system")
-    st.markdown("- [ ] Verify no data remnants")
-    st.markdown("- [ ] Report any security incidents")
 

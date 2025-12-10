@@ -246,6 +246,54 @@ except Exception as e:
             "name_tokens": {}
         }
 
+    # =================================================================================
+    # [OVERRIDE] Strict PII Configuration Injection
+    # Forces PII definition and 65+ specific keywords to EXACT match with 0.95 weight.
+    # =================================================================================
+    try:
+        # 1. Override PII Category Definition
+        ai_classification_service._sensitivity_config.setdefault('categories', {})['PII'] = {
+            'CATEGORY_NAME': 'PII',
+            'DESCRIPTION': 'PERSONAL IDENTIFICATION DATA: Individual human identifiers including full names, email addresses, phone numbers, physical street addresses, Social Security Numbers (SSN), passport numbers, driver license IDs, birth dates, biometric signatures (fingerprints, facial recognition), genetic information, medical patient records, individual demographic attributes (gender, ethnicity, marital status), and any data that uniquely identifies or can be traced back to a specific living person. Primary concern: individual privacy and identity protection under privacy laws like GDPR, CCPA, and HIPAA for healthcare information.',
+            'CONFIDENTIALITY_LEVEL': 3,
+            'INTEGRITY_LEVEL': 2,
+            'AVAILABILITY_LEVEL': 2,
+            'DETECTION_THRESHOLD': 0.35,
+            'IS_ACTIVE': True
+        }
+
+        # 2. Inject Strict Keyword Overrides
+        _pii_keywords = [
+            "phone_number", "residential_address", "birth_date", "mobile_number", "date_of_birth",
+            "passport", "email", "user_email", "dob", "fingerprint", "driver_license", "drivers_license",
+            "SOCIAL_SECURITY_NUMBER", "national_id", "passport_number", "tax_id", "home_address",
+            "cell_phone", "biometric", "medical_record", "patient_id", "health_record", "personal_email",
+            "taxpayer_id", "national_id_number", "voter_id_number", "military_id_number", "biometric_hash",
+            "voice_print_id", "fingerprint_hash", "health_condition", "ethnicity", "religion",
+            "disability_status", "two_factor_phone", "two_factor_email", "gps_coordinates",
+            "last_known_location", "device_location_history", "voip_call_records", "credit_card_holder_name",
+            "business_registration_number", "CUSTOMER_ID", "DRIVERS_LICENSE_NUMBER", "LAST_KNOWN_LOCATION",
+            "GPS_COORDINATES", "VOICE_PRINT_ID", "PASSPORT_NUMBER", "VIDEO_CALL_SIGNATURE",
+            "DISABILITY_STATUS", "CREDIT_CARD_HOLDER_NAME", "IP_ADDRESS", "HEALTH_CONDITION",
+            "ANNUAL_INCOME", "NATIONAL_ID_NUMBER", "VOTER_ID_NUMBER", "TWO_FACTOR_PHONE", "RELIGION",
+            "BIOMETRIC_HASH", "VOIP_CALL_RECORDS", "MILITARY_ID_NUMBER", "TAX_IDENTIFICATION_NUMBER",
+            "TWO_FACTOR_EMAIL", "FINGERPRINT_HASH", "DEVICE_LOCATION_HISTORY", "ETHNICITY", "CREDIT_SCORE",
+            "ALIEN_REGISTRATION_NUMBER"
+        ]
+        
+        _kw_store = ai_classification_service._sensitivity_config.setdefault('keywords', {})
+        for _kw in _pii_keywords:
+            _kw_store[_kw.strip().lower()] = {
+                'KEYWORD_STRING': _kw, 
+                'CATEGORY_NAME': 'PII', 
+                'MATCH_TYPE': 'EXACT', 
+                'SENSITIVITY_WEIGHT': 0.95, 
+                'IS_ACTIVE': True
+            }
+    except Exception as _override_err:
+        pass
+    # =================================================================================
+
 # Add verification of AI service readiness
 def verify_ai_service_ready():
     """Check if AI service is properly configured"""
@@ -7189,30 +7237,53 @@ def _coverage_and_overdue() -> Tuple[pd.DataFrame, Dict[str, int]]:
     db = _get_current_db()
     if not db:
         return pd.DataFrame(), {"total": 0, "classified": 0, "overdue": 0}
+    
     try:
-        rows = snowflake_connector.execute_query(
-            f"""
-            SELECT 
-              FULLY_QUALIFIED_NAME AS FULL_NAME,
-              COALESCE(LAST_MODIFIED_TIMESTAMP, CREATED_TIMESTAMP) AS FIRST_DISCOVERED,
-              (CLASSIFICATION_LABEL IS NOT NULL) AS CLASSIFIED,
-              NULL AS CIA_CONF, NULL AS CIA_INT, NULL AS CIA_AVAIL
-            FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-            ORDER BY COALESCE(LAST_MODIFIED_TIMESTAMP, CREATED_TIMESTAMP) DESC
-            LIMIT 5000
-            """
-        ) or []
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df["FIRST_DISCOVERED_DT"] = pd.to_datetime(df.get("FIRST_DISCOVERED"))
-            df["DUE_BY"] = df["FIRST_DISCOVERED_DT"].apply(lambda d: _sla_due(d) if pd.notnull(d) else pd.NaT)
-            now = datetime.utcnow()
-            df["OVERDUE"] = (~df["CLASSIFIED"].fillna(False)) & (pd.to_datetime(df["DUE_BY"]).dt.tz_localize(None) < now)
-        total = int(len(df))
-        classified = int(df["CLASSIFIED"].fillna(False).sum()) if not df.empty else 0
-        overdue = int(df["OVERDUE"].sum()) if not df.empty and "OVERDUE" in df.columns else 0
+        # Use the centralized asset counting function
+        from src.services.asset_utils import get_asset_counts
+        
+        # Get asset counts
+        counts = get_asset_counts(
+            assets_table=f"{db}.GOVERNANCE.T_ASSETS",
+            where_clause="",  # No additional filters needed here
+            snowflake_connector=snowflake_connector
+        )
+        
+        # Get the list of assets for overdue calculation
+        try:
+            rows = snowflake_connector.execute_query(
+                f"""
+                SELECT 
+                  FULLY_QUALIFIED_NAME AS FULL_NAME,
+                  COALESCE(LAST_MODIFIED_TIMESTAMP, CREATED_TIMESTAMP) AS FIRST_DISCOVERED,
+                  (CLASSIFICATION_LABEL IS NOT NULL) AS CLASSIFIED
+                FROM {db}.GOVERNANCE.T_ASSETS
+                ORDER BY COALESCE(LAST_MODIFIED_TIMESTAMP, CREATED_TIMESTAMP) DESC
+                LIMIT 5000
+                """
+            ) or []
+            
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                df["FIRST_DISCOVERED_DT"] = pd.to_datetime(df.get("FIRST_DISCOVERED"))
+                df["DUE_BY"] = df["FIRST_DISCOVERED_DT"].apply(lambda d: _sla_due(d) if pd.notnull(d) else pd.NaT)
+                now = datetime.utcnow()
+                df["OVERDUE"] = (~df["CLASSIFIED"].fillna(False)) & (pd.to_datetime(df["DUE_BY"]).dt.tz_localize(None) < now)
+                overdue = int(df["OVERDUE"].sum()) if "OVERDUE" in df.columns else 0
+            else:
+                overdue = 0
+        except Exception as e:
+            st.error(f"Error calculating overdue assets: {str(e)}")
+            overdue = 0
+            df = pd.DataFrame()
+        
+        # Use counts from the centralized function
+        total = int(counts.get('total_assets', 0))
+        classified = int(counts.get('classified_count', 0))
+        
         return df, {"total": total, "classified": classified, "overdue": overdue}
-    except Exception:
+    except Exception as e:
+        st.error(f"Error in coverage calculation: {str(e)}")
         return pd.DataFrame(), {"total": 0, "classified": 0, "overdue": 0}
 
 # ---------------------------

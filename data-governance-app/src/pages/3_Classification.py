@@ -44,7 +44,8 @@ try:
     from src.services.ai_assistant_service import ai_assistant_service
 except Exception:
     ai_assistant_service = None
-from src.services.ai_sensitive_tables_service import ai_sensitive_tables_service
+from src.services.ai_sensitive_tables_service import AISensitiveTablesService
+ai_sensitive_tables_service = AISensitiveTablesService()
 from src.services.ai_classification_pipeline_service import ai_classification_pipeline_service
 from src.services.decision_matrix_service import validate as dm_validate
 

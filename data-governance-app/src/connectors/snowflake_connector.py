@@ -348,5 +348,47 @@ class SnowflakeConnector:
             except Exception:
                 pass
 
+    def executemany(self, query: str, params: list, fetch_result: bool = False) -> int:
+        """
+        Execute multiple statements/batch insert.
+        
+        Args:
+            query: SQL statement
+            params: List of parameter tuples
+            fetch_result: Unused, kept for API compatibility
+            
+        Returns:
+            Number of affected rows
+        """
+        conn = self._get_cached_connection()
+        cursor = conn.cursor()
+        tried_reconnect = False
+        try:
+            cursor.executemany(query, params)
+            return cursor.rowcount
+        except Exception as e:
+            if self._is_token_expired_error(e) and not tried_reconnect:
+                tried_reconnect = True
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._reset_cached_connections()
+                conn = self._get_cached_connection()
+                cursor = conn.cursor()
+                cursor.executemany(query, params)
+                return cursor.rowcount
+            logger.error(f"Error executing batch: {e}")
+            raise
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
 # Create a global instance
 snowflake_connector = SnowflakeConnector()

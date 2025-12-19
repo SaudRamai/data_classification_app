@@ -35,6 +35,14 @@ except Exception:
     }
 
 # Get allowed classifications from tagging service
+# ... existing imports ...
+
+# STUB: Missing function definition causing NameError
+# This forces the logic to fall back to the direct Snowflake views/tables which are implemented below.
+def my_fetch_tasks(*args, **kwargs):
+    return []
+
+# Initialize session state for filters
 ALLOWED_CLASSIFICATIONS = TAG_DEFINITIONS.get("DATA_CLASSIFICATION") or ["Public", "Internal", "Restricted", "Confidential"]
 from src.services.reclassification_service import reclassification_service
 from src.services.ai_sensitive_detection_service import ai_sensitive_detection_service
@@ -48,6 +56,7 @@ from src.services.ai_sensitive_tables_service import AISensitiveTablesService
 ai_sensitive_tables_service = AISensitiveTablesService()
 from src.services.ai_classification_pipeline_service import ai_classification_pipeline_service
 from src.services.decision_matrix_service import validate as dm_validate
+from src.services.my_tasks_service import fetch_assigned_tasks
 
 def _detect_sensitive_tables(database: str, schema: Optional[str] = None, sample_size: int = 1000) -> List[Dict[str, Any]]:
     """Detect sensitive tables in the specified database using metadata, patterns, and AI.
@@ -148,7 +157,6 @@ from src.services.notifier_service import notifier_service
 from src.services.governance_db_resolver import resolve_governance_db
 from src.services.policy_enforcement_service import policy_enforcement_service
 from src.services.my_tasks_service import (
-    fetch_assigned_tasks as my_fetch_tasks,
     update_or_submit_classification as my_update_submit,
 )
 from src.ui.classification_history_tab import render_classification_history_tab
@@ -325,33 +333,34 @@ try:
                     st.session_state["governance_schema"] = _auto_detect_governance_schema(_active_db)
         except Exception:
             pass
+except Exception as e:
+    st.error(f"Error initializing database context: {e}")
+    st.stop()
 
     # (Removed) Sidebar scanning options
 
-    
-        # Hidden: previously displayed resolved governance schema
-    with col_db2:
-        if st.button("Re-detect DB", key="btn_redetect_db"):
-            try:
-                _db_new = resolve_governance_db(force_refresh=True)
-                if _db_new:
-                    st.session_state["sf_database"] = _db_new
-                    st.success(f"Detected: {_db_new}")
-                # Removed st.rerun() to prevent no-op warning
-            except Exception as _e:
-                st.warning(f"Re-detect failed: {_e}")
-    with col_db3:
-        if st.button("Re-detect Schema", key="btn_redetect_schema"):
-            try:
-                _active_db = st.session_state.get("sf_database") or _db_resolved
-                if _active_db:
-                    st.session_state["governance_schema"] = _auto_detect_governance_schema(_active_db)
-                    st.success(f"Schema: {st.session_state['governance_schema']}")
-                # Removed st.rerun() to prevent no-op warning
-            except Exception as _e:
-                st.warning(f"Schema detect failed: {_e}")
-except Exception:
+with col_db1:
+    if st.button("Re-detect DB", key="btn_redetect_db"):
+        try:
+            _db_new = resolve_governance_db(force_refresh=True)
+            if _db_new:
+                st.session_state["sf_database"] = _db_new
+                st.success(f"Detected: {_db_new}")
+            # Removed st.rerun() to prevent no-op warning
+        except Exception as _e:
+            st.warning(f"Re-detect failed: {_e}")
+with col_db2:
     pass
+with col_db3:
+    if st.button("Re-detect Schema", key="btn_redetect_schema"):
+        try:
+            _active_db = st.session_state.get("sf_database") or _db_resolved
+            if _active_db:
+                st.session_state["governance_schema"] = _auto_detect_governance_schema(_active_db)
+                st.success(f"Schema: {st.session_state['governance_schema']}")
+            # Removed st.rerun() to prevent no-op warning
+        except Exception as _e:
+            st.warning(f"Schema detect failed: {_e}")
 
 # Global Filters (sidebar) and driver for tabs
 with st.sidebar.expander("🌐 Global Filters", expanded=True):
@@ -361,9 +370,12 @@ with st.sidebar.expander("🌐 Global Filters", expanded=True):
         wh_opts = [r.get("name") or r.get("NAME") for r in wh_rows if (r.get("name") or r.get("NAME"))]
     except Exception:
         wh_opts = []
+
+    # Get current warehouse from session state or use first available
     cur_wh = st.session_state.get('sf_warehouse')
-    # Keep current selection visible even if not in list
     wh_display = ([cur_wh] + [w for w in wh_opts if w != cur_wh]) if cur_wh else wh_opts
+
+    # Create warehouse selection dropdown
     sel_wh = st.selectbox(
         "Warehouse",
         options=(wh_display or [""]),
@@ -371,12 +383,14 @@ with st.sidebar.expander("🌐 Global Filters", expanded=True):
         key="global_wh",
         help="Select a Snowflake warehouse to run queries",
     )
-    if sel_wh:
+
+    # Update warehouse if selection changes
+    if sel_wh and sel_wh != cur_wh:
         try:
             snowflake_connector.execute_non_query(f"USE WAREHOUSE {sel_wh}")
             st.session_state['sf_warehouse'] = sel_wh
-        except Exception:
-            pass
+        except Exception as e:
+            st.error(f"Failed to switch to warehouse {sel_wh}: {str(e)}")
 
     # Database, Schema, Table/View, Column
     global_sel = render_data_filters(key_prefix="global")
@@ -498,40 +512,6 @@ def _apply_snowflake_context() -> None:
                     setattr(settings, "SNOWFLAKE_DATABASE", str(db))
             except Exception:
                 pass
-        # Utilities: one-click refresh/seed of governance config for selected DB
-        c1, c2 = st.columns([1,3])
-        with c1:
-            if st.button("Refresh governance (seed/update)", type="secondary", help="Creates tables if missing, upserts default seeds, and refreshes AI config"):
-                db_f = st.session_state.get("sf_database") or resolve_governance_db()
-                if not db_f:
-                    st.warning("Select a Database first in Global Filters")
-                else:
-                    try:
-                        res = refresh_governance(database=db_f)
-                        # Force-refresh config for active DB/schema
-                        try:
-                            _sc_fqn = f"{db_f}.DATA_CLASSIFICATION_GOVERNANCE"
-                            ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn)
-                        except Exception:
-                            pass
-                        # Feedback
-                        failures = res.get("failures") or []
-                        counts = res.get("counts") or {}
-                        st.success(
-                            f"Governance refresh complete for {db_f}: statements ok={res.get('success_statements',0)}, failures={res.get('failure_count',0)}"
-                        )
-                        if counts:
-                            try:
-                                df_counts = pd.DataFrame([{"TABLE": k, "ROW_COUNT": v} for k, v in counts.items()])
-                                st.dataframe(df_counts, hide_index=True, width='stretch')
-                            except Exception:
-                                st.write(counts)
-                        if failures:
-                            st.warning("Some statements failed. See details below.")
-                            for f in failures[:10]:
-                                st.caption(str(f))
-                    except Exception as _seed_ex:
-                        st.error(f"Refresh failed: {_seed_ex}")
         with c2:
             st.caption("")
         try:
@@ -794,6 +774,7 @@ def _ensure_governance_objects(db: str) -> None:
                 LAST_MODIFIED_TIMESTAMP TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
                 LAST_MODIFIED_BY VARCHAR(100),
                 RECORD_VERSION NUMBER(10,0) DEFAULT 1,
+                WAREHOUSE_NAME VARCHAR(255),
                 ADDITIONAL_NOTES VARCHAR(4000),
                 STAKEHOLDER_COMMENTS VARCHAR(4000),
                 PRIMARY KEY (ASSET_ID)
@@ -1067,324 +1048,15 @@ def render_live_feed():
 # (Removed) Sidebar scanning options (pre-tabs)
 
 # Primary tabs per requirements
-tab_new, tab_tasks, tab_qa = st.tabs([
+tab_new, tab_tasks = st.tabs([
     "New Classification",
     "Classification Management",
-    "Quality Assurance (QA)",
 ])
 
 with tab_new:
     pass
 
-with tab_qa:
-    st.subheader("Quality Assurance (QA)")
-    qa_consistency, qa_peer, qa_metrics = st.tabs([
-        "Consistency Checks",
-        "Peer Review Dashboard",
-        "Metrics Dashboard",
-    ])
 
-    # --- Consistency Checks ---
-    with qa_consistency:
-        st.markdown("#### Consistency Checks")
-        st.caption("Detect similar datasets classified differently (by common object name across schemas/DBs) and governance vs tag drift.")
-        db = _active_db_from_filter()
-        group_by_suffix = st.checkbox("Group by object name only (ignore DB/Schema)", value=True, key="qa_consistency_group")
-        sample_limit = st.slider("Max assets to analyze", 100, 5000, 1000, 100)
-        run = st.button("Run Consistency Scan", type="primary", key="qa_consistency_run")
-
-        if run:
-            inconsistent_df = pd.DataFrame()
-            drift_df = pd.DataFrame()
-            try:
-                # Prefer canonical ASSETS table if present
-                if db:
-                    gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
-                    sql = f"""
-                        select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME,
-                               coalesce(CLASSIFICATION_LABEL, '') as CLASSIFICATION,
-                               coalesce(try_to_number(regexp_substr(CONFIDENTIALITY_LEVEL, '[0-9]')), 0) as C,
-                               coalesce(try_to_number(regexp_substr(INTEGRITY_LEVEL, '[0-9]')), 0)        as I,
-                               coalesce(try_to_number(regexp_substr(AVAILABILITY_LEVEL, '[0-9]')), 0)     as A
-                        from {db}.{gv}.ASSETS
-                        qualify row_number() over (order by DATABASE_NAME, SCHEMA_NAME, ASSET_NAME) <= %(lim)s
-                    """
-                    rows = snowflake_connector.execute_query(sql, {"lim": int(sample_limit)}) or []
-                else:
-                    rows = []
-            except Exception:
-                rows = []
-
-            if rows:
-                df = pd.DataFrame(rows)
-                for col in ["DATABASE_NAME","SCHEMA_NAME","ASSET_NAME","CLASSIFICATION"]:
-                    if col not in df.columns:
-                        df[col] = None
-                key_col = "ASSET_NAME" if group_by_suffix else None
-                if key_col:
-                    grp = (df.assign(KEY=df[key_col].str.upper())
-                             .groupby("KEY")
-                             .agg(distinct_classes=("CLASSIFICATION", lambda s: len(set([str(x).upper() for x in s if str(x).strip()]))),
-                                  samples=("CLASSIFICATION", "count"))
-                             .reset_index())
-                else:
-                    df = df.assign(KEY=(df["DATABASE_NAME"].str.upper()+"."+df["SCHEMA_NAME"].str.upper()+"."+df["ASSET_NAME"].str.upper()))
-                    grp = (df.groupby("KEY")
-                             .agg(distinct_classes=("CLASSIFICATION", lambda s: len(set([str(x).upper() for x in s if str(x).strip()]))),
-                                  samples=("CLASSIFICATION", "count"))
-                             .reset_index())
-                inconsistent = grp[grp["distinct_classes"] > 1]
-                if not inconsistent.empty:
-                    st.warning(f"Found {len(inconsistent)} inconsistent name group(s)")
-                    st.dataframe(inconsistent.sort_values(["distinct_classes","samples"], ascending=False), width='stretch')
-                    # Expand one group for detail preview
-                    pick = st.selectbox("Inspect group", options=inconsistent["KEY"].tolist(), key="qa_consistency_pick")
-                    if pick:
-                        detail = df[df["KEY"] == pick].copy()
-                        st.dataframe(detail[["DATABASE_NAME","SCHEMA_NAME","ASSET_NAME","CLASSIFICATION","C","I","A"]], width='stretch')
-                else:
-                    st.success("No cross-dataset classification inconsistencies detected in the sample.")
-            else:
-                st.info("ASSETS table not available or no rows returned. Falling back to tag drift sample.")
-
-            # Tag drift check (governance vs applied tags)
-            try:
-                from src.services.tag_drift_service import analyze_tag_drift as _drift
-            except Exception:
-                _drift = None
-            if _drift is not None:
-                try:
-                    drift = _drift(database=db, limit=sample_limit)
-                    drift_items = pd.DataFrame(drift.get("items", []))
-                    if not drift_items.empty:
-                        st.markdown("---")
-                        st.markdown("##### Governance vs Tag Drift")
-                        st.dataframe(drift_items, width='stretch')
-                        st.caption(f"Drift %: {drift.get('summary',{}).get('drift_pct', 0)} across {drift.get('summary',{}).get('total_assets_sampled', 0)} assets")
-                    else:
-                        st.info("No drift items detected in the sample.")
-                except Exception as e:
-                    st.warning(f"Tag drift analysis failed: {e}")
-
-    # --- Peer Review Dashboard ---
-    with qa_peer:
-        st.markdown("#### Peer Review Dashboard")
-        lb = st.slider("Lookback days", 7, 90, 30, 1, key="qa_peer_lb")
-        me = None
-        try:
-            ident = authz.get_current_identity()
-            me = getattr(ident, "user", None)
-        except Exception:
-            me = None
-
-        pending = []
-        total = 0
-        error = None
-        if cr_list_reviews is not None:
-            try:
-                all_res = cr_list_reviews(current_user=str(me or ""), review_filter="All", lookback_days=int(lb), page_size=200)
-                pen_res = cr_list_reviews(current_user=str(me or ""), review_filter="Pending approvals", approval_status="All pending", lookback_days=int(lb), page_size=200)
-                total = int(all_res.get("total", 0))
-                pending = pen_res.get("reviews", [])
-            except Exception as e:
-                error = str(e)
-        else:
-            error = "Review service unavailable"
-
-        pending_count = len(pending)
-        completion_pct = round(100.0 * (1 - (pending_count / total)) , 2) if total else 100.0
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Pending approvals", pending_count)
-        with c2:
-            st.metric("Review completion %", completion_pct)
-        with c3:
-            st.metric("Items in lookback", total)
-
-        # Pending table with age buckets
-        if pending_count:
-            pdf = pd.DataFrame(pending)
-            if "change_timestamp" in pdf.columns:
-                try:
-                    pdf["age_days"] = (pd.Timestamp.utcnow() - pd.to_datetime(pdf["change_timestamp"])) / pd.Timedelta(days=1)
-                    pdf["age_days"] = pdf["age_days"].round(1)
-                except Exception:
-                    pdf["age_days"] = None
-            st.dataframe(pdf[[c for c in ["database","schema","asset_name","classification","c_level","created_by","change_timestamp","age_days"] if c in pdf.columns]], width='stretch')
-
-            # Aging chart
-            try:
-                bins = pd.cut(pdf["age_days"].fillna(0), bins=[-1,2,7,14,30,9999], labels=["<=2d","3-7d","8-14d","15-30d",">30d"])
-                aging = bins.value_counts().sort_index()
-                st.bar_chart(aging)
-            except Exception:
-                pass
-        if error:
-            st.caption(f"Note: {error}")
-
-    # --- Metrics Dashboard ---
-    with qa_metrics:
-        st.markdown("#### Metrics Dashboard")
-        db = _active_db_from_filter()
-        cov = {"total_assets": 0, "tagged_assets": 0, "coverage_pct": 0.0}
-        hist = []
-        drift_pct = None
-        pass_rate = None
-
-        # Coverage via metrics_service
-        if metrics_service is not None:
-            try:
-                cov = metrics_service.classification_coverage(database=db)
-            except Exception:
-                pass
-
-        # Accuracy proxy via tag drift (accuracy = 100 - drift%)
-        try:
-            from src.services.tag_drift_service import analyze_tag_drift as _drift
-            dsum = _drift(database=db, limit=1000).get("summary", {})
-            drift_pct = float(dsum.get("drift_pct", 0))
-        except Exception:
-            drift_pct = None
-
-        # Audit pass rate from recent check results
-        if compliance_service is not None:
-            try:
-                checks = compliance_service.list_check_results(limit=1000) or []
-                if checks:
-                    total_checks = len(checks)
-                    passed = sum(1 for c in checks if bool(c.get("PASSED")))
-                    pass_rate = round(100.0 * passed / total_checks, 2)
-            except Exception:
-                pass
-
-        # KPI tiles
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.metric("Classification coverage %", value=cov.get("coverage_pct", 0.0), delta=f"{cov.get('tagged_assets',0)}/{cov.get('total_assets',0)} tagged")
-        with m2:
-            acc = None if drift_pct is None else round(100.0 - float(drift_pct), 2)
-            st.metric("Accuracy rate (proxy)", value=(acc if acc is not None else "N/A"), delta=(f"Drift {drift_pct}%" if drift_pct is not None else None))
-        with m3:
-            st.metric("Audit pass rate", value=(pass_rate if pass_rate is not None else "N/A"))
-
-        # Timeliness KPI: Past Due (≥5 business days)
-        past_due_count = None
-        try:
-            if db:
-                gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
-                # Detect an available date column to use (some environments may lack LAST_CLASSIFIED_DATE)
-                try:
-                    col_rows = snowflake_connector.execute_query(
-                        f"""
-                        select upper(COLUMN_NAME) as CN
-                        from {db}.INFORMATION_SCHEMA.COLUMNS
-                        where TABLE_SCHEMA=%(s)s and TABLE_NAME='ASSETS'
-                        """,
-                        {"s": gv}
-                    ) or []
-                    cols = {r.get("CN") for r in col_rows}
-                except Exception:
-                    cols = set()
-                # Preferred columns in order
-                preferred = [
-                    "LAST_CLASSIFIED_DATE",
-                    "LAST_REVIEW_DATE",
-                    "LAST_MODIFIED_DATE",
-                    "UPDATED_TIMESTAMP",
-                    "CREATED_DATE",
-                ]
-                date_col = next((c for c in preferred if c in cols), None)
-                if date_col is None:
-                    # No suitable column; skip KPI gracefully
-                    past_due_count = None
-                else:
-                    sql_pd = f"""
-                        select
-                          count(*) as total,
-                          sum(CASE
-                                WHEN {date_col} IS NULL THEN 1
-                                WHEN {date_col} < DATEADD(day, -5, CURRENT_DATE()) THEN 1
-                                ELSE 0
-                              END) as past_due
-                        from {db}.{gv}.ASSETS
-                    """
-                    try:
-                        rows_pd = snowflake_connector.execute_query(sql_pd) or []
-                    except Exception:
-                        rows_pd = []
-                    if rows_pd:
-                        past_due_count = int(rows_pd[0].get("PAST_DUE") or rows_pd[0].get("past_due") or 0)
-        except Exception:
-            past_due_count = None
-
-        if past_due_count is not None:
-            c_pd1, c_pd2 = st.columns([1, 3])
-            with c_pd1:
-                st.metric("Past Due (≥5d)", value=past_due_count)
-
-        # Special Category Counts: PII, Financial, Regulatory
-        pii_cnt = fin_cnt = reg_cnt = None
-        try:
-            if db:
-                gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
-                sql_cat = f"""
-                    select
-                      sum(CASE WHEN COALESCE(CONTAINS_PII, false) THEN 1 ELSE 0 END) as pii,
-                      sum(CASE WHEN COALESCE(CONTAINS_FINANCIAL_DATA, false) THEN 1 ELSE 0 END) as financial,
-                      sum(CASE WHEN COALESCE(REGULATORY_DATA, false) THEN 1 ELSE 0 END) as regulatory
-                    from {db}.{gv}.ASSETS
-                """
-                rows_cat = snowflake_connector.execute_query(sql_cat) or []
-                if rows_cat:
-                    pii_cnt = int(rows_cat[0].get("PII") or rows_cat[0].get("pii") or 0)
-                    fin_cnt = int(rows_cat[0].get("FINANCIAL") or rows_cat[0].get("financial") or 0)
-                    reg_cnt = int(rows_cat[0].get("REGULATORY") or rows_cat[0].get("regulatory") or 0)
-        except Exception:
-            pii_cnt = fin_cnt = reg_cnt = None
-
-        if any(v is not None for v in [pii_cnt, fin_cnt, reg_cnt]):
-            st.markdown("##### Special Category Counts")
-            sc1, sc2, sc3 = st.columns(3)
-            with sc1:
-                st.metric("PII Assets", value=(pii_cnt if pii_cnt is not None else "N/A"))
-            with sc2:
-                st.metric("SOX Assets", value=(fin_cnt if fin_cnt is not None else "N/A"))
-            with sc3:
-                st.metric("Regulatory Assets", value=(reg_cnt if reg_cnt is not None else "N/A"))
-
-        # Policy Guidance (Quick Reference)
-        with st.expander("Policy Guidance (Quick Reference)", expanded=False):
-            st.markdown("""
-            - Decision Tree: Public? If yes → Public (C0). Else contains personal/proprietary/confidential? If yes → Severe harm? If yes → Confidential (C3) else Restricted (C2). Then assess I and A.
-            - Checklist (Before): Understand purpose; identify stakeholders; consider regulations; assess C/I/A impact; review similar data; document rationale.
-            - Checklist (After): Apply tags; document decision; communicate; schedule review; ensure handling procedures are followed.
-            """)
-            st.caption("See full policy: docs/DATA_CLASSIFICATION_POLICY.md")
-
-        # Trends and breakdowns
-        if metrics_service is not None:
-            try:
-                hist = metrics_service.historical_classifications(database=db, days=30) or []
-                if hist:
-                    hdf = pd.DataFrame(hist)
-                    hdf = hdf.rename(columns={"DAY": "Day", "DECISIONS": "Decisions"})
-                    st.markdown("##### Decisions over last 30 days")
-                    st.bar_chart(hdf.set_index("Day")[["Decisions"]])
-            except Exception:
-                pass
-
-        # Framework counts (optional)
-        if metrics_service is not None:
-            try:
-                fc = metrics_service.framework_counts(database=db)
-                if fc:
-                    fdf = pd.DataFrame([fc]).T.reset_index()
-                    fdf.columns = ["Framework", "Count"]
-                    st.markdown("##### Compliance framework counts")
-                    st.bar_chart(fdf.set_index("Framework")[["Count"]])
-            except Exception:
-                pass
 
 with tab_new:
     st.subheader("New Classification")
@@ -1659,12 +1331,34 @@ _Download the template below to begin_
                                 scores[cat] = max(scores.get(cat, 0.0), 0.7)  # reinforcement
                     except Exception:
                         pass
-                    # Aggregate best category
+                    
+                    # Normalize category to PII, SOX, SOC2
+                    def _normalize_category(c: str) -> str:
+                        u = str(c).upper().strip()
+                        if u in ("PII", "PERSONAL", "GDPR", "CCPA", "HIPAA"):
+                            return "PII"
+                        if u in ("FINANCIAL", "SOX", "PCI", "PCI DSS", "CREDIT CARD", "BANKING"):
+                            return "SOX"
+                        if u in ("SOC2", "SOC", "TYPE2", "TYPE 2", "SECURITY", "AUDIT"):
+                            return "SOC2"
+                        return None
+
+                    # Aggregate best category with normalization
                     top_cat = None
                     top_score = 0.0
+                    
+                    # Consolidate scores by normalized category
+                    norm_scores = {}
                     for k, v in (scores or {}).items():
+                        norm_k = _normalize_category(k)
+                        if norm_k:
+                            norm_scores[norm_k] = max(norm_scores.get(norm_k, 0.0), float(v))
+                    
+                    # Pick winner from normalized
+                    for k, v in norm_scores.items():
                         if v >= top_score:
                             top_cat, top_score = k, float(v)
+                            
                     # Map to CIA defaults
                     if top_cat:
                         c_def, i_def, a_def = _map_category_to_cia(str(top_cat).upper())
@@ -1760,12 +1454,8 @@ _Download the template below to begin_
                 
                 with col1:
                     if st.button("Submit Valid Rows Only", type="secondary", disabled=not has_valid_some, key="bulk_submit_valid_only"):
-                        v_valid = vdf[vdf["ERRORS"].astype(str).str.strip() == ""]
-                        if v_valid.empty:
-                            st.info("No valid rows to submit.")
-                        else:
-                            # This will be replaced by the actual logic below
-                            st.rerun()
+                        # Set a trigger flag for the processing block below
+                        st.session_state["trigger_bulk_valid_processing"] = True
                 
                 with col2:
                     if st.button("Submit Batch", type="primary", disabled=not can_submit, key="bulk_submit_btn"):
@@ -1783,6 +1473,9 @@ _Download the template below to begin_
                                 route = str(rr.get("ROUTE") or "STANDARD_REVIEW")
                                 owner_email = str(rr.get("OWNER_EMAIL") or "system")
                                 rationale = str(rr.get("RATIONALE") or "")
+                                
+                                # Resolve DB for persistence reliability
+                                _bulk_db = full.split('.')[0] if '.' in full else None
                                 
                                 # Tags (uppercase for TaggingService)
                                 tags = {
@@ -1807,6 +1500,7 @@ _Download the template below to begin_
                                                 c=int(c_s), i=int(i_s), a=int(a_s),
                                                 rationale=rationale,
                                                 details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE")},
+                                                database=_bulk_db
                                             )
                                         except Exception:
                                             pass
@@ -1830,6 +1524,7 @@ _Download the template below to begin_
                                             c=int(c_s), i=int(i_s), a=int(a_s),
                                             rationale=rationale or f"Routed to {route}",
                                             details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE")},
+                                            database=_bulk_db
                                         )
                                         try:
                                             _sf_audit_log_classification(full, "BULK_QUEUED_REVIEW", {"label": lbl, "c": c_s, "i": i_s, "a": a_s, "route": route, "confidence": rr.get("CONFIDENCE")})
@@ -1843,9 +1538,15 @@ _Download the template below to begin_
                                 failed += 1
                                 st.error(f"Failed to process row for {full}: {str(e)}")
                                 continue
+                        
+                        if failed == 0:
+                            st.success(f"Batch processed successfully — Applied: {applied}, Queued: {queued}")
+                        else:
+                            st.warning(f"Batch processed with errors — Applied: {applied}, Queued: {queued}, Failed: {failed}")
+
                 # Submit valid rows only (skips rows with errors)
-                if 'bulk_submit_valid_only' in st.session_state and st.session_state.get('bulk_submit_valid_only'):
-                    st.session_state.bulk_submit_valid_only = False  # Reset the state
+                if st.session_state.get('trigger_bulk_valid_processing'):
+                    st.session_state['trigger_bulk_valid_processing'] = False  # Reset the trigger
                     v_valid = vdf[vdf["ERRORS"].astype(str).str.strip() == ""]
                     if v_valid.empty:
                         st.info("No valid rows to submit.")
@@ -1854,6 +1555,9 @@ _Download the template below to begin_
                         for _, rr in v_valid.iterrows():
                             try:
                                 full = str(rr.get("FULL_NAME"))
+                                # Resolve DB for persistence reliability
+                                _bulk_db = full.split('.')[0] if '.' in full else None
+
                                 c_s = int(rr.get("SUGGESTED_C")); i_s = int(rr.get("SUGGESTED_I")); a_s = int(rr.get("SUGGESTED_A"))
                                 lbl = str(rr.get("SUGGESTED_LABEL") or "Internal")
                                 route = str(rr.get("ROUTE") or "STANDARD_REVIEW")
@@ -1882,6 +1586,7 @@ _Download the template below to begin_
                                             c=int(c_s), i=int(i_s), a=int(a_s),
                                             rationale=rationale,
                                             details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE")},
+                                            database=_bulk_db
                                         )
                                     except Exception:
                                         pass
@@ -1901,6 +1606,7 @@ _Download the template below to begin_
                                             c=int(c_s), i=int(i_s), a=int(a_s),
                                             rationale=rationale or f"Routed to {route}",
                                             details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE")},
+                                            database=_bulk_db
                                         )
                                     except Exception:
                                         pass
@@ -2894,16 +2600,7 @@ _Download the template below to begin_
                           WHERE IS_ACTIVE = TRUE
                         ),
 
-                        -- 2️⃣ Active detection weights
-                        WEIGHTS AS (
-                          SELECT
-                              COALESCE(MAX(CASE WHEN UPPER(SENSITIVITY_TYPE) = 'RULE_BASED' THEN WEIGHT END), 1.0) AS RULE_BASED_WEIGHT,
-                              COALESCE(MAX(CASE WHEN UPPER(SENSITIVITY_TYPE) = 'PATTERN_BASED' THEN WEIGHT END), 1.0) AS PATTERN_BASED_WEIGHT
-                          FROM {gv_str}.SENSITIVITY_WEIGHTS
-                          WHERE IS_ACTIVE = TRUE
-                        ),
-
-                        -- 3️⃣ Rule-based keyword matches
+                        -- 2️⃣ Rule-based keyword matches
                         RULE_BASED AS (
                           SELECT
                               c.TABLE_CATALOG AS DATABASE_NAME,
@@ -2915,7 +2612,7 @@ _Download the template below to begin_
                               'RULE_BASED' AS DETECTION_TYPE,
                               k.KEYWORD_STRING AS MATCHED_KEYWORD,
                               NULL AS MATCHED_PATTERN,
-                              COALESCE(k.SENSITIVITY_WEIGHT, 1.0) AS MATCH_WEIGHT,
+                              COALESCE(k.SENSITIVITY_WEIGHT, 1.0) * 1.0 AS MATCH_WEIGHT,  -- Hardcoded RULE_BASED_WEIGHT of 1.0
                               cat.DETECTION_THRESHOLD,
                               cat.C_LEVEL,
                               cat.I_LEVEL,
@@ -3602,7 +3299,7 @@ _Download the template below to begin_
                         st.info("Detected special categories: " + ", ".join([f"`{c}`" for c in ai_categories]))
                         _det_df = _pd.DataFrame([{"Category": k, "Confidence": round(v, 2)} for k, v in (ai_confidence.items() or [])])
                         if not _det_df.empty:
-                            st.dataframe(_det_df, hide_index=True, use_container_width=True)
+                            st.dataframe(_det_df, hide_index=True, width='stretch')
                     except Exception:
                         pass
                 # Persist detected categories for downstream tagging review
@@ -3814,12 +3511,12 @@ _Download the template below to begin_
                         st.caption("Add justification and save draft for exception processing.")
 
                 # PHASE 3: Structured CIA Assessment (Section 6.2.1)
-                st.markdown("##### Step 6: Structured CIA Assessment (per Policy Section 6.2.1)")
+                st.markdown("##### Step 6: Structured CIA Assessment")
                 with st.expander("Confidentiality Assessment", expanded=True):
                     # TODO: Replace labels below with exact wording from Policy Section 6.2.1
-                    c_q1 = st.text_area("[6.2.1-C1] Describe data categories and sensitivity drivers (exact policy text)", key=f"nc_c_q1_{_aid}")
-                    c_q2 = st.text_area("[6.2.1-C2] Describe access roles, external sharing, contractual constraints (exact policy text)", key=f"nc_c_q2_{_aid}")
-                    c_q3 = st.text_area("[6.2.1-C3] Describe impact of unauthorized disclosure (exact policy text)", key=f"nc_c_q3_{_aid}")
+                    c_q1 = st.text_area("Describe data categories and sensitivity drivers (exact policy text)", key=f"nc_c_q1_{_aid}")
+                    c_q2 = st.text_area(" Describe access roles, external sharing, contractual constraints (exact policy text)", key=f"nc_c_q2_{_aid}")
+                    c_q3 = st.text_area(" Describe impact of unauthorized disclosure (exact policy text)", key=f"nc_c_q3_{_aid}")
                     st.session_state["nc_c_q1"] = c_q1
                     st.session_state["nc_c_q2"] = c_q2
                     st.session_state["nc_c_q3"] = c_q3
@@ -4064,6 +3761,30 @@ _Download the template below to begin_
                     "INTEGRITY_LEVEL": str(_i_val),
                     "AVAILABILITY_LEVEL": str(_a_val),
                 }
+            
+            # --- START PERSISTENCE UPDATE ---
+            # Persist the decision to CLASSIFICATION_DECISIONS table even before applying tags
+            # enabling audit trail for every guided workflow completion.
+            try:
+                # Capture metadata from session
+                _meta_details = {
+                    "guided_workflow": True,
+                    "draft_id": _aid2,
+                    "ai_categories": st.session_state.get("nc_ai_categories", []),
+                    "answers": {
+                        "confidentiality": st.session_state.get("nc_c_answers", {}),
+                        "integrity": st.session_state.get("nc_i_answers", {}),
+                        "availability": st.session_state.get("nc_a_answers", {}),
+                    }
+                }
+                
+                # Check if we should auto-record strictly on review or wait for confirm
+                # For now, we prepare the record call but trigger it on 'Apply' or 'Schedule'.
+                pass
+            except Exception:
+                pass
+            # --- END PERSISTENCE UPDATE ---
+
             try:
                 _ai_specials = st.session_state.get("nc_ai_categories") or []
                 if _ai_specials:
@@ -4101,6 +3822,10 @@ _Download the template below to begin_
                                 except Exception:
                                     user_id = None
                                 actor = str(user_id or st.session_state.get("user") or "user")
+                                
+                                # Resolve database for persistence
+                                _db_arg = sel_asset_nc.split('.')[0] if '.' in sel_asset_nc else None
+                                
                                 try:
                                     classification_decision_service.record(
                                         asset_full_name=sel_asset_nc,
@@ -4110,10 +3835,16 @@ _Download the template below to begin_
                                         label=str(_cls_choice),
                                         c=int(_c_val), i=int(_i_val), a=int(_a_val),
                                         rationale=str(_rat2).strip(),
-                                        details={"scope": "TABLE", "tags": _tags_preview},
+                                        details={
+                                            "scope": "TABLE", 
+                                            "tags": _tags_preview,
+                                            "meta": _meta_details if '_meta_details' in locals() else {}
+                                        },
+                                        database=_db_arg
                                     )
-                                except Exception:
-                                    pass
+                                    st.success("Guided Classification decision saved successfully.")
+                                except Exception as e:
+                                    st.error(f"Audit Persistence Failed: {e}")
                         except Exception as e:
                             st.error(f"Failed to apply tags: {e}")
             with b2:
@@ -4161,12 +3892,38 @@ _Download the template below to begin_
                                         {"full": sel_asset_nc, "tags": _tags_json2, "at": _dt2.isoformat(), "by": str(st.session_state.get("user") or "user")}
                                     )
                                     st.success("Tag application scheduled.")
+                                    
+                                    # Persist decision for scheduled action
+                                    try:
+                                        # We emulate the actor lookup again locally
+                                        _ident_s = authz.get_current_identity()
+                                        _actor_s = str(getattr(_ident_s, "user", None) or st.session_state.get("user") or "user")
+                                        
+                                        classification_decision_service.record(
+                                            asset_full_name=sel_asset_nc,
+                                            decision_by=_actor_s,
+                                            source="GUIDED_TAG_SCHEDULE",
+                                            status="Scheduled",
+                                            label=str(_cls_choice),
+                                            c=int(_c_val), i=int(_i_val), a=int(_a_val),
+                                            rationale=str(_rat2).strip() or "Scheduled tagging",
+                                            details={
+                                                "scope": "TABLE",
+                                                "tags": _tags_preview,
+                                                "scheduled_at": _dt2.isoformat(),
+                                                "meta": _meta_details if '_meta_details' in locals() else {}
+                                            },
+                                            database=db2
+                                        )
+                                        st.success("Guided Classification decision saved successfully.")
+                                    except Exception as e:
+                                        st.error(f"Audit Persistence Failed: {e}")
                                 except Exception as e:
                                     st.error(f"Failed to schedule tag apply: {e}")
                             else:
-                                st.error("Could not determine database from asset name for scheduling.")
-                    except Exception:
-                        pass
+                                st.error("Cannot resolve database from asset name.")
+                    except Exception as e:
+                        st.error(f"Schedule flow error: {e}")
                     # Removed st.rerun() to prevent no-op warning
 
 
@@ -5339,21 +5096,21 @@ if False:
                     try:
                         if not df_success.empty:
                             st.markdown("##### Successfully validated")
-                            st.dataframe(df_success, use_container_width=True)
+                            st.dataframe(df_success, width='stretch')
                             st.download_button("Download Success Report", df_success.to_csv(index=False), "bulk_success.csv", "text/csv", key="bulk_succ_dl")
                     except Exception:
                         pass
                     try:
                         if not df_manual.empty:
                             st.markdown("##### Requires manual review")
-                            st.dataframe(df_manual, use_container_width=True)
+                            st.dataframe(df_manual, width='stretch')
                             st.download_button("Download Manual Review Report", df_manual.to_csv(index=False), "bulk_manual.csv", "text/csv", key="bulk_man_dl")
                     except Exception:
                         pass
                     try:
                         if not df_failed.empty:
                             st.markdown("##### Failed validations")
-                            st.dataframe(df_failed, use_container_width=True)
+                            st.dataframe(df_failed, width='stretch')
                             st.download_button("Download Failed Report", df_failed.to_csv(index=False), "bulk_failed.csv", "text/csv", key="bulk_fail_dl")
                     except Exception:
                         pass
@@ -5492,28 +5249,69 @@ with tab_tasks:
         import pandas as _pd
         svc_df = _pd.DataFrame(svc_tasks)
         if svc_df.empty:
-            # Fallback to Snowflake governance view VW_MY_CLASSIFICATION_TASKS if available
+            # Fallback to Snowflake governance view VW_CLASSIFICATION_REVIEWS
             try:
                 db = st.session_state.get('sf_database') or _active_db_from_filter()
                 gv = st.session_state.get('governance_schema') or 'DATA_CLASSIFICATION_GOVERNANCE'
                 if db:
-                    # Build only safe filters; avoid referencing columns that may not exist in the view
-                    where = []
+                    where = ["1=1"]
                     params = {}
+                    
+                    # Status filter
                     if sel_status and sel_status != "All":
-                        where.append("upper(STATUS) = upper(%(st)s)"); params["st"] = sel_status
-                    # Do NOT push global filters server-side because the column name varies across deployments.
-                    # Fetch rows first, then apply client-side filtering via _matches_global().
+                        if sel_status.lower() == "pending":
+                            where.append("upper(coalesce(STATUS,'')) like '%PENDING%'")
+                        elif sel_status.lower() == "completed":
+                            where.append("upper(coalesce(STATUS,'')) in ('APPROVED', 'REJECTED')")
+                        elif sel_status.lower() == "draft":
+                            where.append("upper(coalesce(STATUS,'')) = 'DRAFT'")
+                    
+                    # Owner filter
+                    if owner_q:
+                        where.append("upper(coalesce(REVIEWER,'')) like upper(%(owner)s)")
+                        params["owner"] = f"%{owner_q}%"
+                    elif me_user:
+                        where.append("upper(coalesce(REVIEWER,'')) = upper(%(me)s)")
+                        params["me"] = me_user
+                    
+                    # Classification level
+                    if sel_level and sel_level != "All":
+                        where.append("upper(coalesce(REQUESTED_LABEL,'')) = upper(%(level)s)")
+                        params["level"] = sel_level
+                    
+                    # Date range filter
+                    if dr_start:
+                        where.append("coalesce(REVIEW_DUE_DATE, current_date()) >= %(start_date)s")
+                        params["start_date"] = str(dr_start)
+                    if dr_end:
+                        where.append("coalesce(REVIEW_DUE_DATE, current_date()) <= %(end_date)s")
+                        params["end_date"] = str(dr_end)
+                    
+                    # Main query using VW_CLASSIFICATION_REVIEWS
                     q = f"""
-                        SELECT *
-                        FROM {db}.{gv}.VW_MY_CLASSIFICATION_TASKS
-                        {('WHERE ' + ' AND '.join(where)) if where else ''}
-                        ORDER BY COALESCE(DUE_DATE, CURRENT_TIMESTAMP()) ASC
+                        SELECT 
+                            REVIEW_ID,
+                            ASSET_FULL_NAME,
+                            REQUESTED_LABEL as CLASSIFICATION_LEVEL,
+                            CONFIDENTIALITY_LEVEL as C,
+                            INTEGRITY_LEVEL as I,
+                            AVAILABILITY_LEVEL as A,
+                            REVIEWER as ASSIGNED_TO,
+                            STATUS,
+                            CREATED_AT,
+                            UPDATED_AT,
+                            REVIEW_DUE_DATE as DUE_DATE,
+                            STATUS_LABEL,
+                            LAST_COMMENT as DETAILS
+                        FROM {db}.{gv}.VW_CLASSIFICATION_REVIEWS
+                        WHERE {' AND '.join(where)}
+                        ORDER BY COALESCE(REVIEW_DUE_DATE, current_date()) ASC
                         LIMIT 500
                     """
                     rows = snowflake_connector.execute_query(q, params) or []
                     svc_df = _pd.DataFrame(rows)
-                    # Apply global filters client-side using best-effort matching
+                    
+                    # Apply global filters client-side
                     try:
                         gf = st.session_state.get('global_filters') or {}
                         if gf and not svc_df.empty:
@@ -5524,42 +5322,8 @@ with tab_tasks:
                     except Exception:
                         pass
             except Exception as e:
-                st.caption(f"Tasks view fallback unavailable: {e}")
-        # Second fallback: query CLASSIFICATION_TASKS table directly (if present)
-        if svc_df.empty:
-            try:
-                db = st.session_state.get('sf_database') or _active_db_from_filter()
-                gv = st.session_state.get('governance_schema') or 'DATA_CLASSIFICATION_GOVERNANCE'
-                if db:
-                    where = []
-                    params = {}
-                    # Status filter
-                    if sel_status and sel_status != "All":
-                        where.append("upper(STATUS) = upper(%(st)s)"); params["st"] = sel_status
-                    # Owner filter: use explicit owner substring or default to current user
-                    if owner_q:
-                        where.append("ASSIGNED_TO ILIKE %(own)s"); params["own"] = f"%{owner_q}%"
-                    elif me_user:
-                        where.append("upper(ASSIGNED_TO) = upper(%(own_eq)s)"); params["own_eq"] = str(me_user)
-                    # Classification level
-                    if sel_level and sel_level != "All":
-                        where.append("upper(CLASSIFICATION_LEVEL) = upper(%(lev)s)"); params["lev"] = sel_level
-                    # Date range on CREATED_DATE
-                    if dr_start:
-                        where.append("CREATED_DATE >= %(ds)s"); params["ds"] = str(dr_start)
-                    if dr_end:
-                        where.append("CREATED_DATE <= %(de)s"); params["de"] = str(dr_end)
-                    q2 = f"""
-                        SELECT *
-                        FROM {db}.{gv}.CLASSIFICATION_TASKS
-                        {('WHERE ' + ' AND '.join(where)) if where else ''}
-                        ORDER BY COALESCE(CREATED_DATE, CURRENT_TIMESTAMP()) DESC
-                        LIMIT 500
-                    """
-                    rows2 = snowflake_connector.execute_query(q2, params) or []
-                    svc_df = _pd.DataFrame(rows2)
-            except Exception as e:
-                st.caption(f"Tasks table fallback unavailable: {e}")
+                st.caption(f"Error loading classification reviews: {e}")
+                svc_df = _pd.DataFrame()  # Ensure empty DataFrame on error
         if svc_df.empty:
             st.info("No tasks found for the selected filters.")
         else:
@@ -5577,7 +5341,6 @@ with tab_tasks:
                 "STATUS":"Status",
                 "ASSIGNED_TO":"Owner",
                 "CLASSIFICATION_LEVEL":"Classification Level",
-                "CREATED_DATE":"Created",
                 "TASK_ID":"Task ID",
                 "ASSET_ID":"Asset ID",
             }, inplace=True)
@@ -6049,6 +5812,7 @@ with tab_tasks:
                             CHANGED_BY varchar(150),
                             CHANGE_REASON varchar(1000),
                             CHANGE_TIMESTAMP timestamp_ntz(9) default current_timestamp(),
+                            WAREHOUSE_NAME varchar(255),
                             APPROVAL_REQUIRED boolean,
                             APPROVED_BY varchar(150),
                             APPROVAL_TIMESTAMP timestamp_ntz(9),
@@ -6077,6 +5841,7 @@ with tab_tasks:
                                 CHANGED_BY varchar(150),
                                 CHANGE_REASON varchar(1000),
                                 CHANGE_TIMESTAMP timestamp_ntz(9) default current_timestamp(),
+                                WAREHOUSE_NAME varchar(255),
                                 APPROVAL_REQUIRED boolean,
                                 APPROVED_BY varchar(150),
                                 APPROVAL_TIMESTAMP timestamp_ntz(9),
@@ -6984,7 +6749,7 @@ if False:
     if tdf.empty:
         st.info("No items for current filters.")
     else:
-        st.dataframe(tdf, use_container_width=True, hide_index=True)
+        st.dataframe(tdf, width='stretch', hide_index=True)
 
         # Drift sync tools
         drift_assets = tdf[tdf.get("drift") == True]["asset_name"].dropna().unique().tolist() if "drift" in tdf.columns else []
@@ -7793,7 +7558,7 @@ def _bulk_classification_panel():
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
         return
-    st.dataframe(df.head(20), use_container_width=True)
+    st.dataframe(df.head(20), width='stretch')
     missing = [c for c in ["FULL_NAME","C","I","A"] if c not in [x.upper() for x in df.columns]]
     if missing:
         st.error(f"Missing required columns: {', '.join(missing)}")
@@ -8029,7 +7794,7 @@ def _management_panel():
                     color = "#10b981"
                 return f"color: {color}; font-weight: 700;"
             styler = df[["Asset Name","Type","Due Date","Priority2","Assignment","Task Type","Status"]].rename(columns={"Priority2":"Priority"}).style.applymap(_style_priority, subset=["Priority"]).hide(axis="index")
-            st.dataframe(styler, use_container_width=True)
+            st.dataframe(styler, width='stretch')
 
             # Quick actions
             sel_asset = st.selectbox("Select a task", options=df["Asset Name"].tolist(), key="tasks_sel_asset")
@@ -8334,7 +8099,7 @@ def _management_panel():
             view = view.copy()
             view["Review Type"] = view.apply(_badge_type, axis=1)
             cols_show = [c for c in ["ID","ASSET_FULL_NAME","PROPOSED_LABEL_N","PC","PI","PA","CREATED_BY","CREATED_AT","Review Type"] if c in view.columns]
-            st.dataframe(view[cols_show], use_container_width=True)
+            st.dataframe(view[cols_show], width='stretch')
         else:
             st.info("No pending reviews found for the selected filters.")
 
@@ -8487,7 +8252,7 @@ def _management_panel():
                     except Exception:
                         labels.append(None)
                 sim_df["DATA_CLASSIFICATION"] = labels
-                st.dataframe(sim_df[[c for c in ["FULL_NAME","OBJECT_DOMAIN","DATA_CLASSIFICATION","CIA_CONF","CIA_INT","CIA_AVAIL"] if c in sim_df.columns]], use_container_width=True)
+                st.dataframe(sim_df[[c for c in ["FULL_NAME","OBJECT_DOMAIN","DATA_CLASSIFICATION","CIA_CONF","CIA_INT","CIA_AVAIL"] if c in sim_df.columns]], width='stretch')
 
                 # Inconsistency hint
                 try:
@@ -8590,7 +8355,7 @@ def _management_panel():
                 rdf = rdf[rdf["Risk"].isin([r.replace("Impact", "").strip() for r in risk_level])]
 
             cols = [c for c in ["ID","ASSET_FULL_NAME","Risk","Trigger Source","Impact Scope","Implementation Status","STATUS","CREATED_AT"] if c in rdf.columns]
-            st.dataframe(rdf[cols], use_container_width=True)
+            st.dataframe(rdf[cols], width='stretch')
         else:
             st.info("No reclassification requests found.")
 
@@ -8647,7 +8412,7 @@ def _management_panel():
                         else:
                             cutoff = now - pd.Timedelta(days=30)
                         reqs_df = reqs_df[pd.to_datetime(reqs_df["CREATED_AT"], errors='coerce') >= cutoff]
-                st.dataframe(reqs_df, use_container_width=True)
+                st.dataframe(reqs_df, width='stretch')
             except Exception as e:
                 st.info(f"No reclassification history: {e}")
             try:
@@ -8682,7 +8447,7 @@ def _management_panel():
                     logs_df = logs_df[logs_df["Activity Type"].isin(activity_type)]
                 # User role filter is best-effort without directory: show unchanged
                 # Change magnitude placeholder: treat High CIA deltas as Major (not derivable here) -> skip
-                st.dataframe(logs_df, use_container_width=True)
+                st.dataframe(logs_df, width='stretch')
             except Exception as e:
                 st.info(f"No audit logs: {e}")
 
@@ -8770,7 +8535,7 @@ def _management_panel():
                     tdf = tdf[pd.to_datetime(tdf["Last Sync"], errors='coerce') >= cutoff]
                 else:
                     tdf = tdf[pd.to_datetime(tdf["Last Sync"], errors='coerce') < (now - pd.Timedelta(days=7))]
-            st.dataframe(tdf, use_container_width=True)
+            st.dataframe(tdf, width='stretch')
         else:
             st.info("No tag data available to display.")
 
@@ -8816,7 +8581,7 @@ def _compliance_panel():
     c2.metric("Classified", metrics.get("classified", 0))
     c3.metric("Overdue (SLA 5d)", metrics.get("overdue", 0))
     if not df.empty:
-        st.dataframe(df[[c for c in ["FULL_NAME","FIRST_DISCOVERED","CLASSIFIED","CIA_CONF","CIA_INT","CIA_AVAIL","DUE_BY","OVERDUE"] if c in df.columns]], use_container_width=True)
+        st.dataframe(df[[c for c in ["FULL_NAME","FIRST_DISCOVERED","CLASSIFIED","CIA_CONF","CIA_INT","CIA_AVAIL","DUE_BY","OVERDUE"] if c in df.columns]], width='stretch')
 
 # ---------------------------
 # Page Render
@@ -8872,7 +8637,7 @@ with tab0:
             idf = pd.DataFrame(rows)
             idf.rename(columns={"FULL_NAME":"Asset","OBJECT_DOMAIN":"Type"}, inplace=True)
             idf["Status"] = idf["CLASSIFIED"].apply(lambda x: "Classified " if x else "Unclassified ")
-            st.dataframe(idf[["Asset","Type","FIRST_DISCOVERED","LAST_SEEN","Status"]], use_container_width=True)
+            st.dataframe(idf[["Asset","Type","FIRST_DISCOVERED","LAST_SEEN","Status"]], width='stretch')
         else:
             st.info("No assets in inventory yet. Run a scan below.")
     except Exception as e:
@@ -8934,9 +8699,9 @@ with tab0:
         except Exception:
             pass
         st.markdown("**Tables**")
-        st.dataframe(tdf, use_container_width=True)
+        st.dataframe(tdf, width='stretch')
         st.markdown("**Columns**")
-        st.dataframe(cdf, use_container_width=True)
+        st.dataframe(cdf, width='stretch')
     else:
         st.info("Enter a search string above to find tables and columns.")
 
@@ -9780,7 +9545,7 @@ with tab1:
                                 """,
                                 {"afn": f"{table_full}.{colnm}"},
                             ) or []
-                            st.dataframe(_pd.DataFrame(rows), use_container_width=True)
+                            st.dataframe(_pd.DataFrame(rows), width='stretch')
                         except Exception as e:
                             st.info(f"No history available: {e}")
             except Exception:
@@ -10130,7 +9895,7 @@ with tab3:
             out = out[out["HIGHEST"] >= int(min_threshold)] if not out.empty else out
             st.markdown("**Legend:** 🔴 High  🟠 Medium  🟢 Low")
             show_cols = ["RISK_IND","FULL_NAME","CLASSIFICATION_LEVEL","CIA_CONF","CIA_INT","CIA_AVAIL","RISK","Regulatory","Rationale"]
-            st.dataframe(out[show_cols], use_container_width=True)
+            st.dataframe(out[show_cols], width='stretch')
             try:
                 csv_bytes = out[show_cols].to_csv(index=False).encode("utf-8")
                 st.download_button(
@@ -10240,7 +10005,7 @@ with tab4:
     if prov:
         import pandas as _pd
         pdf = _pd.DataFrame(prov)
-        st.dataframe(pdf[[c for c in ["ID","ASSET_FULL_NAME","REASON","CONFIDENCE","SENSITIVE_CATEGORIES","CREATED_AT"] if c in pdf.columns]], use_container_width=True)
+        st.dataframe(pdf[[c for c in ["ID","ASSET_FULL_NAME","REASON","CONFIDENCE","SENSITIVE_CATEGORIES","CREATED_AT"] if c in pdf.columns]], width='stretch')
         sel_id = st.selectbox("Select provisional item", options=[p.get("ID") for p in prov])
         chosen = next((p for p in prov if p.get("ID") == sel_id), None)
         if chosen:
@@ -10378,7 +10143,7 @@ with tab4:
             for col in ["CURRENT_C","CURRENT_I","CURRENT_A","PROPOSED_C","PROPOSED_I","PROPOSED_A"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-            st.dataframe(df[show_cols], use_container_width=True)
+            st.dataframe(df[show_cols], width='stretch')
             sel = st.selectbox("Select Request", options=[r.get("ID") for r in rows])
             approver = st.text_input("Your email (approver)", key="reclass_approver")
             c1, c2 = st.columns(2)
@@ -10440,7 +10205,7 @@ with tab5:
                 for col in ["CURRENT_C","CURRENT_I","CURRENT_A","PROPOSED_C","PROPOSED_I","PROPOSED_A"]:
                     if col in reqs_df.columns:
                         reqs_df[col] = pd.to_numeric(reqs_df[col], errors="coerce").fillna(0).astype(int)
-                st.dataframe(reqs_df[show_cols], use_container_width=True)
+                st.dataframe(reqs_df[show_cols], width='stretch')
                 try:
                     req_csv = reqs_df[show_cols].to_csv(index=False).encode("utf-8")
                     st.download_button(
@@ -10466,7 +10231,7 @@ with tab5:
                 for c in log_cols:
                     if c not in logs_df.columns:
                         logs_df[c] = None
-                st.dataframe(logs_df[log_cols], use_container_width=True)
+                st.dataframe(logs_df[log_cols], width='stretch')
                 try:
                     logs_csv = logs_df[log_cols].to_csv(index=False).encode("utf-8")
                     st.download_button(

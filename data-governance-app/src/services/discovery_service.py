@@ -64,26 +64,48 @@ class DiscoveryService:
             """
         )
         upserted = 0
+        # Get current warehouse for tagging the discovery
+        try:
+            wh_row = self.connector.execute_query("SELECT CURRENT_WAREHOUSE() AS WH")
+            active_wh = wh_row[0].get('WH') if wh_row else None
+        except Exception:
+            active_wh = None
+
         for r in rows:
             try:
                 self.connector.execute_non_query(
                     f"""
                     MERGE INTO {DB}.{SCHEMA}.{INVENTORY} t
                     USING (
-                        SELECT %(full)s AS FULL_NAME, %(dom)s AS OBJECT_DOMAIN, %(rc)s AS ROW_COUNT, %(ddl)s AS LAST_DDL_TIME
+                        SELECT 
+                            %(full)s AS FULL_NAME, 
+                            %(dom)s AS OBJECT_DOMAIN, 
+                            %(rc)s AS ROW_COUNT, 
+                            %(ddl)s AS LAST_DDL_TIME,
+                            %(wh)s AS WAREHOUSE
                     ) s
                     ON t.FULLY_QUALIFIED_NAME = s.FULL_NAME
                     WHEN MATCHED THEN UPDATE SET 
                         ASSET_TYPE = s.OBJECT_DOMAIN,
+                        WAREHOUSE_NAME = COALESCE(s.WAREHOUSE, t.WAREHOUSE_NAME),
                         LAST_MODIFIED_TIMESTAMP = CURRENT_TIMESTAMP
-                    WHEN NOT MATCHED THEN INSERT (ASSET_ID, FULLY_QUALIFIED_NAME, ASSET_NAME, ASSET_TYPE, DATABASE_NAME, SCHEMA_NAME, OBJECT_NAME, DATA_OWNER, CREATED_TIMESTAMP, LAST_MODIFIED_TIMESTAMP)
-                    VALUES (UUID_STRING(), s.FULL_NAME, SPLIT_PART(s.FULL_NAME, '.', 3), s.OBJECT_DOMAIN, SPLIT_PART(s.FULL_NAME, '.', 1), SPLIT_PART(s.FULL_NAME, '.', 2), SPLIT_PART(s.FULL_NAME, '.', 3), 'SYSTEM', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    WHEN NOT MATCHED THEN INSERT (
+                        ASSET_ID, FULLY_QUALIFIED_NAME, ASSET_NAME, ASSET_TYPE, 
+                        DATABASE_NAME, SCHEMA_NAME, OBJECT_NAME, DATA_OWNER, 
+                        WAREHOUSE_NAME, CREATED_TIMESTAMP, LAST_MODIFIED_TIMESTAMP
+                    )
+                    VALUES (
+                        UUID_STRING(), s.FULL_NAME, SPLIT_PART(s.FULL_NAME, '.', 3), s.OBJECT_DOMAIN, 
+                        SPLIT_PART(s.FULL_NAME, '.', 1), SPLIT_PART(s.FULL_NAME, '.', 2), SPLIT_PART(s.FULL_NAME, '.', 3), 
+                        'SYSTEM', s.WAREHOUSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
                     """,
                     {
                         "full": r["FULL_NAME"],
                         "dom": r["OBJECT_DOMAIN"],
                         "rc": r.get("ROW_COUNT", 0),
                         "ddl": r.get("LAST_DDL_TIME"),
+                        "wh": active_wh
                     },
                 )
                 upserted += 1

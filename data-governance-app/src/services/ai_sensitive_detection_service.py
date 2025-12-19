@@ -8,6 +8,8 @@ This service provides comprehensive sensitive data detection across Snowflake by
 4. Contextual sensitivity inference
 5. Table-level classification
 """
+
+__all__ = ['ai_sensitive_detection_service', 'AISensitiveDetectionService', 'DetectionResult']
 import logging
 import re
 from typing import Dict, List, Any, Optional, Tuple, Set
@@ -718,22 +720,8 @@ class AISensitiveDetectionService:
             logger.warning(f"Categories load failed: {e}")
             self.categories = self.categories or set()
             
-        # 4. Compliance mapping (Dynamic)
-        try:
-            cmap = snowflake_connector.execute_query(
-                f"SELECT c.CATEGORY_NAME, m.COMPLIANCE_STANDARD FROM {gv_fqn}.COMPLIANCE_MAPPING m JOIN {gv_fqn}.SENSITIVITY_CATEGORIES c ON m.CATEGORY_ID = c.CATEGORY_ID WHERE m.IS_ACTIVE"
-            ) or []
-            m: Dict[str, List[str]] = {}
-            for r in cmap:
-                cat = (r.get("CATEGORY_NAME") or "").upper()
-                tag = r.get("COMPLIANCE_STANDARD")
-                if not cat or not tag:
-                    continue
-                m.setdefault(cat, []).append(str(tag))
-            self.compliance_map = m
-        except Exception as e:
-            logger.warning(f"Compliance mapping load failed: {e}")
-            self.compliance_map = {}
+        # 4. Compliance mapping (Removed COMPLIANCE_MAPPING table reference)
+        self.compliance_map = {}
 
     def _get_fallback_keywords(self) -> List[Dict[str, Any]]:
         """Return hard-coded keywords for fallback protection when governance tables are unavailable."""
@@ -883,22 +871,32 @@ class AISensitiveDetectionService:
             except Exception as e:
                 logger.warning(f"Table creation skipped: {e}")
             
-            # Add columns if they don't exist (handle "already exists" errors gracefully)
+            # Add columns safely by checking existence first
             try:
-                snowflake_connector.execute_non_query(
-                    f"ALTER TABLE {db}.{gv}.AI_ASSISTANT_SENSITIVE_ASSETS ADD COLUMN IF NOT EXISTS PREV_SHA256_HEX STRING"
-                )
+                existing_cols = set()
+                try:
+                    cols_rows = snowflake_connector.execute_query(
+                        f"DESC TABLE {db}.{gv}.AI_ASSISTANT_SENSITIVE_ASSETS"
+                    ) or []
+                    for r in cols_rows:
+                        if isinstance(r, dict):
+                            existing_cols.add(str(r.get('name') or '').upper())
+                        else:
+                            existing_cols.add(str(r[0]).upper())
+                except Exception:
+                    pass
+
+                if 'PREV_SHA256_HEX' not in existing_cols:
+                    snowflake_connector.execute_non_query(
+                       f"ALTER TABLE {db}.{gv}.AI_ASSISTANT_SENSITIVE_ASSETS ADD COLUMN IF NOT EXISTS PREV_SHA256_HEX STRING"
+                    )
+                
+                if 'CHAIN_SHA256_HEX' not in existing_cols:
+                    snowflake_connector.execute_non_query(
+                       f"ALTER TABLE {db}.{gv}.AI_ASSISTANT_SENSITIVE_ASSETS ADD COLUMN IF NOT EXISTS CHAIN_SHA256_HEX STRING"
+                    )
             except Exception as e:
-                if "already exists" not in str(e).lower():
-                    logger.warning(f"Column PREV_SHA256_HEX add failed: {e}")
-            
-            try:
-                snowflake_connector.execute_non_query(
-                    f"ALTER TABLE {db}.{gv}.AI_ASSISTANT_SENSITIVE_ASSETS ADD COLUMN IF NOT EXISTS CHAIN_SHA256_HEX STRING"
-                )
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    logger.warning(f"Column CHAIN_SHA256_HEX add failed: {e}")
+                logger.warning(f"Column addition checks failed: {e}")
             
             logger.info("Governance tables verified/created successfully")
             
@@ -906,13 +904,12 @@ class AISensitiveDetectionService:
             logger.warning(f"Governance table setup failed: {e}")
 
     def _lazy_load_ai_service(self):
-        """Lazy load the AI service to prevent circular imports."""
         if self.ai_service is None:
             try:
-                from src.services.ai_classification_pipeline_service import ai_classification_pipeline_service
-                self.ai_service = ai_classification_pipeline_service
-            except ImportError as e:
-                logger.warning(f"Could not import AI Classification Pipeline Service: {e}")
+                import src.services.ai_classification_pipeline_service as aicps
+                self.ai_service = aicps.ai_classification_pipeline_service
+            except (ImportError, AttributeError) as e:
+                logger.debug(f"Could not import AI Classification Pipeline Service: {e}")
                 self.ai_service = None
 
 # Singleton instance

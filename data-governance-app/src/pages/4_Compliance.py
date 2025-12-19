@@ -1872,12 +1872,18 @@ with tab1:
             
             # Snowflake Tags Applied Correctly
             st.write("**Snowflake Tags Applied Correctly**")
-            tag_progress = metrics['tag_pct'] / 100.0
+            tag_pct = metrics.get('tag_pct', 0)  # Default to 0 if key doesn't exist
+            tag_total = metrics.get('tag_total', 0)
+            tagged_assets = metrics.get('tagged_assets', 0)
+            
+            # Ensure progress is between 0 and 1
+            tag_progress = min(max(tag_pct / 100.0, 0.0), 1.0)
             st.progress(tag_progress)
             
             # Dynamic caption with status
-            tag_status = "✓" if metrics['tag_pct'] >= 100 else "⚠️"
-            tag_text = "All tags applied" if metrics['tag_pct'] >= 100 else f"{metrics['tag_total'] - metrics['tagged_assets']} assets need tags"
+            tag_status = "✓" if tag_pct >= 100 else "⚠️"
+            needs_tag = max(tag_total - tagged_assets, 0)  # Ensure non-negative
+            tag_text = "All tags applied" if tag_pct >= 100 else f"{needs_tag} assets need tags"
             st.caption(f"{metrics['tagged_assets']}/{metrics['tag_total']} assets ({metrics['tag_pct']:.0f}%) - {tag_status} {tag_text}")
         
         with col2:
@@ -1958,7 +1964,7 @@ Scheduled: Q2 2025""")
     # ========================================================================
     
     with subtab2:
-        st.write("### Risk Classification Distribution (Section 5.3)")
+        st.write("### Risk Classification Distribution")
         
         # Fetch risk data from TAG_REFERENCES
         risk_data = get_risk_classification_data(db, filters=filters)

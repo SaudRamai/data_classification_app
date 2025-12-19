@@ -971,6 +971,29 @@ class ComprehensiveDetectionService:
             cia_levels = result.get('cia_levels', {})
             validation_status = result.get('validation_status')
 
+            # Determine if the asset contains PII, financial data, etc.
+            category_upper = str(category).upper() if category else ''
+            
+            # Check if category is in PII-related categories
+            contains_pii = 1 if any(pii_term in category_upper for pii_term in 
+                                 ['PII', 'PERSONAL', 'IDENTIFIABLE', 'PRIVATE', 'SENSITIVE']) else 0
+            
+            # Check if category is financial data
+            contains_financial = 1 if any(fin_term in category_upper for fin_term in 
+                                       ['FINANCIAL', 'PAYMENT', 'TRANSACTION', 'BANK', 'CREDIT']) else 0
+            
+            # Check if category is SOX relevant
+            sox_relevant = 1 if any(sox_term in category_upper for sox_term in 
+                                 ['FINANCIAL', 'ACCOUNTING', 'AUDIT', 'SOX', 'REPORTING']) else 0
+            
+            # Check if category is SOC2 relevant
+            soc_relevant = 1 if any(soc_term in category_upper for soc_term in 
+                                 ['PII', 'PERSONAL', 'SECURITY', 'PRIVACY', 'CONFIDENTIAL']) else 0
+            
+            # Check if category is regulatory data
+            regulatory_data = 1 if any(reg_term in category_upper for reg_term in 
+                                    ['REGULATORY', 'COMPLIANCE', 'LEGAL', 'GOVERNANCE', 'REQUIREMENT']) else 0
+
             # Update ASSETS table
             assets_update = """
                 UPDATE DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
@@ -981,7 +1004,12 @@ class ComprehensiveDetectionService:
                     RISK_SCORE = %(risk_score)s,
                     LAST_CLASSIFIED_DATE = CURRENT_DATE(),
                     LAST_MODIFIED_DATE = CURRENT_TIMESTAMP(),
-                    TAGS = %(tags)s
+                    TAGS = %(tags)s,
+                    CONTAINS_PII = %(contains_pii)s,
+                    CONTAINS_FINANCIAL_DATA = %(contains_financial)s,
+                    SOX_RELEVANT = %(sox_relevant)s,
+                    SOC_RELEVANT = %(soc_relevant)s,
+                    REGULATORY_DATA = %(regulatory_data)s
                 WHERE FULL_NAME = %(asset_path)s
             """
 
@@ -1002,6 +1030,11 @@ class ComprehensiveDetectionService:
                 'a_level': cia_levels.get('A', 'A1').replace('A', ''),
                 'risk_score': risk_score,
                 'tags': json.dumps(result.get('routing_decision', {})),
+                'contains_pii': contains_pii,
+                'contains_financial': contains_financial,
+                'sox_relevant': sox_relevant,
+                'soc_relevant': soc_relevant,
+                'regulatory_data': regulatory_data,
                 'asset_path': asset_path
             })
 

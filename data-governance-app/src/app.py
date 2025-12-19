@@ -4,6 +4,10 @@ Main Streamlit application for data governance.
 import sys
 import os
 import pathlib
+import logging
+
+# Suppress Streamlit's ScriptRunContext warning
+logging.getLogger('streamlit.runtime.scriptrunner.script_runner').setLevel(logging.ERROR)
 
 # Add the project root to the Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

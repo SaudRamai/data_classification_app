@@ -68,43 +68,24 @@ def get_sensitive_patterns() -> List[Dict[str, Any]]:
         st.error(f"Error fetching sensitive patterns: {str(e)}")
         return []
 
+from src.services.ai_classification_pipeline_service import ai_classification_pipeline_service
+
 def save_keyword(keyword_data: Dict[str, Any], is_new: bool = True) -> bool:
-    """Save a keyword to the database."""
+    """Save a keyword to the database using the centralized service."""
     try:
-        if is_new:
-            query = """
-                INSERT INTO DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS (
-                    KEYWORD_ID, CATEGORY_ID, KEYWORD_STRING, MATCH_TYPE, 
-                    SENSITIVITY_WEIGHT, IS_ACTIVE, CREATED_AT, VERSION_NUMBER
-                )
-                SELECT 
-                    %(keyword_id)s,
-                    (SELECT CATEGORY_ID FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES 
-                     WHERE CATEGORY_NAME = %(category_name)s LIMIT 1),
-                    %(keyword_string)s,
-                    %(match_type)s,
-                    %(sensitivity_weight)s,
-                    %(is_active)s,
-                    CURRENT_TIMESTAMP(),
-                    1
-            """
-        else:
-            query = """
-                UPDATE DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
-                SET 
-                    CATEGORY_ID = (SELECT CATEGORY_ID FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES 
-                                  WHERE CATEGORY_NAME = %(category_name)s LIMIT 1),
-                    KEYWORD_STRING = %(keyword_string)s,
-                    MATCH_TYPE = %(match_type)s,
-                    SENSITIVITY_WEIGHT = %(sensitivity_weight)s,
-                    IS_ACTIVE = %(is_active)s,
-                    UPDATED_AT = CURRENT_TIMESTAMP(),
-                    VERSION_NUMBER = VERSION_NUMBER + 1
-                WHERE KEYWORD_ID = %(keyword_id)s
-            """
+        # Extract fields from the dictionary
+        keyword = keyword_data.get("keyword_string") or keyword_data.get("KEYWORD_STRING")
+        category = keyword_data.get("category_name") or keyword_data.get("CATEGORY_NAME")
+        match_type = keyword_data.get("match_type") or keyword_data.get("MATCH_TYPE", "CONTAINS")
+        weight = float(keyword_data.get("sensitivity_weight") or keyword_data.get("SENSITIVITY_WEIGHT", 0.8))
         
-        snowflake_connector.execute_query(query, keyword_data)
-        return True
+        # Use the service to upsert (handles sync with classification results)
+        return ai_classification_pipeline_service.upsert_sensitive_keyword(
+            keyword=keyword,
+            category_name=category,
+            match_type=match_type,
+            sensitivity_weight=weight
+        )
     except Exception as e:
         st.error(f"Error saving keyword: {str(e)}")
         return False
@@ -152,15 +133,10 @@ def save_pattern(pattern_data: Dict[str, Any], is_new: bool = True) -> bool:
         st.error(f"Error saving pattern: {str(e)}")
         return False
 
-def delete_keyword(keyword_id: str) -> bool:
-    """Delete a keyword from the database."""
+def delete_keyword(keyword: str, category: str) -> bool:
+    """Delete a keyword using the centralized service."""
     try:
-        query = """
-            DELETE FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS
-            WHERE KEYWORD_ID = %(keyword_id)s
-        """
-        snowflake_connector.execute_query(query, {"keyword_id": keyword_id})
-        return True
+        return ai_classification_pipeline_service.delete_sensitive_keyword(keyword, category)
     except Exception as e:
         st.error(f"Error deleting keyword: {str(e)}")
         return False
@@ -402,7 +378,7 @@ def render_keywords_tab():
             
             with col2:
                 if st.button("Delete Keyword", type="primary"):
-                    if delete_keyword(keyword_id):
+                    if delete_keyword(keyword_data["KEYWORD_STRING"], keyword_data["CATEGORY_NAME"]):
                         st.success("Keyword deleted successfully!")
                         st.rerun()
     

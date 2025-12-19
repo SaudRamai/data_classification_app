@@ -1,7 +1,7 @@
 """
 Tag Drift Service
 
-Detects drift between governance table classification (`ASSETS.CLASSIFICATION_TAG`) and
+Detects drift between governance table classification (`ASSETS.CLASSIFICATION_LABEL`) and
 actual Snowflake tags applied to objects.
 
 Approach:
@@ -55,7 +55,7 @@ def analyze_tag_drift(database: Optional[str] = None, limit: int = 1000) -> Dict
     assets_sql = f"""
         select 
           ASSET_ID, DATABASE_NAME, SCHEMA_NAME, ASSET_NAME,
-          coalesce(CLASSIFICATION_TAG, '') as CLASSIFICATION_TAG
+          coalesce(CLASSIFICATION_LABEL, '') as CLASSIFICATION_LABEL
         from {db}.{sc}.ASSETS
         qualify row_number() over (order by DATABASE_NAME, SCHEMA_NAME, ASSET_NAME) <= %(lim)s
     """
@@ -98,7 +98,7 @@ def analyze_tag_drift(database: Optional[str] = None, limit: int = 1000) -> Dict
     tagged = 0
     for r in rows:
         key = (r.get("DATABASE_NAME"), r.get("SCHEMA_NAME"), r.get("ASSET_NAME"))
-        gov = (r.get("CLASSIFICATION_TAG") or "").strip()
+        gov = (r.get("CLASSIFICATION_LABEL") or "").strip()
         actual = (tag_lookup.get(key) or "").strip()
         is_tagged = actual != ""
         drift = False

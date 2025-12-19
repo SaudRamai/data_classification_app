@@ -84,17 +84,20 @@ class SnowflakeConnector:
             code = getattr(err, "errno", None)
             sqlstate = getattr(err, "sqlstate", "")
             # 390114/08001: Authentication token has expired. The user must authenticate again.
-            if code in (390114, 390100, 390111):
+            # 250002/08003: Connection is closed
+            if code in (390114, 390100, 390111, 250002):
                 return True
-            if isinstance(err, DatabaseError) and ("token has expired" in msg.lower() or "session is expired" in msg.lower()):
-                return True
-            if isinstance(err, InterfaceError) and ("connection" in msg.lower() and "closed" in msg.lower()):
+            msg_lower = msg.lower()
+            if isinstance(err, DatabaseError):
+                if "token has expired" in msg_lower or "session is expired" in msg_lower:
+                    return True
+                if "connection is closed" in msg_lower or "is closed" in msg_lower:
+                    return True
+            if isinstance(err, InterfaceError) and ("connection" in msg_lower and "closed" in msg_lower):
                 # Sometimes manifests as interface error after expiry
                 return True
-            if sqlstate and sqlstate.upper() == "08001":
-                # General connection error; combine with message check
-                if "token has expired" in msg.lower():
-                    return True
+            if sqlstate and sqlstate.upper() in ("08001", "08003"):
+                return True
             return False
         except Exception:
             return False
@@ -263,10 +266,12 @@ class SnowflakeConnector:
         Returns:
             List of query results
         """
-        conn = self._get_cached_connection()
-        cursor = conn.cursor(DictCursor)
+        conn = None
+        cursor = None
         tried_reconnect = False
         try:
+            conn = self._get_cached_connection()
+            cursor = conn.cursor(DictCursor)
             if params:
                 cursor.execute(query, params)
             else:
@@ -277,11 +282,13 @@ class SnowflakeConnector:
             if self._is_token_expired_error(e) and not tried_reconnect:
                 tried_reconnect = True
                 try:
-                    cursor.close()
+                    if cursor:
+                        cursor.close()
                 except Exception:
                     pass
                 try:
-                    conn.close()
+                    if conn:
+                        conn.close()
                 except Exception:
                     pass
                 # Clear cached resources and rebuild connection
@@ -297,7 +304,8 @@ class SnowflakeConnector:
             raise
         finally:
             try:
-                cursor.close()
+                if cursor:
+                    cursor.close()
             except Exception:
                 pass
     
@@ -312,10 +320,12 @@ class SnowflakeConnector:
         Returns:
             Number of affected rows
         """
-        conn = self._get_cached_connection()
-        cursor = conn.cursor()
+        conn = None
+        cursor = None
         tried_reconnect = False
         try:
+            conn = self._get_cached_connection()
+            cursor = conn.cursor()
             if params:
                 cursor.execute(query, params)
             else:
@@ -325,11 +335,13 @@ class SnowflakeConnector:
             if self._is_token_expired_error(e) and not tried_reconnect:
                 tried_reconnect = True
                 try:
-                    cursor.close()
+                    if cursor:
+                        cursor.close()
                 except Exception:
                     pass
                 try:
-                    conn.close()
+                    if conn:
+                        conn.close()
                 except Exception:
                     pass
                 self._reset_cached_connections()
@@ -344,7 +356,8 @@ class SnowflakeConnector:
             raise
         finally:
             try:
-                cursor.close()
+                if cursor:
+                    cursor.close()
             except Exception:
                 pass
 
@@ -360,21 +373,25 @@ class SnowflakeConnector:
         Returns:
             Number of affected rows
         """
-        conn = self._get_cached_connection()
-        cursor = conn.cursor()
+        conn = None
+        cursor = None
         tried_reconnect = False
         try:
+            conn = self._get_cached_connection()
+            cursor = conn.cursor()
             cursor.executemany(query, params)
             return cursor.rowcount
         except Exception as e:
             if self._is_token_expired_error(e) and not tried_reconnect:
                 tried_reconnect = True
                 try:
-                    cursor.close()
+                    if cursor:
+                        cursor.close()
                 except Exception:
                     pass
                 try:
-                    conn.close()
+                    if conn:
+                        conn.close()
                 except Exception:
                     pass
                 self._reset_cached_connections()
@@ -386,7 +403,8 @@ class SnowflakeConnector:
             raise
         finally:
             try:
-                cursor.close()
+                if cursor:
+                    cursor.close()
             except Exception:
                 pass
 

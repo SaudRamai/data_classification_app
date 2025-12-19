@@ -115,15 +115,18 @@ def fetch_assigned_tasks(
     params: Dict[str, object] = {"me": current_user or ""}
 
     # Filter: assigned to current user
-    where_clauses.append("upper(coalesce(ASSIGNED_TO,'')) = upper(%(me)s)")
+    where_clauses.append("upper(coalesce(REVIEWER,'')) = upper(%(me)s)")
 
     # Optional filters
     if status:
         s = status.strip().lower()
-        # Map UI statuses to canonical task statuses
-        if s in ("draft", "pending", "completed"):
-            where_clauses.append("lower(coalesce(STATUS,'')) = %(status)s")
-            params["status"] = s.capitalize() if s != "pending" else "Pending"
+        # Map UI statuses to review statuses
+        if s == "draft":
+            where_clauses.append("lower(coalesce(STATUS,'')) = 'draft'")
+        elif s == "pending":
+            where_clauses.append("lower(coalesce(STATUS,'')) like '%pending%'")
+        elif s == "completed":
+            where_clauses.append("lower(coalesce(STATUS,'')) in ('approved', 'rejected')")
     if owner:
         where_clauses.append("upper(coalesce(ASSIGNED_TO,'')) like upper(%(owner)s)")
         params["owner"] = f"%{owner}%"
@@ -141,36 +144,28 @@ def fetch_assigned_tasks(
 
     if db and schema and tasks and decisions:
         try:
-            # TODO: Replace this with your canonical governance view/table
-            # Example structure using hypothetical TASKS view and DECISIONS for CIA
+            # Using VW_CLASSIFICATION_REVIEWS view as the source
             sql = f"""
-            with latest_cia as (
-              select
-                d.ASSET_FULL_NAME,
-                try_to_number(d.C) as C,
-                try_to_number(d.I) as I,
-                try_to_number(d.A) as A,
-                row_number() over (partition by d.ASSET_FULL_NAME order by d.DECIDED_AT desc) as rn
-              from {db}.{schema}.{decisions} d
-            )
             select
-              t.ASSET_FULL_NAME,
-              split_part(t.ASSET_FULL_NAME, '.', 1) as DATABASE,
-              split_part(t.ASSET_FULL_NAME, '.', 2) as SCHEMA,
-              split_part(t.ASSET_FULL_NAME, '.', 3) as DATASET_NAME,
-              coalesce(t.ASSIGNED_TO, '') as OWNER,
-              coalesce(t.CLASSIFICATION_LEVEL, '') as CLASSIFICATION_LEVEL,
-              coalesce(l.C, 0) as C,
-              coalesce(l.I, 0) as I,
-              coalesce(l.A, 0) as A,
-              coalesce(t.STATUS, 'Draft') as STATUS,
-              coalesce(t.DUE_DATE, current_date()) as DUE_DATE
-            from {db}.{schema}.{tasks} t
-            left join latest_cia l on l.ASSET_FULL_NAME = t.ASSET_FULL_NAME and l.rn = 1
+              ASSET_FULL_NAME,
+              split_part(ASSET_FULL_NAME, '.', 1) as DATABASE,
+              split_part(ASSET_FULL_NAME, '.', 2) as SCHEMA,
+              split_part(ASSET_FULL_NAME, '.', 3) as DATASET_NAME,
+              coalesce(REVIEWER, '') as OWNER,
+              REQUESTED_LABEL as CLASSIFICATION_LEVEL,
+              coalesce(CONFIDENTIALITY_LEVEL, 0) as C,
+              coalesce(INTEGRITY_LEVEL, 0) as I,
+              coalesce(AVAILABILITY_LEVEL, 0) as A,
+              coalesce(STATUS, 'Pending') as STATUS,
+              coalesce(REVIEW_DUE_DATE, dateadd(day, 14, current_date())) as DUE_DATE,
+              CREATED_AT,
+              UPDATED_AT,
+              REVIEW_ID,
+              LAST_COMMENT,
+              STATUS_LABEL
+            from {db}.{schema}.VW_CLASSIFICATION_REVIEWS
             where {' and '.join(where_clauses)}
-            qualify row_number() over (
-              partition by t.ASSET_FULL_NAME order by coalesce(t.DUE_DATE, current_date()) asc
-            ) = 1
+            order by coalesce(REVIEW_DUE_DATE, current_date()) asc
             limit {int(limit)}
             """
             rows = snowflake_connector.execute_query(sql, params) or []
@@ -189,7 +184,12 @@ def fetch_assigned_tasks(
                     "c": c, "i": i, "a": a,
                     "overall_risk": _risk_from_cia(c, i, a),
                     "status": r.get("STATUS"),
+                    "status_label": r.get("STATUS_LABEL", ""),
                     "due_date": r.get("DUE_DATE"),
+                    "review_id": r.get("REVIEW_ID"),
+                    "last_comment": r.get("LAST_COMMENT"),
+                    "created_at": r.get("CREATED_AT"),
+                    "updated_at": r.get("UPDATED_AT")
                 })
             return out
         except Exception:

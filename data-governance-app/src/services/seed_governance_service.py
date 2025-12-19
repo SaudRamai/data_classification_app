@@ -14,7 +14,6 @@ TABLES = [
     "SENSITIVE_KEYWORDS",
     "SENSITIVITY_CATEGORIES",
     "SENSITIVITY_THRESHOLDS",
-    "SENSITIVITY_WEIGHTS",
     "SENSITIVE_BUNDLES",
     "COMPLIANCE_MAPPING",
     "SENSITIVITY_MODEL_CONFIG",
@@ -29,8 +28,7 @@ def _split_sql(sql_text: str) -> List[str]:
 def _ensure_active_flags(database: str, schema: str = "DATA_CLASSIFICATION_GOVERNANCE") -> None:
     for t in [
         "SENSITIVE_PATTERNS", "SENSITIVE_KEYWORDS", "SENSITIVITY_CATEGORIES",
-        "SENSITIVITY_THRESHOLDS", "SENSITIVITY_WEIGHTS", "SENSITIVE_BUNDLES",
-        "COMPLIANCE_MAPPING"
+        "SENSITIVITY_THRESHOLDS", "SENSITIVITY_WEIGHTS", "SENSITIVE_BUNDLES"
     ]:
         try:
             snowflake_connector.execute_non_query(

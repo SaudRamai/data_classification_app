@@ -21,16 +21,20 @@ logger = logging.getLogger(__name__)
 
 def _load_allowed_values(connector, value_type: str) -> List[str]:
     """Load allowed values for a specific tag type from the database"""
+    defaults = {
+        "CLASSIFICATION": ["Public", "Internal", "Restricted", "Confidential"],
+        "CIA_LEVEL": ["0", "1", "2", "3"],
+        "CONFIDENTIALITY_LEVEL": ["C0", "C1", "C2", "C3"],
+        "INTEGRITY_LEVEL": ["I0", "I1", "I2", "I3"],
+        "AVAILABILITY_LEVEL": ["A0", "A1", "A2", "A3"],
+        "SPECIAL_CATEGORY": ["PII", "PHI", "PCI", "SOX", "Financial", "Auth", "Confidential", "Other"],
+        "COMPLIANCE_FRAMEWORKS": ["PII", "SOX", "SOC2", "GDPR", "CCPA", "HIPAA", "PCI DSS", "Internal/Other"],
+        "REVIEW_STATUS": ["Pending Reclassification", "Due Soon", "Overdue", "Reviewed"]
+    }
+    
     # Resolve active DB from settings; bail out early if invalid to avoid noisy errors
     active_db = getattr(settings, "SNOWFLAKE_DATABASE", None)
     if not active_db or str(active_db).strip().upper() in {"", "NONE", "(NONE)", "NULL", "UNKNOWN"}:
-        defaults = {
-            "CLASSIFICATION": ["Public", "Internal", "Restricted", "Confidential"],
-            "CIA_LEVEL": ["0", "1", "2", "3"],
-            "SPECIAL_CATEGORY": ["PII", "PHI", "PCI", "SOX", "Financial", "Auth", "Confidential", "Other"],
-            "COMPLIANCE_CATEGORY": ["GDPR", "CCPA", "HIPAA", "SOX", "PCI DSS", "SOC", "Internal/Other"],
-            "REVIEW_STATUS": ["Pending Reclassification", "Due Soon", "Overdue", "Reviewed"]
-        }
         return defaults.get(value_type, [])
     try:
         fqn = f"{active_db}.DATA_CLASSIFICATION_GOVERNANCE.TAG_ALLOWED_VALUES"
@@ -43,17 +47,14 @@ def _load_allowed_values(connector, value_type: str) -> List[str]:
             """,
             {"type": value_type}
         ) or []
+        
+        # Consistent fallback to defaults if result is empty
+        if not rows:
+             return defaults.get(value_type, [])
+             
         return [str(r.get("VALUE")) for r in rows]
     except Exception as e:
         print(f"Warning: Could not load allowed values for {value_type}: {str(e)}")
-        # Default fallback values if database is not available
-        defaults = {
-            "CLASSIFICATION": ["Public", "Internal", "Restricted", "Confidential"],
-            "CIA_LEVEL": ["0", "1", "2", "3"],
-            "SPECIAL_CATEGORY": ["PII", "PHI", "PCI", "SOX", "Financial", "Auth", "Confidential", "Other"],
-            "COMPLIANCE_CATEGORY": ["GDPR", "CCPA", "HIPAA", "SOX", "PCI DSS", "SOC", "Internal/Other"],
-            "REVIEW_STATUS": ["Pending Reclassification", "Due Soon", "Overdue", "Reviewed"]
-        }
         return defaults.get(value_type, [])
 
 from src.services.governance_db_resolver import resolve_governance_db
@@ -67,13 +68,13 @@ def get_tag_definitions() -> Dict[str, Any]:
     return {
         # Classification and CIA levels
         "DATA_CLASSIFICATION": _load_allowed_values(snowflake_connector, "CLASSIFICATION"),
-        "CONFIDENTIALITY_LEVEL": _load_allowed_values(snowflake_connector, "CIA_LEVEL"),
-        "INTEGRITY_LEVEL": _load_allowed_values(snowflake_connector, "CIA_LEVEL"),
-        "AVAILABILITY_LEVEL": _load_allowed_values(snowflake_connector, "CIA_LEVEL"),
+        "CONFIDENTIALITY_LEVEL": _load_allowed_values(snowflake_connector, "CONFIDENTIALITY_LEVEL"),
+        "INTEGRITY_LEVEL": _load_allowed_values(snowflake_connector, "INTEGRITY_LEVEL"),
+        "AVAILABILITY_LEVEL": _load_allowed_values(snowflake_connector, "AVAILABILITY_LEVEL"),
         
         # Data categories and compliance
         "SPECIAL_CATEGORY": _load_allowed_values(snowflake_connector, "SPECIAL_CATEGORY"),
-        "COMPLIANCE_CATEGORY": _load_allowed_values(snowflake_connector, "COMPLIANCE_CATEGORY"),
+        "COMPLIANCE_FRAMEWORKS": _load_allowed_values(snowflake_connector, "COMPLIANCE_FRAMEWORKS"),
         
         # Lifecycle & Review tags
         "LAST_CLASSIFIED_DATE": "__DATE__",
@@ -340,8 +341,8 @@ class TaggingService:
         # Regulatory-driven overrides: enforce stronger minimums when special/compliance categories indicate PCI/PHI/HIPAA
         try:
             special = (tags.get("SPECIAL_CATEGORY") or "").strip()
-            compliance = (tags.get("COMPLIANCE_CATEGORY") or "").strip()
-            # Normalize to set for easy checks (COMPLIANCE_CATEGORY may be CSV)
+            compliance = (tags.get("COMPLIANCE_FRAMEWORKS") or "").strip()
+            # Normalize to set for easy checks (COMPLIANCE_FRAMEWORKS may be CSV)
             special_set = {s.strip() for s in special.split(',') if s.strip()}
             compliance_set = {c.strip() for c in compliance.split(',') if c.strip()}
         except Exception:
@@ -418,10 +419,10 @@ class TaggingService:
                 if not re.match(r"^\d{4}-\d{2}-\d{2}$", sv):
                     raise ValueError(f"Invalid date format for {k}: '{v}'. Expected YYYY-MM-DD")
                 continue
-            # Standard enumeration validation (supports CSV for COMPLIANCE_CATEGORY)
+            # Standard enumeration validation (supports CSV for COMPLIANCE_FRAMEWORKS)
             if isinstance(allowed, list):
                 sv = str(v)
-                if k == "COMPLIANCE_CATEGORY" and ("," in sv):
+                if k == "COMPLIANCE_FRAMEWORKS" and ("," in sv):
                     parts = [p.strip() for p in sv.split(",") if p.strip()]
                     bad = [p for p in parts if p not in allowed]
                     if bad:
@@ -539,6 +540,43 @@ class TaggingService:
             logger.warning(f"ACCOUNT_USAGE.TAG_REFERENCES column-level failed for {full_name}: {e}")
             column_refs = []
         return object_refs + column_refs
+
+    def get_bulk_object_tags(self, full_names: List[str]) -> List[Dict]:
+        """Return tags for multiple objects and their columns in a single batch query."""
+        if not full_names:
+            return []
+        
+        # Group objects by database to handle potential account-wide scale efficiently
+        db_groups = {}
+        for fn in full_names:
+            try:
+                db = fn.split(".")[0]
+                db_groups.setdefault(db, []).append(fn)
+            except Exception:
+                continue
+                
+        results = []
+        for db, fns in db_groups.items():
+            # Process in chunks of 50 to avoid excessively long SQL strings or parameter limits
+            for i in range(0, len(fns), 50):
+                chunk = fns[i:i+50]
+                try:
+                    # Construct matching predicates for database, schema, and object name
+                    # Filter by DB first to narrow down ACCOUNT_USAGE scan if possible
+                    in_list = ", ".join([f"'{x}'" for x in chunk])
+                    rows = self.connector.execute_query(
+                        f"""
+                        SELECT OBJECT_DATABASE, OBJECT_SCHEMA, OBJECT_NAME, COLUMN_NAME, TAG_NAME, TAG_VALUE
+                        FROM "SNOWFLAKE"."ACCOUNT_USAGE"."TAG_REFERENCES"
+                        WHERE OBJECT_DATABASE = %(db)s
+                          AND (OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME) IN ({in_list})
+                        """,
+                        {"db": db}
+                    ) or []
+                    results.extend(rows)
+                except Exception as e:
+                    logger.warning(f"Bulk tag retrieval failed for DB {db}, chunk starting {i}: {e}")
+        return results
 
     def bulk_apply_classification(
         self,

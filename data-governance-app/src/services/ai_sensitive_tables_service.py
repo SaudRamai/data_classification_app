@@ -139,8 +139,16 @@ class AISensitiveTablesService:
                         return d[k]
                 return None
 
-            # Display tables in a dataframe
-            records = []
+            # Group tables by risk level
+            risk_groups = {
+                'CRITICAL RISK': [],
+                'HIGH RISK': [],
+                'MEDIUM RISK': [],
+                'LOW RISK': [],
+                'UNKNOWN': []
+            }
+            
+            # Process and group tables by risk level
             for table in sensitive_tables:
                 fqn = _g(table, "table_fqn", "TABLE_FQN")
                 if not fqn:
@@ -151,25 +159,84 @@ class AISensitiveTablesService:
                         fqn = f"{dbn}.{scn}.{tbn}"
                 if not fqn:
                     continue
-                records.append({
+                    
+                # Get risk level, default to 'UNKNOWN' if not found
+                risk_level = str(_g(table, "TABLE_SENSITIVITY_LEVEL", "table_sensitivity_level") or "").upper()
+                if 'CRITICAL' in risk_level:
+                    risk_level = 'CRITICAL RISK'
+                elif 'HIGH' in risk_level:
+                    risk_level = 'HIGH RISK'
+                elif 'MEDIUM' in risk_level:
+                    risk_level = 'MEDIUM RISK'
+                elif 'LOW' in risk_level:
+                    risk_level = 'LOW RISK'
+                else:
+                    risk_level = 'UNKNOWN'
+                
+                table_data = {
                     "Table Name": fqn,
                     "Primary Sensitivity": _g(table, "PRIMARY_SENSITIVITY", "primary_sensitivity"),
                     "Confidence Score": f"{round(float(_g(table, 'CONFIDENCE_SCORE', 'confidence_score') or 0.0), 2)}%",
                     "Table Sensitivity Level": _g(table, "TABLE_SENSITIVITY_LEVEL", "table_sensitivity_level"),
                     "CIA Classification": _g(table, "CIA_CLASSIFICATION", "cia_classification"),
-                })
-
-            display_df = pd.DataFrame(records)
-            if not display_df.empty:
-                st.dataframe(display_df[[
-                    "Table Name", "Primary Sensitivity", "Table Sensitivity Level"
-                ]], width='stretch', hide_index=True)
-            else:
+                    "Sensitive Columns": int(_g(table, "SENSITIVE_COLUMN_COUNT", "sensitive_column_count") or 0)
+                }
+                risk_groups[risk_level].append(table_data)
+            
+            # Display tables grouped by risk level
+            table_options = [""]  # For drill-down selection
+            
+            # Critical Risk Tables
+            if risk_groups['CRITICAL RISK']:
+                st.markdown("#### 🔴 Critical Risk Tables")
+                crit_df = pd.DataFrame(risk_groups['CRITICAL RISK'])
+                st.dataframe(crit_df[["Table Name", "Primary Sensitivity", "Confidence Score"]], 
+                           width='stretch', hide_index=True)
+                table_options.extend(crit_df["Table Name"].tolist())
+            
+            # High Risk Tables
+            if risk_groups['HIGH RISK']:
+                st.markdown("#### 🟠 High Risk Tables")
+                high_df = pd.DataFrame(risk_groups['HIGH RISK'])
+                st.dataframe(high_df[["Table Name", "Primary Sensitivity", "Confidence Score"]], 
+                           width='stretch', hide_index=True)
+                table_options.extend(high_df["Table Name"].tolist())
+            
+            # Medium Risk Tables (collapsed by default)
+            if risk_groups['MEDIUM RISK']:
+                with st.expander(f"#### 🟡 Medium Risk Tables ({len(risk_groups['MEDIUM RISK'])})"):
+                    med_df = pd.DataFrame(risk_groups['MEDIUM RISK'])
+                    st.dataframe(med_df[["Table Name", "Primary Sensitivity", "Confidence Score"]], 
+                               width='stretch', hide_index=True)
+                    table_options.extend(med_df["Table Name"].tolist())
+            
+            # Low Risk Tables (collapsed by default)
+            if risk_groups['LOW RISK']:
+                with st.expander(f"#### 🟢 Low Risk Tables ({len(risk_groups['LOW RISK'])})"):
+                    low_df = pd.DataFrame(risk_groups['LOW RISK'])
+                    st.dataframe(low_df[["Table Name", "Primary Sensitivity", "Confidence Score"]], 
+                               width='stretch', hide_index=True)
+                    table_options.extend(low_df["Table Name"].tolist())
+            
+            # Unknown Risk Tables (collapsed by default, if any)
+            if risk_groups['UNKNOWN']:
+                with st.expander(f"#### ⚪ Unclassified Tables ({len(risk_groups['UNKNOWN'])})"):
+                    unk_df = pd.DataFrame(risk_groups['UNKNOWN'])
+                    st.dataframe(unk_df[["Table Name", "Primary Sensitivity"]], 
+                               width='stretch', hide_index=True)
+                    table_options.extend(unk_df["Table Name"].tolist())
+            
+            if not any(risk_groups.values()):
                 st.info("No sensitive tables found for the selected scope.")
                 return
-
+                
+            # Collect all table options for drill-down
+            all_tables = []
+            for risk_level in risk_groups.values():
+                all_tables.extend(risk_level)
+                
             # Table selection for drill-down
-            table_options = [""] + [str(r.get("Table Name")) for r in records if r.get("Table Name")]
+            table_options = [""] + [str(t.get("Table Name")) for t in all_tables if t.get("Table Name")]
             selected_table = st.selectbox(
                 "Select a table to drill down into sensitive columns",
                 options=table_options,
@@ -201,16 +268,7 @@ class AISensitiveTablesService:
                   CONFIDENTIALITY_LEVEL AS C_LEVEL,
                   INTEGRITY_LEVEL AS I_LEVEL,
                   AVAILABILITY_LEVEL AS A_LEVEL
-              FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES
-              WHERE IS_ACTIVE = TRUE
-            ),
-
-            -- 2️⃣ Active sensitivity weights
-            WEIGHTS AS (
-              SELECT
-                  COALESCE(MAX(CASE WHEN UPPER(SENSITIVITY_TYPE) = 'RULE_BASED' THEN WEIGHT END), 1.0) AS RULE_BASED_WEIGHT,
-                  COALESCE(MAX(CASE WHEN UPPER(SENSITIVITY_TYPE) = 'PATTERN_BASED' THEN WEIGHT END), 1.0) AS PATTERN_BASED_WEIGHT
-              FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_WEIGHTS
+              FROM {gv_str}.SENSITIVITY_CATEGORIES
               WHERE IS_ACTIVE = TRUE
             ),
 
@@ -226,8 +284,8 @@ class AISensitiveTablesService:
                   k.KEYWORD_STRING AS MATCHED_KEYWORD,
                   COALESCE(k.SENSITIVITY_WEIGHT, 1.0) AS MATCH_WEIGHT,
                   cat.C_LEVEL, cat.I_LEVEL, cat.A_LEVEL
-              FROM DATA_CLASSIFICATION_DB.INFORMATION_SCHEMA.COLUMNS c
-              JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS k
+              FROM {db}.INFORMATION_SCHEMA.COLUMNS c
+              JOIN {gv_str}.SENSITIVE_KEYWORDS k
                 ON k.IS_ACTIVE = TRUE
                AND (
                     (k.MATCH_TYPE = 'EXACT' AND LOWER(c.COLUMN_NAME) = LOWER(k.KEYWORD_STRING))
@@ -249,8 +307,8 @@ class AISensitiveTablesService:
                   p.PATTERN_NAME AS MATCHED_PATTERN,
                   COALESCE(p.SENSITIVITY_WEIGHT, 1.0) AS MATCH_WEIGHT,
                   cat.C_LEVEL, cat.I_LEVEL, cat.A_LEVEL
-              FROM DATA_CLASSIFICATION_DB.INFORMATION_SCHEMA.COLUMNS c
-              JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS p
+              FROM {db}.INFORMATION_SCHEMA.COLUMNS c
+              JOIN {gv_str}.SENSITIVE_PATTERNS p
                 ON p.IS_ACTIVE = TRUE
                AND REGEXP_LIKE(LOWER(c.COLUMN_NAME), p.PATTERN_REGEX, 'i')
               JOIN CATEGORIES cat ON p.CATEGORY_ID = cat.CATEGORY_ID
@@ -272,11 +330,7 @@ class AISensitiveTablesService:
                   CATEGORY_NAME,
                   CATEGORY_ID,
                   ROUND(
-                    CASE 
-                      WHEN DETECTION_TYPE = 'RULE_BASED' THEN MATCH_WEIGHT * (SELECT RULE_BASED_WEIGHT FROM WEIGHTS)
-                      WHEN DETECTION_TYPE = 'PATTERN_BASED' THEN MATCH_WEIGHT * (SELECT PATTERN_BASED_WEIGHT FROM WEIGHTS)
-                      ELSE MATCH_WEIGHT
-                    END * 100, 2
+                    MATCH_WEIGHT * 100, 2
                   ) AS CONFIDENCE,
                   C_LEVEL, I_LEVEL, A_LEVEL
               FROM COMBINED
@@ -320,15 +374,9 @@ class AISensitiveTablesService:
             COMPLIANCE AS (
               SELECT 
                   CATEGORY_ID,
-                  LISTAGG(DISTINCT COMPLIANCE_STANDARD, ', ') AS ASSOCIATED_COMPLIANCES,
-                  LISTAGG(
-                    DISTINCT REPLACE(
-                      REPLACE(REQUIREMENT_IDS::STRING, '[', ''),
-                      ']', ''
-                    ), ', '
-                  ) AS ASSOCIATED_REQUIREMENTS,
-                  LISTAGG(DISTINCT DESCRIPTION, '; ') AS COMPLIANCE_DESCRIPTION
-              FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.COMPLIANCE_MAPPING
+                  '' AS ASSOCIATED_REQUIREMENTS,
+                  '' AS COMPLIANCE_DESCRIPTION
+              FROM {gv_str}.SENSITIVITY_CATEGORIES
               WHERE IS_ACTIVE = TRUE
               GROUP BY CATEGORY_ID
             )
@@ -370,7 +418,6 @@ class AISensitiveTablesService:
                     WHEN t.AVG_CONFIDENCE >= 60 THEN 'MEDIUM RISK'
                     ELSE 'LOW RISK'
                 END AS TABLE_SENSITIVITY_LEVEL,
-                COALESCE(c.ASSOCIATED_COMPLIANCES, 'None') AS RELEVANT_COMPLIANCES,
                 COALESCE(c.ASSOCIATED_REQUIREMENTS, 'None') AS KEY_REQUIREMENTS,
                 COALESCE(c.COMPLIANCE_DESCRIPTION, 'No specific compliance mapping') AS COMPLIANCE_SUMMARY,
                 CURRENT_TIMESTAMP() AS ANALYZED_AT
@@ -579,18 +626,10 @@ class AISensitiveTablesService:
                   CONFIDENTIALITY_LEVEL AS C_LEVEL,
                   INTEGRITY_LEVEL AS I_LEVEL,
                   AVAILABILITY_LEVEL AS A_LEVEL
-              FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES
+              FROM {gv_str}.SENSITIVITY_CATEGORIES
               WHERE IS_ACTIVE = TRUE
             ),
 
-            -- 2️⃣ Detection weights
-            WEIGHTS AS (
-              SELECT
-                  COALESCE(MAX(CASE WHEN UPPER(SENSITIVITY_TYPE) = 'RULE_BASED' THEN WEIGHT END), 1.0) AS RULE_BASED_WEIGHT,
-                  COALESCE(MAX(CASE WHEN UPPER(SENSITIVITY_TYPE) = 'PATTERN_BASED' THEN WEIGHT END), 1.0) AS PATTERN_BASED_WEIGHT
-              FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_WEIGHTS
-              WHERE IS_ACTIVE = TRUE
-            ),
 
             -- 3️⃣ Rule-based detections (keyword-based)
             RULE_BASED AS (
@@ -610,8 +649,8 @@ class AISensitiveTablesService:
                   cat.C_LEVEL,
                   cat.I_LEVEL,
                   cat.A_LEVEL
-              FROM DATA_CLASSIFICATION_DB.INFORMATION_SCHEMA.COLUMNS c
-              JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_KEYWORDS k
+              FROM {db}.INFORMATION_SCHEMA.COLUMNS c
+              JOIN {gv_str}.SENSITIVE_KEYWORDS k
                 ON k.IS_ACTIVE = TRUE
                AND (
                     (k.MATCH_TYPE = 'EXACT' AND LOWER(c.COLUMN_NAME) = LOWER(k.KEYWORD_STRING))
@@ -640,8 +679,8 @@ class AISensitiveTablesService:
                   cat.C_LEVEL,
                   cat.I_LEVEL,
                   cat.A_LEVEL
-              FROM DATA_CLASSIFICATION_DB.INFORMATION_SCHEMA.COLUMNS c
-              JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVE_PATTERNS p
+              FROM {db}.INFORMATION_SCHEMA.COLUMNS c
+              JOIN {gv_str}.SENSITIVE_PATTERNS p
                 ON p.IS_ACTIVE = TRUE
                AND REGEXP_LIKE(LOWER(c.COLUMN_NAME), p.PATTERN_REGEX, 'i')
               JOIN CATEGORIES cat ON p.CATEGORY_ID = cat.CATEGORY_ID
@@ -689,10 +728,7 @@ class AISensitiveTablesService:
                   s.I_LEVEL,
                   s.A_LEVEL,
                   LEAST(
-                    CASE 
-                      WHEN s.DETECTION_TYPE = 'RULE_BASED' THEN s.MATCH_WEIGHT * (SELECT RULE_BASED_WEIGHT FROM WEIGHTS)
-                      WHEN s.DETECTION_TYPE = 'PATTERN_BASED' THEN s.MATCH_WEIGHT * (SELECT PATTERN_BASED_WEIGHT FROM WEIGHTS)
-                      ELSE s.MATCH_WEIGHT
+                    s.MATCH_WEIGHT * 1.0
                     END * 100,
                     100
                   ) AS CONFIDENCE_SCORE,
@@ -721,14 +757,10 @@ class AISensitiveTablesService:
                       WHEN f.CONFIDENCE_SCORE >= (f.DETECTION_THRESHOLD * 100 * 0.6) THEN 'NEEDS_REVIEW'
                       ELSE 'OK'
                   END AS RECOMMENDED_POLICY,
-                  cm.COMPLIANCE_STANDARD,
                   cm.REQUIREMENT_IDS,
-                  cm.DESCRIPTION AS COMPLIANCE_DESCRIPTION,
+                  '' AS COMPLIANCE_DESCRIPTION,
                   CURRENT_TIMESTAMP() AS DETECTED_AT
               FROM FINAL f
-              LEFT JOIN DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.COMPLIANCE_MAPPING cm
-                     ON f.CATEGORY_ID = cm.CATEGORY_ID
-                     AND cm.IS_ACTIVE = TRUE
             )
 
             -- ✅ Final output
@@ -756,7 +788,6 @@ class AISensitiveTablesService:
                         "availability": row.get("A_LEVEL", 1)
                     },
                     "compliance": {
-                        "standard": row.get("COMPLIANCE_STANDARD"),
                         "requirements": row.get("REQUIREMENT_IDS"),
                         "description": row.get("COMPLIANCE_DESCRIPTION")
                     },

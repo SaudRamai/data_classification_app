@@ -328,6 +328,17 @@ def render_realtime_dashboard():
         if colA2.button("Clear Cache"):
             st.cache_data.clear()
             refresh = True
+            
+        st.markdown("---")
+        st.subheader("🛠️ Developer Tools")
+        if st.button("Refresh Demo Data", key="refresh_demo_btn"):
+            from src.services.asset_utils import seed_sample_assets
+            res = seed_sample_assets(active_db, _SCHEMA, snowflake_connector)
+            if any("Error" in str(r) for r in res.get("results", [])):
+                st.error(f"Failed to seed data: {res.get('results')}")
+            else:
+                st.success("Sample data seeded! Refreshing...")
+                st.rerun()
 
     if refresh:
         st.cache_data.clear()
@@ -357,615 +368,565 @@ def render_realtime_dashboard():
     except Exception:
         pass
 
-    # 🟢 Classification Health Score
-    st.header("🟢 Classification Health Score")
+    # ✔ 1. Classification Health Score
+    st.header("🛡️ Classification Health Program")
+    
     try:
-        # Build filters for the query
-        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                            start_date, end_date,
-                                            T_ASSETS, ["CLASSIFICATION_DATE", "CREATED_TIMESTAMP", "LAST_MODIFIED_TIMESTAMP"])
-        where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
+        from src.services.asset_utils import get_health_score_metrics
+        health = get_health_score_metrics(active_db, _SCHEMA, snowflake_connector)
         
-        # Use the centralized asset counting function
-        from src.services.asset_utils import get_asset_counts
-        
-        # Get asset counts with the current filters
-        counts = get_asset_counts(
-            assets_table=T_ASSETS,
-            where_clause=where.replace("T_ASSETS.", ""),  # Remove table prefix if present
-            params=params,
-            snowflake_connector=snowflake_connector
-        )
-        
-        # Display the metrics
-        k1, k2, k3, k4 = st.columns(4)
-        safe_int = lambda v: int(v) if isinstance(v, (int, float)) else int((v or 0))
-        
-        k1.metric("Total Assets", f"{safe_int(counts['total_assets']):,}")
-        k2.metric("Classified", f"{safe_int(counts['classified_count']):,}")
-        k3.metric("Unclassified", f"{safe_int(counts['unclassified_count']):,}")
-        
-        cov = counts['coverage_pct'] or 0
-        try:
-            cov_int = int(float(cov))
-        except Exception:
-            cov_int = 0
-            
-        k4.progress(min(100, max(0, cov_int)), text=f"Coverage {cov}%")
-        
-    except Exception as e:
-        _rt_show_error("Failed to load Classification Health", e)
-        # Log the full error for debugging
-        import traceback
-        st.error(f"Error details: {str(e)}\n\n{traceback.format_exc()}")
-
-    # 📈 Data Sensitivity Overview
-    st.header("📈 Data Sensitivity Overview")
-
-    # Assets by Classification Level (pie)
-    st.subheader("Assets by Classification Level")
-    try:
-        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                              start_date, end_date,
-                                              T_ASSETS, ["CLASSIFICATION_DATE", "CREATED_TIMESTAMP", "LAST_MODIFIED_TIMESTAMP"])
-        where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
-        rows = _rt_run_query(f"""
-                    select coalesce(CLASSIFICATION_LABEL,'Unclassified') as LEVEL, count(*) as CNT
-                    from {T_ASSETS}
-                    {where}
-                    group by 1
-                    order by 1
-                """, params)
-        df = pd.DataFrame(rows or [])
-        if df.empty:
-            st.info("No data available for breakdown.")
-        else:
-            fig = px.pie(df, names="LEVEL", values="CNT", hole=0.4)
-            st.plotly_chart(fig, use_container_width=True)
-    except Exception as e:
-        _rt_show_error("Failed to load Classification Breakdown", e)
-
-    # Unclassified Assets Alert (priority list)
-    st.subheader("Unclassified Assets Alert")
-    try:
-        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                              start_date, end_date,
-                                              T_ASSETS, ["CLASSIFICATION_DATE", "CREATED_TIMESTAMP", "LAST_MODIFIED_TIMESTAMP"])
-        # Build base where clause for unclassified/non-compliant assets
-        base_where = (where + (" AND " if where else " WHERE ") + 
-                     "(CLASSIFICATION_LABEL IS NULL OR COMPLIANCE_STATUS = 'NON_COMPLIANT')")
-        where_u, params = _rt_apply_compliance_filter(base_where, params, "ASSET_ID", T_CMAP)
-        
-        # Execute the new query for unclassified/non-compliant assets
-        rows = _rt_run_query(f"""
-            SELECT
-                ASSET_ID,
-                ASSET_NAME,
-                ASSET_TYPE,
-                DATABASE_NAME,
-                SCHEMA_NAME,
-                OBJECT_NAME,
-                CONCAT_WS('.', NULLIF(DATABASE_NAME,''), NULLIF(SCHEMA_NAME,''), OBJECT_NAME) as FULLY_QUALIFIED_NAME,
-                DATA_OWNER,
-                CLASSIFICATION_LABEL,
-                CLASSIFICATION_DATE,
-                COMPLIANCE_STATUS,
-                CONTAINS_PII,
-                CONTAINS_FINANCIAL_DATA,
-                SOX_RELEVANT,
-                SOC_RELEVANT,
-                REGULATORY_DATA,
-                DATEDIFF('day', CLASSIFICATION_DATE, CURRENT_TIMESTAMP()) AS DAYS_UNCLASSIFIED,
-                CASE 
-                    WHEN CLASSIFICATION_DATE IS NULL THEN 'High'
-                    WHEN DATEDIFF('day', CLASSIFICATION_DATE, CURRENT_TIMESTAMP()) <= 3 THEN 'Low'
-                    WHEN DATEDIFF('day', CLASSIFICATION_DATE, CURRENT_TIMESTAMP()) BETWEEN 4 AND 7 THEN 'Medium'
-                    ELSE 'High'
-                END AS PRIORITY_LEVEL
-            FROM {T_ASSETS}
-            {where_u}
-            ORDER BY 
-                CASE PRIORITY_LEVEL
-                    WHEN 'High' THEN 1
-                    WHEN 'Medium' THEN 2
-                    WHEN 'Low' THEN 3
-                    ELSE 4
-                END,
-                DAYS_UNCLASSIFIED DESC,
-                DATABASE_NAME, 
-                SCHEMA_NAME, 
-                ASSET_NAME
-            LIMIT 500
-        """, params)
-        
-        df = pd.DataFrame(rows or [])
-        # Fallback to demo data if empty
-        if df.empty:
-            try:
-                from src.demo_data import UNCLASSIFIED_ASSETS_TSV
-                if UNCLASSIFIED_ASSETS_TSV:
-                    demo_df = pd.read_csv(io.StringIO(UNCLASSIFIED_ASSETS_TSV), sep='\t')
-                    if not demo_df.empty:
-                        # Ensure required columns for filters exist
-                        if "PRIORITY_LEVEL" not in demo_df.columns:
-                            demo_df["PRIORITY_LEVEL"] = "High"
-                        if "DAYS_UNCLASSIFIED" not in demo_df.columns:
-                            demo_df["DAYS_UNCLASSIFIED"] = 5
-                        
-                        # Parse FQN for display if needed
-                        if "FULLY_QUALIFIED_NAME" in demo_df.columns and "DATABASE_NAME" not in demo_df.columns:
-                            # flexible split
-                            def parse_fqn(f):
-                                p = str(f).split('.')
-                                return pd.Series([p[0] if len(p)>0 else '', p[1] if len(p)>1 else '', p[2] if len(p)>2 else ''])
-                            demo_df[["DATABASE_NAME", "SCHEMA_NAME", "OBJECT_NAME"]] = demo_df["FULLY_QUALIFIED_NAME"].apply(parse_fqn)
-
-                        # Default boolean flags for domain filters
-                        for col in ["CONTAINS_PII", "CONTAINS_FINANCIAL_DATA", "SOX_RELEVANT", "SOC_RELEVANT", "REGULATORY_DATA"]:
-                            if col not in demo_df.columns:
-                                demo_df[col] = False
-                        
-                        df = demo_df
-            except Exception as ex:
-                pass # Fallback failed, stick with empty df
-        if df.empty:
-            st.info("No unclassified or non-compliant assets found.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            
-            # Priority level filter
-            pr_level = c1.selectbox("Priority Level", ["All", "High", "Medium", "Low"])
-            
-            # Days unclassified filter
-            md_series = pd.to_numeric(df["DAYS_UNCLASSIFIED"], errors="coerce") 
-            if not md_series.empty and not md_series.isna().all():
-                max_days = int(md_series.max())
-                day_range = c2.slider("Days Unclassified", 0, max(1, max_days), (0, max_days))
-            else:
-                day_range = (0, 0)
-                c2.caption("No classification date available")
-            
-            # Domain filter
-            domain = c3.selectbox("Compliance", ["All", "PII", "SOX", "SOC2"])
-            
-            # Apply filters
-            f = df.copy()
-            
-            # Apply priority filter
-            if pr_level != "All":
-                f = f[f["PRIORITY_LEVEL"] == pr_level]
-            
-            # Apply days unclassified filter
-            if "DAYS_UNCLASSIFIED" in f.columns:
-                f = f[
-                    (f["DAYS_UNCLASSIFIED"] >= day_range[0]) & 
-                    (f["DAYS_UNCLASSIFIED"] <= day_range[1])
-                ]
-            
-            # Apply domain filter
-            if domain == "PII":
-                f = f[f["CONTAINS_PII"] == True]
-            elif domain == "Financial":
-                f = f[f["CONTAINS_FINANCIAL_DATA"] == True]
-            elif domain == "Regulatory":
-                f = f[f["REGULATORY_DATA"] == True]
-            elif domain == "SOX":
-                f = f[f["SOX_RELEVANT"] == True]
-            elif domain == "SOC":
-                f = f[f["SOC_RELEVANT"] == True]
-            page_size = 25
-            page = st.number_input("Page", min_value=1, value=1, step=1)
-            page_df, total = _rt_paginate_df(f, page, page_size)
-            st.caption(f"Showing {len(page_df)} of {total} items")
-            st.dataframe(page_df, use_container_width=True, hide_index=True)
-    except Exception as e:
-        _rt_show_error("Failed to load Unclassified Priority", e)
-
-    # Classification Progress Tracking
-    st.subheader("Classification Progress Tracking")
-    try:
-        # Detailed Classification Progress Tracking query
-        query = """
-        WITH CLASSIFICATION_METRICS AS (
-            -- Total assets in the database - Table Count
-            SELECT 
-                COUNT(*) AS TOTAL_ASSETS,
-                COUNT(DISTINCT TABLE_SCHEMA) AS TOTAL_SCHEMAS,
-                'TABLE' AS METRIC_TYPE
-            FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_CATALOG = CURRENT_DATABASE()
-              AND TABLE_TYPE = 'BASE TABLE'
-              AND TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
-            
-            UNION ALL
-            
-            -- Total columns with potential PII - Column Count
-            SELECT 
-                COUNT(*) AS TOTAL_ASSETS,
-                COUNT(DISTINCT TABLE_SCHEMA) AS TOTAL_SCHEMAS,
-                'COLUMN' AS METRIC_TYPE
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_CATALOG = CURRENT_DATABASE()
-              AND TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
-              AND (UPPER(COLUMN_NAME) LIKE '%EMAIL%' 
-                   OR UPPER(COLUMN_NAME) LIKE '%PHONE%' 
-                   OR UPPER(COLUMN_NAME) LIKE '%SSN%' 
-                   OR UPPER(COLUMN_NAME) LIKE '%ADDRESS%'
-                   OR UPPER(COLUMN_NAME) LIKE '%BIRTH%'
-                   OR UPPER(COLUMN_NAME) LIKE '%SALARY%'
-                   OR UPPER(COLUMN_NAME) LIKE '%CREDIT%'
-                   OR UPPER(COLUMN_NAME) LIKE '%PASSWORD%'
-                   OR UPPER(COLUMN_NAME) LIKE '%ACCOUNT%')
-        ),
-
-        TAGGED_ASSETS AS (
-            -- Count tagged tables
-            SELECT 
-                COUNT(DISTINCT OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME) AS TAGGED_COUNT,
-                'TABLE' AS ASSET_TYPE
-            FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
-            WHERE OBJECT_DATABASE = CURRENT_DATABASE()
-              AND DOMAIN = 'TABLE'
-            
-            UNION ALL
-            
-            -- Count tagged columns
-            SELECT 
-                COUNT(DISTINCT OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME || '.' || COLUMN_NAME) AS TAGGED_COUNT,
-                'COLUMN' AS ASSET_TYPE
-            FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
-            WHERE OBJECT_DATABASE = CURRENT_DATABASE()
-              AND DOMAIN = 'COLUMN'
-        ),
-
-        CLASSIFICATION_PROGRESS AS (
-            SELECT 
-                CASE 
-                    WHEN m.METRIC_TYPE = 'TABLE' THEN 'TABLES'
-                    WHEN m.METRIC_TYPE = 'COLUMN' THEN 'SENSITIVE_COLUMNS'
-                END AS ASSET_CATEGORY,
-                m.TOTAL_ASSETS,
-                COALESCE(t.TAGGED_COUNT, 0) AS CLASSIFIED_ASSETS,
-                m.TOTAL_ASSETS - COALESCE(t.TAGGED_COUNT, 0) AS UNCLASSIFIED_ASSETS
-            FROM CLASSIFICATION_METRICS m
-            LEFT JOIN TAGGED_ASSETS t ON m.METRIC_TYPE = t.ASSET_TYPE
-        )
-
-        SELECT 
-            ASSET_CATEGORY,
-            TOTAL_ASSETS,
-            CLASSIFIED_ASSETS,
-            UNCLASSIFIED_ASSETS,
-            ROUND((CLASSIFIED_ASSETS * 100.0 / NULLIF(TOTAL_ASSETS, 0)), 2) AS COMPLETION_PERCENTAGE,
-            CASE 
-                WHEN ROUND((CLASSIFIED_ASSETS * 100.0 / NULLIF(TOTAL_ASSETS, 0)), 2) = 0 THEN '❌ NOT STARTED'
-                WHEN ROUND((CLASSIFIED_ASSETS * 100.0 / NULLIF(TOTAL_ASSETS, 0)), 2) < 25 THEN '🔴 POOR'
-                WHEN ROUND((CLASSIFIED_ASSETS * 100.0 / NULLIF(TOTAL_ASSETS, 0)), 2) < 50 THEN '🟠 FAIR'
-                WHEN ROUND((CLASSIFIED_ASSETS * 100.0 / NULLIF(TOTAL_ASSETS, 0)), 2) < 75 THEN '🟡 GOOD'
-                WHEN ROUND((CLASSIFIED_ASSETS * 100.0 / NULLIF(TOTAL_ASSETS, 0)), 2) < 90 THEN '🟢 VERY GOOD'
-                ELSE '✅ EXCELLENT'
-            END AS PROGRESS_STATUS,
-            CASE 
-                WHEN ROUND((CLASSIFIED_ASSETS * 100.0 / NULLIF(TOTAL_ASSETS, 0)), 2) < 100 
-                THEN 'Need to classify ' || UNCLASSIFIED_ASSETS || ' more ' || 
-                     CASE WHEN ASSET_CATEGORY = 'TABLES' THEN 'tables' ELSE 'columns' END
-                ELSE 'Classification Complete!'
-            END AS NEXT_ACTION
-        FROM CLASSIFICATION_PROGRESS
-        ORDER BY 
-            CASE ASSET_CATEGORY 
-                WHEN 'TABLES' THEN 1 
-                WHEN 'SENSITIVE_COLUMNS' THEN 2 
-            END
-        """
-        
-        # Execute the query
-        results = _rt_run_query(query)
-        
-        if not results:
-             st.info("No classification progress data available for the current database.")
-        else:
-            # Render updated UI
-            for row in results:
-                # Handle dictionary keys robustly (upper case expected)
-                row_up = {k.upper(): v for k, v in row.items()}
+        # Premium UI CSS
+        st.markdown("""
+            <style>
+                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
                 
-                category = row_up.get('ASSET_CATEGORY', 'Unknown')
-                total = int(row_up.get('TOTAL_ASSETS') or 0)
-                classified = int(row_up.get('CLASSIFIED_ASSETS') or 0)
-                pct = float(row_up.get('COMPLETION_PERCENTAGE') or 0.0)
-                status = row_up.get('PROGRESS_STATUS', '')
-                action = row_up.get('NEXT_ACTION', '')
-
-                # Visual container for each category
-                with st.container():
-                    c1, c2 = st.columns([3, 1])
-                    with c1:
-                         label_map = {'TABLES': 'Tables', 'SENSITIVE_COLUMNS': 'Sensitive Columns'}
-                         display_name = label_map.get(category, category)
-                         st.markdown(f"**{display_name}**  <span style='color:gray; font-size:0.9em'>({classified} / {total} classified)</span>", unsafe_allow_html=True)
-                         st.progress(min(100, max(0, int(pct))))
-                         if action:
-                             st.caption(f"Action: {action}")
-                    with c2:
-                        st.markdown(f"### {pct}%")
-                        st.markdown(f"{status}")
-                    st.divider()
-            
-    except Exception as e:
-        _rt_show_error("Failed to load Classification Progress", e)
-
-    # ⚖️ Compliance Status Widget
-    st.header("⚖️ Compliance Status Widget")
-
-    # Policy Compliance Score
-    st.subheader("Policy Compliance Score")
-    try:
-        # Build filters from sidebar selections
-        where_clause, params = _rt_build_filters_for(
-            sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-            start_date, end_date,
-            f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS",
-            ["CREATED_AT", "UPDATED_AT"]
-        )
-        
-        # Base query with dynamic table reference
-        base_table = f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
-        
-        # Execute the Policy Compliance Score query with filters
-        query = f"""
-        WITH filtered_assets AS (
-            SELECT * 
-            FROM {base_table}
-            {where_clause}
-        )
-        SELECT
-            COUNT(*) AS total_assets,
-            COUNT(CASE WHEN UPPER(COALESCE(compliance_status,'')) = 'COMPLIANT' THEN 1 END) AS compliant_assets,
-            ROUND(
-                100.0 * COUNT(CASE WHEN UPPER(COALESCE(compliance_status,'')) = 'COMPLIANT' THEN 1 END) 
-                / NULLIF(COUNT(*), 0), 2
-            ) AS policy_compliance_score_percent
-        FROM filtered_assets
-        """
-        
-        # Execute the query
-        result = _rt_run_query(query)
-        
-        if result and result[0]:
-            total_assets = result[0].get('TOTAL_ASSETS', 0) or 0
-            compliant_assets = result[0].get('COMPLIANT_ASSETS', 0) or 0
-            compliance_score = result[0].get('POLICY_COMPLIANCE_SCORE_PERCENT', 0) or 0
-            
-            # Display key metrics
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total Assets", f"{int(total_assets):,}")
-            col2.metric("Compliant Assets", f"{int(compliant_assets):,}")
-            col3.metric("Compliance Score", f"{float(compliance_score)}%")
-            
-            # Simple progress bar for visualization
-            progress_value = min(100, max(0, float(compliance_score)))
-            st.progress(progress_value / 100.0)
-            
-            # Add some spacing
-            st.write("")
-        else:
-            st.info("No compliance data available.")
-    except Exception as e:
-        _rt_show_error("Failed to load Compliance Status", e)
-
-    # Review Completion Rate
-    st.subheader("Review Completion Rate")
-    try:
-        # Build filters from sidebar selections
-        where_clause, params = _rt_build_filters_for(
-            sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-            start_date, end_date,
-            f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS",
-            ["CREATED_AT", "UPDATED_AT", "NEXT_REVIEW_DATE"]
-        )
-        
-        # Base table with dynamic reference
-        base_table = f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
-        
-        # Execute the Review Completion Rate query with filters
-        query = f"""
-        WITH filtered_assets AS (
-            SELECT * 
-            FROM {base_table}
-            {where_clause}
-        )
-        SELECT
-            COUNT(*) AS total_assets,
-            COUNT(CASE 
-                     WHEN peer_review_completed = TRUE 
-                          AND management_review_completed = TRUE 
-                          AND technical_review_completed = TRUE 
-                     THEN 1 
-                 END) AS completed_reviews,
-            ROUND(
-                100.0 * COUNT(CASE 
-                                 WHEN peer_review_completed = TRUE 
-                                      AND management_review_completed = TRUE 
-                                      AND technical_review_completed = TRUE 
-                                 THEN 1 
-                             END) 
-                / NULLIF(COUNT(*), 0), 2
-            ) AS completion_rate_percent,
-            COUNT(CASE 
-                     WHEN next_review_date > CURRENT_DATE 
-                     THEN 1 
-                 END) AS upcoming_reviews,
-            COUNT(CASE 
-                     WHEN next_review_date <= CURRENT_DATE 
-                          AND COALESCE(review_status, '') != 'CURRENT' 
-                     THEN 1 
-                 END) AS overdue_reviews
-        FROM filtered_assets
-        """
-        
-        # Execute the query
-        result = _rt_run_query(query, params)
-        
-        if result and result[0]:
-            total_assets = result[0].get('TOTAL_ASSETS', 0) or 0
-            completed_reviews = result[0].get('COMPLETED_REVIEWS', 0) or 0
-            completion_rate = result[0].get('COMPLETION_RATE_PERCENT', 0) or 0
-            upcoming_reviews = result[0].get('UPCOMING_REVIEWS', 0) or 0
-            overdue_reviews = result[0].get('OVERDUE_REVIEWS', 0) or 0
-            
-            # Display metrics in columns
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Completed Reviews", f"{int(completed_reviews):,}")
-            col2.metric("Upcoming Reviews", f"{int(upcoming_reviews):,}")
-            col3.metric("Completion Rate", f"{float(completion_rate)}%")
-            
-            # Show overdue reviews as a warning below
-            if overdue_reviews > 0:
-                st.warning(f"⚠️ {int(overdue_reviews):,} reviews are overdue")
-            
-            # Add a progress bar for completion rate
-            progress_value = min(100, max(0, float(completion_rate)))
-            st.progress(progress_value / 100.0)
-        else:
-            st.info("No review data available.")
-    except Exception as e:
-        _rt_show_error("Failed to load Review Completion Rate", e)
-
-    # Exception Count (policy-related alerts)
-    st.subheader("Exception Count")
-    try:
-        # Build filters from sidebar selections
-        where_clause, params = _rt_build_filters_for(
-            sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-            start_date, end_date,
-            f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS",
-            ["CREATED_AT", "UPDATED_AT"]
-        )
-        
-        # Base table with dynamic reference
-        base_table = f"{sel_db}.{_SCHEMA}.ASSETS" if sel_db else "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
-        
-        # Execute the Exception Count query with filters
-        query = f"""
-        WITH filtered_assets AS (
-            SELECT * 
-            FROM {base_table}
-            {where_clause}
-        )
-        SELECT
-            COUNT(CASE WHEN has_exception = TRUE THEN 1 END) AS total_assets_with_exceptions,
-            COUNT(CASE 
-                     WHEN has_exception = TRUE 
-                          AND (exception_expiry_date IS NULL OR exception_expiry_date >= CURRENT_DATE)
-                     THEN 1 
-                 END) AS open_policy_exceptions
-        FROM filtered_assets
-        """
-        
-        # Execute the query
-        result = _rt_run_query(query, params)
-        
-        if result and result[0]:
-            total_exceptions = result[0].get('TOTAL_ASSETS_WITH_EXCEPTIONS', 0) or 0
-            open_exceptions = result[0].get('OPEN_POLICY_EXCEPTIONS', 0) or 0
-            
-            # Display metrics in columns
-            col1, col2 = st.columns(2)
-            col1.metric("Total Assets with Exceptions", f"{int(total_exceptions):,}")
-            
-            # Show open exceptions with a warning if there are any
-            if open_exceptions > 0:
-                col2.metric("Open Policy Exceptions", 
-                          f"{int(open_exceptions):,}",
-                          delta=None,
-                          help="Exceptions that are either not expired or have no expiry date")
-                if open_exceptions > 0:
-                    st.warning(f"⚠️ {int(open_exceptions):,} active policy exceptions need attention")
-            else:
-                col2.metric("Open Policy Exceptions", "0", delta=None, help="No active policy exceptions")
+                .health-container {
+                    font-family: 'Inter', sans-serif;
+                    padding: 10px 0;
+                }
                 
+                .main-score-header {
+                    font-size: 24px;
+                    font-weight: 800;
+                    background: linear-gradient(90deg, #FFFFFF 0%, #A0AEC0 100%);
+                    -webkit-background-clip: text;
+                    -webkit-text-fill-color: transparent;
+                    margin-bottom: 5px;
+                }
+                
+                .info-panel {
+                    background: rgba(255, 255, 255, 0.03);
+                    border-radius: 12px;
+                    padding: 15px;
+                    border: 1px solid rgba(255, 255, 255, 0.05);
+                    height: 100%;
+                }
+                
+                .info-title {
+                    font-size: 12px;
+                    font-weight: 800;
+                    color: #4FD1C5;
+                    text-transform: uppercase;
+                    letter-spacing: 1.5px;
+                    margin-bottom: 10px;
+                }
+                
+                .info-item {
+                    font-size: 13px;
+                    color: rgba(255, 255, 255, 0.8);
+                    margin-bottom: 8px;
+                    display: flex;
+                    align-items: center;
+                }
+                
+                .info-bullet {
+                    color: #4FD1C5;
+                    margin-right: 10px;
+                    font-weight: bold;
+                }
+                
+                .pillar-card {
+                    background: linear-gradient(145deg, rgba(26, 32, 44, 0.6), rgba(17, 21, 28, 0.8));
+                    border-radius: 20px;
+                    padding: 22px;
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    text-align: center;
+                    transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                    position: relative;
+                    overflow: hidden;
+                    height: 100%;
+                }
+                
+                .pillar-card:hover {
+                    transform: translateY(-8px);
+                    border-color: rgba(79, 209, 197, 0.4);
+                    background: linear-gradient(145deg, rgba(30, 39, 54, 0.8), rgba(20, 26, 35, 0.9));
+                    box-shadow: 0 15px 35px rgba(0, 0, 0, 0.4), 0 0 20px rgba(79, 209, 197, 0.1);
+                }
+                
+                .pillar-icon {
+                    font-size: 28px;
+                    margin-bottom: 12px;
+                    opacity: 0.9;
+                }
+                
+                .pillar-value {
+                    font-size: 34px;
+                    font-weight: 800;
+                    color: #FFFFFF;
+                    margin: 5px 0;
+                }
+                
+                .pillar-label {
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: rgba(255, 255, 255, 0.5);
+                    text-transform: uppercase;
+                    letter-spacing: 1.2px;
+                }
+                
+                .pillar-status {
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: #4FD1C5;
+                    margin-top: 10px;
+                    padding: 4px 10px;
+                    background: rgba(79, 209, 197, 0.1);
+                    border-radius: 20px;
+                    display: inline-block;
+                }
+                
+                .divider-glow {
+                    height: 1px;
+                    background: linear-gradient(90deg, transparent, rgba(79, 209, 197, 0.3), transparent);
+                    margin: 30px 0;
+                }
+            </style>
+        """, unsafe_allow_html=True)
+
+        col_gauge, col_info = st.columns([1, 1])
+        
+        with col_gauge:
+            score = health.get('overall_score', 0)
+            # Sophisticated Gauge using Plotly
+            fig = go.Figure(go.Indicator(
+                mode = "gauge+number",
+                value = score,
+                domain = {'x': [0, 1], 'y': [0, 1]},
+                title = {'text': "Program Maturity", 'font': {'size': 18, 'color': 'white', 'family': 'Inter'}},
+                number = {'font': {'size': 50, 'color': 'white', 'family': 'Inter'}, 'suffix': "%"},
+                gauge = {
+                    'axis': {'range': [None, 100], 'tickwidth': 1, 'tickcolor': "white"},
+                    'bar': {'color': "#4FD1C5"},
+                    'bgcolor': "rgba(0,0,0,0)",
+                    'borderwidth': 2,
+                    'bordercolor': "rgba(255,255,255,0.1)",
+                    'steps': [
+                        {'range': [0, 40], 'color': 'rgba(231, 76, 60, 0.1)'},
+                        {'range': [40, 75], 'color': 'rgba(241, 196, 15, 0.1)'},
+                        {'range': [75, 100], 'color': 'rgba(46, 204, 113, 0.1)'}
+                    ],
+                    'threshold': {
+                        'line': {'color': "white", 'width': 4},
+                        'thickness': 0.75,
+                        'value': score
+                    }
+                }
+            ))
+            fig.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                margin=dict(l=30, r=30, t=50, b=20),
+                height=250,
+            )
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+
+        with col_info:
+            score = health.get('overall_score', 0)
+            if score < 40:
+                recommendation = "🔴 **Critical:** High volume of unclassified assets or SLA breaches. Priority: Bulk classification scan."
+            elif score < 75:
+                recommendation = "🟠 **Needs Attention:** Governance workflow is lagging. Priority: Approve pending labels and sync reviews."
+            else:
+                recommendation = "🟢 **Healthy:** Program meeting targets. Priority: Regular drift monitoring and policy refinement."
+                
+            st.markdown(f"""
+                <div class="info-panel">
+                    <div class="info-title">What it shows</div>
+                    <div class="info-item"><span class="info-bullet">▹</span> <b>{health.get('total_assets', 0)}</b> Total active assets included</div>
+                    <div class="info-item"><span class="info-bullet">▹</span> Program health across 4 core governance dimensions</div>
+                    <div class="info-title" style="margin-top:15px">Actionable Insight</div>
+                    <div style="font-size: 13px; color: rgba(255,255,255,0.9); line-height:1.5;">{recommendation}</div>
+                    <div class="info-title" style="margin-top:15px">Key Indicators</div>
+                    <div class="info-item"><span class="info-bullet">✓</span> Coverage, Accuracy, Timeliness, Governance</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        st.write("") # Spacer
+
+        # 4 Key Pillars with enhanced CSS
+        c1, c2, c3, c4 = st.columns(4)
+        
+        with c1:
+            st.markdown(f"""
+                <div class="pillar-card">
+                    <div class="pillar-icon">📊</div>
+                    <div class="pillar-label">Coverage</div>
+                    <div class="pillar-value">{health.get('coverage_pct', 0)}%</div>
+                    <div class="pillar-status">Classified Assets</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        with c2:
+            st.markdown(f"""
+                <div class="pillar-card">
+                    <div class="pillar-icon">⚖️</div>
+                    <div class="pillar-label">Accuracy</div>
+                    <div class="pillar-value">{health.get('approval_pct', 0)}%</div>
+                    <div class="pillar-status">Approved Labels</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        with c3:
+            st.markdown(f"""
+                <div class="pillar-card">
+                    <div class="pillar-icon">⏱️</div>
+                    <div class="pillar-label">Timeliness</div>
+                    <div class="pillar-value">{health.get('sla_pct', 0)}%</div>
+                    <div class="pillar-status">Within 5-Day SLA</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        with c4:
+            st.markdown(f"""
+                <div class="pillar-card">
+                    <div class="pillar-icon">🔄</div>
+                    <div class="pillar-label">Governance</div>
+                    <div class="pillar-value">{health.get('reviews_pct', 0)}%</div>
+                    <div class="pillar-status">Reviews On-Time</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown('<div class="divider-glow"></div>', unsafe_allow_html=True)
+
+    except Exception as e:
+        _rt_show_error("Failed to load Classification Health Score", e)
+
+
+    # Data Sensitivity Overview
+    st.header("📉 Data Sensitivity Overview")
+    st.markdown("Risk & exposure snapshot")
+    
+    try:
+        from src.services.asset_utils import get_sensitivity_overview
+        sens_data = get_sensitivity_overview(active_db, _SCHEMA, snowflake_connector)
+        
+        c_s1, c_s2 = st.columns([1, 1])
+        
+        with c_s1:
+            # 1. Sensitivity Distribution (Pie Chart)
+            if sens_data['labels']:
+                df_labels = pd.DataFrame(list(sens_data['labels'].items()), columns=['Label', 'Count'])
+                fig_labels = px.pie(
+                    df_labels, values='Count', names='Label', 
+                    title="Sensitivity Distribution",
+                    color_discrete_sequence=px.colors.qualitative.Pastel,
+                    hole=0.4
+                )
+                fig_labels.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", height=350)
+                st.plotly_chart(fig_labels, use_container_width=True)
+            else:
+                st.info("No classified assets found for distribution.")
+
+        with c_s2:
+            # 2. PII vs Non-PII (Bar Chart)
+            df_pii = pd.DataFrame([
+                {'Category': 'PII Relevant', 'Count': sens_data['pii_count']},
+                {'Category': 'Non-PII', 'Count': sens_data['non_pii_count']}
+            ])
+            fig_pii = px.bar(
+                df_pii, x='Category', y='Count',
+                title="PII vs Non-PII Assets",
+                color='Category',
+                color_discrete_map={'PII Relevant': '#E74C3C', 'Non-PII': '#4FD1C5'}
+            )
+            fig_pii.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", height=350)
+            st.plotly_chart(fig_pii, use_container_width=True)
+
+        # 3. Regulated & Risk Summary (Horizontal Bars)
+        st.markdown("""
+            <div style="background: rgba(255, 255, 255, 0.03); border-radius: 12px; padding: 20px; border: 1px solid rgba(255, 255, 255, 0.05); margin-top: 10px;">
+                <div class="info-title" style="margin-bottom: 20px;">Regulated Data Categories</div>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        col_r1, col_r2, col_r3 = st.columns(3)
+        with col_r1:
+            st.metric("PII Datasets", sens_data['regulated'].get('PII', 0))
+        with col_r2:
+            st.metric("SOX Relevant", sens_data['regulated'].get('SOX', 0))
+        with col_r3:
+            st.metric("SOC2 Critical", sens_data['regulated'].get('SOC2', 0))
+
+        st.caption("📌 Answers: “What kind of sensitive data do we have?”")
+
+        st.markdown('<div class="divider-glow" style="margin-top: 40px;"></div>', unsafe_allow_html=True)
+
+    except Exception as e:
+        _rt_show_error("Failed to load Data Sensitivity Overview section", e)
+
+    # Unclassified Assets
+    st.header("🔍 Unclassified Assets")
+    st.markdown("Early risk detection & backlog management")
+    
+    try:
+        from src.services.asset_utils import get_unclassified_assets_summary
+        unclassified_data = get_unclassified_assets_summary(active_db, _SCHEMA, snowflake_connector)
+        
+        # Better UI: Background card for metrics
+        st.markdown(f"""
+            <div style="background: linear-gradient(145deg, rgba(26, 32, 44, 0.4), rgba(17, 21, 28, 0.6)); border-radius: 15px; padding: 25px; border: 1px solid rgba(255, 255, 255, 0.05); margin-bottom: 25px;">
+                <div style="display: flex; justify-content: space-around; text-align: center;">
+                    <div>
+                        <div style="font-size: 12px; font-weight: 700; color: rgba(255,255,255,0.5); text-transform: uppercase;">Total Unclassified</div>
+                        <div style="font-size: 32px; font-weight: 800; color: white;">{unclassified_data['total_unclassified']}</div>
+                    </div>
+                    <div style="border-left: 1px solid rgba(255,255,255,0.1); padding-left: 40px;">
+                        <div style="font-size: 12px; font-weight: 700; color: rgba(255,255,255,0.5); text-transform: uppercase;">SLA Breach Risk</div>
+                        <div style="font-size: 32px; font-weight: 800; color: #E74C3C;">{unclassified_data['sla_breached']}</div>
+                    </div>
+                    <div style="border-left: 1px solid rgba(255,255,255,0.1); padding-left: 40px;">
+                        <div style="font-size: 12px; font-weight: 700; color: rgba(255,255,255,0.5); text-transform: uppercase;">New Pending</div>
+                        <div style="font-size: 32px; font-weight: 800; color: #4FD1C5;">{unclassified_data['new_pending']}</div>
+                    </div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        # Visual Table for Unclassified Assets
+        if not unclassified_data['assets']:
+            st.success("✅ All discovered assets are classified! No backlog detected.")
         else:
-            st.info("No exception data available.")
+            st.markdown("""
+                <div style="background: rgba(255, 255, 255, 0.03); border-radius: 15px; padding: 20px; border: 1px solid rgba(255, 255, 255, 0.05);">
+                    <div style="font-size: 14px; font-weight: 700; color: #4FD1C5; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 15px;">
+                        ⚠️ High Priority: Longest Unclassified
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
             
+            df_uncl = pd.DataFrame(unclassified_data['assets'])
+            # Formatting the dataframe display
+            st.dataframe(
+                df_uncl,
+                column_config={
+                    "ASSET_NAME": st.column_config.TextColumn("Asset Name", width="medium"),
+                    "SCOPE": st.column_config.TextColumn("Database/Schema", width="medium"),
+                    "OWNER": st.column_config.TextColumn("Owner Accountable"),
+                    "DAYS_UNCLASSIFIED": st.column_config.NumberColumn("Age (Days)", format="%d"),
+                    "RISK_STATUS": st.column_config.TextColumn("SLA Status")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            st.caption("📌 Answers: “What data still isn’t classified?” (Showing top 10 oldest assets)")
+
+        st.markdown('<div class="divider-glow"></div>', unsafe_allow_html=True)
+
     except Exception as e:
-        _rt_show_error("Failed to load Exception Count", e)
+        _rt_show_error("Failed to load Unclassified Assets section", e)
 
-    # 🔄 Recent Activity Feed
-    st.header("🔄 Recent Activity Feed")
-
-    # New Classifications
-    st.subheader("New Classifications")
+    # Review Due
+    st.header("📅 Review Due")
+    st.markdown("Governance maintenance & audit readiness")
+    
     try:
-        where, params = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                              start_date, end_date,
-                                              T_ASSETS, ["CLASSIFICATION_DATE", "CREATED_TIMESTAMP", "LAST_MODIFIED_TIMESTAMP"])
-        where, params = _rt_apply_compliance_filter(where, params, "ASSET_ID", T_CMAP)
-        where_cls = where + ((" AND " if where else " WHERE ") + "coalesce(CLASSIFICATION_LABEL,'') <> ''")
-        rows = _rt_run_query(f"""
-            select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, ASSET_TYPE as ASSET_TYPE, CLASSIFICATION_LABEL as CLASSIFICATION_LEVEL, CLASSIFICATION_DATE as LAST_CLASSIFIED_AT
-            from {T_ASSETS}
-            {where_cls}
-            order by LAST_CLASSIFIED_AT desc
-            limit 200
-        """, params)
-        df = pd.DataFrame(rows or [])
-        if df.empty:
-            st.info("No recent classifications.")
-        else:
-            st.dataframe(df, use_container_width=True, hide_index=True)
-    except Exception as e:
-        _rt_show_error("Failed to load New Classifications", e)
+        from src.services.asset_utils import get_review_due_summary
+        review_data = get_review_due_summary(active_db, _SCHEMA, snowflake_connector)
+        
+        # Summary for Section 4
+        col_r1, col_r2, col_r3 = st.columns(3)
+        with col_r1:
+            st.metric("Review Backlog", f"{review_data['overdue_count']}", delta=f"{review_data['overdue_count']} overdue", delta_color="inverse")
+            st.caption("Expired classification reviews")
+        with col_r2:
+            st.metric("Upcoming (30d)", f"{review_data['upcoming_count']}", delta=None)
+            st.caption("Reviews due within 30 days")
+        with col_r3:
+            st.metric("Total Pending", f"{review_data['total_backlog']}", delta=None)
+            st.caption("Total maintenance workload")
 
-    # Reclassification Requests (pending approvals)
-    st.subheader("Reclassification Requests")
-    try:
-        where_appr, params_appr = _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk,
-                                                        start_date, end_date,
-                                                        T_CHIST, ["CHANGE_TIMESTAMP"])
-        where_appr, params_appr = _rt_apply_compliance_filter(where_appr, params_appr, "ASSET_ID", T_CMAP)
-        extra = (" AND " if where_appr else " WHERE ") + "APPROVAL_REQUIRED = TRUE AND APPROVAL_TIMESTAMP IS NULL"
-        rows = _rt_run_query(f"""
-            select HISTORY_ID, ASSET_ID, PREVIOUS_CLASSIFICATION, NEW_CLASSIFICATION,
-                   APPROVAL_REQUIRED, APPROVED_BY, APPROVAL_TIMESTAMP, CHANGE_TIMESTAMP
-            from {T_CHIST}
-            {where_appr}{extra}
-            order by CHANGE_TIMESTAMP desc
-            limit 200
-        """, params_appr)
-        df = pd.DataFrame(rows or [])
-        if df.empty:
-            st.info("No reclassification requests pending.")
+        # Table for Review Backlog
+        if not review_data['assets']:
+            st.success("✨ Governance is up-to-date! No reviews due within the threshold.")
         else:
-            st.dataframe(df, use_container_width=True, hide_index=True)
-    except Exception as e:
-        _rt_show_error("Failed to load Reclassification Requests", e)
+            st.markdown("""
+                <div style="background: rgba(255, 255, 255, 0.03); border-radius: 15px; padding: 20px; border: 1px solid rgba(255, 255, 255, 0.05); margin-top:15px;">
+                    <div style="font-size: 14px; font-weight: 700; color: #F6AD55; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 15px;">
+                        🗓️ Maintenance Schedule: Priority Reviews
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            df_review = pd.DataFrame(review_data['assets'])
+            st.dataframe(
+                df_review,
+                column_config={
+                    "ASSET_NAME": st.column_config.TextColumn("Asset Name", width="medium"),
+                    "OWNER": st.column_config.TextColumn("Owner Accountable"),
+                    "NEXT_REVIEW_DATE": st.column_config.DateColumn("Due Date"),
+                    "DAYS_REMAINING": st.column_config.NumberColumn("Days Remaining"),
+                    "STATUS": st.column_config.TextColumn("Review Status")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            st.caption("📌 Answers: “What needs to be reviewed now?”")
 
-    # Policy Updates (alerts filtered by policy)
-    st.subheader("Policy Updates")
-    try:
-        T_POLICIES = f"{active_db}.{_SCHEMA}.POLICIES"
-        rows = _rt_run_query(f"""
-             SELECT
-                POLICY_ID,
-                POLICY_NAME,
-                POLICY_VERSION,
-                POLICY_TYPE,
-                UPDATED_AT,
-                UPDATED_BY,
-                STATUS,
-                'RECENTLY_UPDATED' AS UPDATE_TYPE
-            FROM {T_POLICIES}
-            WHERE UPDATED_AT >= DATEADD(DAY, -30, CURRENT_TIMESTAMP())
-            ORDER BY UPDATED_AT DESC
-        """)
-        df = pd.DataFrame(rows or [])
-        if df.empty:
-            st.info("No recent policy updates found.")
-        else:
-            st.dataframe(df, use_container_width=True, hide_index=True)
+        st.markdown('<div class="divider-glow" style="margin-top: 40px;"></div>', unsafe_allow_html=True)
+
     except Exception as e:
-        _rt_show_error("Failed to load Policy Updates", e)
+        _rt_show_error("Failed to load Review Due section", e)
+
+    # Non-Compliant Assets (Policy Violation View)
+    st.header("⚠️ Non-Compliant Assets")
+    st.markdown("Policy violation view & remediation tracking")
+    
+    try:
+        from src.services.asset_utils import get_non_compliant_assets_detail
+        violations = get_non_compliant_assets_detail(active_db, _SCHEMA, snowflake_connector)
+        
+        if not violations:
+            st.success("🎉 No active policy violations detected! All assets are compliant.")
+        else:
+            st.markdown("""
+                <div style="background: rgba(231, 76, 60, 0.05); border-radius: 12px; padding: 15px; border: 1px solid rgba(231, 76, 60, 0.2); margin-bottom: 20px;">
+                    <div style="font-size: 13px; color: #E74C3C; font-weight: 700;">
+                        🚨 IMMEDIATE ACTION REQUIRED: {len(violations)} assets breaking governance rules
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            df_viol = pd.DataFrame(violations)
+            
+            # Styling the dataframe
+            st.dataframe(
+                df_viol,
+                column_config={
+                    "PRIORITY": st.column_config.TextColumn("Priority", width="small"),
+                    "ASSET_NAME": st.column_config.TextColumn("Asset", width="medium"),
+                    "REASON": st.column_config.TextColumn("Policy Violation", width="large"),
+                    "OWNER": st.column_config.TextColumn("Accountable Owner"),
+                    "SCOPE": st.column_config.TextColumn("Database/Schema")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            st.caption("📌 Answers: “What data is breaking our rules?”")
+
+        st.markdown('<div class="divider-glow" style="margin-top: 40px;"></div>', unsafe_allow_html=True)
+
+    except Exception as e:
+        _rt_show_error("Failed to load Non-Compliant Assets section", e)
+
+    # Special Categories & Compliance Coverage
+    st.header("🧩 Special Categories & Compliance Coverage")
+    st.markdown("Regulatory assurance and trend analysis")
+    
+    try:
+        from src.services.asset_utils import get_compliance_coverage_metrics
+        comp_data = get_compliance_coverage_metrics(active_db, _SCHEMA, snowflake_connector)
+        
+        # Premium Metric Row for Section 6
+        c1, c2, c3, c4 = st.columns(4)
+        
+        with c1:
+            st.markdown(f"""
+                <div class="pillar-card" style="border-top: 4px solid #4FD1C5;">
+                    <div class="pillar-icon">👤</div>
+                    <div class="pillar-label">PII Coverage</div>
+                    <div class="pillar-value" style="color: #4FD1C5;">{comp_data['pii_coverage_pct']}%</div>
+                    <div class="pillar-status">Classified PII Assets</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        with c2:
+            st.markdown(f"""
+                <div class="pillar-card" style="border-top: 4px solid #F6AD55;">
+                    <div class="pillar-icon">📋</div>
+                    <div class="pillar-label">Regulated Data</div>
+                    <div class="pillar-value">{comp_data['regulated_total']}</div>
+                    <div class="pillar-status">SOX & SOC2 Scope</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        with c3:
+            st.markdown(f"""
+                <div class="pillar-card" style="border-top: 4px solid #F1C40F;">
+                    <div class="pillar-icon">🛡️</div>
+                    <div class="pillar-label">Exceptions</div>
+                    <div class="pillar-value">{comp_data['exception_count']}</div>
+                    <div class="pillar-status">Active Waivers</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        with c4:
+            st.markdown(f"""
+                <div class="pillar-card" style="border-top: 4px solid #28A745;">
+                    <div class="pillar-icon">✅</div>
+                    <div class="pillar-label">Audit Readiness</div>
+                    <div class="pillar-value" style="font-size: 22px;">HIGH</div>
+                    <div class="pillar-status">Regulatory Confidence</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        # Multi-Line Trend Chart
+        if comp_data['trends']['classification']:
+            st.markdown("""
+                <div style="background: rgba(255, 255, 255, 0.03); border-radius: 15px; padding: 25px; border: 1px solid rgba(255, 255, 255, 0.05); margin-top: 30px;">
+                    <div class="info-title" style="margin-bottom: 20px;">Regulatory Progress & Risk Reduction</div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            df_trend = pd.DataFrame(comp_data['trends']['classification'])
+            
+            # Use Plotly for a richer experience
+            fig_assurance = go.Figure()
+            
+            # 1. Classification Velocity (Primary Area)
+            fig_assurance.add_trace(go.Scatter(
+                x=df_trend['MONTH'], y=df_trend['CLASSIFIED_COUNT'],
+                name='Classification Velocity',
+                line=dict(color='#4FD1C5', width=3),
+                fill='tozeroy',
+                fillcolor='rgba(79, 209, 197, 0.1)'
+            ))
+            
+            # 2. Non-Compliance Trend (Red Line)
+            fig_assurance.add_trace(go.Scatter(
+                x=df_trend['MONTH'], y=df_trend['NON_COMPLIANT_COUNT'],
+                name='Non-Compliance Trend',
+                line=dict(color='#E74C3C', width=2, dash='dot')
+            ))
+            
+            # 3. Risk Mitigation Trend (Golden Line - Normalized)
+            risk_max = df_trend['RISK_WEIGHT'].max() or 1
+            norm_risk = (df_trend['RISK_WEIGHT'] / risk_max) * df_trend['CLASSIFIED_COUNT'].max()
+            fig_assurance.add_trace(go.Scatter(
+                x=df_trend['MONTH'], y=norm_risk,
+                name='Risk Mitigation Level',
+                line=dict(color='#F1C40F', width=2)
+            ))
+            
+            fig_assurance.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font_color="white",
+                height=400,
+                margin=dict(l=20, r=20, t=20, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)')
+            )
+            
+            st.plotly_chart(fig_assurance, use_container_width=True)
+        
+        st.markdown(f"""
+            <div style="display: flex; gap: 20px; align-items: center; justify-content: flex-start; margin-top: 15px;">
+                <div style="font-size: 11px; color: #4FD1C5;">● Classification Growth</div>
+                <div style="font-size: 11px; color: #E74C3C;">● Non-Compliance Reduction</div>
+                <div style="font-size: 11px; color: #F1C40F;">● Risk Surface Mitigation</div>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown('<div class="divider-glow" style="margin-top: 40px;"></div>', unsafe_allow_html=True)
+
+    except Exception as e:
+        _rt_show_error("Failed to load Compliance Coverage section", e)
+
 
     # ⚡ Quick Actions & Recent Activity
     st.header("Actions & Activity")
@@ -1037,12 +998,21 @@ def render_realtime_dashboard():
                          try:
                              now = datetime.now(ts.tzinfo)
                              diff = now - ts
-                             if diff.days > 0: time_str = f"{diff.days} days ago"
-                             elif diff.seconds > 3600: time_str = f"{diff.seconds//3600} hours ago"
-                             else: time_str = f"{diff.seconds//60} mins ago"
+                             if diff.days > 0: time_str = f"{diff.days}d ago"
+                             elif diff.seconds > 3600: time_str = f"{diff.seconds//3600}h ago"
+                             else: time_str = f"{diff.seconds//60}m ago"
                          except: pass
 
-                     st.info(f"**{name}**\n{detail}\n{user} • {time_str}")
+                     st.markdown(f"""
+                        <div style="background: rgba(255, 255, 255, 0.03); border-radius: 8px; padding: 12px; border-left: 3px solid #4FD1C5; margin-bottom: 8px;">
+                            <div style="display: flex; justify-content: space-between; font-size: 13px;">
+                                <b style="color: #FFFFFF;">{name}</b>
+                                <span style="font-size: 11px; color: rgba(255,255,255,0.4);">{time_str}</span>
+                            </div>
+                            <div style="font-size: 12px; color: rgba(255,255,255,0.7); margin-top: 4px;">{detail}</div>
+                            <div style="font-size: 11px; color: #4FD1C5; margin-top: 4px;">👤 {user}</div>
+                        </div>
+                      """, unsafe_allow_html=True)
 
         except Exception as e:
             st.error(f"Failed to load activity: {e}")

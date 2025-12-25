@@ -27,13 +27,6 @@ for _ in range(3):
 import streamlit as st
 import plotly.io as pio
 import plotly.graph_objects as go
-
-# Page configuration
-st.set_page_config(
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
 try:
     from src.ui.theme import apply_global_theme
     from src.components.filters import render_data_filters
@@ -80,6 +73,12 @@ if st.session_state.user is None and snowflake_connector.is_sis():
             logger.info(f"Auto-logged in as {ident.user} via SiS")
     except Exception as e:
         logger.warning(f"SiS auto-login failed: {e}")
+
+# Page configuration
+st.set_page_config(
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 # Apply centralized global theme (fonts, CSS variables, Plotly template)
 apply_global_theme()
@@ -637,8 +636,8 @@ else:
                 st.rerun()
         elif not can_compliance:
             st.caption("")
-    c4, c5 = st.columns(2)
-    with c4:
+    c3, c4 = st.columns(2)
+    with c3:
         if can_discovery and st.button("Data Discovery", use_container_width=True):
             try:
                 # Redirect to the unified Classification module (Discovery tab lives there)
@@ -647,7 +646,7 @@ else:
                 st.rerun()
         elif not can_discovery:
             st.caption("")
-    with c5:
+    with c4:
         if can_admin and st.button("Administration", use_container_width=True):
             try:
                 st.switch_page("pages/10_Administration.py")

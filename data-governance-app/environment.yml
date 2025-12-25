@@ -2,10 +2,9 @@ name: data_governance_app
 channels:
   - snowflake
 dependencies:
-  - python=3.9
+  - python=3.11
   - streamlit
   - snowflake-snowpark-python
-  - snowflake-connector-python
   - pandas
   - numpy
   - pydantic
@@ -14,3 +13,4 @@ dependencies:
   - plotly
   - altair
   - requests
+  - authlib

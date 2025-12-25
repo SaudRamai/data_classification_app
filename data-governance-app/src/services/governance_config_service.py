@@ -1,32 +1,63 @@
 """
-Governance Rules Loader Service (View-Based)
+Unified Governance Configuration Service
 
-This service loads all classification rules and metadata from Snowflake VIEWS
-that dynamically derive rules from existing governance tables:
-- SENSITIVITY_CATEGORIES
-- SENSITIVE_KEYWORDS  
-- SENSITIVE_PATTERNS
+Consolidates governance DB resolution, rules loading, and seeding/refresh
+into a single service and public interface.
 
-This approach eliminates the need for separate rule tables and ensures
-all logic is derived from your core governance data.
+Public API:
+- resolve_context(force_refresh: bool = False) -> dict
+- load_config(force_refresh: bool = False) -> dict
+- refresh(database: Optional[str] = None, sql_file: Optional[str] = None) -> dict
+- clear_cache() -> None
 
-Author: AI Classification System
-Date: 2025-12-04
-Version: 2.0 (View-Based)
+This service is the single source of truth for governance configuration.
+Legacy modules (governance_db_resolver, governance_rules_loader, seed_governance_service)
+have been inlined here.
 """
+from __future__ import annotations
 
 import logging
 import json
-from typing import List, Dict, Any, Optional
+import os
+import re
+from typing import Any, Dict, Optional, List, Iterable
+
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
 from src.connectors.snowflake_connector import snowflake_connector
+from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+# Constants for governance resolution
+EXPECTED_SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
+EXPECTED_TABLES = ("ASSETS", "CLASSIFICATION_HISTORY", "RECLASSIFICATION_REQUESTS")
+INVALID_DB_VALUES = {"NONE", "NULL", "UNKNOWN", "(NONE)"}
 
-class GovernanceRulesLoaderV2:
-    """Service for loading all governance rules from dynamic views."""
+# Constants for seeding
+SQL_FILE_DEFAULT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
+    "sql", 
+    "011_seed_sensitivity_config.sql"
+)
+SEED_TABLES = [
+    "SENSITIVE_PATTERNS",
+    "SENSITIVE_KEYWORDS",
+    "SENSITIVITY_CATEGORIES",
+    "SENSITIVITY_THRESHOLDS",
+    "SENSITIVE_BUNDLES",
+    "COMPLIANCE_MAPPING",
+    "SENSITIVITY_MODEL_CONFIG",
+]
 
-    def __init__(self, governance_db: str = "DATA_CLASSIFICATION_DB", governance_schema: str = "DATA_CLASSIFICATION_GOVERNANCE"):
+
+class GovernanceRulesLoader:
+    """Service for loading all governance rules from dynamic views (V2 - Enhanced)."""
+
+    def __init__(self, governance_db: str, governance_schema: str = "DATA_CLASSIFICATION_GOVERNANCE"):
         """
         Initialize the governance rules loader.
 
@@ -130,7 +161,7 @@ class GovernanceRulesLoaderV2:
             logger.error(f"Failed to load classification rules: {e}")
             return []
 
-    def load_context_aware_rules(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    def load_context_aware_rules(self, force_refresh: bool = False) -> Dict[str, List[Dict[str, Any]]]:
         """
         Load context-aware adjustment rules from VW_CONTEXT_AWARE_RULES view.
         These rules boost/reduce scores based on table and column context.
@@ -139,7 +170,7 @@ class GovernanceRulesLoaderV2:
             force_refresh: If True, bypass cache and reload from database
 
         Returns:
-            List of context-aware rules
+            Dictionary mapping rule type to list of rules
         """
         cache_key = "context_aware_rules"
         
@@ -216,11 +247,11 @@ class GovernanceRulesLoaderV2:
             # Group by policy group
             keywords_by_group: Dict[str, List[Dict[str, Any]]] = {}
             for row in results:
-                policy_group = row.get('POLICY_GROUP', '').upper()
+                policy_group = str(row.get('POLICY_GROUP', '')).upper()
                 if policy_group not in keywords_by_group:
                     keywords_by_group[policy_group] = []
                 keywords_by_group[policy_group].append({
-                    'keyword': row.get('KEYWORD', '').lower(),
+                    'keyword': str(row.get('KEYWORD', '')).lower(),
                     'weight': float(row.get('WEIGHT', 1.0)),
                     'category': row.get('CATEGORY_NAME', '')
                 })
@@ -318,7 +349,7 @@ class GovernanceRulesLoaderV2:
             
             for row in results:
                 exc_type = row.get('EXCLUSION_TYPE', 'UNKNOWN')
-                keyword = row.get('KEYWORD_PARSED', '').lower().strip()
+                keyword = str(row.get('KEYWORD_PARSED', '')).lower().strip()
                 
                 if not keyword:
                     continue
@@ -388,12 +419,12 @@ class GovernanceRulesLoaderV2:
             # Group by policy group
             keywords_by_group: Dict[str, List[Dict[str, Any]]] = {}
             for row in results:
-                policy_group = row.get('POLICY_GROUP', '').upper()
+                policy_group = str(row.get('POLICY_GROUP', '')).upper()
                 if policy_group not in keywords_by_group:
                     keywords_by_group[policy_group] = []
                 keywords_by_group[policy_group].append({
-                    'keyword': row.get('KEYWORD_STRING', '').lower(),
-                    'match_type': row.get('MATCH_TYPE', 'CONTAINS').upper(),
+                    'keyword': str(row.get('KEYWORD_STRING', '')).lower(),
+                    'match_type': str(row.get('MATCH_TYPE', 'CONTAINS')).upper(),
                     'weight': float(row.get('SENSITIVITY_WEIGHT', 0.5)),
                     'category': row.get('CATEGORY_NAME', ''),
                     'threshold': float(row.get('DETECTION_THRESHOLD', 0.5))
@@ -450,10 +481,10 @@ class GovernanceRulesLoaderV2:
             # Convert to dictionary keyed by category name
             weights_by_category: Dict[str, Dict[str, Any]] = {}
             for row in results:
-                cat_name = row.get('CATEGORY_NAME', '').upper()
+                cat_name = str(row.get('CATEGORY_NAME', '')).upper()
                 weights_by_category[cat_name] = {
                     'category_id': row.get('CATEGORY_ID'),
-                    'policy_group': row.get('POLICY_GROUP', '').upper(),
+                    'policy_group': str(row.get('POLICY_GROUP', '')).upper(),
                     'weight_embedding': float(row.get('WEIGHT_EMBEDDING', 0.6)),
                     'weight_keyword': float(row.get('WEIGHT_KEYWORD', 0.25)),
                     'weight_pattern': float(row.get('WEIGHT_PATTERN', 0.15)),
@@ -518,12 +549,12 @@ class GovernanceRulesLoaderV2:
             # Convert to dictionary keyed by category name
             metadata_by_category: Dict[str, Dict[str, Any]] = {}
             for row in results:
-                cat_name = row.get('CATEGORY_NAME', '').upper()
+                cat_name = str(row.get('CATEGORY_NAME', '')).upper()
                 metadata_by_category[cat_name] = {
                     'category_id': row.get('CATEGORY_ID'),
                     'category_name': cat_name,
                     'description': row.get('DESCRIPTION', ''),
-                    'policy_group': row.get('POLICY_GROUP', '').upper(),
+                    'policy_group': str(row.get('POLICY_GROUP', '')).upper(),
                     'confidentiality_level': int(row.get('CONFIDENTIALITY_LEVEL', 1)),
                     'integrity_level': int(row.get('INTEGRITY_LEVEL', 1)),
                     'availability_level': int(row.get('AVAILABILITY_LEVEL', 1)),
@@ -579,5 +610,157 @@ class GovernanceRulesLoaderV2:
         logger.debug("Cache disabled and cleared")
 
 
-# Global singleton instance
-governance_rules_loader = GovernanceRulesLoaderV2()
+
+class GovernanceConfigService:
+    def __init__(self) -> None:
+        self._cache: Dict[str, Any] = {}
+        self._loader: Optional[GovernanceRulesLoader] = None
+        self._db: Optional[str] = None
+        self._schema: str = "DATA_CLASSIFICATION_GOVERNANCE"
+
+    def _has_any_table(self, db: str, tables: Iterable[str]) -> bool:
+        try:
+            rows = snowflake_connector.execute_query(
+                f"""
+                SELECT count(*) as CNT FROM {db}.INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_SCHEMA = %(sc)s AND TABLE_NAME IN ({", ".join(["%(t" + str(i) + ")s" for i in range(len(list(tables)))])})
+                """,
+                {"sc": self._schema, **{f"t{i}": t for i, t in enumerate(tables)}},
+            ) or []
+            return int(rows[0].get("CNT", 0)) > 0
+        except Exception:
+            return False
+
+    def _resolve_db_internal(self) -> str:
+        """Resolve governance DB using session -> settings -> current_db -> probe."""
+        # 1) Streamlit Session
+        if st is not None:
+            try:
+                v = st.session_state.get("sf_database")
+                if v and str(v).strip().upper() not in INVALID_DB_VALUES:
+                    return str(v).strip()
+            except Exception: pass
+
+        # 2) Settings
+        try:
+            conf = getattr(settings, "SNOWFLAKE_DATABASE", None)
+            if conf and str(conf).strip().upper() not in INVALID_DB_VALUES:
+                return str(conf).strip()
+        except Exception: pass
+
+        # 3) Current DB Probe
+        try:
+            rows = snowflake_connector.execute_query("SELECT current_database() as DB") or []
+            db = rows[0].get("DB")
+            if db and str(db).strip().upper() not in INVALID_DB_VALUES:
+                if self._has_any_table(str(db), EXPECTED_TABLES):
+                    return str(db)
+        except Exception: pass
+
+        # 4) Global Probe
+        try:
+            db_rows = snowflake_connector.execute_query("SHOW DATABASES") or []
+            names = [r.get("name") or r.get("NAME") for r in db_rows if (r.get("name") or r.get("NAME"))]
+            for name in names:
+                if name and self._has_any_table(str(name), EXPECTED_TABLES):
+                    return str(name)
+        except Exception: pass
+
+        return "DATA_CLASSIFICATION_DB"
+
+    def resolve_context(self, force_refresh: bool = False) -> Dict[str, Any]:
+        if not force_refresh and self._db:
+            return {"database": self._db, "schema": self._schema, "method": "CACHE"}
+
+        db = self._resolve_db_internal()
+        self._db = db
+        self._loader = GovernanceRulesLoader(governance_db=db, governance_schema=self._schema)
+        logger.info(f"GovConfig: Context resolved to {db}.{self._schema}")
+        return {"database": db, "schema": self._schema, "method": "RESOLVED"}
+
+    def _ensure_loader(self) -> GovernanceRulesLoader:
+        if self._loader is None:
+            self.resolve_context()
+        assert self._loader is not None
+        return self._loader
+
+    @property
+    def loader(self) -> GovernanceRulesLoader:
+        """Returns the active governance rules loader."""
+        return self._ensure_loader()
+
+    def load_config(self, force_refresh: bool = False) -> Dict[str, Any]:
+        if not force_refresh and self._cache.get("loaded"):
+            return dict(self._cache)
+
+        loader = self._ensure_loader()
+        ctx = self.resolve_context(force_refresh=force_refresh)
+        
+        bundle: Dict[str, Any] = {
+            "database": ctx["database"],
+            "schema": ctx["schema"],
+        }
+        try:
+            bundle["rules"] = loader.load_classification_rules(force_refresh)
+            bundle["context_rules"] = loader.load_context_aware_rules(force_refresh)
+            bundle["tiebreakers"] = loader.load_tiebreaker_keywords(force_refresh)
+            bundle["address_indicators"] = loader.load_address_context_indicators(force_refresh)
+            bundle["exclusions"] = loader.load_exclusion_patterns(force_refresh)
+            bundle["policy_group_keywords"] = loader.load_policy_group_keywords(force_refresh)
+            bundle["category_weights"] = loader.load_category_scoring_weights(force_refresh)
+            bundle["category_metadata"] = loader.load_category_metadata(force_refresh)
+            bundle["loaded"] = True
+            self._cache = dict(bundle)
+        except Exception as e:
+            logger.error(f"GovConfig: Failed to load config bundle: {e}")
+            bundle["loaded"] = False
+            self._cache = dict(bundle)
+        return dict(self._cache)
+
+    def refresh(self, database: Optional[str] = None, sql_file: Optional[str] = None) -> Dict[str, Any]:
+        """Inlined seeding logic from seed_governance_service."""
+        db = database or self._db or self._resolve_db_internal()
+        if db:
+            snowflake_connector.execute_non_query(f"CREATE DATABASE IF NOT EXISTS {db}")
+            snowflake_connector.execute_non_query(f"USE DATABASE {db}")
+        
+        path = sql_file or SQL_FILE_DEFAULT
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                sql_text = f.read()
+            # Split and execute
+            statements = [s.strip() for s in sql_text.split(";") if s.strip()]
+            success, failures = 0, []
+            for s in statements:
+                try:
+                    snowflake_connector.execute_non_query(s)
+                    success += 1
+                except Exception as e:
+                    failures.append(f"{str(e)} | STMT: {s[:100]}...")
+            
+            # Post-step: fix IS_ACTIVE
+            for t in ["SENSITIVE_PATTERNS", "SENSITIVE_KEYWORDS", "SENSITIVITY_CATEGORIES"]:
+                try:
+                    snowflake_connector.execute_non_query(
+                        f"UPDATE {db}.{self._schema}.{t} SET IS_ACTIVE = TRUE WHERE COALESCE(IS_ACTIVE, FALSE) = FALSE"
+                    )
+                except Exception: pass
+            
+            # Clear caches
+            self.clear_cache()
+            self.load_config(force_refresh=True)
+            
+            return {
+                "seed": {"success": success, "failures": len(failures), "details": failures},
+                "config": {"loaded": self._cache.get("loaded", False)}
+            }
+        except Exception as e:
+            logger.error(f"GovConfig: Refresh failed: {e}")
+            return {"error": str(e)}
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+        if self._loader: self._loader.clear_cache()
+
+
+governance_config_service = GovernanceConfigService()

@@ -21,8 +21,8 @@ if _project_root not in sys.path:
 from src.connectors.snowflake_connector import snowflake_connector
 from src.ui.theme import apply_global_theme
 from src.config.settings import settings
-from src.services.metrics_service import metrics_service
-from src.services.tag_drift_service import analyze_tag_drift
+from src.services.compliance_service import compliance_service
+# Removed broken tag_drift_service import
 try:
     from src.services.authorization_service import authz as _authz
 except Exception:
@@ -206,19 +206,22 @@ def render_realtime_dashboard():
     # Fallback: check Streamlit session creds
     if not has_session:
         has_session = bool(st.session_state.get("sf_user") and st.session_state.get("sf_account"))
-    # If Snowflake session is missing but app user exists, do NOT redirect or stop.
+    # If Snowflake session is missing, render UI but disable data access
     if not has_session:
         if st.session_state.get("user") is not None:
             st.warning("Snowflake session is not active. Some data may not load. Use Home to re-authenticate when ready.")
         else:
-            st.warning("Please sign in to Snowflake to view the dashboard.")
-            st.caption("Go to the Home page and login with your Snowflake account or SSO.")
-            try:
-                if hasattr(st, "switch_page"):
-                    st.switch_page("app.py")
-            except Exception:
-                pass
-            st.stop()
+            st.warning("You are not signed in. Data access is disabled until login.")
+            st.caption("Open Home and login with your Snowflake account or SSO to enable live data.")
+        # Render lightweight, non-query placeholders and exit the function to avoid queries
+        st.markdown("---")
+        st.subheader("Overview")
+        st.info("Data will appear here after you sign in.")
+        st.subheader("Trends")
+        st.info("Charts are disabled until authentication.")
+        st.subheader("Recent Activity")
+        st.info("Recent events will load after login.")
+        return
 
     # Resolve active database for all queries (fallback to settings or default)
     active_db = (
@@ -227,13 +230,10 @@ def render_realtime_dashboard():
         or "DATA_CLASSIFICATION_DB"
     )
     # Centralized FQNs (initial; may be overridden after sidebar selection)
+    # Authoritative Data Sources (Optimized)
     _SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
     T_ASSETS = f"{active_db}.{_SCHEMA}.ASSETS"
-    T_CMAP = f"{active_db}.{_SCHEMA}.COMPLIANCE_MAPPING"
-    T_CHIST = f"{active_db}.{_SCHEMA}.CLASSIFICATION_HISTORY"
-    T_ALERTS = f"{active_db}.{_SCHEMA}.ALERT_LOGS"
-    T_RISK = f"{active_db}.{_SCHEMA}.RISK_ASSESSMENTS"
-    T_DQ = f"{active_db}.{_SCHEMA}.DATA_QUALITY_METRICS"
+    T_AI_RESULTS = f"{active_db}.{_SCHEMA}.CLASSIFICATION_AI_RESULTS"
 
     # Global Filters sidebar (restored)
     _rt_ensure_session_context()
@@ -359,12 +359,7 @@ def render_realtime_dashboard():
             st.session_state["sf_database"] = sel_db
             # Recompute active DB and FQNs
             active_db = sel_db
-            T_ASSETS = f"{active_db}.{_SCHEMA}.ASSETS"
-            T_CMAP = f"{active_db}.{_SCHEMA}.COMPLIANCE_MAPPING"
-            T_CHIST = f"{active_db}.{_SCHEMA}.CLASSIFICATION_HISTORY"
-            T_ALERTS = f"{active_db}.{_SCHEMA}.ALERT_LOGS"
-            T_RISK = f"{active_db}.{_SCHEMA}.RISK_ASSESSMENTS"
-            T_DQ = f"{active_db}.{_SCHEMA}.DATA_QUALITY_METRICS"
+            T_AI_RESULTS = f"{active_db}.{_SCHEMA}.CLASSIFICATION_AI_RESULTS"
     except Exception:
         pass
 
@@ -563,7 +558,7 @@ def render_realtime_dashboard():
                     <div class="pillar-icon">⚖️</div>
                     <div class="pillar-label">Accuracy</div>
                     <div class="pillar-value">{health.get('approval_pct', 0)}%</div>
-                    <div class="pillar-status">Approved Labels</div>
+                    <div class="pillar-status">Approved/Validated</div>
                 </div>
             """, unsafe_allow_html=True)
 
@@ -573,7 +568,7 @@ def render_realtime_dashboard():
                     <div class="pillar-icon">⏱️</div>
                     <div class="pillar-label">Timeliness</div>
                     <div class="pillar-value">{health.get('sla_pct', 0)}%</div>
-                    <div class="pillar-status">Within 5-Day SLA</div>
+                    <div class="pillar-status">Within SLA Window</div>
                 </div>
             """, unsafe_allow_html=True)
 
@@ -583,7 +578,7 @@ def render_realtime_dashboard():
                     <div class="pillar-icon">🔄</div>
                     <div class="pillar-label">Governance</div>
                     <div class="pillar-value">{health.get('reviews_pct', 0)}%</div>
-                    <div class="pillar-status">Reviews On-Time</div>
+                    <div class="pillar-status">Policy Compliance</div>
                 </div>
             """, unsafe_allow_html=True)
 
@@ -778,7 +773,7 @@ def render_realtime_dashboard():
         from src.services.asset_utils import get_non_compliant_assets_detail
         violations = get_non_compliant_assets_detail(active_db, _SCHEMA, snowflake_connector)
         
-        if not violations:
+        if violations.empty:
             st.success("🎉 No active policy violations detected! All assets are compliant.")
         else:
             st.markdown("""
@@ -951,40 +946,38 @@ def render_realtime_dashboard():
         st.subheader("🔔 Recent Activity")
         try:
              # Fetch real activity from history and updates
-             # 1. Recent History (Classifications)
-             hist_rows = _rt_run_query(f"""
+             # 1. Recent AI Insights (from CLASSIFICATION_AI_RESULTS)
+             ai_rows = _rt_run_query(f"""
                 select TOP 5 
-                    UPPER(a.ASSET_NAME) as NAME, 
-                    h.NEW_CLASSIFICATION as DETAIL, 
-                    h.CHANGED_BY as USER, 
-                    h.CHANGE_TIMESTAMP as TS,
-                    'Classification Change' as TYPE
-                from {T_CHIST} h
-                left join {T_ASSETS} a on h.ASSET_ID = a.ASSET_ID
-                where h.CHANGE_TIMESTAMP >= dateadd('day', -7, current_timestamp())
+                    UPPER(TABLE_NAME) as NAME, 
+                    AI_CATEGORY || ' (' || ROUND(FINAL_CONFIDENCE * 100, 1) || '%)' as DETAIL, 
+                    'AI Engine' as USER, 
+                    CREATED_AT as TS,
+                    'AI Discovery' as TYPE
+                from {T_AI_RESULTS}
+                where CREATED_AT >= dateadd('day', -7, current_timestamp())
                 order by TS desc
              """)
              
-             # 2. Recent Asset Updates (e.g. Reviews)
-             # Simulate review activity from ASSETS modified timestamp if history is empty or for variety
+             # 2. Recent Asset Management (from ASSETS)
              asset_rows = _rt_run_query(f"""
                 select TOP 5
                     UPPER(ASSET_NAME) as NAME,
-                    'Asset Updated' as DETAIL,
-                    LAST_MODIFIED_BY as USER,
+                    CASE WHEN CLASSIFICATION_LABEL IS NOT NULL THEN 'Classified as ' || CLASSIFICATION_LABEL ELSE 'Metadata updated' END as DETAIL,
+                    COALESCE(LAST_MODIFIED_BY, CREATED_BY, 'System') as USER,
                     LAST_MODIFIED_TIMESTAMP as TS,
-                    'Update' as TYPE
+                    'Governance' as TYPE
                 from {T_ASSETS}
                 where LAST_MODIFIED_TIMESTAMP >= dateadd('day', -7, current_timestamp())
                 order by TS desc
              """)
              
-             # Combine and sort
-             combined = (hist_rows or []) + (asset_rows or [])
+             # Combine and sort from authoritative sources
+             combined = (ai_rows or []) + (asset_rows or [])
              combined.sort(key=lambda x: x['TS'] if x['TS'] else datetime.min, reverse=True)
              
              if not combined:
-                 st.info("No recent activity found.")
+                 st.info("No recent governance or AI activity found in the primary tables.")
              else:
                  for item in combined[:4]:
                      name = item.get('NAME') or 'Unknown Asset'

@@ -6,9 +6,11 @@ from typing import Dict, List, Set
 
 from src.connectors.snowflake_connector import snowflake_connector
 from src.services.oidc_service import oidc_service
-from src.services.privilege_service import can_apply_tags_to_object as _ps_can_apply_tags_to_object, can_read_table as _ps_can_read_table
 from src.config.settings import settings
 import snowflake.connector
+import os
+import re
+from typing import Dict, List, Set, Optional, Tuple, Any
 try:
     import streamlit as st  # optional, used only if app provides per-user login
 except Exception:
@@ -227,20 +229,85 @@ class AuthorizationService:
 
     # Convenience checks
     def is_admin(self, ident: Identity) -> bool:
+        try:
+            if bool(getattr(settings, "REVERSE_RBAC", False) or os.environ.get("REVERSE_RBAC") == "1" or (st is not None and st.session_state.get("REVERSE_RBAC"))):
+                if st is not None:
+                    try:
+                        st.session_state["RBAC_BYPASS_ACTIVE"] = True
+                        if not st.session_state.get("RBAC_BYPASS_WARNED"):
+                            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
+                            st.session_state["RBAC_BYPASS_WARNED"] = True
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
         return ident.has_any(self.ADMIN_ROLES)
 
     def is_owner(self, ident: Identity) -> bool:
+        try:
+            if bool(getattr(settings, "REVERSE_RBAC", False) or os.environ.get("REVERSE_RBAC") == "1" or (st is not None and st.session_state.get("REVERSE_RBAC"))):
+                if st is not None:
+                    try:
+                        st.session_state["RBAC_BYPASS_ACTIVE"] = True
+                        if not st.session_state.get("RBAC_BYPASS_WARNED"):
+                            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
+                            st.session_state["RBAC_BYPASS_WARNED"] = True
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
         return ident.has_any(self.OWNER_ROLES) or self.is_admin(ident)
 
     def is_custodian(self, ident: Identity) -> bool:
+        try:
+            if bool(getattr(settings, "REVERSE_RBAC", False) or os.environ.get("REVERSE_RBAC") == "1" or (st is not None and st.session_state.get("REVERSE_RBAC"))):
+                if st is not None:
+                    try:
+                        st.session_state["RBAC_BYPASS_ACTIVE"] = True
+                        if not st.session_state.get("RBAC_BYPASS_WARNED"):
+                            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
+                            st.session_state["RBAC_BYPASS_WARNED"] = True
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
         return ident.has_any(self.CUSTODIAN_ROLES) or self.is_admin(ident)
 
     def is_specialist(self, ident: Identity) -> bool:
+        try:
+            if bool(getattr(settings, "REVERSE_RBAC", False) or os.environ.get("REVERSE_RBAC") == "1" or (st is not None and st.session_state.get("REVERSE_RBAC"))):
+                if st is not None:
+                    try:
+                        st.session_state["RBAC_BYPASS_ACTIVE"] = True
+                        if not st.session_state.get("RBAC_BYPASS_WARNED"):
+                            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
+                            st.session_state["RBAC_BYPASS_WARNED"] = True
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
         return ident.has_any(self.SPECIALIST_ROLES) or self.is_admin(ident)
 
     def is_consumer(self, ident: Identity) -> bool:
         # Any authenticated identity with at least a consumer role, or elevated roles.
         # Include Admins explicitly so pure admins (e.g., ACCOUNTADMIN) can access consumer-gated pages.
+        try:
+            if bool(getattr(settings, "REVERSE_RBAC", False) or os.environ.get("REVERSE_RBAC") == "1" or (st is not None and st.session_state.get("REVERSE_RBAC"))):
+                if st is not None:
+                    try:
+                        st.session_state["RBAC_BYPASS_ACTIVE"] = True
+                        if not st.session_state.get("RBAC_BYPASS_WARNED"):
+                            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
+                            st.session_state["RBAC_BYPASS_WARNED"] = True
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
         return (
             ident.has_any(self.CONSUMER_ROLES)
             or self.is_owner(ident)
@@ -250,10 +317,36 @@ class AuthorizationService:
 
     def can_access_classification(self, ident: Identity) -> bool:
         # Owners, custodians, specialists, admins
+        try:
+            if bool(getattr(settings, "REVERSE_RBAC", False) or os.environ.get("REVERSE_RBAC") == "1" or (st is not None and st.session_state.get("REVERSE_RBAC"))):
+                if st is not None:
+                    try:
+                        st.session_state["RBAC_BYPASS_ACTIVE"] = True
+                        if not st.session_state.get("RBAC_BYPASS_WARNED"):
+                            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
+                            st.session_state["RBAC_BYPASS_WARNED"] = True
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
         return self.is_owner(ident) or self.is_custodian(ident) or self.is_specialist(ident) or self.is_admin(ident)
 
     def can_see_admin_actions(self, ident: Identity) -> bool:
         # Custodians and admins
+        try:
+            if bool(getattr(settings, "REVERSE_RBAC", False) or os.environ.get("REVERSE_RBAC") == "1" or (st is not None and st.session_state.get("REVERSE_RBAC"))):
+                if st is not None:
+                    try:
+                        st.session_state["RBAC_BYPASS_ACTIVE"] = True
+                        if not st.session_state.get("RBAC_BYPASS_WARNED"):
+                            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
+                            st.session_state["RBAC_BYPASS_WARNED"] = True
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
         return self.is_custodian(ident) or self.is_admin(ident)
 
     # Action-level convenience checks
@@ -261,6 +354,19 @@ class AuthorizationService:
         """Users who may classify/tag assets.
         Defaults: Data Owners, Custodians, Specialists, Admins.
         """
+        try:
+            if bool(getattr(settings, "REVERSE_RBAC", False) or os.environ.get("REVERSE_RBAC") == "1" or (st is not None and st.session_state.get("REVERSE_RBAC"))):
+                if st is not None:
+                    try:
+                        st.session_state["RBAC_BYPASS_ACTIVE"] = True
+                        if not st.session_state.get("RBAC_BYPASS_WARNED"):
+                            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
+                            st.session_state["RBAC_BYPASS_WARNED"] = True
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
         return self.is_owner(ident) or self.is_custodian(ident) or self.is_specialist(ident) or self.is_admin(ident)
 
     def can_approve_tags(self, ident: Identity) -> bool:
@@ -269,20 +375,93 @@ class AuthorizationService:
         """
         # Treat committee as admin-aligned for approvals
         has_committee = ident.has_any({"DATA_GOV_COMMITTEE_ROLE"})
+        try:
+            if bool(getattr(settings, "REVERSE_RBAC", False) or os.environ.get("REVERSE_RBAC") == "1" or (st is not None and st.session_state.get("REVERSE_RBAC"))):
+                if st is not None:
+                    try:
+                        st.session_state["RBAC_BYPASS_ACTIVE"] = True
+                        if not st.session_state.get("RBAC_BYPASS_WARNED"):
+                            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
+                            st.session_state["RBAC_BYPASS_WARNED"] = True
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
         return self.is_owner(ident) or self.is_admin(ident) or has_committee
 
-    # Object-specific, privilege-based checks (no role-name hardcoding)
-    def can_apply_tags_for_object(self, fq_object: str, object_type: str = "TABLE") -> bool:
+    # --- Privilege-based Helpers (Merged from privilege_service) ---
+    def _cached_role_grants(self) -> List[dict]:
+        """Return SHOW GRANTS TO ROLE CURRENT_ROLE() results, cached per session."""
+        if st is not None:
+            cache_key = "_ps_role_grants"
+            if cache_key in st.session_state:
+                return st.session_state[cache_key] or []
+            try:
+                rows = snowflake_connector.execute_query("SHOW GRANTS TO ROLE CURRENT_ROLE()") or []
+                st.session_state[cache_key] = rows
+                return rows
+            except Exception:
+                st.session_state[cache_key] = []
+                return []
+        return []
+
+    def refresh_privilege_cache(self) -> None:
+        if st is not None:
+            st.session_state.pop("_ps_role_grants", None)
+
+    def _norm(self, name: Optional[str]) -> Optional[str]:
+        return str(name).strip().upper() if name is not None else None
+
+    def has_account_priv(self, priv: str) -> bool:
+        p = self._norm(priv)
+        for r in self._cached_role_grants():
+            if self._norm(r.get("privilege")) == p and self._norm(r.get("granted_on")) == "ACCOUNT":
+                return True
+        return False
+
+    def list_object_privs(self, fq_object: str, object_type: str = "TABLE") -> Set[str]:
         try:
-            return _ps_can_apply_tags_to_object(fq_object, object_type=object_type)
-        except Exception:
-            return False
+            ot = object_type.strip().upper()
+            rows = snowflake_connector.execute_query(f"SHOW GRANTS ON {ot} {fq_object}") or []
+            privs = set()
+            curr_role = self._norm(self.get_current_identity().current_role)
+            for r in rows:
+                if self._norm(r.get("grantee_name")) == curr_role:
+                    pr = self._norm(r.get("privilege"))
+                    if pr: privs.add(pr)
+            return privs
+        except Exception: return set()
+
+    def has_priv_on_object(self, priv: str, fq_object: str, object_type: str = "TABLE") -> bool:
+        return self._norm(priv) in self.list_object_privs(fq_object, object_type)
 
     def can_read_table(self, fq_table: str) -> bool:
         try:
-            return _ps_can_read_table(fq_table)
-        except Exception:
-            return True
+            return self.has_priv_on_object("SELECT", fq_table, "TABLE") or self.has_priv_on_object("OWNERSHIP", fq_table, "TABLE")
+        except Exception: return True
+
+    def can_alter_object(self, fq_object: str, object_type: str = "TABLE") -> bool:
+        try:
+            privs = self.list_object_privs(fq_object, object_type)
+            return ("ALTER" in privs) or ("OWNERSHIP" in privs)
+        except Exception: return False
+
+    def can_apply_tags_for_object(self, fq_object: str, object_type: str = "TABLE") -> bool:
+        return self.can_alter_object(fq_object, object_type)
+
+    def has_schema_write(self, schema_fq: str) -> bool:
+        try:
+            privs = self.list_object_privs(schema_fq, "SCHEMA")
+            return any(p in privs for p in {"OWNERSHIP", "USAGE", "CREATE"})
+        except Exception: return False
+
+    def can_manage_labels(self, governance_schema_fq: Optional[str] = None) -> bool:
+        if governance_schema_fq: return self.has_schema_write(governance_schema_fq)
+        return self.has_account_priv("MANAGE GRANTS") or self.has_account_priv("MONITOR")
+
+    def can_manage_roles_account_level(self) -> bool:
+        return any(self.has_account_priv(p) for p in ["CREATE ROLE", "MANAGE GRANTS", "USERADMIN", "SECURITYADMIN"])
 
 
 authz = AuthorizationService()

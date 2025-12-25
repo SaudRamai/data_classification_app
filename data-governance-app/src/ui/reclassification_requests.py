@@ -39,15 +39,15 @@ try:
 except Exception:  # type: ignore
     snowflake_connector = None  # type: ignore
 
-try:
-    from src.services.reclassification_service import reclassification_service
-except Exception:  # type: ignore
-    reclassification_service = None  # type: ignore
+from src.services.classification_workflow_service import classification_workflow_service as reclassification_service
 
 try:
-    from src.services.audit_service import audit_service
+    from src.services.classification_audit_service import classification_audit_service as audit_service
 except Exception:  # type: ignore
     audit_service = None  # type: ignore
+
+# Orchestration façade (preferred entry point)
+from src.services.classification_workflow_service import classification_workflow_service as cwf
 
 
 GOV_SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
@@ -168,25 +168,48 @@ class SnowflakeOps:
         INSERT INTO <DB>.DATA_CLASSIFICATION_GOVERNANCE.RECLASSIFICATION_REQUESTS (...columns...)
         VALUES (...)
         """
+        # Preferred path: façade orchestrates downstream effects
+        if cwf:
+            try:
+                rid = cwf.submit_reclassification(
+                    asset_full_name=req.asset_full_name,
+                    proposed=(req.proposed_label or "Review", req.proposed_c or 0, req.proposed_i or 0, req.proposed_a or 0),
+                    justification=req.rationale or req.reason,
+                    created_by=req.created_by,
+                    trigger_type="MANUAL",
+                )
+                # Attachment handling placeholder: store metadata only
+                self.insert_log(
+                    request_id=rid,
+                    action="SUBMIT",
+                    actor=req.created_by,
+                    comment=f"Attachment: {req.attachment_name or 'None'} (not persisted)",
+                    old_status=None,
+                    new_status="Pending",
+                )
+                return rid
+            except Exception:
+                pass
         if reclassification_service:
-            # Preferred path: use central service (handles audit + downstream effects)
-            rid = reclassification_service.submit_request(
-                asset_full_name=req.asset_full_name,
-                proposed=(req.proposed_label or "Review", req.proposed_c or 0, req.proposed_i or 0, req.proposed_a or 0),
-                justification=req.rationale or req.reason,
-                created_by=req.created_by,
-                trigger_type="MANUAL",
-            )
-            # Attachment handling placeholder: store metadata only
-            self.insert_log(
-                request_id=rid,
-                action="SUBMIT",
-                actor=req.created_by,
-                comment=f"Attachment: {req.attachment_name or 'None'} (not persisted)",
-                old_status=None,
-                new_status="Pending",
-            )
-            return rid
+            try:
+                rid = reclassification_service.submit_request(
+                    asset_full_name=req.asset_full_name,
+                    proposed=(req.proposed_label or "Review", req.proposed_c or 0, req.proposed_i or 0, req.proposed_a or 0),
+                    justification=req.rationale or req.reason,
+                    created_by=req.created_by,
+                    trigger_type="MANUAL",
+                )
+                self.insert_log(
+                    request_id=rid,
+                    action="SUBMIT",
+                    actor=req.created_by,
+                    comment=f"Attachment: {req.attachment_name or 'None'} (not persisted)",
+                    old_status=None,
+                    new_status="Pending",
+                )
+                return rid
+            except Exception:
+                pass
         # Fallback direct SQL
         if not self.sf:
             # Last resort: stash in session (demo only)
@@ -280,10 +303,10 @@ class SnowflakeOps:
         """
         # Service path preferred (maps to same table and ensures compatibility)
         try:
-            if reclassification_service and status in (None, "All"):
-                rows = reclassification_service.list_requests(limit=limit)
-            elif reclassification_service and status in VALID_STATUSES:
-                rows = reclassification_service.list_requests(status=status, limit=limit)
+            if cwf and status in (None, "All"):
+                rows = cwf.list_reclassification_requests(limit=limit)
+            elif cwf and status in VALID_STATUSES:
+                rows = cwf.list_reclassification_requests(status=status, limit=limit)
             else:
                 rows = None
         except Exception:
@@ -345,13 +368,13 @@ class SnowflakeOps:
             return
         # Prefer service transitions where possible
         try:
-            if reclassification_service and new_status == "Approved":
-                reclassification_service.approve(request_id, actor)
+            if cwf and new_status == "Approved":
+                cwf.approve_reclassification(request_id, actor)
                 old_status = "Pending"
                 self.insert_log(request_id, "APPROVE", actor, comment or "Approved", old_status, "Approved")
                 return
-            if reclassification_service and new_status == "Rejected":
-                reclassification_service.reject(request_id, actor, comment)
+            if cwf and new_status == "Rejected":
+                cwf.reject_reclassification(request_id, actor, comment)
                 old_status = "Pending"
                 self.insert_log(request_id, "REJECT", actor, comment or "Rejected", old_status, "Rejected")
                 return

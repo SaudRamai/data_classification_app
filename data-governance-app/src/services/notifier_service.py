@@ -1,126 +1,114 @@
 """
-Notifier service: sends alerts for compliance and SLA violations.
-- Primary channel: Slack via webhook (SLACK_WEBHOOK_URL)
-- Optional fallback: SMTP email (SMTP_* environment variables)
-- Reads from DATA_GOVERNANCE.NOTIFICATIONS_OUTBOX and marks as sent.
-
-No secrets are stored in code. All credentials must come from environment or a secrets manager.
+Notifier Service (Lightweight Utility)
+Sends alerts for compliance and SLA violations via Slack or Email.
 """
 from __future__ import annotations
 import os
 import json
-import time
-from typing import List, Dict, Any
+import logging
+from typing import Optional
 
 try:
-    import requests  # type: ignore
-except Exception:  # pragma: no cover
-    requests = None  # type: ignore
+    import requests
+except ImportError:
+    requests = None
 
 try:
     import smtplib
     from email.mime.text import MIMEText
-except Exception:  # pragma: no cover
-    smtplib = None  # type: ignore
-    MIMEText = None  # type: ignore
+except ImportError:
+    smtplib = None
+    MIMEText = None
 
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
 
-DB = settings.SNOWFLAKE_DATABASE
+logger = logging.getLogger(__name__)
 
-
-class NotifierService:
-    def __init__(self) -> None:
-        self.slack_webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip()
-        self.smtp_host = os.getenv("SMTP_HOST", "").strip()
-        self.smtp_user = os.getenv("SMTP_USER", "").strip()
-        self.smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
-        self.smtp_port = int(os.getenv("SMTP_PORT", "587") or 587)
-        self.smtp_from = os.getenv("SMTP_FROM", "no-reply@datagov.local").strip()
-
-    def _ensure_tables(self) -> None:
-        snowflake_connector.execute_non_query(
-            f"""
-            CREATE SCHEMA IF NOT EXISTS {DB}.DATA_GOVERNANCE;
-            CREATE TABLE IF NOT EXISTS {DB}.DATA_GOVERNANCE.NOTIFICATIONS_OUTBOX (
-              ID STRING,
-              CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP,
-              CHANNEL STRING,            -- 'SLACK' or 'EMAIL'
-              TARGET STRING,             -- webhook URL or email address
-              SUBJECT STRING,
-              BODY STRING,
-              SENT_AT TIMESTAMP_NTZ,
-              SENT_RESULT STRING
-            );
-            """
+def _send_slack(target_url: str, subject: str, message: str) -> bool:
+    if not requests:
+        logger.warning("Requests not installed, cannot send Slack notification")
+        return False
+    
+    payload = {"text": f"*{subject}*\n{message}"}
+    try:
+        resp = requests.post(
+            target_url, 
+            data=json.dumps(payload), 
+            headers={"Content-Type": "application/json"}, 
+            timeout=10
         )
+        return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"Failed to send Slack notification: {e}")
+        return False
 
-    def _send_slack(self, target_url: str, subject: str, body: str) -> str:
-        if not requests:
-            return "requests_not_installed"
-        payload = {"text": f"*{subject}*\n{body}"}
-        try:
-            resp = requests.post(target_url, data=json.dumps(payload), headers={"Content-Type": "application/json"}, timeout=10)
-            return f"{resp.status_code}"
-        except Exception as e:  # pragma: no cover
-            return f"error:{e}"
+def _send_email(to_email: str, subject: str, message: str) -> bool:
+    if not smtplib or not MIMEText:
+        logger.warning("smtplib or MIMEText not available, cannot send email")
+        return False
+    
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
+    smtp_user = os.getenv("SMTP_USER", "").strip()
+    smtp_pass = os.getenv("SMTP_PASSWORD", "").strip()
+    smtp_port = int(os.getenv("SMTP_PORT", "587") or 587)
+    smtp_from = os.getenv("SMTP_FROM", "no-reply@datagov.local").strip()
 
-    def _send_email(self, to_email: str, subject: str, body: str) -> str:
-        if not (smtplib and MIMEText):
-            return "smtplib_not_available"
-        if not (self.smtp_host and self.smtp_user and self.smtp_password):
-            return "smtp_not_configured"
-        try:
-            msg = MIMEText(body)
-            msg["Subject"] = subject
-            msg["From"] = self.smtp_from
-            msg["To"] = to_email
-            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
-                server.starttls()
-                server.login(self.smtp_user, self.smtp_password)
-                server.sendmail(self.smtp_from, [to_email], msg.as_string())
-            return "sent"
-        except Exception as e:  # pragma: no cover
-            return f"error:{e}"
+    if not all([smtp_host, smtp_user, smtp_pass]):
+        logger.warning("SMTP not fully configured, skipping email")
+        return False
 
-    def run_once(self, limit: int = 100) -> int:
-        """Send up to <limit> unsent notifications and mark them SENT_AT.
-        Returns number of notifications processed.
-        """
-        self._ensure_tables()
-        rows = snowflake_connector.execute_query(
-            f"""
-            SELECT ID, CHANNEL, TARGET, SUBJECT, BODY
-            FROM {DB}.DATA_GOVERNANCE.NOTIFICATIONS_OUTBOX
-            WHERE SENT_AT IS NULL
-            ORDER BY CREATED_AT
-            LIMIT %(lim)s
-            """,
-            {"lim": int(limit)}
-        ) or []
-        count = 0
-        for r in rows:
-            nid = r.get("ID")
-            channel = (r.get("CHANNEL") or "").upper()
-            target = r.get("TARGET") or ""
-            subject = r.get("SUBJECT") or "Notification"
-            body = r.get("BODY") or ""
-            result = "skipped"
-            if channel == "SLACK" and self.slack_webhook:
-                result = self._send_slack(target or self.slack_webhook, subject, body)
-            elif channel == "EMAIL" and target:
-                result = self._send_email(target, subject, body)
-            snowflake_connector.execute_non_query(
-                f"""
-                UPDATE {DB}.DATA_GOVERNANCE.NOTIFICATIONS_OUTBOX
-                   SET SENT_AT = CURRENT_TIMESTAMP, SENT_RESULT = %(res)s
-                 WHERE ID = %(id)s
-                """,
-                {"res": result, "id": nid}
-            )
-            count += 1
-        return count
+    try:
+        msg = MIMEText(message)
+        msg["Subject"] = subject
+        msg["From"] = smtp_from
+        msg["To"] = to_email
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_from, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        return False
 
+def notify_slack(subject: str, message: str, target_url: Optional[str] = None) -> bool:
+    """Public wrapper to send a Slack notification.
+    Uses SLACK_WEBHOOK_URL env var if target_url is not provided.
+    Returns True on success, False otherwise.
+    """
+    url = (target_url or os.getenv("SLACK_WEBHOOK_URL", "").strip())
+    if not url:
+        logger.warning("No Slack webhook URL configured; skipping Slack notification")
+        return False
+    return _send_slack(url, subject, message)
 
-notifier_service = NotifierService()
+def notify_email(to_email: str, subject: str, message: str) -> bool:
+    """Public wrapper to send an email notification.
+    Returns True on success, False otherwise.
+    """
+    return _send_email(to_email, subject, message)
+
+def notify_owner(asset_full_name: str, subject: str, message: str, owner_email: Optional[str] = None) -> bool:
+    """
+    Unified entry point for notifying an asset owner.
+    """
+    logger.info(f"Notifying owner of {asset_full_name}: {subject}")
+    
+    # Try Slack if webhook is configured
+    slack_webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+    if slack_webhook:
+        _send_slack(slack_webhook, f"{subject} - {asset_full_name}", message)
+    
+    # Try Email if we have an owner email
+    if owner_email:
+        _send_email(owner_email, subject, f"Asset: {asset_full_name}\n\n{message}")
+    
+    return True
+
+# Backward compatibility singleton wrapper if needed
+class NotifierWrapper:
+    def notify_owner(self, *args, **kwargs):
+        return notify_owner(*args, **kwargs)
+
+notifier_service = NotifierWrapper()

@@ -1,4 +1,4 @@
-from pathlib import Path as _Path
+﻿from pathlib import Path as _Path
 import sys
 import os
 
@@ -44,19 +44,22 @@ def my_fetch_tasks(*args, **kwargs):
 
 # Initialize session state for filters
 ALLOWED_CLASSIFICATIONS = TAG_DEFINITIONS.get("DATA_CLASSIFICATION") or ["Public", "Internal", "Restricted", "Confidential"]
-from src.services.reclassification_service import reclassification_service
-from src.services.ai_sensitive_detection_service import ai_sensitive_detection_service
-from src.services.governance_db_resolver import resolve_governance_db
-from src.services.audit_service import audit_service
-try:
-    from src.services.ai_assistant_service import ai_assistant_service
-except Exception:
-    ai_assistant_service = None
-from src.services.ai_sensitive_tables_service import AISensitiveTablesService
-ai_sensitive_tables_service = AISensitiveTablesService()
-from src.services.ai_classification_pipeline_service import ai_classification_pipeline_service
-from src.services.decision_matrix_service import validate as dm_validate
-from src.services.my_tasks_service import fetch_assigned_tasks
+from src.services.classification_workflow_service import classification_workflow_service
+from src.services.governance_config_service import governance_config_service
+from src.services.classification_audit_service import classification_audit_service as audit_service
+
+# Aliases for backward compatibility in this large file
+reclassification_service = classification_workflow_service
+fetch_assigned_tasks = classification_workflow_service.list_tasks
+from src.services.classification_workflow_service import _validate_cia as dm_validate
+
+# Import from consolidated classification pipeline service (single authoritative module)
+from src.services.classification_pipeline_service import (
+    ai_classification_pipeline_service,
+    ai_assistant_service,
+    ai_classification_service,
+    discovery_service,
+)
 
 def _detect_sensitive_tables(database: str, schema: Optional[str] = None, sample_size: int = 1000) -> List[Dict[str, Any]]:
     """Detect sensitive tables in the specified database using metadata, patterns, and AI.
@@ -148,40 +151,24 @@ def _detect_sensitive_tables(database: str, schema: Optional[str] = None, sample
         return []
 
  
-from src.services.audit_service import audit_service
-from src.services.ai_classification_service import ai_classification_service
-import src.services.classification_history_service as classification_history_service
-import src.services.tag_drift_service as tag_drift_service
-from src.services.classification_decision_service import classification_decision_service
-from src.services.notifier_service import notifier_service
-from src.services.governance_db_resolver import resolve_governance_db
-from src.services.policy_enforcement_service import policy_enforcement_service
-from src.services.my_tasks_service import (
-    update_or_submit_classification as my_update_submit,
-)
+# Consolidate imports and provide backward compatibility aliases
+classification_history_service = classification_workflow_service
+try:
+    import src.services.tag_drift_service as tag_drift_service
+except Exception:
+    tag_drift_service = None  # type: ignore
+
+classification_decision_service = classification_workflow_service
+from src.services.compliance_service import compliance_service
+my_update_submit = classification_workflow_service.update_or_submit_task
 from src.ui.classification_history_tab import render_classification_history_tab
-from src.services.seed_governance_service import refresh_governance
-try:
-    from src.services.classification_review_service import list_reviews as cr_list_reviews
-except Exception:
-    cr_list_reviews = None
-try:
-    from src.services.discovery_service import discovery_service
-except Exception:
-    discovery_service = None
-from src.services import review_actions_service as review_actions
+from src.services.governance_config_service import governance_config_service
+cr_list_reviews = classification_workflow_service.list_reviews
+review_actions = classification_workflow_service
 try:
     from src.ui.reclassification_requests import render_reclassification_requests
 except Exception:
     render_reclassification_requests = None
-try:
-    from src.services.metrics_service import metrics_service
-except Exception:
-    metrics_service = None
-try:
-    from src.services.compliance_service import compliance_service
-except Exception:
-    compliance_service = None
 
 try:
     from src.config.settings import settings
@@ -196,7 +183,7 @@ except Exception:
 # Page configuration
 st.set_page_config(
     page_title="Data Classification",
-    page_icon="🏷️",
+    page_icon="???",
     layout="wide",
 )
 
@@ -220,7 +207,7 @@ except Exception as _top_auth_err:
 try:
     if hasattr(ai_classification_service, "set_mode"):
         ai_classification_service.set_mode(True)
-    _db_init = st.session_state.get("sf_database") or resolve_governance_db()
+    _db_init = st.session_state.get("sf_database") or governance_config_service.resolve_context().get('database')
     if _db_init:
         _sc_fqn_init = f"{_db_init}.DATA_CLASSIFICATION_GOVERNANCE"
         try:
@@ -320,7 +307,7 @@ def verify_ai_service_ready():
 try:
     col_db1, col_db2, col_db3 = st.columns([3,1,1])
     with col_db1:
-        _db_resolved = resolve_governance_db()
+        _db_resolved = governance_config_service.resolve_context().get('database')
         # Auto-detect governance schema (force DATA_CLASSIFICATION_GOVERNANCE)
         def _auto_detect_governance_schema(active_db: str) -> str:
             return "DATA_CLASSIFICATION_GOVERNANCE"
@@ -342,7 +329,7 @@ except Exception as e:
 with col_db1:
     if st.button("Re-detect DB", key="btn_redetect_db"):
         try:
-            _db_new = resolve_governance_db(force_refresh=True)
+            _db_new = governance_config_service.resolve_context(force_refresh=True).get('database')
             if _db_new:
                 st.session_state["sf_database"] = _db_new
                 st.success(f"Detected: {_db_new}")
@@ -363,7 +350,7 @@ with col_db3:
             st.warning(f"Schema detect failed: {_e}")
 
 # Global Filters (sidebar) and driver for tabs
-with st.sidebar.expander("🌐 Global Filters", expanded=True):
+with st.sidebar.expander("?? Global Filters", expanded=True):
     # Warehouse selector (optional, shown by default)
     try:
         wh_rows = snowflake_connector.execute_query("SHOW WAREHOUSES") or []
@@ -461,7 +448,7 @@ except Exception:
 
 def _active_db_from_filter() -> Optional[str]:
     """Resolve active DB for this page, prioritizing the sidebar selection.
-    Order: sidebar/session → resolver → None.
+    Order: sidebar/session ? resolver ? None.
     """
     try:
         db = st.session_state.get("sf_database")
@@ -472,7 +459,7 @@ def _active_db_from_filter() -> Optional[str]:
     except Exception:
         pass
     try:
-        return resolve_governance_db()
+        return governance_config_service.resolve_context().get('database')
     except Exception:
         return None
 
@@ -1625,23 +1612,11 @@ _Download the template below to begin_
 
     # AI Assistant tab
     with sub_ai:
-        # Render AI Assistant sub-tabs via modular services
-        ai_overview_tab, ai_pipeline_tab = st.tabs([
-            "Sensitive Tables Overview",
-            "Automatic AI Classification Pipeline",
-        ])
-
-        with ai_overview_tab:
-            try:
-                ai_sensitive_tables_service.render_sensitive_tables_overview()
-            except Exception as e:
-                st.error(f"Failed to render Sensitive Tables Overview: {e}")
-
-        with ai_pipeline_tab:
-            try:
-                ai_classification_pipeline_service.render_classification_pipeline()
-            except Exception as e:
-                st.error(f"Failed to render AI Classification Pipeline: {e}")
+        # Render only the Automatic AI Classification Pipeline (Sensitive Tables Overview removed)
+        try:
+            ai_classification_pipeline_service.render_classification_pipeline()
+        except Exception as e:
+            st.error(f"Failed to render AI Classification Pipeline: {e}")
 
     _LEGACY_AI_ASSISTANT_DISABLED = '''
                       'PUBLIC': {'BASELINE_LABEL': 'Public', 'BASELINE_C': 0, 'BASELINE_I': 0, 'BASELINE_A': 0, 'COMPLIANCE': 'Public Disclosure'},
@@ -1736,8 +1711,8 @@ _Download the template below to begin_
                             _tf = str(sel_table_filter).upper()
                             specials = [r for r in specials if _tf in str(r.get('TABLE') or '').upper()]
                         st.markdown("#### Special Categories Detected (Preview)")
-                        st.caption("CIA → Label rules: 🟥 Confidential (C3,I3,A2–A3) | 🟧 Restricted (C2,I2,A1–A2) | 🟨 Internal (C1,I1,A1) | 🟩 Public (C0,I0,A0)")
-                        st.caption("Risk rules: High (any CIA=3) → Strict governance; Medium (any CIA=2) → Moderate controls; Low (all ≤1) → Standard")
+                        st.caption("CIA ? Label rules: ?? Confidential (C3,I3,A2–A3) | ?? Restricted (C2,I2,A1–A2) | ?? Internal (C1,I1,A1) | ?? Public (C0,I0,A0)")
+                        st.caption("Risk rules: High (any CIA=3) ? Strict governance; Medium (any CIA=2) ? Moderate controls; Low (all =1) ? Standard")
                         if specials and _pd is not None:
                             df_spec = _pd.DataFrame(specials)
                             st.dataframe(df_spec[[
@@ -1779,8 +1754,8 @@ _Download the template below to begin_
                                 sel_apply = st.multiselect("Select tables to apply tags:", options=_choices, key="ai_spec_apply_sel")
                                 if st.button("Apply Tags to Selected Tables", key="btn_apply_tags_selected") and sel_apply:
                                     from src.services.tagging_service import tagging_service as _tag_svc
-                                    from src.services.classification_decision_service import classification_decision_service as _cds
-                                    from src.services.audit_service import audit_service as _aud
+                                    from src.services.classification_workflow_service import classification_workflow_service as _cds
+                                    from src.services.classification_audit_service import classification_audit_service as _aud
                                     applied_ok = 0
                                     failed_appl = 0
                                     for fqn in sel_apply:
@@ -1842,7 +1817,7 @@ _Download the template below to begin_
                                         st.success(f"Applied tags to {applied_ok} table(s). {('Failures: ' + str(failed_appl)) if failed_appl else ''}")
                             # Drill-down: select a table to view column-level detections
                             try:
-                                from src.services.ai_classification_service import ai_classification_service as _svc
+                                from src.services.classification_pipeline_service import ai_classification_service as _svc
                             except Exception:
                                 _svc = None
                             if _svc is not None:
@@ -1903,16 +1878,16 @@ _Download the template below to begin_
                                                     
                                                     # Map scores to labels with emojis and descriptions
                                                     if max_score == 0:
-                                                        return "🟢 Public (C0) - Data is public; no confidentiality risk. Example: Public holidays, published press release dates"
+                                                        return "?? Public (C0) - Data is public; no confidentiality risk. Example: Public holidays, published press release dates"
                                                     elif max_score == 1:
-                                                        return "🟡 Internal (C1) - For internal use only; minor impact if leaked. Example: Employee training schedule dates, internal project timelines"
+                                                        return "?? Internal (C1) - For internal use only; minor impact if leaked. Example: Employee training schedule dates, internal project timelines"
                                                     elif max_score == 2:
-                                                        return "🟠 Restricted (C2) - Sensitive data; unauthorized disclosure could cause moderate to significant harm. Example: Customer contract start/end dates, financial reporting period dates"
+                                                        return "?? Restricted (C2) - Sensitive data; unauthorized disclosure could cause moderate to significant harm. Example: Customer contract start/end dates, financial reporting period dates"
                                                     else:  # max_score >= 3
-                                                        return "🔴 Confidential (C3) - Highly sensitive or regulated data; severe business, financial, or legal impact if disclosed. Example: Employee date of birth, social security numbers, payroll dates"
+                                                        return "?? Confidential (C3) - Highly sensitive or regulated data; severe business, financial, or legal impact if disclosed. Example: Employee date of birth, social security numbers, payroll dates"
                                                     elif max_score >= 3:
-                                                        return "🔴 Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
-                                                    return "🟡 Internal (C1) - Default classification"
+                                                        return "?? Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
+                                                    return "?? Internal (C1) - Default classification"
                                                 c_val,i_val,a_val = int(cia.get('C',0)), int(cia.get('I',0)), int(cia.get('A',0))
                                                 _lbl = _label_from_cia2(c_val,i_val,a_val)
                                                 # Generate tag SQL for column
@@ -1973,14 +1948,14 @@ _Download the template below to begin_
                                                             
                                                             # Map scores to labels
                                                             if max_score == 0:
-                                                                return "🟢 Public (C0) - Data is public, no confidentiality risk"
+                                                                return "?? Public (C0) - Data is public, no confidentiality risk"
                                                             elif max_score == 1:
-                                                                return "🟡 Internal (C1) - For internal use, minor impact if leaked"
+                                                                return "?? Internal (C1) - For internal use, minor impact if leaked"
                                                             elif max_score == 2:
-                                                                return "🟠 Restricted (C2) - Sensitive business info, moderate to significant impact if disclosed"
+                                                                return "?? Restricted (C2) - Sensitive business info, moderate to significant impact if disclosed"
                                                             elif max_score >= 3:
-                                                                return "🔴 Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
-                                                            return "🟡 Internal (C1) - Default classification"
+                                                                return "?? Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
+                                                            return "?? Internal (C1) - Default classification"
                                                         rowc = df_dd[df_dd['COLUMN_NAME'] == sel_col].iloc[0]
                                                         c_txt = str(rowc.get('CIA') or '')
                                                         c_val,i_val,a_val = _parse_cia(c_txt)
@@ -1989,8 +1964,8 @@ _Download the template below to begin_
                                                         if st.button("Apply Column Tag", key="btn_apply_col_tag"):
                                                             try:
                                                                 from src.services.tagging_service import tagging_service as _tag_svc
-                                                                from src.services.classification_decision_service import classification_decision_service as _cds
-                                                                from src.services.audit_service import audit_service as _aud
+                                                                from src.services.classification_workflow_service import classification_workflow_service as _cds
+                                                                from src.services.classification_audit_service import classification_audit_service as _aud
                                                                 # High-risk gating for columns
                                                                 if lbl_col == 'Confidential' or (c_val >= 3 and i_val >= 3 and a_val >= 2):
                                                                     try:
@@ -2264,9 +2239,9 @@ _Download the template below to begin_
 
         # Service handle
         try:
-            from src.services.ai_classification_service import ai_classification_service as _svc
+            from src.services.classification_pipeline_service import ai_classification_service
         except Exception:
-            _svc = None
+            ai_classification_service = None
 
         # Use existing global filters from the sidebar (no new filters here)
         # Active DB from helper; schema from session/global filters if available
@@ -2288,281 +2263,10 @@ _Download the template below to begin_
             sel_table = None
         st.caption("Scope is controlled by the sidebar global filter (Database/Schema).")
 
-        # Level 1 — Sensitive Tables Overview
+        # Level 1 — Sensitive Tables Overview (removed)
         st.markdown("####  Sensitive Tables Overview")
-        import pandas as _pd
-        level1_rows: list[dict] = []
-        try:
-            _active_db = sel_db or _active_db_from_filter()
-            _gv = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
-            fqn_candidates = [
-                f"{_active_db}.{_gv}.AI_ASSISTANT_SENSITIVE_ASSETS" if _active_db else None,
-                "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.AI_ASSISTANT_SENSITIVE_ASSETS",
-            ]
-            fqn_candidates = [x for x in fqn_candidates if x]
-            rows = []
-            # Primary: run dynamic CTE over the active DB's INFORMATION_SCHEMA
-            if _active_db:
-                try:
-                    _schema_filter = " AND UPPER(c.TABLE_SCHEMA) = UPPER(%(sc)s)" if sel_schema else ""
-                    cte_sql = f"""
-                    WITH
-                    -- 1️⃣ Get all active categories dynamically
-                    ACTIVE_CATEGORIES AS (
-                        SELECT 
-                            CATEGORY_ID,
-                            CATEGORY_NAME,
-                            DETECTION_THRESHOLD
-                        FROM {gv_str}.SENSITIVITY_CATEGORIES
-                        WHERE IS_ACTIVE = TRUE
-                    ),
-
-                    -- 2️⃣ Detect sensitive columns (keywords + patterns)
-                    COLUMN_SCORES AS (
-                        SELECT
-                            c.TABLE_CATALOG AS DATABASE_NAME,
-                            c.TABLE_SCHEMA,
-                            c.TABLE_NAME,
-                            c.COLUMN_NAME,
-                            COALESCE(k.CATEGORY_ID, p.CATEGORY_ID) AS CATEGORY_ID,
-                            COALESCE(cat.CATEGORY_NAME, 'UNCATEGORIZED') AS CATEGORY_NAME,
-                            COALESCE(k.SENSITIVITY_WEIGHT, p.SENSITIVITY_WEIGHT, 1.0) AS MATCH_WEIGHT,
-                            COALESCE(cat.DETECTION_THRESHOLD, 0.7) AS DETECTION_THRESHOLD,
-                            CASE 
-                                WHEN k.KEYWORD_STRING IS NOT NULL THEN 'KEYWORD_MATCH'
-                                WHEN p.PATTERN_NAME IS NOT NULL THEN 'PATTERN_MATCH'
-                                ELSE 'UNKNOWN'
-                            END AS DETECTION_TYPE
-                        FROM {_active_db}.INFORMATION_SCHEMA.COLUMNS c
-                        LEFT JOIN {gv_str}.SENSITIVE_KEYWORDS k
-                            ON k.IS_ACTIVE = TRUE
-                           AND (
-                                (k.MATCH_TYPE = 'EXACT' AND LOWER(c.COLUMN_NAME) = LOWER(k.KEYWORD_STRING))
-                                OR
-                                (k.MATCH_TYPE = 'CONTAINS' AND LOWER(c.COLUMN_NAME) LIKE CONCAT('%', LOWER(k.KEYWORD_STRING), '%'))
-                                OR
-                                (k.MATCH_TYPE = 'PARTIAL' AND LOWER(c.COLUMN_NAME) LIKE CONCAT('%', LOWER(k.KEYWORD_STRING), '%'))
-                            )
-                        LEFT JOIN {gv_str}.SENSITIVE_PATTERNS p
-                            ON p.IS_ACTIVE = TRUE
-                           AND REGEXP_LIKE(LOWER(c.COLUMN_NAME), p.PATTERN_STRING, 'i')
-                        LEFT JOIN ACTIVE_CATEGORIES cat
-                            ON COALESCE(k.CATEGORY_ID, p.CATEGORY_ID) = cat.CATEGORY_ID
-                        WHERE COALESCE(k.CATEGORY_ID, p.CATEGORY_ID) IS NOT NULL
-                          AND cat.CATEGORY_ID IS NOT NULL{_schema_filter}
-                    ),
-
-                    -- 3️⃣ Rank detections per column and pick the highest confidence match
-                    COLUMN_TOP_CATEGORY AS (
-                        SELECT
-                            DATABASE_NAME,
-                            TABLE_SCHEMA,
-                            TABLE_NAME,
-                            COLUMN_NAME,
-                            CATEGORY_ID,
-                            CATEGORY_NAME,
-                            LEAST(MATCH_WEIGHT, 1.0) AS MATCH_WEIGHT,
-                            DETECTION_THRESHOLD,
-                            DETECTION_TYPE,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
-                                ORDER BY MATCH_WEIGHT DESC
-                            ) AS RANK_ORDER
-                        FROM COLUMN_SCORES
-                    ),
-
-                    -- 4️⃣ Pick only the top match per column
-                    COLUMN_TOP_ONLY AS (
-                        SELECT *
-                        FROM COLUMN_TOP_CATEGORY
-                        WHERE RANK_ORDER = 1
-                    ),
-
-                    -- 5️⃣ Aggregate per table (average of column scores)
-                    TABLE_AGG AS (
-                        SELECT
-                            DATABASE_NAME,
-                            TABLE_SCHEMA,
-                            TABLE_NAME,
-                            CATEGORY_NAME AS MOST_RELEVANT_CATEGORY,
-                            ROUND(AVG(MATCH_WEIGHT), 3) AS AVG_CONFIDENCE_SCORE,
-                            MAX(DETECTION_THRESHOLD) AS DETECTION_THRESHOLD
-                        FROM COLUMN_TOP_ONLY
-                        GROUP BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME, CATEGORY_NAME
-                    ),
-
-                    -- 6️⃣ Pick top-scoring category per table
-                    TABLE_TOP_CATEGORY AS (
-                        SELECT
-                            DATABASE_NAME,
-                            TABLE_SCHEMA,
-                            TABLE_NAME,
-                            MOST_RELEVANT_CATEGORY,
-                            AVG_CONFIDENCE_SCORE,
-                            DETECTION_THRESHOLD,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME
-                                ORDER BY AVG_CONFIDENCE_SCORE DESC
-                            ) AS CAT_RANK
-                        FROM TABLE_AGG
-                    )
-                    """
-                    where_parts = []
-                    params = {}
-                    if sel_schema:
-                        where_parts.append("TABLE_SCHEMA = %(sc)s"); params["sc"] = sel_schema
-                    if sel_table:
-                        where_parts.append("TABLE_NAME = %(tb)s"); params["tb"] = sel_table
-                    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-                    agg_sql = f"""
-                    {cte_sql}
-                    SELECT
-                        CONCAT(DATABASE_NAME, '.', TABLE_SCHEMA, '.', TABLE_NAME) AS "Table Name",
-                        MOST_RELEVANT_CATEGORY AS "Sensitive Data Type",
-                        CONCAT(TO_VARCHAR(ROUND(LEAST(AVG_CONFIDENCE_SCORE, 1.0) * 100, 2)), '%') AS "Confidence Score",
-                        CASE 
-                            WHEN AVG_CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'POLICY_REQUIRED'
-                            WHEN AVG_CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'NEEDS_REVIEW'
-                            ELSE 'OK'
-                        END AS "Recommended Policy",
-                        CASE 
-                            WHEN AVG_CONFIDENCE_SCORE >= DETECTION_THRESHOLD THEN 'HIGH'
-                            WHEN AVG_CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 0.6) THEN 'MEDIUM'
-                            ELSE 'LOW'
-                        END AS "Sensitivity Level",
-                        CURRENT_TIMESTAMP() AS DETECTED_AT
-                    FROM TABLE_TOP_CATEGORY
-                    WHERE CAT_RANK = 1
-                    {" AND " + where_sql[6:] if where_sql else ""}
-                    AND MOST_RELEVANT_CATEGORY IS NOT NULL AND AVG_CONFIDENCE_SCORE > 0
-                    ORDER BY AVG_CONFIDENCE_SCORE DESC, DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME
-                    """
-                    rows = snowflake_connector.execute_query(agg_sql, params) or []
-                except Exception:
-                    rows = []
-            # Fallback: use persisted AI assistant table if CTE had no rows
-            if not rows:
-                for _fqn in fqn_candidates:
-                    where = []
-                    params = {}
-                    if sel_db:
-                        where.append("DATABASE_NAME = %(db)s"); params["db"] = sel_db
-                    if sel_schema:
-                        where.append("SCHEMA_NAME = %(sc)s"); params["sc"] = sel_schema
-                    if sel_table:
-                        where.append("TABLE_NAME = %(tb)s"); params["tb"] = sel_table
-                    sql = f"""
-                        SELECT 
-                          DATABASE_NAME, 
-                          SCHEMA_NAME, 
-                          TABLE_NAME, 
-                          COALESCE(DETECTED_CATEGORY, DETECTED_TYPE) AS DETECTED_TYPE,
-                          MAX_CONF,
-                          LAST_SCAN_TS
-                        FROM (
-                          SELECT 
-                            DATABASE_NAME,
-                            SCHEMA_NAME,
-                            TABLE_NAME,
-                            DETECTED_CATEGORY,
-                            DETECTED_TYPE,
-                            LAST_SCAN_TS,
-                            COMBINED_CONFIDENCE AS CONF,
-                            MAX(COMBINED_CONFIDENCE) OVER (PARTITION BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME) AS MAX_CONF,
-                            ROW_NUMBER() OVER (
-                              PARTITION BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME 
-                              ORDER BY LAST_SCAN_TS DESC, COMBINED_CONFIDENCE DESC
-                            ) AS RN
-                          FROM {_fqn}
-                          {('WHERE ' + ' AND '.join(where)) if where else ''}
-                        ) t
-                        WHERE RN = 1 AND COALESCE(DETECTED_CATEGORY, DETECTED_TYPE) IS NOT NULL
-                        ORDER BY MAX_CONF DESC, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME
-                        LIMIT 1000
-                    """
-                    try:
-                        rows = snowflake_connector.execute_query(sql, params) or []
-                        if rows:
-                            break
-                    except Exception:
-                        continue
-            for r in rows:
-                if "Table Name" in r:
-                    fqn = str(r.get("Table Name") or "").strip()
-                    if not fqn or not r.get("Sensitive Data Type"):
-                        continue
-                    level1_rows.append({
-                        "Table Name": fqn,
-                        "Sensitive Data Type": r.get("Sensitive Data Type"),
-                        "Confidence Score": r.get("Confidence Score"),
-                        "Recommended Policy": r.get("Recommended Policy"),
-                        "Sensitivity Level": r.get("Sensitivity Level"),
-                        "_FQN": fqn,
-                    })
-                else:
-                    db = r.get("DATABASE_NAME"); sc = r.get("SCHEMA_NAME"); tbl = r.get("TABLE_NAME")
-                    fqn = f"{db}.{sc}.{tbl}"
-                    cat = str(r.get("DETECTED_TYPE") or "")
-                    if not cat:
-                        continue
-                    try:
-                        maxc = float(r.get('MAX_CONF') or 0.0)
-                    except Exception:
-                        maxc = 0.0
-                    _thr = 0.7
-                    if maxc >= _thr:
-                        pol = 'POLICY_REQUIRED'
-                        level = 'HIGH'
-                    elif maxc >= (_thr * 0.6):
-                        pol = 'NEEDS_REVIEW'
-                        level = 'MEDIUM'
-                    else:
-                        pol = 'OK'
-                        level = 'LOW'
-                    level1_rows.append({
-                        "Table Name": fqn,
-                        "Sensitive Data Type": cat,
-                        "Confidence Score": f"{round(maxc*100, 2)}%",
-                        "Recommended Policy": pol,
-                        "Sensitivity Level": level,
-                        "_FQN": fqn,
-                    })
-        except Exception:
-            level1_rows = []
-
-        df_level1 = _pd.DataFrame(level1_rows)
-        if df_level1.empty:
-            st.info("No sensitive tables found for the selected scope.")
-            if st.button("Scan now", key="ai_scan_now"):
-                _db_to_scan = sel_db or _active_db_from_filter()
-                if _db_to_scan:
-                    with st.spinner("Scanning sensitive data for selected scope..."):
-                        try:
-                            summary = ai_sensitive_detection_service.run_scan_and_persist(
-                                _db_to_scan,
-                                schema_name=(sel_schema or None),
-                                table_name=(sel_table or None)
-                            )
-                            st.success(f"Scan complete. Columns detected: {summary.get('columns_detected', 0)}")
-                        except Exception as e:
-                            st.error(f"Scan failed: {e}")
-                        # Removed st.rerun() to prevent no-op warning
-                else:
-                    st.warning("Please select a Database in the global filter to run a scan.")
-            selected_full_name = ""
-        else:
-            st.dataframe(df_level1[[
-                "Table Name",
-                "Sensitive Data Type",
-                "Recommended Policy"
-            ]], width='stretch', hide_index=True)
-            # Simple selection for drill-down without session syncing
-            _options = [""] + df_level1["_FQN"].tolist()
-            selected_label = st.selectbox(
-                "Select a table to drill down",
-                options=_options,
-            )
-            selected_full_name = selected_label
+        st.caption("This AI Assistant feature has been removed. Use Data Assets and Classification pages for sensitive table reports.")
+        selected_full_name = ""
 
         # Level 2 — Drill-Down: Sensitive Columns View (editable)
         if selected_full_name:
@@ -2587,7 +2291,7 @@ _Download the template below to begin_
                         raise RuntimeError("Invalid context (db/schema/table)")
                     cte_sql = f"""
                         WITH
-                        -- 1️⃣ Active sensitivity categories (with default CIA levels)
+                        -- 1?? Active sensitivity categories (with default CIA levels)
                         CATEGORIES AS (
                           SELECT 
                               CATEGORY_ID,
@@ -2600,7 +2304,7 @@ _Download the template below to begin_
                           WHERE IS_ACTIVE = TRUE
                         ),
 
-                        -- 2️⃣ Rule-based keyword matches
+                        -- 2?? Rule-based keyword matches
                         RULE_BASED AS (
                           SELECT
                               c.TABLE_CATALOG AS DATABASE_NAME,
@@ -2629,7 +2333,7 @@ _Download the template below to begin_
                             ON k.CATEGORY_ID = cat.CATEGORY_ID
                         ),
 
-                        -- 4️⃣ Pattern-based detections
+                        -- 4?? Pattern-based detections
                         PATTERN_BASED AS (
                           SELECT
                               c.TABLE_CATALOG AS DATABASE_NAME,
@@ -2654,14 +2358,14 @@ _Download the template below to begin_
                             ON p.CATEGORY_ID = cat.CATEGORY_ID
                         ),
 
-                        -- 5️⃣ Combine detections
+                        -- 5?? Combine detections
                         COMBINED AS (
                           SELECT * FROM RULE_BASED
                           UNION ALL
                           SELECT * FROM PATTERN_BASED
                         ),
 
-                        -- 6️⃣ Rank detections per column
+                        -- 6?? Rank detections per column
                         RANKED_DETECTIONS AS (
                           SELECT
                               DATABASE_NAME,
@@ -2685,14 +2389,14 @@ _Download the template below to begin_
                           FROM COMBINED
                         ),
 
-                        -- 7️⃣ Take top detection per column
+                        -- 7?? Take top detection per column
                         TOP_DETECTIONS AS (
                           SELECT *
                           FROM RANKED_DETECTIONS
                           WHERE RANK_ORDER = 1
                         ),
 
-                        -- 8️⃣ Aggregate detections
+                        -- 8?? Aggregate detections
                         AGGREGATED AS (
                           SELECT
                               DATABASE_NAME,
@@ -2713,7 +2417,7 @@ _Download the template below to begin_
                           GROUP BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, CATEGORY_NAME
                         ),
 
-                        -- 9️⃣ Compute weighted confidence score
+                        -- 9?? Compute weighted confidence score
                         SCORED AS (
                           SELECT
                               a.*,
@@ -3068,8 +2772,8 @@ _Download the template below to begin_
                                     "comment": row_new.get("Reason / Justification"),
                                 }
                                 try:
-                                    if _svc and hasattr(_svc, 'audit_change'):
-                                        _svc.audit_change(selected_full_name, str(col_name or ""), "EDIT", change_payload)
+                                    if ai_classification_service and hasattr(ai_classification_service, 'audit_change'):
+                                        ai_classification_service.audit_change(selected_full_name, str(col_name or ""), "EDIT", change_payload)
                                 except Exception:
                                     pass
                         # Persist override aggregate for column
@@ -3112,8 +2816,8 @@ _Download the template below to begin_
                                 "reason": row_new.get("Reason / Justification"),
                                 "keywords": [s.strip() for s in str(row_new.get("Keywords") or "").split(',') if s.strip()],
                             }
-                            if _svc and hasattr(_svc, 'persist_column_overrides'):
-                                _svc.persist_column_overrides(selected_full_name, str(col_name or ""), ov)
+                            if ai_classification_service and hasattr(ai_classification_service, 'persist_column_overrides'):
+                                ai_classification_service.persist_column_overrides(selected_full_name, str(col_name or ""), ov)
                         except Exception:
                             pass
                     st.success("Changes saved and audited.")
@@ -3122,7 +2826,7 @@ _Download the template below to begin_
         # Minimal debug expander
         show_debug = st.checkbox("Show Debug Info", value=False)
         if show_debug:
-            with st.expander("🔍 Debug Information", expanded=False):
+            with st.expander("?? Debug Information", expanded=False):
                 try:
                     cfg = getattr(ai_classification_service, '_sensitivity_config', {})
                     st.json({
@@ -3953,7 +3657,7 @@ _Download the template below to begin_
         def _sf_audit_log_classification(asset_full_name, action, details):
             """Insert into CLASSIFICATION_AUDIT or use audit_service."""
             try:
-                db = _active_db_from_filter() or resolve_governance_db()
+                db = _active_db_from_filter() or governance_config_service.resolve_context().get('database')
                 if db:
                     import json as _json
                     snowflake_connector.execute_non_query(
@@ -4148,7 +3852,7 @@ _Download the template below to begin_
             # Run only for a bounded set to limit cost
             sample_conf_map: Dict[str, float] = {}
             try:
-                from src.services.ai_classification_service import ai_classification_service as _svc
+                from src.services.classification_pipeline_service import ai_classification_service as _svc
             except Exception:
                 _svc = None  # type: ignore
             try:
@@ -4325,7 +4029,7 @@ if False:
                 st.error(f"Error during sensitive table detection: {str(e)}")
     
     # Manual scan button
-    if st.button("🔍 Scan for Sensitive Tables"):
+    if st.button("?? Scan for Sensitive Tables"):
         st.session_state["trigger_sensitive_scan"] = True
         st.experimental_rerun()
     
@@ -4481,7 +4185,7 @@ if False:
         sum_df = _pd.DataFrame(sum_rows)
         # Augment with aggregated table-level detection (label, confidence) via classify_table()
         try:
-            from src.services.ai_classification_service import ai_classification_service as _svc
+            from src.services.classification_pipeline_service import ai_classification_service as _svc
             st.session_state.setdefault("ai_table_agg", {})
             names = [str(r.get("FULL_NAME")) for r in sum_rows if r.get("FULL_NAME")]
             new_agg = {}
@@ -4545,8 +4249,8 @@ if False:
                         cols = []
                     cand = [c.get('COLUMN_NAME') for c in cols if str(c.get('DATA_TYPE','')).upper().startswith(('VARCHAR','STRING','TEXT'))][:5]
                     # sample up to 1000 rows to compute pattern prevalence per column using dynamic patterns
-                    from src.services.ai_classification_service import ai_classification_service as _svc
-                    from src.services.sensitive_detection import regex_screen as _rx_screen
+                    from src.services.classification_pipeline_service import ai_classification_service as _svc
+                    from src.services.classification_pipeline_service import regex_screen as _rx_screen
                     import pandas as _pdx
                     _cfg = _svc.load_sensitivity_config() if _svc else {}
                     total_rows = 0
@@ -5210,11 +4914,11 @@ with tab_tasks:
                         CREATED_AT,
                         UPDATED_AT,
                         case 
-                            when upper(coalesce(STATUS,'')) like '%PENDING%' then '🟡 Pending Review'
-                            when upper(coalesce(STATUS,'')) like '%APPROVED%' then '🟢 Approved'
-                            when upper(coalesce(STATUS,'')) like '%REJECTED%' then '🔴 Rejected'
-                            when upper(coalesce(STATUS,'')) like '%COMPLETED%' then '✅ Completed'
-                            else '⚪ Unknown'
+                            when upper(coalesce(STATUS,'')) like '%PENDING%' then '?? Pending Review'
+                            when upper(coalesce(STATUS,'')) like '%APPROVED%' then '?? Approved'
+                            when upper(coalesce(STATUS,'')) like '%REJECTED%' then '?? Rejected'
+                            when upper(coalesce(STATUS,'')) like '%COMPLETED%' then '? Completed'
+                            else '? Unknown'
                         end as STATUS_LABEL,
                         DETAILS
                     from {db}.{gv}.CLASSIFICATION_TASKS
@@ -5439,7 +5143,7 @@ with tab_tasks:
             import pandas as _pd
             sort_opts = ["Due Date (asc)"]
             if "overall_risk" in disp.columns:
-                sort_opts.append("Risk (High→Low)")
+                sort_opts.append("Risk (High?Low)")
             if "Priority" in disp.columns:
                 sort_opts.append("Priority")
             sort_by = st.selectbox("Sort by", options=sort_opts, index=0, key="mt_sort_mytasks")
@@ -6564,7 +6268,7 @@ if False:
 if False:
     st.subheader("Reclassification Management")
     st.caption("Manage triggers, analyze impact, and run bulk operations.")
-    from src.services.reclassification_service import reclassification_service as _reclass
+    from src.services.classification_workflow_service import classification_workflow_service as _reclass
     # Load requests
     reqs = _reclass.list_requests(limit=500) or []
     df = pd.DataFrame(reqs)
@@ -6754,7 +6458,7 @@ if False:
         # Drift sync tools
         drift_assets = tdf[tdf.get("drift") == True]["asset_name"].dropna().unique().tolist() if "drift" in tdf.columns else []
         sel_drift = st.selectbox("Select drifted asset to sync", options=drift_assets)
-        if sel_drift and st.button("Sync Governance → Tag"):
+        if sel_drift and st.button("Sync Governance ? Tag"):
             try:
                 row = tdf[tdf["asset_name"] == sel_drift].head(1)
                 gov_val = row.iloc[0]["governance_classification"] if not row.empty else None
@@ -6867,7 +6571,7 @@ def _list_tables(limit: int = 300) -> List[str]:
                 pass
             # Try resolver
             try:
-                r = resolve_governance_db()
+                r = governance_config_service.resolve_context().get('database')
                 if r:
                     names.append(r)
             except Exception:
@@ -6950,8 +6654,8 @@ def _apply_tags(asset_full_name: str, cia: CIA, risk: str, who: str, rationale: 
             _asset_db = None
         db = _asset_db or (_active_db_from_filter() if ('_active_db_from_filter' in globals() or '_active_db_from_filter' in dir()) else st.session_state.get('sf_database'))
         try:
-            from src.services.governance_db_resolver import resolve_governance_db as _res_gov
-            db = db or _res_gov()
+            from src.services.governance_config_service import governance_config_service as _gov_svc
+            db = db or _gov_svc.resolve_context().get('database')
         except Exception:
             pass
         if db:
@@ -7012,6 +6716,7 @@ def _coverage_and_overdue() -> Tuple[pd.DataFrame, Dict[str, int]]:
         counts = get_asset_counts(
             assets_table=f"{db}.GOVERNANCE.T_ASSETS",
             where_clause="",  # No additional filters needed here
+            params={},
             snowflake_connector=snowflake_connector
         )
         
@@ -7181,7 +6886,7 @@ def _ai_assistance_panel():
     # Resolve active DB from Global Filters/session
     db = _active_db_from_filter() or _get_current_db()
     if not db:
-        st.info("Select a database from the 🌐 Global Filters to enable detection.")
+        st.info("Select a database from the ?? Global Filters to enable detection.")
         return
 
     # Track DB in session to trigger refresh on change
@@ -7275,7 +6980,7 @@ def _ai_assistance_panel():
             pass
         # Governance SENSITIVE_EXCLUSIONS (best-effort: support EXCLUDE_PATTERN or TABLE_NAME/FULL_NAME)
         try:
-            gv_db = resolve_governance_db() or db_name
+            gv_db = governance_config_service.resolve_context().get('database') or db_name
             rows = snowflake_connector.execute_query(
                 f"""
                 select coalesce(FULL_NAME, TABLE_NAME) as NAME, EXCLUDE_PATTERN
@@ -8151,7 +7856,7 @@ def _management_panel():
                     cv = int(cur.get(k)) if cur.get(k) is not None else None
                     pv = int(proposed.get(k)) if proposed.get(k) is not None else None
                     if cv is not None and pv is not None and pv != cv:
-                        deltas[k] = f"{cv} → {pv}"
+                        deltas[k] = f"{cv} ? {pv}"
                 if deltas:
                     st.warning("Changes detected: " + ", ".join([f"{k}: {v}" for k, v in deltas.items()]))
             except Exception:
@@ -8730,7 +8435,7 @@ with tab1:
 
     # Load assets from inventory or fallback to INFORMATION_SCHEMA
     try:
-        from src.services.discovery_service import discovery_service
+        from src.services.classification_pipeline_service import discovery_service
         with st.spinner("Loading assets from inventory..."):
             inv_rows = discovery_service.get_queue(limit=500) or []
             inv_assets = [r.get("FULL_NAME") for r in inv_rows if r.get("FULL_NAME")]
@@ -8773,7 +8478,7 @@ with tab1:
         up = (name or "").upper()
         c, i, a = 0, 0, 0
         try:
-            from src.services.ai_classification_service import ai_classification_service as _svc
+            from src.services.classification_pipeline_service import ai_classification_service as _svc
             cfg = _svc.load_sensitivity_config()
             kws = (cfg.get("keywords") or [])
             cats = (cfg.get("categories") or {})
@@ -9008,13 +8713,13 @@ with tab1:
             if violations and not request_exception:
                 st.error("Classification below policy minimums for some assets (Policy 5.5). Enable 'Request exception' or adjust levels.")
                 for v in violations[:10]:
-                    st.warning(f"{v['asset']}: requires at least {v['required_cls']} (C≥{v['required_c']}) due to {v['reg']}")
+                    st.warning(f"{v['asset']}: requires at least {v['required_cls']} (C={v['required_c']}) due to {v['reg']}")
                 st.stop()
 
             # If exceptions requested, submit them first
             if req_payloads:
                 try:
-                    from src.services.exception_service import exception_service
+                    from src.services.classification_workflow_service import classification_workflow_service as exception_service
                 except Exception as e:
                     st.error(f"Exception service unavailable: {e}")
                     st.stop()
@@ -9047,7 +8752,7 @@ with tab1:
             requires_approval = (str(cls_val).lower() == "confidential" or int(c_val) == 3) and (not _can_approve)
             if requires_approval:
                 try:
-                    from src.services.reclassification_service import reclassification_service as _reclass
+                    from src.services.classification_workflow_service import classification_workflow_service as _reclass
                     created = 0
                     for asset in selected_assets:
                         rid = _reclass.submit_request(
@@ -9077,7 +8782,7 @@ with tab1:
                     st.error(f"Failed to submit for approval: {e}")
                 st.stop()
 
-            from src.services.audit_service import audit_service
+            from src.services.classification_audit_service import classification_audit_service as audit_service
             applied = 0
             enforced_cols = 0
             for asset in selected_assets:
@@ -9096,7 +8801,7 @@ with tab1:
                             "AVAILABILITY_LEVEL": str(int(a_val)),
                         },
                     )
-                    from src.services.discovery_service import discovery_service as _disc
+                    from src.services.classification_pipeline_service import discovery_service as _disc
                     _disc.mark_classified(asset, cls_val, int(c_val), int(i_val), int(a_val))
                     audit_service.log(user_email, "MANUAL_CLASSIFY_APPLY", "ASSET", asset, {"cls": cls_val, "c": c_val, "i": i_val, "a": a_val, "just": justification})
                     # Record applied decision
@@ -9118,7 +8823,7 @@ with tab1:
                     # Auto-enforce masking policies for sensitive columns (tag-aware RBAC enforcement)
                     try:
                         detections = ai_classification_service.detect_sensitive_columns(asset)
-                        result = policy_enforcement_service.auto_enforce_for_table(table=asset, detections=detections)
+                        result = compliance_service.enforcement.auto_enforce_for_table(table=asset, detections=detections)
                         enforced_cols += len(result.get("applied", []))
                     except Exception:
                         pass
@@ -9571,7 +9276,7 @@ with tab1:
             if not authz.can_apply_tags_for_object(table_full, object_type="TABLE"):
                 st.error("Insufficient privileges to tag columns on this table (ALTER/OWNERSHIP required)")
                 st.stop()
-            from src.services.audit_service import audit_service as _audit
+            from src.services.classification_audit_service import classification_audit_service as _audit
             applied = 0
             errors = []
             # Iterate over edited grid rows to pick chosen values
@@ -9680,7 +9385,7 @@ with tab2:
             except Exception as e:
                 st.error(f"SYSTEM$CLASSIFY failed: {e}")
     try:
-        from src.services.ai_classification_service import ai_classification_service
+        from src.services.classification_pipeline_service import ai_classification_service
         # Asset list
         try:
             with st.spinner("Loading assets from Snowflake..."):
@@ -9785,7 +9490,7 @@ with tab2:
                                 # Gate C3/Confidential behind approval if user lacks approval capability
                                 requires_approval_ai = ((result.get('classification') or '').lower() == 'confidential' or int(sug_c) == 3) and (not _can_approve)
                                 if requires_approval_ai:
-                                    from src.services.reclassification_service import reclassification_service as _reclass
+                                    from src.services.classification_workflow_service import classification_workflow_service as _reclass
                                     rid = _reclass.submit_request(
                                         selected_asset,
                                         (suggested_cls if suggested_cls in ALLOWED_CLASSIFICATIONS else 'Internal', int(sug_c), int(sug_i), int(sug_a)),
@@ -9886,14 +9591,14 @@ with tab3:
                 if any(k in up for k in ["HIPAA","PHI","HEALTH","MEDICAL"]):
                     regs.append("HIPAA")
                 # Risk indicator emoji
-                emoji = '🟢' if level == 'Low' else ('🟠' if level == 'Medium' else '🔴')
+                emoji = '??' if level == 'Low' else ('??' if level == 'Medium' else '??')
                 return pd.Series({"RISK": level, "RISK_IND": emoji, "Regulatory": ", ".join(regs), "RegsList": regs, "Rationale": rationale, "HIGHEST": highest})
             risk = df.apply(risk_row, axis=1)
             out = pd.concat([df, risk], axis=1)
             # Min CIA threshold filter
             min_threshold = st.slider("Min CIA threshold", min_value=0, max_value=3, value=0, help="Show assets with max(C,I,A) >= threshold")
             out = out[out["HIGHEST"] >= int(min_threshold)] if not out.empty else out
-            st.markdown("**Legend:** 🔴 High  🟠 Medium  🟢 Low")
+            st.markdown("**Legend:** ?? High  ?? Medium  ?? Low")
             show_cols = ["RISK_IND","FULL_NAME","CLASSIFICATION_LEVEL","CIA_CONF","CIA_INT","CIA_AVAIL","RISK","Regulatory","Rationale"]
             st.dataframe(out[show_cols], width='stretch')
             try:
@@ -10186,7 +9891,7 @@ with tab5:
         asset_options = []
     hist_asset = st.selectbox("Select dataset", options=asset_options if asset_options else ["No assets available"], key="hist_asset")
 
-    from src.services.audit_service import audit_service
+    from src.services.classification_audit_service import classification_audit_service as audit_service
     if hist_asset and hist_asset != "No assets available":
         # Show reclassification history
         try:

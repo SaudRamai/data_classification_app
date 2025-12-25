@@ -21,19 +21,17 @@ import time
 from datetime import datetime
 
 from src.ui.theme import apply_global_theme
-from src.services.label_service import get_label_service
 from src.services.tagging_service import tagging_service, ALLOWED_CLASSIFICATIONS
-from src.services.discovery_service import discovery_service
+from src.services.classification_pipeline_service import discovery_service
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
-from src.services.policy_enforcement_service import policy_enforcement_service
+from src.services.compliance_service import compliance_service
 from src.services.authorization_service import authz
-from src.services.system_classify_service import system_classify_service
-from src.services.dynamic_compliance_report_service import dynamic_compliance_report_service
+# Removed broken system_classify_service import
 from src.ui.quick_links import render_quick_links
 
-# Lazy init label service instance
-label_service = get_label_service()
+# Use tagging_service for label registry operations (backward-compatible alias)
+label_service = tagging_service
 
 # Page configuration
 st.set_page_config(

@@ -14,7 +14,7 @@ import streamlit as st
 import pandas as pd
 from src.ui.theme import apply_global_theme
 
-from src.services import nlp_compliance_service as _ncs  # provides AI policy parsing utilities
+from src.services.compliance_service import compliance_service as _ncs
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
 

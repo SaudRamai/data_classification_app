@@ -31,49 +31,6 @@ apply_global_theme()
 st.title("Data Intelligence")
 st.caption("Unified Quality and Lineage powered by Snowflake metadata and account usage views")
 
-# ------------- Asset Metrics Section -------------
-with st.container():
-    st.markdown("### 🎯 Data Classification Overview")
-    
-    try:
-        active_db = (
-            st.session_state.get("sf_database")
-            or getattr(settings, "SNOWFLAKE_DATABASE", None)
-            or "DATA_CLASSIFICATION_DB"
-        )
-        _SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
-        T_ASSETS = f"{active_db}.{_SCHEMA}.ASSETS"
-
-        counts = get_asset_counts(
-            assets_table=T_ASSETS,
-            where_clause="",
-            snowflake_connector=snowflake_connector
-        )
-        
-        # Display metrics in columns
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total Assets", f"{int(counts.get('total_assets', 0)):,}")
-            
-        with col2:
-            st.metric("Classified", f"{int(counts.get('classified_count', 0)):,}")
-            
-        with col3:
-            st.metric("Unclassified", f"{int(counts.get('unclassified_count', 0)):,}")
-            
-        with col4:
-            cov = counts.get('coverage_pct', 0)
-            cov_int = min(100, max(0, int(round(cov))))
-            st.metric("Classification Coverage", f"{cov_int}%")
-            
-    except Exception as e:
-        st.error(f"Error loading asset metrics: {str(e)}")
-        import traceback
-        st.error(f"Details: {traceback.format_exc()}")
-    
-    st.markdown("---")
-
 # Require Snowflake credentials before running any queries on this page
 _has_user = bool(st.session_state.get("sf_user") or getattr(settings, "SNOWFLAKE_USER", None))
 _has_account = bool(st.session_state.get("sf_account") or getattr(settings, "SNOWFLAKE_ACCOUNT", None))

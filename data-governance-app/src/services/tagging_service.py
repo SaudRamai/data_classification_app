@@ -57,7 +57,7 @@ def _load_allowed_values(connector, value_type: str) -> List[str]:
         print(f"Warning: Could not load allowed values for {value_type}: {str(e)}")
         return defaults.get(value_type, [])
 
-from src.services.governance_db_resolver import resolve_governance_db
+from src.services.governance_config_service import governance_config_service
 
 # Default fallback values
 DEFAULT_TAG_DB = "DATA_CLASSIFICATION_DB"
@@ -112,7 +112,7 @@ class TaggingService:
         """Resolve the database where tags are stored."""
         try:
             # Dynamically resolve governance DB (handles UI filters/session state)
-            config_db = resolve_governance_db()
+            config_db = governance_config_service.resolve_context().get('database')
             if config_db and str(config_db).upper() not in ('NONE', 'NULL', '', 'UNKNOWN'):
                 return config_db
             
@@ -716,4 +716,93 @@ class TaggingService:
         return suggestions
 
 
+    # --- Label Registry Management (Merged from LabelService) ---
+    def _ensure_label_registry(self) -> None:
+        try:
+            db = self.tag_db
+            schema = "DATA_CLASSIFICATION_GOVERNANCE"
+            table = "LABEL_REGISTRY"
+            self.connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {db}.{schema}")
+            self.connector.execute_non_query(
+                f"""
+                CREATE TABLE IF NOT EXISTS {db}.{schema}.{table} (
+                    LABEL_NAME STRING PRIMARY KEY,
+                    DESCRIPTION STRING,
+                    COLOR STRING,
+                    DEFAULT_C NUMBER,
+                    DEFAULT_I NUMBER,
+                    DEFAULT_A NUMBER,
+                    ENFORCEMENT_POLICY STRING
+                )
+                """
+            )
+            cnt_res = self.connector.execute_query(f"SELECT COUNT(*) AS C FROM {db}.{schema}.{table}")
+            if cnt_res and cnt_res[0]["C"] == 0:
+                self.seed_label_defaults()
+        except Exception as e:
+            logger.error(f"Failed ensuring label registry: {e}")
+
+    def seed_label_defaults(self) -> None:
+        db = self.tag_db
+        schema = "DATA_CLASSIFICATION_GOVERNANCE"
+        table = "LABEL_REGISTRY"
+        defaults = [
+            ("Public", "Low sensitivity data; open access", "#2ECC71", 0, 0, 0, "ROW_ACCESS=NONE;MASKING=NONE"),
+            ("Internal", "Company-internal data", "#F1C40F", 1, 1, 1, "ROW_ACCESS=STANDARD;MASKING=LIGHT"),
+            ("Restricted", "Sensitive business data", "#E67E22", 2, 2, 2, "ROW_ACCESS=STRICT;MASKING=STRONG"),
+            ("Confidential", "Highly sensitive data (PII/SOX)", "#E74C3C", 3, 3, 3, "ROW_ACCESS=VERY_STRICT;MASKING=MAX"),
+        ]
+        for name, desc, color, c, i, a, pol in defaults:
+            try:
+                self.connector.execute_non_query(
+                    f"""
+                    MERGE INTO {db}.{schema}.{table} t
+                    USING (SELECT %(n)s AS LABEL_NAME) s
+                    ON t.LABEL_NAME = s.LABEL_NAME
+                    WHEN NOT MATCHED THEN INSERT (LABEL_NAME, DESCRIPTION, COLOR, DEFAULT_C, DEFAULT_I, DEFAULT_A, ENFORCEMENT_POLICY)
+                    VALUES (%(n)s, %(d)s, %(col)s, %(c)s, %(i)s, %(a)s, %(p)s)
+                    """,
+                    {"n": name, "d": desc, "col": color, "c": c, "i": i, "a": a, "p": pol},
+                )
+            except Exception as e:
+                logger.warning(f"Failed seeding label {name}: {e}")
+
+    def list_labels(self) -> List[Dict[str, Any]]:
+        self._ensure_label_registry()
+        try:
+            db = self.tag_db
+            schema = "DATA_CLASSIFICATION_GOVERNANCE"
+            table = "LABEL_REGISTRY"
+            return self.connector.execute_query(f"SELECT * FROM {db}.{schema}.{table} ORDER BY LABEL_NAME")
+        except Exception as e:
+            logger.error(f"Failed listing labels: {e}")
+            return []
+
+    def upsert_label(self, label_name: str, description: str, color: str, default_c: int, default_i: int, default_a: int, policy: str) -> None:
+        db = self.tag_db
+        schema = "DATA_CLASSIFICATION_GOVERNANCE"
+        table = "LABEL_REGISTRY"
+        self.connector.execute_non_query(
+            f"""
+            MERGE INTO {db}.{schema}.{table} t
+            USING (SELECT %(n)s AS LABEL_NAME) s
+            ON t.LABEL_NAME = s.LABEL_NAME
+            WHEN MATCHED THEN UPDATE SET DESCRIPTION=%(d)s, COLOR=%(col)s, DEFAULT_C=%(c)s, DEFAULT_I=%(i)s, DEFAULT_A=%(a)s, ENFORCEMENT_POLICY=%(p)s
+            WHEN NOT MATCHED THEN INSERT (LABEL_NAME, DESCRIPTION, COLOR, DEFAULT_C, DEFAULT_I, DEFAULT_A, ENFORCEMENT_POLICY)
+            VALUES (%(n)s, %(d)s, %(col)s, %(c)s, %(i)s, %(a)s, %(p)s)
+            """,
+            {"n": label_name, "d": description, "col": color, "c": default_c, "i": default_i, "a": default_a, "p": policy},
+        )
+
+    def delete_label(self, label_name: str) -> None:
+        db = self.tag_db
+        schema = "DATA_CLASSIFICATION_GOVERNANCE"
+        table = "LABEL_REGISTRY"
+        self.connector.execute_non_query(
+            f"DELETE FROM {db}.{schema}.{table} WHERE LABEL_NAME = %(n)s",
+            {"n": label_name},
+        )
+
+
 tagging_service = TaggingService()
+label_service = tagging_service # Alias for backward compatibility

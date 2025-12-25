@@ -140,7 +140,7 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
         with col_b:
             if st.button("Suggest Classification", key=f"{key_prefix}_suggest", disabled=not fqtn):
                 try:
-                    from src.services.ai_classification_service import ai_classification_service
+                    from src.services.classification_pipeline_service import ai_classification_service
                     detections = ai_classification_service.detect_sensitive_columns(fqtn, sample_size=50)
                     cats = sorted({c for r in (detections or []) for c in (r.get('categories') or [])})
                     st.write({"detected_categories": cats})

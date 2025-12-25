@@ -1,8 +1,9 @@
-from typing import List, Optional, Dict, Any, Tuple
+﻿from typing import List, Optional, Dict, Any, Tuple
 import json
 from datetime import datetime
 import math
 import re
+import logging
 try:
     import numpy as _np  # optional
 except Exception:
@@ -10,8 +11,64 @@ except Exception:
 
 from src.connectors.snowflake_connector import snowflake_connector
 
+logger = logging.getLogger(__name__)
 
 class MetadataCatalogService:
+    def migrate_assets_table(self, database: str) -> None:
+        """Evolve ASSETS table schema to include BUSINESS_UNIT and REGULATORY columns."""
+        schema = "DATA_CLASSIFICATION_GOVERNANCE"
+        table = "ASSETS"
+        fqn = f"{database}.{schema}.{table}"
+        try:
+            cols = {r['COLUMN_NAME'] for r in self._q(f"SELECT COLUMN_NAME FROM {database}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA='{schema}' AND TABLE_NAME='{table}'")}
+            if 'BUSINESS_UNIT' not in cols:
+                self._x(f"ALTER TABLE {fqn} ADD COLUMN BUSINESS_UNIT STRING")
+            if 'REGULATORY' not in cols:
+                self._x(f"ALTER TABLE {fqn} ADD COLUMN REGULATORY STRING")
+            
+            # Backfill logic based on naming conventions and tags
+            self._x(f"""
+                UPDATE {fqn} 
+                SET BUSINESS_UNIT = CASE 
+                    WHEN ASSET_NAME LIKE 'FIN%%' THEN 'Finance'
+                    WHEN ASSET_NAME LIKE 'HR%%' THEN 'HR'
+                    WHEN ASSET_NAME LIKE 'SALES%%' THEN 'Sales'
+                    ELSE 'General'
+                END
+                WHERE BUSINESS_UNIT IS NULL
+            """)
+            self._x(f"""
+                UPDATE {fqn}
+                SET REGULATORY = CASE
+                    WHEN ASSET_NAME LIKE '%%PII%%' THEN 'GDPR'
+                    WHEN ASSET_NAME LIKE '%%SOX%%' THEN 'SOX'
+                    ELSE 'Internal'
+                END
+                WHERE REGULATORY IS NULL
+            """)
+        except Exception as e:
+            logger.error(f"Migration failed for {fqn}: {e}")
+
+    def get_filter_context(self) -> Dict[str, Any]:
+        """Resolves active filters from session state."""
+        import streamlit as st
+        return {
+            "database": st.session_state.get("active_database"),
+            "schema": st.session_state.get("active_schema"),
+            "warehouse": st.session_state.get("active_warehouse"),
+            "label": st.session_state.get("active_label"),
+            "owner": st.session_state.get("active_owner"),
+        }
+
+    def resolve_fqn(self, db: str, sc: str, obj: str) -> str:
+        return f'"{db}"."{sc}"."{obj}"'
+
+    def parse_fqn(self, fqn: str) -> Tuple[str, str, str]:
+        parts = fqn.split('.')
+        if len(parts) == 3:
+            return parts[0].strip('"'), parts[1].strip('"'), parts[2].strip('"')
+        raise ValueError(f"Invalid FQN: {fqn}")
+
     def __init__(self):
         self.sf = snowflake_connector
 
@@ -845,10 +902,25 @@ class MetadataCatalogService:
             if lab:
                 votes[lab] = votes.get(lab, 0.0) + float(sim)
             neighbors.append({"neighbor": f"{r.get('TABLE_CATALOG')}.{r.get('TABLE_SCHEMA')}.{r.get('TABLE_NAME')}.{r.get('COLUMN_NAME')}", "sim": round(float(sim),3), "label": lab})
-        suggestion = None
         if votes:
             suggestion = sorted(votes.items(), key=lambda kv: -kv[1])[0][0]
         return {"suggestion": suggestion, "neighbors": neighbors, "model": model}
+
+    def list_bu_mappings(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        db = self.sf.execute_query("SELECT CURRENT_DATABASE() AS DB")[0]["DB"]
+        sc = "DATA_CLASSIFICATION_GOVERNANCE"
+        tb = "BUSINESS_UNIT_MAP"
+        try:
+            self._x(f"CREATE TABLE IF NOT EXISTS {db}.{sc}.{tb} (FULL_NAME STRING, BUSINESS_UNIT STRING)")
+            return self._q(f"SELECT * FROM {db}.{sc}.{tb} ORDER BY FULL_NAME LIMIT {int(limit)}")
+        except Exception: return []
+
+    def upsert_bu_mapping(self, full_name: str, business_unit: str) -> None:
+        db = self.sf.execute_query("SELECT CURRENT_DATABASE() AS DB")[0]["DB"]
+        sc = "DATA_CLASSIFICATION_GOVERNANCE"
+        tb = "BUSINESS_UNIT_MAP"
+        self._x(f"DELETE FROM {db}.{sc}.{tb} WHERE UPPER(FULL_NAME) = UPPER(%(f)s)", {"f": full_name})
+        self._x(f"INSERT INTO {db}.{sc}.{tb} (FULL_NAME, BUSINESS_UNIT) VALUES (%(f)s, %(b)s)", {"f": full_name, "b": business_unit})
 
     def detect_schema_drift(self, table_fqn: str) -> Dict[str, Any]:
         """Detect added/removed columns vs last audit snapshot and suggest renames via embedding similarity."""
@@ -920,3 +992,10 @@ class MetadataCatalogService:
             except Exception:
                 pass
         return {"added": added, "removed": removed, "renamed": renames}
+
+metadata_catalog_service = MetadataCatalogService()
+asset_catalog_service = metadata_catalog_service
+asset_utils = metadata_catalog_service
+filter_context = metadata_catalog_service
+migration_service = metadata_catalog_service
+bu_map_service = metadata_catalog_service

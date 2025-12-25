@@ -36,7 +36,7 @@ import streamlit as st
 
 # Local project imports
 from src.connectors.snowflake_connector import snowflake_connector
-from src.services.governance_db_resolver import resolve_governance_db
+from src.services.governance_config_service import governance_config_service
 from src.config import settings
 
 
@@ -45,7 +45,7 @@ from src.config import settings
 def sf_get_active_db() -> Optional[str]:
     """Resolve the active governance database for audit queries."""
     try:
-        db = resolve_governance_db()
+        db = governance_config_service.resolve_context().get('database')
         if db:
             return db
     except Exception:

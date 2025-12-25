@@ -11,7 +11,7 @@ logging.getLogger('streamlit.runtime.scriptrunner.script_runner').setLevel(loggi
 
 # Add the project root to the Python path
 try:
-    _file = __file__
+    _file = str(__file__)
 except NameError:
     _file = "app.py"
 

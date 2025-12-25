@@ -6,7 +6,7 @@ import os
 
 # Add the project root (parent of 'src') to the Python path
 try:
-    _file = __file__
+    _file = str(__file__)
 except NameError:
     _file = "4_Compliance.py"
 _root = os.path.abspath(_file)

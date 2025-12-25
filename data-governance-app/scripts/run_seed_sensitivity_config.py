@@ -2,7 +2,7 @@ import os
 import sys
 import argparse
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(str(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
 from src.connectors.snowflake_connector import snowflake_connector  # type: ignore

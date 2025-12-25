@@ -9,7 +9,7 @@ import os
 
 # Add the project root (parent of 'src') to the Python path
 try:
-    _file = __file__
+    _file = str(__file__)
 except NameError:
     _file = "12_Policy_Guidance.py"
 _root = os.path.abspath(_file)

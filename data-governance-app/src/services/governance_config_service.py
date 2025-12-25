@@ -39,7 +39,7 @@ INVALID_DB_VALUES = {"NONE", "NULL", "UNKNOWN", "(NONE)"}
 
 # Constants for seeding
 SQL_FILE_DEFAULT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
+    os.path.dirname(os.path.dirname(os.path.dirname(str(__file__)))), 
     "sql", 
     "011_seed_sensitivity_config.sql"
 )

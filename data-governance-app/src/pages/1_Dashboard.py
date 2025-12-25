@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 import io
 
 # Ensure project root is on path for imports
-_here = os.path.abspath(__file__)
+_here = os.path.abspath(str(__file__))
 _src_dir = os.path.dirname(os.path.dirname(_here))  # .../src
 _project_root = os.path.dirname(_src_dir)
 if _project_root not in sys.path:

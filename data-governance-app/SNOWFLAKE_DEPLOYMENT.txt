@@ -1,0 +1,39 @@
+# Snowflake Deployment Report: Data Governance App
+
+The repository has been refactored and is now fully compatible with Streamlit in Snowflake (SiS). The following changes ensure that the application handles authentication, data access, and environment constraints within Snowflake seamlessly.
+
+## Key Changes for Snowflake Compatibility
+
+1. Snowflake Session Management
+- Centralized Session Utility: The SnowflakeConnector in src/connectors/snowflake_connector.py now identifies if it is running inside Snowflake.
+- Active Session Priority: It uses snowflake.snowpark.context.get_active_session() as the primary connection method.
+- Improved Data Execution: execute_query and execute_non_query now support Snowpark sessions, with automatic conversion of Rows to dictionaries.
+
+2. Authentication and Navigation
+- Auto-Login: src/app.py has been updated to automatically sign in the user based on their active Snowflake session.
+- SSO/Login Bypass: The manual login screen is automatically bypassed when a Snowflake session is detected.
+
+3. Environment Configuration
+- environment.yml Created: A specialized environment file was created with necessary dependencies for Snowflake Conda.
+- Filesystem Adapters: src/app.py now configures caching to use the /tmp directory.
+
+4. Dependency Handling
+- Graceful Fallbacks: AI services have been verified to have fallbacks when internet access is unavailable.
+
+---
+
+## Deployment Instructions
+
+Step 1: Upload Files to a Snowflake Stage
+Upload the entire contents of the data-governance-app directory to a Snowflake internal stage.
+
+Step 2: Create the Streamlit App
+Run the following SQL command:
+
+CREATE STREAMLIT DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.GOVERNANCE_APP
+ROOT_LOCATION = '@DATA_CLASSIFICATION_DB.PUBLIC.APP_STAGE'
+MAIN_FILE = 'app.py'
+QUERY_WAREHOUSE = 'YOUR_WAREHOUSE_NAME';
+
+Step 3: Grant Access
+GRANT USAGE ON STREAMLIT DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.GOVERNANCE_APP TO ROLE YOUR_ROLE;

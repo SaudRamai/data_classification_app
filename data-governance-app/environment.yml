@@ -1,0 +1,20 @@
+name: data_governance_app
+channels:
+  - snowflake
+dependencies:
+  - python=3.10
+  - streamlit
+  - snowflake-snowpark-python
+  - snowflake-connector-python
+  - pandas
+  - numpy
+  - scikit-learn
+  - pydantic
+  - pydantic-settings
+  - sqlalchemy
+  - loguru
+  - cryptography
+  - plotly
+  - altair
+  - openpyxl
+  - requests

@@ -5,10 +5,17 @@ Snowflake connector module with improved security and connection management.
 import snowflake.connector
 from snowflake.connector import DictCursor
 from snowflake.connector.errors import DatabaseError, InterfaceError
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import logging
 from contextlib import contextmanager
 import os
+
+try:
+    from snowflake.snowpark.context import get_active_session
+    from snowflake.snowpark.session import Session
+except ImportError:
+    get_active_session = None
+    Session = None
 
 from src.config.settings import settings
 try:
@@ -29,7 +36,28 @@ else:
 logger = logging.getLogger(__name__)
 
 class SnowflakeConnector:
-    """Snowflake connector with connection pooling and secure credential management."""
+    """Snowflake connector with support for Snowpark (SiS) and standard python connector."""
+
+    @staticmethod
+    def is_sis() -> bool:
+        """Check if running inside Snowflake Streamlit (SiS)."""
+        try:
+            if get_active_session:
+                get_active_session()
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def get_active_session() -> Optional[Any]:
+        """Returns the active Snowpark session if available."""
+        if get_active_session:
+            try:
+                return get_active_session()
+            except Exception:
+                return None
+        return None
 
     @staticmethod
     def _normalize_account(acct: str) -> str:
@@ -266,6 +294,34 @@ class SnowflakeConnector:
         Returns:
             List of query results
         """
+        # Try active session (SiS) first
+        session = self.get_active_session()
+        if session:
+            try:
+                # Snowpark session.sql doesn't support %(param)s syntax directly in the same way 
+                # as the connector unless we use .call or formatted strings carefully.
+                # Heuristic: if params exist, we might need the traditional connector or bind variables.
+                # However, for SiS, we typically use session.sql with f-strings or bind variables.
+                if params:
+                    # Simple parameter replacement for common cases (best-effort)
+                    formatted_query = query
+                    for k, v in params.items():
+                        # Basic replacement - sensitive to SQL injection if not used carefully, 
+                        # but SiS is inherently more secure. Ideally use bind variables.
+                        placeholder = f"%({k})s"
+                        if placeholder in formatted_query:
+                            val = f"'{v}'" if isinstance(v, str) else str(v)
+                            formatted_query = formatted_query.replace(placeholder, val)
+                    df = session.sql(formatted_query)
+                else:
+                    df = session.sql(query)
+                
+                # Convert Snowpark Rows to dictionaries
+                return [row.as_dict() for row in df.collect()]
+            except Exception as e:
+                logger.error(f"SiS Error executing query: {e}")
+                raise
+
         conn = None
         cursor = None
         tried_reconnect = False
@@ -320,6 +376,31 @@ class SnowflakeConnector:
         Returns:
             Number of affected rows
         """
+        # Try active session (SiS) first
+        session = self.get_active_session()
+        if session:
+            try:
+                if params:
+                    formatted_query = query
+                    for k, v in params.items():
+                        placeholder = f"%({k})s"
+                        if placeholder in formatted_query:
+                            val = f"'{v}'" if isinstance(v, str) else str(v)
+                            formatted_query = formatted_query.replace(placeholder, val)
+                    res = session.sql(formatted_query).collect()
+                else:
+                    res = session.sql(query).collect()
+                # Best effort at returning row count; session.sql doesn't always provide it cleanly for all queries
+                try:
+                    if res and len(res) > 0 and 'number of rows updated' in str(res[0]).lower():
+                        return int(list(res[0].as_dict().values())[0])
+                    return len(res)
+                except Exception:
+                    return 1
+            except Exception as e:
+                logger.error(f"SiS Error executing non-query: {e}")
+                raise
+
         conn = None
         cursor = None
         tried_reconnect = False

@@ -126,7 +126,32 @@ class AuthorizationService:
             return None
 
     def get_current_identity(self) -> Identity:
-        # Try per-user session connection first
+        # Try active Snowpark session (SiS) first
+        session = snowflake_connector.get_active_session()
+        if session:
+            try:
+                # In SiS, we can get current user and role directly from SQL
+                meta = snowflake_connector.execute_query("SELECT CURRENT_USER() AS USERNAME, CURRENT_ROLE() AS ROLE")
+                user = (meta[0].get("USERNAME") if meta else None) or ""
+                current_role = (meta[0].get("ROLE") if meta else None) or ""
+                
+                # Fetch roles
+                roles: Set[str] = {current_role}
+                try:
+                    # SHOW GRANTS TO USER can be restricted; fallback to current_role only if it fails
+                    show_rows = snowflake_connector.execute_query(f"SHOW GRANTS TO USER \"{user}\"") or []
+                    for r in show_rows:
+                        role_name = r.get("role") or r.get("ROLE") or r.get("ROLE_NAME") or r.get("GRANTED_ROLE")
+                        if role_name:
+                            roles.add(str(role_name))
+                except Exception:
+                    pass
+                
+                return Identity(user=user, current_role=current_role, roles=roles)
+            except Exception as e:
+                logger.warning(f"Failed to get identity via SiS session: {e}")
+
+        # Try per-user session connection (for local/standalone mode)
         conn = self._session_connection()
         if conn is not None:
             try:

@@ -26,9 +26,36 @@ from src.services.authorization_service import authz
 from src.services.oidc_service import oidc_service
 from src.connectors.snowflake_connector import snowflake_connector
 
+# Snowflake SiS Environment Setup
+if snowflake_connector.is_sis():
+    # Set up caching for libraries that use local storage
+    # SiS has a read-only filesystem except for /tmp
+    for env_var in ['TRANSFORMERS_CACHE', 'HF_HOME', 'MPLCONFIGDIR', 'NLTK_DATA']:
+        if not os.environ.get(env_var):
+            tmp_path = "/tmp/" + env_var.lower()
+            os.makedirs(tmp_path, exist_ok=True)
+            os.environ[env_var] = tmp_path
+
 # Initialize session state
 if 'user' not in st.session_state:
     st.session_state.user = None
+
+# Auto-login for Snowflake SiS
+if st.session_state.user is None and snowflake_connector.is_sis():
+    try:
+        ident = authz.get_current_identity()
+        if ident and ident.user:
+            st.session_state.user = User(
+                id=f"sf_{ident.user}",
+                username=ident.user,
+                email=f"{ident.user}@snowflake",
+                role=ident.current_role or "",
+                created_at=datetime.utcnow(),
+            )
+            # Re-initialize connector if needed
+            logger.info(f"Auto-logged in as {ident.user} via SiS")
+    except Exception as e:
+        logger.warning(f"SiS auto-login failed: {e}")
 
 # Page configuration
 st.set_page_config(

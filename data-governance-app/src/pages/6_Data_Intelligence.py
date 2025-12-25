@@ -1,5 +1,6 @@
 import os
 import sys
+import pathlib
 import random
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,19 +14,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 import re
 
-# Add the project root (parent of 'src') to the Python path
-try:
-    _file = str(__file__)
-except NameError:
-    _file = "6_Data_Intelligence.py"
-_root = os.path.abspath(_file)
-_dir = os.path.dirname(_root)
+# Add the project root to the Python path
+_here = pathlib.Path(str(__file__)).resolve()
+_dir = _here.parent
+# Traverse up to find directory containing 'src'
 for _ in range(3):
-    if os.path.exists(os.path.join(_dir, "src")):
-        if _dir not in sys.path:
-            sys.path.insert(0, _dir)
+    if (_dir / "src").exists():
+        if str(_dir) not in sys.path:
+            sys.path.insert(0, str(_dir))
         break
-    _dir = os.path.dirname(_dir)
+    _dir = _dir.parent
 
 from src.ui.theme import apply_global_theme
 from src.connectors.snowflake_connector import snowflake_connector

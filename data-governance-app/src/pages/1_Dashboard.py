@@ -1,5 +1,6 @@
 import os
 import sys
+import pathlib
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple, Set
 
@@ -12,11 +13,16 @@ import plotly.graph_objects as go
 import io
 
 # Ensure project root is on path for imports
-_here = os.path.abspath(str(__file__))
-_src_dir = os.path.dirname(os.path.dirname(_here))  # .../src
-_project_root = os.path.dirname(_src_dir)
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
+_here = pathlib.Path(str(__file__)).resolve()
+_dir = _here.parent
+# Traverse up to find directory containing 'src'
+for _ in range(3):
+    if (_dir / "src").exists():
+        if str(_dir) not in sys.path:
+            sys.path.insert(0, str(_dir))
+        break
+    _dir = _dir.parent
+_project_root = str(_dir)
 
 from src.connectors.snowflake_connector import snowflake_connector
 from src.ui.theme import apply_global_theme

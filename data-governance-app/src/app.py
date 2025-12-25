@@ -5,27 +5,24 @@ import sys
 import os
 import pathlib
 import logging
+from datetime import datetime
 
 # Suppress Streamlit's ScriptRunContext warning
 logging.getLogger('streamlit.runtime.scriptrunner.script_runner').setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
 
 # Add the project root to the Python path
-try:
-    _file = str(__file__)
-except NameError:
-    _file = "app.py"
-
-_root = os.path.abspath(_file)
+_here = pathlib.Path(str(__file__)).resolve()
+_dir = _here.parent
 # Traverse up to find directory containing 'src'
-_dir = os.path.dirname(_root)
 _found_root = False
-for _ in range(3): # Check current, parent, grandparent
-    if os.path.exists(os.path.join(_dir, "src")):
-        if _dir not in sys.path:
-            sys.path.insert(0, _dir)
+for _ in range(3):
+    if (_dir / "src").exists():
+        if str(_dir) not in sys.path:
+            sys.path.insert(0, str(_dir))
         _found_root = True
         break
-    _dir = os.path.dirname(_dir)
+    _dir = _dir.parent
 
 import streamlit as st
 import plotly.io as pio

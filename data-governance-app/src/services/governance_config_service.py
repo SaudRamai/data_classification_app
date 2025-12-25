@@ -20,6 +20,7 @@ import logging
 import json
 import os
 import re
+import pathlib
 from typing import Any, Dict, Optional, List, Iterable
 
 try:
@@ -38,11 +39,8 @@ EXPECTED_TABLES = ("ASSETS", "CLASSIFICATION_HISTORY", "RECLASSIFICATION_REQUEST
 INVALID_DB_VALUES = {"NONE", "NULL", "UNKNOWN", "(NONE)"}
 
 # Constants for seeding
-SQL_FILE_DEFAULT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(str(__file__)))), 
-    "sql", 
-    "011_seed_sensitivity_config.sql"
-)
+_here = pathlib.Path(str(__file__)).resolve()
+SQL_FILE_DEFAULT = str(_here.parent.parent.parent / "sql" / "011_seed_sensitivity_config.sql")
 SEED_TABLES = [
     "SENSITIVE_PATTERNS",
     "SENSITIVE_KEYWORDS",

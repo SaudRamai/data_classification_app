@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import sys
+import pathlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
@@ -27,11 +28,10 @@ import pandas as pd
 import streamlit as st
 
 # Ensure project root on path for `src.*` imports when running as a Streamlit page
-_here = os.path.abspath(str(__file__))
-_src_dir = os.path.dirname(os.path.dirname(_here))  # .../src
-_project_root = os.path.dirname(_src_dir)
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
+_here = pathlib.Path(str(__file__)).resolve()
+_project_root = _here.parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 # Services and connectors (best-effort imports)
 try:

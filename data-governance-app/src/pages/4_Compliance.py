@@ -5,11 +5,18 @@ import sys
 import os
 
 # Add the project root (parent of 'src') to the Python path
-_here = os.path.abspath(__file__)
-_src_dir = os.path.dirname(os.path.dirname(_here))
-_project_root = os.path.dirname(_src_dir)
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
+try:
+    _file = __file__
+except NameError:
+    _file = "4_Compliance.py"
+_root = os.path.abspath(_file)
+_dir = os.path.dirname(_root)
+for _ in range(3):
+    if os.path.exists(os.path.join(_dir, "src")):
+        if _dir not in sys.path:
+            sys.path.insert(0, _dir)
+        break
+    _dir = os.path.dirname(_dir)
 
 import streamlit as st
 import pandas as pd

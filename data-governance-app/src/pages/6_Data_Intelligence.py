@@ -13,12 +13,19 @@ import plotly.express as px
 import plotly.graph_objects as go
 import re
 
-# Ensure project root on path
-_here = os.path.abspath(__file__)
-_src_dir = os.path.dirname(os.path.dirname(_here))
-_project_root = os.path.dirname(_src_dir)
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
+# Add the project root (parent of 'src') to the Python path
+try:
+    _file = __file__
+except NameError:
+    _file = "6_Data_Intelligence.py"
+_root = os.path.abspath(_file)
+_dir = os.path.dirname(_root)
+for _ in range(3):
+    if os.path.exists(os.path.join(_dir, "src")):
+        if _dir not in sys.path:
+            sys.path.insert(0, _dir)
+        break
+    _dir = os.path.dirname(_dir)
 
 from src.ui.theme import apply_global_theme
 from src.connectors.snowflake_connector import snowflake_connector

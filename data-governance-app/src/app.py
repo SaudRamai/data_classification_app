@@ -10,31 +10,51 @@ import logging
 logging.getLogger('streamlit.runtime.scriptrunner.script_runner').setLevel(logging.ERROR)
 
 # Add the project root to the Python path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    _file = __file__
+except NameError:
+    _file = "app.py"
 
-# Do NOT load a local .env file; secrets must come from environment or a secrets manager.
+_root = os.path.abspath(_file)
+# Traverse up to find directory containing 'src'
+_dir = os.path.dirname(_root)
+_found_root = False
+for _ in range(3): # Check current, parent, grandparent
+    if os.path.exists(os.path.join(_dir, "src")):
+        if _dir not in sys.path:
+            sys.path.insert(0, _dir)
+        _found_root = True
+        break
+    _dir = os.path.dirname(_dir)
 
 import streamlit as st
 import plotly.io as pio
 import plotly.graph_objects as go
-from src.ui.theme import apply_global_theme
-from src.components.filters import render_data_filters
-from datetime import datetime
-from src.config.settings import settings
-from src.models.data_models import User
-from src.services.authorization_service import authz
-from src.services.oidc_service import oidc_service
-from src.connectors.snowflake_connector import snowflake_connector
+try:
+    from src.ui.theme import apply_global_theme
+    from src.components.filters import render_data_filters
+    from src.config.settings import settings
+    from src.models.data_models import User
+    from src.services.authorization_service import authz
+    from src.services.oidc_service import oidc_service
+    from src.connectors.snowflake_connector import snowflake_connector
+except ImportError as e:
+    st.error(f"Import error: {e}. Check directory structure.")
+    st.stop()
 
 # Snowflake SiS Environment Setup
 if snowflake_connector.is_sis():
     # Set up caching for libraries that use local storage
     # SiS has a read-only filesystem except for /tmp
     for env_var in ['TRANSFORMERS_CACHE', 'HF_HOME', 'MPLCONFIGDIR', 'NLTK_DATA']:
-        if not os.environ.get(env_var):
-            tmp_path = "/tmp/" + env_var.lower()
-            os.makedirs(tmp_path, exist_ok=True)
-            os.environ[env_var] = tmp_path
+        try:
+            if not os.environ.get(env_var):
+                tmp_path = os.path.join("/tmp", env_var.lower())
+                if not os.path.exists(tmp_path):
+                    os.makedirs(tmp_path, exist_ok=True)
+                os.environ[env_var] = str(tmp_path)
+        except Exception:
+            pass # Non-critical if some env vars fail to set
 
 # Initialize session state
 if 'user' not in st.session_state:

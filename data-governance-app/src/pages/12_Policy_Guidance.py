@@ -7,8 +7,19 @@ from src.ui.quick_links import render_quick_links
 import sys
 import os
 
-# Add the project root to the Python path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add the project root (parent of 'src') to the Python path
+try:
+    _file = __file__
+except NameError:
+    _file = "12_Policy_Guidance.py"
+_root = os.path.abspath(_file)
+_dir = os.path.dirname(_root)
+for _ in range(3):
+    if os.path.exists(os.path.join(_dir, "src")):
+        if _dir not in sys.path:
+            sys.path.insert(0, _dir)
+        break
+    _dir = os.path.dirname(_dir)
 
 import streamlit as st
 import pandas as pd

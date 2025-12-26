@@ -76,6 +76,12 @@ except ImportError as e:
     st.error(f"Import error: {e}. Check directory structure.")
     st.stop()
 
+# Page configuration
+st.set_page_config(
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 # Snowflake SiS Environment Setup
 if snowflake_connector.is_sis():
     # Set up caching for libraries that use local storage
@@ -111,11 +117,7 @@ if st.session_state.user is None and snowflake_connector.is_sis():
     except Exception as e:
         logger.warning(f"SiS auto-login failed: {e}")
 
-# Page configuration
-st.set_page_config(
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+
 
 # Apply centralized global theme (fonts, CSS variables, Plotly template)
 apply_global_theme()

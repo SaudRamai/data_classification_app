@@ -4072,7 +4072,7 @@ if False:
             
             st.dataframe(
                 pd.DataFrame(summary_data),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
             
@@ -4093,7 +4093,7 @@ if False:
                     if col_details:
                         st.dataframe(
                             pd.DataFrame(col_details),
-                            use_container_width=True,
+                            width='stretch',
                             hide_index=True
                         )
                     else:
@@ -7086,7 +7086,7 @@ def _ai_assistance_panel():
         tdf[[
             'Table Name','Detected Sensitivity Types','AI_C','AI_I','AI_A','Compliance'
         ]],
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
     )
 
@@ -7118,7 +7118,7 @@ def _ai_assistance_panel():
     st.markdown("### Column-Level Detection (live)")
     st.dataframe(
         cols_df,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
     )
     # Only show live detection; skip legacy editing UI
@@ -7135,7 +7135,7 @@ def _ai_assistance_panel():
         st.markdown("**Table-level Classification (editable)**")
         table_edit = st.data_editor(
             pd.DataFrame([{'Table Name': sel_tbl, 'Label': tLabel, 'C': tC, 'I': tI, 'A': tA}]),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             num_rows="fixed",
             column_config={
@@ -9230,7 +9230,7 @@ with tab1:
         edited_df = st.data_editor(
             df_grid,
             num_rows="dynamic",
-            use_container_width=True,
+            width='stretch',
             column_config=editor_conf,
             disabled=["Column","Type","Suggested Label","Current Tags"],
             key="col_editor",

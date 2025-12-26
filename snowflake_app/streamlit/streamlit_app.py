@@ -12,17 +12,49 @@ logging.getLogger('streamlit.runtime.scriptrunner.script_runner').setLevel(loggi
 logger = logging.getLogger(__name__)
 
 # Add the project root to the Python path
-_here = pathlib.Path(str(__file__)).resolve()
-_dir = _here.parent
-# Traverse up to find directory containing 'src'
+# In Snowflake SiS, __file__ may point to /tmp/app@ost/ or similar staging directory
+# We need to handle this by checking both __file__ location and current working directory
 _found_root = False
-for _ in range(3):
-    if (_dir / "src").exists():
-        if str(_dir) not in sys.path:
-            sys.path.insert(0, str(_dir))
-        _found_root = True
-        break
-    _dir = _dir.parent
+
+try:
+    # First try: use __file__ to find src
+    _here = pathlib.Path(str(__file__)).resolve()
+    _dir = _here.parent
+    
+    # Traverse up to find directory containing 'src'
+    for _ in range(5):  # Increased range for deeper nesting
+        if (_dir / "src").exists():
+            if str(_dir) not in sys.path:
+                sys.path.insert(0, str(_dir))
+            _found_root = True
+            logger.info(f"Found src directory at: {_dir}")
+            break
+        _dir = _dir.parent
+except Exception as e:
+    logger.warning(f"Failed to resolve path from __file__: {e}")
+
+# Fallback: try current working directory
+if not _found_root:
+    try:
+        _cwd = pathlib.Path(os.getcwd()).resolve()
+        if (_cwd / "src").exists():
+            if str(_cwd) not in sys.path:
+                sys.path.insert(0, str(_cwd))
+            _found_root = True
+            logger.info(f"Found src directory at cwd: {_cwd}")
+        # Also try parent of cwd
+        elif (_cwd.parent / "src").exists():
+            if str(_cwd.parent) not in sys.path:
+                sys.path.insert(0, str(_cwd.parent))
+            _found_root = True
+            logger.info(f"Found src directory at parent of cwd: {_cwd.parent}")
+    except Exception as e:
+        logger.warning(f"Failed to resolve path from cwd: {e}")
+
+# Final check: warn if src directory was never found
+if not _found_root:
+    logger.error(f"Could not find 'src' directory. __file__={__file__}, cwd={os.getcwd()}")
+    logger.error(f"sys.path={sys.path}")
 
 import streamlit as st
 import plotly.io as pio
@@ -219,7 +251,7 @@ def _login_section():
     # Place Login button centered directly under inputs using columns
     _lc1, _lc2, _lc3 = st.columns([1, 2, 1])
     with _lc2:
-        _login_clicked = st.button("Login", type="primary", use_container_width=False)
+        _login_clicked = st.button("Login", type="primary", width='content')
     if _login_clicked:
         if not (acct and user):
             st.error("Please provide Account and User")
@@ -608,13 +640,13 @@ else:
     st.markdown("**Quick Links**")
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("Dashboard", use_container_width=True):
+        if st.button("Dashboard", width='stretch'):
             try:
                 st.switch_page("pages/1_Dashboard.py")
             except Exception:
                 st.rerun()
     with c2:
-        if can_data and st.button("Data Assets", use_container_width=True):
+        if can_data and st.button("Data Assets", width='stretch'):
             try:
                 st.switch_page("pages/2_Data_Assets.py")
             except Exception:
@@ -622,14 +654,14 @@ else:
         elif not can_data:
             st.caption("")
     with c3:
-        if can_classify and st.button("Classification", use_container_width=True):
+        if can_classify and st.button("Classification", width='stretch'):
             try:
                 st.switch_page("pages/3_Classification.py")
             except Exception:
                 st.rerun()
         elif not can_classify:
             st.caption("")
-        if can_compliance and st.button("Compliance", use_container_width=True):
+        if can_compliance and st.button("Compliance", width='stretch'):
             try:
                 st.switch_page("pages/4_Compliance.py")
             except Exception:
@@ -638,7 +670,7 @@ else:
             st.caption("")
     c3, c4 = st.columns(2)
     with c3:
-        if can_discovery and st.button("Data Discovery", use_container_width=True):
+        if can_discovery and st.button("Data Discovery", width='stretch'):
             try:
                 # Redirect to the unified Classification module (Discovery tab lives there)
                 st.switch_page("pages/3_Classification.py")
@@ -647,7 +679,7 @@ else:
         elif not can_discovery:
             st.caption("")
     with c4:
-        if can_admin and st.button("Administration", use_container_width=True):
+        if can_admin and st.button("Administration", width='stretch'):
             try:
                 st.switch_page("pages/10_Administration.py")
             except Exception:

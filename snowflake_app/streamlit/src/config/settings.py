@@ -106,3 +106,16 @@ _ensure_dev_defaults()
 
 # Create settings instance
 settings = Settings()
+
+# Post-initialization cleanup for environment-injected 'NONE' values
+for key in (
+    "SNOWFLAKE_ACCOUNT",
+    "SNOWFLAKE_USER",
+    "SNOWFLAKE_PASSWORD",
+    "SNOWFLAKE_WAREHOUSE",
+    "SNOWFLAKE_DATABASE",
+    "SNOWFLAKE_SCHEMA",
+):
+    val = getattr(settings, key, None)
+    if val and str(val).strip().upper() in ("NONE", "NULL", "(NONE)", "UNKNOWN", ""):
+        setattr(settings, key, None)

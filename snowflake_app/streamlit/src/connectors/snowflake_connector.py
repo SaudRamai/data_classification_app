@@ -10,6 +10,10 @@ import logging
 from contextlib import contextmanager
 import os
 
+class CredentialsMissingError(ValueError):
+    """Raised when Snowflake credentials are missing."""
+    pass
+
 try:
     from snowflake.snowpark.context import get_active_session
     from snowflake.snowpark.session import Session
@@ -278,7 +282,7 @@ class SnowflakeConnector:
         
         # Final validation: ensure we have at least account and user
         if not params.get("account") or not params.get("user"):
-            raise ValueError("Snowflake connection failed: 'account' or 'user' is missing. "
+            raise CredentialsMissingError("Snowflake connection failed: 'account' or 'user' is missing. "
                              "Please provide credentials via .env file or sign in via the UI.")
                              
         # Use cached connection factory
@@ -360,7 +364,12 @@ class SnowflakeConnector:
                 else:
                     cursor.execute(query)
                 return cursor.fetchall()
-            logger.error(f"Error executing query: {e}")
+            if isinstance(e, CredentialsMissingError):
+                # We skip logging this as an Error since it's a common startup state 
+                # before the user logs in. Components should handle empty results.
+                logger.debug(f"{e}")
+            else:
+                logger.error(f"Error executing query: {e}")
             raise
         finally:
             try:
@@ -437,7 +446,10 @@ class SnowflakeConnector:
                 else:
                     cursor.execute(query)
                 return cursor.rowcount
-            logger.error(f"Error executing statement: {e}")
+            if isinstance(e, CredentialsMissingError):
+                logger.debug(f"{e}")
+            else:
+                logger.error(f"Error executing statement: {e}")
             raise
         finally:
             try:
@@ -484,7 +496,10 @@ class SnowflakeConnector:
                 cursor = conn.cursor()
                 cursor.executemany(query, params)
                 return cursor.rowcount
-            logger.error(f"Error executing batch: {e}")
+            if isinstance(e, CredentialsMissingError):
+                logger.debug(f"{e}")
+            else:
+                logger.error(f"Error executing batch: {e}")
             raise
         finally:
             try:

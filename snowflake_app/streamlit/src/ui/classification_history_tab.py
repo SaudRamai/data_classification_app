@@ -143,7 +143,7 @@ def render_classification_history_tab(key_prefix: str = "cm_hist") -> None:
         }
     )
 
-    st.dataframe(display_df, use_container_width=True)
+    st.dataframe(display_df, width='stretch')
 
     # CSV download
     try:

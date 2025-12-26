@@ -1,0 +1,12 @@
+manifest_version: 1
+artifacts:
+  setup_script: setup.sql
+  default_streamlit:
+    name: DATA_GOVERNANCE_APP
+    directory: streamlit
+    main_file: app.py
+
+# Define application roles
+application_roles:
+  app_public:
+    description: Public role for the application

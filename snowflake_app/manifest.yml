@@ -4,7 +4,7 @@ artifacts:
   default_streamlit:
     name: DATA_GOVERNANCE_APP
     directory: streamlit
-    main_file: app.py
+    main_file: streamlit_app.py
 
 # Define application roles
 application_roles:

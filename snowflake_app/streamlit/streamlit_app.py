@@ -12,50 +12,47 @@ logging.getLogger('streamlit.runtime.scriptrunner.script_runner').setLevel(loggi
 logger = logging.getLogger(__name__)
 
 # Add the project root to the Python path
-# In Snowflake SiS, the structure is: /tmp/appRoot/streamlit_app.py and /tmp/appRoot/src/
-# So src is a sibling directory to streamlit_app.py
-_found_root = False
+# In Snowflake SiS, the structure is flattened or mounted specifically.
+# We use os.path for robustness.
+import os
+import sys
 
+_found_root = False
 try:
-    # First try: use __file__ to find src (it should be in the same directory)
-    _here = pathlib.Path(str(__file__)).resolve()
-    _app_dir = _here.parent  # This is the directory containing streamlit_app.py
+    # Use os.path.abspath(__file__) to get the current script location
+    _here = os.path.abspath(__file__)
+    _app_dir = os.path.dirname(_here)
     
-    # Check if src exists as a sibling (same directory level)
-    if (_app_dir / "src").exists():
-        if str(_app_dir) not in sys.path:
-            sys.path.insert(0, str(_app_dir))
+    # Check for 'src' in the same directory
+    _src_path = os.path.join(_app_dir, "src")
+    if os.path.exists(_src_path):
+        if _app_dir not in sys.path:
+            sys.path.insert(0, _app_dir)
         _found_root = True
         logger.info(f"Found src directory at: {_app_dir}")
     else:
-        # Fallback: traverse up to find directory containing 'src'
-        _dir = _app_dir.parent
-        for _ in range(5):
-            if (_dir / "src").exists():
-                if str(_dir) not in sys.path:
-                    sys.path.insert(0, str(_dir))
+        # Fallback: traverse up a few levels (useful for local dev vs deployed)
+        _dir = os.path.dirname(_app_dir)
+        for _ in range(3):
+            if os.path.exists(os.path.join(_dir, "src")):
+                if _dir not in sys.path:
+                    sys.path.insert(0, _dir)
                 _found_root = True
                 logger.info(f"Found src directory at: {_dir}")
                 break
-            _dir = _dir.parent
+            _dir = os.path.dirname(_dir)
 except Exception as e:
-    logger.warning(f"Failed to resolve path from __file__: {e}")
+    logger.warning(f"Failed to resolve path: {e}")
 
 # Fallback: try current working directory
 if not _found_root:
     try:
-        _cwd = pathlib.Path(os.getcwd()).resolve()
-        if (_cwd / "src").exists():
-            if str(_cwd) not in sys.path:
-                sys.path.insert(0, str(_cwd))
+        _cwd = os.getcwd()
+        if os.path.exists(os.path.join(_cwd, "src")):
+            if _cwd not in sys.path:
+                sys.path.insert(0, _cwd)
             _found_root = True
             logger.info(f"Found src directory at cwd: {_cwd}")
-        # Also try parent of cwd
-        elif (_cwd.parent / "src").exists():
-            if str(_cwd.parent) not in sys.path:
-                sys.path.insert(0, str(_cwd.parent))
-            _found_root = True
-            logger.info(f"Found src directory at parent of cwd: {_cwd.parent}")
     except Exception as e:
         logger.warning(f"Failed to resolve path from cwd: {e}")
 

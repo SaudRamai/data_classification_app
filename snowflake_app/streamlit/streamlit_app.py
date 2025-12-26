@@ -12,24 +12,32 @@ logging.getLogger('streamlit.runtime.scriptrunner.script_runner').setLevel(loggi
 logger = logging.getLogger(__name__)
 
 # Add the project root to the Python path
-# In Snowflake SiS, __file__ may point to /tmp/app@ost/ or similar staging directory
-# We need to handle this by checking both __file__ location and current working directory
+# In Snowflake SiS, the structure is: /tmp/appRoot/streamlit_app.py and /tmp/appRoot/src/
+# So src is a sibling directory to streamlit_app.py
 _found_root = False
 
 try:
-    # First try: use __file__ to find src
+    # First try: use __file__ to find src (it should be in the same directory)
     _here = pathlib.Path(str(__file__)).resolve()
-    _dir = _here.parent
+    _app_dir = _here.parent  # This is the directory containing streamlit_app.py
     
-    # Traverse up to find directory containing 'src'
-    for _ in range(5):  # Increased range for deeper nesting
-        if (_dir / "src").exists():
-            if str(_dir) not in sys.path:
-                sys.path.insert(0, str(_dir))
-            _found_root = True
-            logger.info(f"Found src directory at: {_dir}")
-            break
-        _dir = _dir.parent
+    # Check if src exists as a sibling (same directory level)
+    if (_app_dir / "src").exists():
+        if str(_app_dir) not in sys.path:
+            sys.path.insert(0, str(_app_dir))
+        _found_root = True
+        logger.info(f"Found src directory at: {_app_dir}")
+    else:
+        # Fallback: traverse up to find directory containing 'src'
+        _dir = _app_dir.parent
+        for _ in range(5):
+            if (_dir / "src").exists():
+                if str(_dir) not in sys.path:
+                    sys.path.insert(0, str(_dir))
+                _found_root = True
+                logger.info(f"Found src directory at: {_dir}")
+                break
+            _dir = _dir.parent
 except Exception as e:
     logger.warning(f"Failed to resolve path from __file__: {e}")
 

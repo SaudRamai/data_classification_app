@@ -101,7 +101,7 @@ class AuthorizationService:
             # Optional settings
             if wh:
                 params["warehouse"] = wh
-            if db:
+            if db and str(db).strip().upper() not in ("NONE", "NULL", "(NONE)", "UNKNOWN", ""):
                 params["database"] = db
             if sc:
                 params["schema"] = sc

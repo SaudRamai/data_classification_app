@@ -520,7 +520,7 @@ def render_realtime_dashboard():
                 margin=dict(l=30, r=30, t=50, b=20),
                 height=250,
             )
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(fig, width='stretch', config={'displayModeBar': False})
 
         with col_info:
             score = health.get('overall_score', 0)
@@ -615,7 +615,7 @@ def render_realtime_dashboard():
                     hole=0.4
                 )
                 fig_labels.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", height=350)
-                st.plotly_chart(fig_labels, use_container_width=True)
+                st.plotly_chart(fig_labels, width='stretch')
             else:
                 st.info("No classified assets found for distribution.")
 
@@ -632,7 +632,7 @@ def render_realtime_dashboard():
                 color_discrete_map={'PII Relevant': '#E74C3C', 'Non-PII': '#4FD1C5'}
             )
             fig_pii.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white", height=350)
-            st.plotly_chart(fig_pii, use_container_width=True)
+            st.plotly_chart(fig_pii, width='stretch')
 
         # 3. Regulated & Risk Summary (Horizontal Bars)
         st.markdown("""
@@ -707,7 +707,7 @@ def render_realtime_dashboard():
                     "DAYS_UNCLASSIFIED": st.column_config.NumberColumn("Age (Days)", format="%d"),
                     "RISK_STATUS": st.column_config.TextColumn("SLA Status")
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
             
@@ -760,7 +760,7 @@ def render_realtime_dashboard():
                     "DAYS_REMAINING": st.column_config.NumberColumn("Days Remaining"),
                     "STATUS": st.column_config.TextColumn("Review Status")
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
             
@@ -802,7 +802,7 @@ def render_realtime_dashboard():
                     "OWNER": st.column_config.TextColumn("Accountable Owner"),
                     "SCOPE": st.column_config.TextColumn("Database/Schema")
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
             
@@ -913,7 +913,7 @@ def render_realtime_dashboard():
                 yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)')
             )
             
-            st.plotly_chart(fig_assurance, use_container_width=True)
+            st.plotly_chart(fig_assurance, width='stretch')
         
         st.markdown(f"""
             <div style="display: flex; gap: 20px; align-items: center; justify-content: flex-start; margin-top: 15px;">
@@ -935,17 +935,17 @@ def render_realtime_dashboard():
     
     with col1:
         st.subheader("⚡ Quick Actions")
-        if st.button("🏷️ Classify New Asset", use_container_width=True):
+        if st.button("🏷️ Classify New Asset", width='stretch'):
             st.switch_page("pages/3_Classification.py")
         
-        if st.button("📄 Run Compliance Report", use_container_width=True):
+        if st.button("📄 Run Compliance Report", width='stretch'):
              st.switch_page("pages/4_Compliance.py")
 
-        if st.button("⏰ Review Overdue Tasks", use_container_width=True):
+        if st.button("⏰ Review Overdue Tasks", width='stretch'):
              # Navigate to Data Assets for detailed review
              st.switch_page("pages/2_Data_Assets.py")
              
-        if st.button("📖 View Policy Guidelines", use_container_width=True):
+        if st.button("📖 View Policy Guidelines", width='stretch'):
              st.switch_page("pages/12_Policy_Guidance.py")
     
     with col2:

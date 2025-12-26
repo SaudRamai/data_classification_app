@@ -1999,7 +1999,7 @@ with q_tab:
             rows_inc = snowflake_connector.execute_query(query_inc, params_inc)
             if rows_inc:
                 df_inc = pd.DataFrame(rows_inc)
-                st.dataframe(df_inc, width='stretch', use_container_width=True, hide_index=True)
+                st.dataframe(df_inc, width='stretch', width='stretch', hide_index=True)
             else:
                 st.info("No recent incidents found for the current selection.")
         except Exception as e:
@@ -2168,7 +2168,7 @@ with q_tab:
                 st.plotly_chart(
                     px.bar(null_df, x="DIMENSION", y="NULL_PCT", title="Completeness: % Nulls by Attribute", text="NULL_PCT")
                     .update_traces(texttemplate='%{text:.2f}%', textposition='outside'),
-                    use_container_width=True
+                    width='stretch'
                 )
 
                 # Validity mini-cards
@@ -2710,7 +2710,7 @@ with l_tab:
                         
                         # Show raw data in an expander
                         with st.expander("View Raw Lineage Data", expanded=False):
-                            st.dataframe(df, use_container_width=True)
+                            st.dataframe(df, width='stretch')
                         
                         # Basic visualization using graphviz
                         try:
@@ -3101,7 +3101,7 @@ with l_tab:
                         {"s": sch, "t": name}
                     ) or []
                     st.markdown("**Masking Policies**")
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    st.dataframe(pd.DataFrame(rows), width='stretch')
                 except Exception as e:
                     st.info(f"Masking policy info unavailable: {e}")
             st.markdown("---")
@@ -3116,7 +3116,7 @@ with l_tab:
                     {"f": sel_object}
                 ) or []
                 if rows:
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    st.dataframe(pd.DataFrame(rows), width='stretch')
                 else:
                     # Fallback via VIEW_COLUMN_USAGE for simple view -> base column mapping
                     try:

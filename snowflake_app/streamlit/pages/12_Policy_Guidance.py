@@ -143,11 +143,11 @@ with tab_dash:
         st.subheader("📄 Policy Hub")
         for p in policies:
             label = f"{p.get('TITLE', 'Policy')} (v{p.get('VERSION','1.0')})" 
-            if st.button(label, key=f"pol_btn_{p.get('TITLE')}", use_container_width=True):
+            if st.button(label, key=f"pol_btn_{p.get('TITLE')}", width='stretch'):
                 st.info(f"Summary: {p.get('DESC', 'No preview available.')}")
 
         if len(policies) < 4:
-             st.button("FAQ & Best Practices", use_container_width=True)
+             st.button("FAQ & Best Practices", width='stretch')
 
     with col2:
         st.subheader("👥 Roles & Responsibilities")

@@ -948,7 +948,7 @@ class AIClassificationPipelineService:
         
         # 2. Run Scan Button in second column
         with f_col2:
-            if st.button("?? Run New Scan", type="primary", use_container_width=True):
+            if st.button("?? Run New Scan", type="primary", width='stretch'):
                 db = self._get_active_database()
                 gov_db = self._get_governance_database(db) if db else None
                 if db:
@@ -1378,7 +1378,7 @@ class AIClassificationPipelineService:
             
             st.dataframe(
                 grouped[['Schema', 'Table', 'Sensitive Cols', 'Category', 'Confidentiality', 'Integrity', 'Availability']],
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 column_config={
                     "Sensitive Cols": st.column_config.NumberColumn(
@@ -1832,7 +1832,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
 
                 edited_df = st.data_editor(
                     table_details[['Column', 'All Categories', 'Sensitivity', 'Confidentiality', 'Integrity', 'Availability']],
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                     key="drill_down_editor",
                     # Disable direct editing in the grid to encourage using the cleaner form
@@ -2072,7 +2072,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                     st.info("No data to display")
             
             st.markdown("#### Top High-Risk Tables")
-            st.dataframe(top_tables, use_container_width=True)
+            st.dataframe(top_tables, width='stretch')
 
 
     def _check_keyword_exists(self, keyword: str) -> bool:

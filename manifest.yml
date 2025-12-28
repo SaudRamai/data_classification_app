@@ -3,7 +3,7 @@ artifacts:
   setup_script: setup.sql
   default_streamlit:
     name: DATA_GOVERNANCE_APP
-    directory: streamlit
+    directory: .
     main_file: streamlit_app.py
 
 # Define application roles

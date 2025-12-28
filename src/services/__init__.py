@@ -8,7 +8,10 @@ except Exception:
     asset_catalog_service = None  # type: ignore
 from .authorization_service import authz as authorization_service
 from .classification_audit_service import classification_audit_service as audit_service
-from .classification_pipeline_service import ai_classification_pipeline_service as ai_pipeline_service
+from .classification_pipeline_service import AIClassificationPipelineService
+
+# Create an instance of the AI Classification Pipeline Service
+ai_pipeline_service = AIClassificationPipelineService()
 from .classification_workflow_service import classification_workflow_service
 from .compliance_service import compliance_service
 from .governance_config_service import governance_config_service

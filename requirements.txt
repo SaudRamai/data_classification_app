@@ -1,29 +1,14 @@
-# Core
-streamlit>=1.32.0
-pandas>=2.0.0
-numpy>=1.24.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-cryptography>=41.0.0
+# Snowflake Native App requirements (Python 3.11)
+# These packages must be available in the Snowflake Anaconda channel
+pandas
+numpy
+pydantic
+cryptography
 authlib>=1.0.0
-
-# Database
-snowflake-connector-python>=3.6.0
-snowflake-snowpark-python>=1.11.1
-sqlalchemy>=2.0.0
-requests>=2.31.0
-
-# Data Processing
-pandas>=2.0.0
-numpy>=1.24.0
-pyarrow>=12.0.0
-
-# Visualization
-plotly>=5.13.0
-altair>=4.2.2
-
-# Utilities
-python-dateutil>=2.8.2
-pytz>=2023.3
-
-
+sqlalchemy
+requests
+pyarrow
+plotly
+altair
+python-dateutil
+pytz

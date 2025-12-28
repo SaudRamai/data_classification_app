@@ -11,16 +11,27 @@ import os
 import logging
 import secrets
 from typing import Optional
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel
+
+try:
+    from pydantic import ConfigDict
+except ImportError:
+    ConfigDict = None
+
 try:
     import streamlit as st  # optional; used to read local secrets during dev
 except Exception:  # pragma: no cover
     st = None
 
 
-class Settings(BaseSettings):
+class Settings(BaseModel):
     # Do not load from local .env; rely strictly on process environment / secrets manager.
-    model_config = SettingsConfigDict(case_sensitive=True)
+    if ConfigDict:
+        model_config = ConfigDict(case_sensitive=True)
+    else:
+        class Config:
+            case_sensitive = True
+
     # Snowflake connection settings (optional for local dev; enforced at connection time)
     SNOWFLAKE_ACCOUNT: Optional[str] = None
     SNOWFLAKE_USER: Optional[str] = None
@@ -53,6 +64,24 @@ class Settings(BaseSettings):
     SLA_AUDIT_PENALTY_PER_VIOLATION: float = 0.5     # points to subtract per open violation
     SLA_AUDIT_PENALTY_MAX: float = 10.0              # max penalty points
     SLA_PROVISIONAL_IA_DAYS: int = 7                 # grace period (days) to finalize provisional I/A
+
+    def __init__(self, **data):
+        # Manual environment variable loading to replace pydantic-settings
+        # Compatible with both Pydantic V1 and V2
+        fields = []
+        if hasattr(self, 'model_fields'):  # V2
+            fields = self.model_fields.keys()
+        elif hasattr(self, '__fields__'):  # V1
+            fields = self.__fields__.keys()
+            
+        env_values = {}
+        for f in fields:
+            val = os.environ.get(f)
+            if val is not None:
+                env_values[f] = val
+        
+        # Merge env values with passed data (data takes precedence)
+        super().__init__(**{**env_values, **data})
     
 def _populate_env_from_streamlit_secrets():
     """Populate os.environ from Streamlit secrets if available.

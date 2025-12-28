@@ -21,6 +21,14 @@ for _ in range(3):
     _dir = _dir.parent
 
 import streamlit as st
+
+# Page configuration - MUST be the first Streamlit command
+st.set_page_config(
+    page_title="Administration - Data Governance App",
+    page_icon="🛠️",
+    layout="wide"
+)
+
 import pandas as pd
 import time
 from datetime import datetime
@@ -37,13 +45,6 @@ from src.ui.quick_links import render_quick_links
 
 # Use tagging_service for label registry operations (backward-compatible alias)
 label_service = tagging_service
-
-# Page configuration
-st.set_page_config(
-    page_title="Administration - Data Governance App",
-    page_icon="🛠️",
-    layout="wide"
-)
 
 # Apply centralized theme
 apply_global_theme()

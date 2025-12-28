@@ -1,6 +1,13 @@
-"""
-Main Streamlit application for data governance.
-"""
+import streamlit as st
+
+# Page configuration - MUST be the first Streamlit command
+st.set_page_config(
+    page_title="Data Governance App",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 import sys
 import os
 import pathlib
@@ -69,9 +76,9 @@ if not _found_root:
     logger.error(f"Could not find 'src' directory. __file__={__file__}, cwd={os.getcwd()}")
     logger.error(f"sys.path={sys.path}")
 
-import streamlit as st
 import plotly.io as pio
 import plotly.graph_objects as go
+
 try:
     from src.ui.theme import apply_global_theme
     from src.components.filters import render_data_filters
@@ -81,14 +88,10 @@ try:
     from src.services.oidc_service import oidc_service
     from src.connectors.snowflake_connector import snowflake_connector
 except ImportError as e:
+    # We can only show an error if page config was already set or if it's the first command.
+    # Note: st.error here is fine now as set_page_config is called above.
     st.error(f"Import error: {e}. Check directory structure.")
     st.stop()
-
-# Page configuration
-st.set_page_config(
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 # Snowflake SiS Environment Setup
 if snowflake_connector.is_sis():

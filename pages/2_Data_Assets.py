@@ -22,6 +22,14 @@ for _ in range(3):
     _dir = _dir.parent
 
 import streamlit as st
+
+# Page configuration - MUST be the first Streamlit command
+st.set_page_config(
+    page_title="Data Assets - Data Governance App",
+    page_icon="🗂️",
+    layout="wide"
+)
+
 import pandas as pd
 import altair as alt
 from io import BytesIO, StringIO
@@ -43,13 +51,6 @@ try:
     alt.themes.enable('dark')
 except Exception:
     pass
-
-# Page configuration
-st.set_page_config(
-    page_title="Data Assets - Data Governance App",
-    page_icon="🗂️",
-    layout="wide"
-)
 
 # Apply centralized theme (fonts, CSS variables, Plotly template)
 apply_global_theme()

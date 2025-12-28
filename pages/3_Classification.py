@@ -22,6 +22,14 @@ for _ in range(3):
 _project_root = str(_dir) # Define globally as string for downstream use
 
 import streamlit as st
+
+# Page configuration - MUST be the first Streamlit command
+st.set_page_config(
+    page_title="Data Classification",
+    page_icon="🔍",
+    layout="wide",
+)
+
 import pandas as pd
 import re
 import json
@@ -184,13 +192,6 @@ except Exception:
 # Classification Center to ensure a single policy-aligned implementation.
 
  
-
-# Page configuration
-st.set_page_config(
-    page_title="Data Classification",
-    page_icon="???",
-    layout="wide",
-)
 
 # Apply centralized theme (fonts, CSS variables, Plotly template)
 apply_global_theme()

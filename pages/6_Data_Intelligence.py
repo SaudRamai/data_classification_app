@@ -7,6 +7,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import textwrap
 
 import streamlit as st
+
+# MUST be the first Streamlit command
+st.set_page_config(page_title="Data Intelligence", page_icon="🧠", layout="wide")
+
 import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
@@ -31,7 +35,6 @@ from src.config.settings import settings
 from src.services.asset_utils import get_asset_counts
 
 # ------------- Page Setup -------------
-st.set_page_config(page_title="Data Intelligence", page_icon="🧠", layout="wide")
 apply_global_theme()
 st.title("Data Intelligence")
 st.caption("Unified Quality and Lineage powered by Snowflake metadata and account usage views")
@@ -1999,7 +2002,7 @@ with q_tab:
             rows_inc = snowflake_connector.execute_query(query_inc, params_inc)
             if rows_inc:
                 df_inc = pd.DataFrame(rows_inc)
-                st.dataframe(df_inc, width='stretch', width='stretch', hide_index=True)
+                st.dataframe(df_inc, width='stretch', hide_index=True)
             else:
                 st.info("No recent incidents found for the current selection.")
         except Exception as e:

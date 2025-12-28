@@ -20,14 +20,15 @@ for _ in range(3):
     _dir = _dir.parent
 
 import streamlit as st
+
+# MUST be the first Streamlit command
+st.set_page_config(page_title="Handling Rules & Policy Guidance", page_icon="📘", layout="wide")
+
 import pandas as pd
 from src.ui.theme import apply_global_theme
-
 from src.services.compliance_service import compliance_service as _ncs
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
-
-st.set_page_config(page_title="Handling Rules & Policy Guidance", page_icon="📘", layout="wide")
 
 # Apply centralized theme
 apply_global_theme()

@@ -17,6 +17,14 @@ for _ in range(3):
     _dir = _dir.parent
 
 import streamlit as st
+
+# Page configuration - MUST be the first Streamlit command
+st.set_page_config(
+    page_title="Monitoring & Compliance - Data Governance App",
+    page_icon="✅",
+    layout="wide"
+)
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -28,13 +36,6 @@ from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
 from src.services.authorization_service import authz
 from src.ui.quick_links import render_quick_links
-
-# Page configuration
-st.set_page_config(
-    page_title="Monitoring & Compliance - Data Governance App",
-    page_icon="✅",
-    layout="wide"
-)
 
 # Apply centralized theme
 apply_global_theme()

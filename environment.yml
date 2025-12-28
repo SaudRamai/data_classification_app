@@ -1,16 +1,20 @@
-name: data_governance_app
+name: data_classification_app
 channels:
   - snowflake
 dependencies:
   - python=3.11
   - streamlit
   - snowflake-snowpark-python
+  - snowflake-connector-python
   - pandas
   - numpy
   - pydantic
-  - pydantic-settings
   - cryptography
+  - authlib
+  - sqlalchemy
+  - requests
+  - pyarrow
   - plotly
   - altair
-  - requests
-  - authlib
+  - python-dateutil
+  - pytz

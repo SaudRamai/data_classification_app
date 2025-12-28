@@ -6,6 +6,10 @@ from typing import Dict, Any, Optional, List, Tuple, Set
 
 import streamlit as st
 import streamlit.components.v1 as components
+
+# MUST be the first Streamlit command
+st.set_page_config(page_title="Dashboard", page_icon="📊", layout="wide")
+
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -197,7 +201,6 @@ def _rt_paginate_df(df: pd.DataFrame, page: int, page_size: int) -> Tuple[pd.Dat
     return df.iloc[start:end], total
 
 def render_realtime_dashboard():
-    st.set_page_config(page_title="Dashboard", page_icon="📊", layout="wide")
     apply_global_theme()
     st.title("Dashboard")
 

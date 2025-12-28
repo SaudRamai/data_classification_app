@@ -28,10 +28,15 @@ import pandas as pd
 import streamlit as st
 
 # Ensure project root on path for `src.*` imports when running as a Streamlit page
-_here = pathlib.Path(str(__file__)).resolve()
-_project_root = _here.parent.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
+try:
+    _here = pathlib.Path(str(__file__)).resolve()
+    _project_root = _here.parent.parent.parent
+    if str(_project_root) not in sys.path:
+        sys.path.insert(0, str(_project_root))
+except Exception:
+    # Fallback: if structure is flattened or __file__ fails, rely on CWD being root
+    if os.getcwd() not in sys.path:
+        sys.path.insert(0, os.getcwd())
 
 # Services and connectors (best-effort imports)
 try:

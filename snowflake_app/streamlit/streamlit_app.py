@@ -5,10 +5,18 @@ import sys
 import os
 import pathlib
 import logging
+import warnings
 from datetime import datetime
 
-# Suppress Streamlit's ScriptRunContext warning
+# Suppress Streamlit warnings that are not applicable in Snowflake Native Apps
 logging.getLogger('streamlit.runtime.scriptrunner.script_runner').setLevel(logging.ERROR)
+logging.getLogger('streamlit.runtime.secrets').setLevel(logging.ERROR)
+logging.getLogger('streamlit.watcher').setLevel(logging.ERROR)
+
+# Suppress secrets.toml warnings (not used in Snowflake Native Apps)
+warnings.filterwarnings('ignore', message='.*secrets.toml.*')
+warnings.filterwarnings('ignore', category=UserWarning, module='streamlit')
+
 logger = logging.getLogger(__name__)
 
 # Add the project root to the Python path

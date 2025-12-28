@@ -5769,10 +5769,13 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
 
         # Merge from Streamlit secrets if available
         try:
-            if hasattr(st, "secrets"):
+            if hasattr(st, "secrets") and st.secrets:
                 sec = st.secrets.get("AI_PIPELINE_CONFIG")  # type: ignore[attr-defined]
                 if isinstance(sec, dict):
                     cfg.update(sec)  # type: ignore[arg-type]
+        except (FileNotFoundError, AttributeError, KeyError):
+            # Secrets not configured - this is expected in Snowflake Native Apps
+            pass
         except Exception:
             pass
 

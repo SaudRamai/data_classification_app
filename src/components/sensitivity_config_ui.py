@@ -357,7 +357,7 @@ def render_keywords_tab():
             "Last Updated": st.column_config.DatetimeColumn("Last Updated")
         },
         hide_index=True,
-        width='stretch',
+        use_container_width=True,
         key="keywords_table"
     )
     
@@ -438,7 +438,7 @@ def render_patterns_tab():
             "Pattern": st.column_config.TextColumn("Pattern")
         },
         hide_index=True,
-        width='stretch',
+        use_container_width=True,
         key="patterns_table"
     )
     

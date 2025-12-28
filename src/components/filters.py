@@ -134,7 +134,7 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
                             "DOMAIN", "TAG_OWNER", "COLUMN_ID",
                         ]
                         show_cols = [c for c in preferred_cols if c in df.columns]
-                        st.dataframe(df[show_cols] if show_cols else df, width='stretch', hide_index=True)
+                        st.dataframe(df[show_cols] if show_cols else df, use_container_width=True, hide_index=True)
                 except Exception as e:
                     st.warning(f"Unable to fetch tags: {e}")
         with col_b:

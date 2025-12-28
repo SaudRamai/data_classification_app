@@ -6642,7 +6642,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                         # Skip only pure integers (avoid skipping formatted numeric PII like SSN, cards)
                         if re.fullmatch(r"\s*\d+\s*", sv) and len(sv.strip()) < 5:
                             continue
-                        sv_trim = sv[:200] + ("…" if len(sv) > 200 else "")
+                        sv_trim = sv[:200] + ("..." if len(sv) > 200 else "")
                         sample_values.append(f"{cn}:{sv_trim}")
                         cnt += 1
                         if cnt >= max_vals:
@@ -7206,7 +7206,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         # ACTION BUTTON: Apply to Snowflake
         c_act1, c_act2 = st.columns([2, 5])
         with c_act1:
-            if st.button("?? Apply All to Snowflake", type="primary", help="Apply these classification results as Snowflake Tags (DATA_CLASSIFICATION, C/I/A Levels)"):
+            if st.button("Apply All to Snowflake", type="primary", help="Apply these classification results as Snowflake Tags (DATA_CLASSIFICATION, C/I/A Levels)"):
                 self._apply_results_to_snowflake(results)
         
         st.markdown("#### Classification Results")

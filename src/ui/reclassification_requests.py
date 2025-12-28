@@ -534,7 +534,7 @@ def render_reclassification_requests(key_prefix: str = "reclass") -> None:
         for c in show_cols:
             if c not in df.columns:
                 df[c] = None
-        st.dataframe(df[show_cols], width='stretch', hide_index=True)
+        st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
 
         st.markdown("#### Take Action")
         colsel, colactor = st.columns([2, 2])

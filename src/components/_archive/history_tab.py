@@ -325,7 +325,7 @@ def render_history_tab(key_prefix: str = "hist") -> None:
         if c not in df.columns:
             df[c] = None
 
-    st.dataframe(df[desired_cols].sort_values(by=["Approved","Submitted"], ascending=[False, False]), width='stretch')
+    st.dataframe(df[desired_cols].sort_values(by=["Approved","Submitted"], ascending=[False, False]), use_container_width=True)
 
     # Download
     try:

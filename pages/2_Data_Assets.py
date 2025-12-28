@@ -1004,7 +1004,7 @@ with tab_inv_browser:
                     "soc2_cnt": "SOC2 Count",
                     "compliance_status": "Compliance Status",
                 }),
-                width='stretch',
+                use_container_width=True,
             )
             # Bulk actions row
             c1, c2, c3, c4 = st.columns(4)
@@ -1100,7 +1100,7 @@ with tab_inv_browser:
                     "high_risk": "High-risk Objects",
                     "owner_coverage_%": "Owner Coverage %",
                 }),
-                width='stretch',
+                use_container_width=True,
             )
             s1, s2, s3 = st.columns(3)
             
@@ -1255,7 +1255,7 @@ with tab_inv_browser:
         st.markdown("**Pinned Assets**")
         if not vz.empty:
             show_cols = ["Asset","Label","C","I","A","Risk","SLA","Compliance","Owner"]
-            st.dataframe(vz[show_cols], width='stretch', hide_index=True)
+            st.dataframe(vz[show_cols], use_container_width=True, hide_index=True)
         else:
             st.info("No favorite assets to display.")
 
@@ -1324,12 +1324,12 @@ with tab_inv_browser:
                 except Exception:
                     hist2 = []
                 if hist:
-                    st.dataframe(pd.DataFrame(hist), width='stretch')
+                    st.dataframe(pd.DataFrame(hist), use_container_width=True)
                 else:
                     st.caption("No classification history found.")
                 if hist2:
                     st.markdown("Audit Trail (History)")
-                    st.dataframe(pd.DataFrame(hist2), width='stretch')
+                    st.dataframe(pd.DataFrame(hist2), use_container_width=True)
             except Exception as e:
                 st.caption("History unavailable.")
 
@@ -1440,7 +1440,7 @@ with tab_inv_browser:
                 c for c in ["Location","Database","Schema","Name","Type","Classification","CIA Score","C","I","A","Owner","Risk","Status","Rows","Size (MB)","Last Updated"]
                 if c in adv_df.columns
             ]
-            st.dataframe(adv_df[show_cols].head(500), width='stretch', hide_index=True)
+            st.dataframe(adv_df[show_cols].head(500), use_container_width=True, hide_index=True)
     
     # Show helpful message if no assets found
     if assets_df.empty:
@@ -1899,7 +1899,7 @@ with tab_inv_browser:
                 if c in page_df.columns
             ]
             if not page_df.empty and preview_cols:
-                st.dataframe(page_df[preview_cols], width='stretch', hide_index=True)
+                st.dataframe(page_df[preview_cols], use_container_width=True, hide_index=True)
             else:
                 st.info("No rows available. Adjust filters.")
         except Exception:
@@ -2043,7 +2043,7 @@ with tab_inv_browser:
                             if 'Regulatory' in up: icons.append('⚖️')
                             return (s + ' ' + ' '.join(icons)).strip()
                         df_cols['Flags'] = df_cols['Flags'].apply(_flag_emojis)
-                    st.dataframe(df_cols, width='stretch')
+                    st.dataframe(df_cols, use_container_width=True)
                 else:
                     st.info("No columns found or insufficient privileges.")
                 if show_debug and err:
@@ -2112,7 +2112,7 @@ if False:
                 data=csv,
                 file_name="dataset_inventory.csv",
                 mime="text/csv",
-                width='stretch'
+                use_container_width=True
             )
         
         with col_excel:
@@ -2131,7 +2131,7 @@ if False:
                     data=xbytes,
                     file_name="dataset_inventory.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width='stretch'
+                    use_container_width=True
                 )
             except Exception:
                 st.caption("Excel export unavailable - install openpyxl")
@@ -2162,7 +2162,7 @@ if False:
                     data=pbytes,
                     file_name="assets_summary.pdf",
                     mime="application/pdf",
-                    width='stretch'
+                    use_container_width=True
                 )
             except Exception:
                 st.caption("PDF export unavailable - install reportlab")
@@ -2170,7 +2170,7 @@ if False:
         # Export preview
         st.markdown("---")
         st.markdown("**📋 Export Preview** (first 10 rows)")
-        st.dataframe(exp_df[export_cols].head(10), width='stretch')
+        st.dataframe(exp_df[export_cols].head(10), use_container_width=True)
         
     if exp_df is None or exp_df.empty:
         st.info("No assets available to export. Apply filters to view assets.")

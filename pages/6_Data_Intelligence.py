@@ -1663,7 +1663,7 @@ with q_tab:
                 hovermode="x unified"
             )
             
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
         
         st.markdown("---")
         
@@ -1966,7 +1966,7 @@ with q_tab:
                 "Status": ["Failing", "Warning", "Failing"],
                 "Last Checked": ["5m ago", "15m ago", "1h ago"]
             }
-            st.dataframe(pd.DataFrame(rules_data), width='stretch')
+            st.dataframe(pd.DataFrame(rules_data), use_container_width=True)
         
         # Recent Incidents
         st.markdown("#### Recent Incidents")
@@ -2002,7 +2002,7 @@ with q_tab:
             rows_inc = snowflake_connector.execute_query(query_inc, params_inc)
             if rows_inc:
                 df_inc = pd.DataFrame(rows_inc)
-                st.dataframe(df_inc, width='stretch', hide_index=True)
+                st.dataframe(df_inc, use_container_width=True, hide_index=True)
             else:
                 st.info("No recent incidents found for the current selection.")
         except Exception as e:
@@ -2171,7 +2171,7 @@ with q_tab:
                 st.plotly_chart(
                     px.bar(null_df, x="DIMENSION", y="NULL_PCT", title="Completeness: % Nulls by Attribute", text="NULL_PCT")
                     .update_traces(texttemplate='%{text:.2f}%', textposition='outside'),
-                    width='stretch'
+                    use_container_width=True
                 )
 
                 # Validity mini-cards
@@ -2202,7 +2202,7 @@ with q_tab:
                     ) or []
                     st.subheader("COLUMNS LEVEL DETAILED VIEW")
                     st.caption("Source: SNOWFLAKE.ACCOUNT_USAGE.COLUMNS")
-                    st.dataframe(pd.DataFrame(rows), width='stretch')
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
                 except Exception as e:
                     st.info(f"Account usage columns unavailable: {e}")
             # Table metadata + size
@@ -2374,7 +2374,7 @@ with q_tab:
                     continue
             if stats_rows:
                 df_stats = pd.DataFrame(stats_rows)
-                st.dataframe(df_stats, width='stretch')
+                st.dataframe(df_stats, use_container_width=True)
 
             # Simple distributions for first selected column
             if chosen_cols:
@@ -2385,7 +2385,7 @@ with q_tab:
                     ) or []
                     if vals:
                         dfv = pd.DataFrame(vals)
-                        st.plotly_chart(px.bar(dfv, x="V", y="C", title=f"Distribution: {col0}"), width='stretch')
+                        st.plotly_chart(px.bar(dfv, x="V", y="C", title=f"Distribution: {col0}"), use_container_width=True)
                 except Exception:
                     pass
 
@@ -2432,7 +2432,7 @@ with q_tab:
                 rows_stale = []
                 st.info("Stale scan unavailable.")
             st.markdown("**Stale Tables**")
-            st.dataframe(pd.DataFrame(rows_stale), width='stretch')
+            st.dataframe(pd.DataFrame(rows_stale), use_container_width=True)
 
             # Empty tables
             try:
@@ -2453,7 +2453,7 @@ with q_tab:
                 rows_empty = []
                 st.info("Empty table scan unavailable.")
             st.markdown("**Empty Tables**")
-            st.dataframe(pd.DataFrame(rows_empty), width='stretch')
+            st.dataframe(pd.DataFrame(rows_empty), use_container_width=True)
 
             # Schema quality summary (nullability)
             try:
@@ -2474,7 +2474,7 @@ with q_tab:
                 rows_schema = []
                 st.info("Schema quality scan unavailable.")
             st.markdown("**Schema Quality (Nullability Summary)**")
-            st.dataframe(pd.DataFrame(rows_schema), width='stretch')
+            st.dataframe(pd.DataFrame(rows_schema), use_container_width=True)
 
         def _detect_and_persist(dbname: Optional[str], thr_null_pct: float, thr_duplicates_pct: float) -> int:
             if not dbname:
@@ -2553,7 +2553,7 @@ with q_tab:
                 st.session_state["dq_resolutions"].append({"at": datetime.utcnow().isoformat(), "note": res_note})
         if st.session_state["dq_resolutions"]:
             st.markdown("**Notes (session)**")
-            st.dataframe(pd.DataFrame(st.session_state["dq_resolutions"]), width='stretch', hide_index=True)
+            st.dataframe(pd.DataFrame(st.session_state["dq_resolutions"]), use_container_width=True, hide_index=True)
         st.markdown("---")
         st.subheader("Verify Resolutions")
         st.caption("Re-run the Quality Issues scans to confirm issues are resolved")
@@ -2713,7 +2713,7 @@ with l_tab:
                         
                         # Show raw data in an expander
                         with st.expander("View Raw Lineage Data", expanded=False):
-                            st.dataframe(df, width='stretch')
+                            st.dataframe(df, use_container_width=True)
                         
                         # Basic visualization using graphviz
                         try:
@@ -2893,7 +2893,7 @@ with l_tab:
                                          marker=dict(size=12, color=marker_colors),
                                          hovertext=hover_text, hoverinfo='text'))
                 fig.update_layout(showlegend=False, margin=dict(l=10,r=10,t=30,b=30), height=560)
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Select an object from the sidebar to visualize lineage.")
 
@@ -2911,7 +2911,7 @@ with l_tab:
                 ]].drop_duplicates()
                 down["FULL_NAME"] = down["REFERENCING_OBJECT_CATALOG"] + "." + down["REFERENCING_OBJECT_SCHEMA"] + "." + down["REFERENCING_OBJECT_NAME"]
                 st.markdown("**Downstream Objects**")
-                st.dataframe(down[["FULL_NAME"]], width='stretch')
+                st.dataframe(down[["FULL_NAME"]], use_container_width=True)
                 # Query history: who uses downstream
                 try:
                     start_dt = datetime.utcnow() - timedelta(days=30)
@@ -2929,7 +2929,7 @@ with l_tab:
                     ) or []
                     qdf = pd.DataFrame(qh)
                     st.markdown("**Dependent Queries (30d)**")
-                    st.dataframe(qdf, width='stretch')
+                    st.dataframe(qdf, use_container_width=True)
                     # Risk score: simple heuristic
                     affected_assets = len(down)
                     distinct_users = qdf.get("USER_NAME", pd.Series(dtype=str)).nunique() if not qdf.empty else 0
@@ -2957,7 +2957,7 @@ with l_tab:
                 view = df.copy()
                 if typ:
                     view = view[view["REFERENCED_TYPE"].isin(typ)]
-                st.dataframe(view, width='stretch')
+                st.dataframe(view, use_container_width=True)
                 # PK/FK best-effort and orphan/cycle detection around selected schema
                 if db and sel_schema and sel_schema != "All":
                     try:
@@ -2973,7 +2973,7 @@ with l_tab:
                             {"s": sel_schema}
                         ) or []
                         st.markdown("**PK/UNIQUE columns (best-effort)**")
-                        st.dataframe(pd.DataFrame(keys), width='stretch')
+                        st.dataframe(pd.DataFrame(keys), use_container_width=True)
                     except Exception:
                         pass
                 # Graph-based checks
@@ -2988,7 +2988,7 @@ with l_tab:
                     orphans = [n for n in nodes if in_deg.get(n,0)==0 and out_deg.get(n,0)==0]
                     st.markdown("**Orphan Objects**")
                     if orphans:
-                        st.dataframe(pd.DataFrame({"ORPHAN": orphans}), width='stretch')
+                        st.dataframe(pd.DataFrame({"ORPHAN": orphans}), use_container_width=True)
                     # Simple cycle detection (depth-limited)
                     from collections import defaultdict, deque
                     g = defaultdict(list)
@@ -3010,7 +3010,7 @@ with l_tab:
                                     dq.append((nb, path+[nb]))
                     if cycles:
                         st.markdown("**Detected Cycles (truncated)**")
-                        st.dataframe(pd.DataFrame({"CYCLE": [" -> ".join(c[:10]) for c in cycles[:20]]}), width='stretch')
+                        st.dataframe(pd.DataFrame({"CYCLE": [" -> ".join(c[:10]) for c in cycles[:20]]}), use_container_width=True)
                 except Exception:
                     pass
         except Exception as e:
@@ -3064,7 +3064,7 @@ with l_tab:
                 {"f": sel_object}
             ) or []
             if rows:
-                st.dataframe(pd.DataFrame(rows), width='stretch')
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
             else:
                 st.info("No lineage information available")
         except Exception as e:
@@ -3089,7 +3089,7 @@ with l_tab:
                         {"d": db, "s": sch, "t": name}
                     ) or []
                     st.markdown("**Column Tags**")
-                    st.dataframe(pd.DataFrame(tr), width='stretch')
+                    st.dataframe(pd.DataFrame(tr), use_container_width=True)
                 except Exception as e:
                     st.info(f"TAG_REFERENCES unavailable: {e}")
             with c2:
@@ -3104,7 +3104,7 @@ with l_tab:
                         {"s": sch, "t": name}
                     ) or []
                     st.markdown("**Masking Policies**")
-                    st.dataframe(pd.DataFrame(rows), width='stretch')
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
                 except Exception as e:
                     st.info(f"Masking policy info unavailable: {e}")
             st.markdown("---")
@@ -3119,7 +3119,7 @@ with l_tab:
                     {"f": sel_object}
                 ) or []
                 if rows:
-                    st.dataframe(pd.DataFrame(rows), width='stretch')
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
                 else:
                     # Fallback via VIEW_COLUMN_USAGE for simple view -> base column mapping
                     try:
@@ -3133,7 +3133,7 @@ with l_tab:
                             {"s": sch, "t": name}
                         ) or []
                         if vcu:
-                            st.dataframe(pd.DataFrame(vcu), width='stretch')
+                            st.dataframe(pd.DataFrame(vcu), use_container_width=True)
                         else:
                             st.info("No column-level lineage returned.")
                     except Exception as e:

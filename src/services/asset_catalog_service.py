@@ -1,4 +1,4 @@
-﻿from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple
 import json
 from datetime import datetime
 import math

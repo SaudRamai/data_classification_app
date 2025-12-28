@@ -1673,7 +1673,7 @@ if active_schema != "DATA_CLASSIFICATION_GOVERNANCE":
 # Refresh button
 col1, col2 = st.columns([6, 1])
 with col2:
-    if st.button("🔄 Refresh Data", help="Reload all compliance data", width='stretch'):
+    if st.button("🔄 Refresh Data", help="Reload all compliance data", use_container_width=True):
         st.rerun()
 
 
@@ -1977,7 +1977,7 @@ Scheduled: Q2 2025""")
         
         if not risk_data.empty:
             # Display the data table
-            st.dataframe(risk_data, width='stretch', hide_index=True)
+            st.dataframe(risk_data, use_container_width=True, hide_index=True)
             
             st.write("")
             col1, col2 = st.columns(2)
@@ -2168,10 +2168,10 @@ with tab2:
                     data=csv_data,
                     file_name="review_schedule.csv",
                     mime="text/csv",
-                    width='stretch'
+                    use_container_width=True
                 )
                 
-                if st.button("📧 Send Reminder Emails", width='stretch'):
+                if st.button("📧 Send Reminder Emails", use_container_width=True):
                     st.success(f"✓ Reminders sent to {unique_owners} Data Owners")
             
             st.markdown("---")
@@ -2198,7 +2198,7 @@ with tab2:
                     'Completion Rate': 'Completion Rate'
                 })
                 
-                st.dataframe(assignments, width='stretch', hide_index=True)
+                st.dataframe(assignments, use_container_width=True, hide_index=True)
             else:
                 st.info("No Data Owner information available for assignment table.")
                 
@@ -2231,7 +2231,7 @@ with tab2:
                 'Scope': ['Coverage & Accuracy', 'Decisions & Implementation', 'Program Effectiveness', 'Financial Data'],
                 'Status': ['Upcoming', 'Upcoming', 'Planned', 'Planned']
             })
-            st.dataframe(upcoming_audits, width='stretch', hide_index=True)
+            st.dataframe(upcoming_audits, use_container_width=True, hide_index=True)
         
         with col2:
             st.write("**Recent Audit Results**")
@@ -2247,11 +2247,11 @@ with tab2:
                 'Issues': [2, 5, 0],
                 'Score': ['96%', '89%', '100%']
             })
-            st.dataframe(past_audits, width='stretch', hide_index=True)
+            st.dataframe(past_audits, use_container_width=True, hide_index=True)
         
         st.markdown("---")
         
-        if st.button("📄 Generate Audit Report", width='stretch'):
+        if st.button("📄 Generate Audit Report", use_container_width=True):
             st.success("✓ Comprehensive audit report generated")
 # ============================================================================
 
@@ -2300,7 +2300,7 @@ with tab3:
             
             # Display detailed breakdown table
             st.write("#### Policy Violations Breakdown")
-            st.dataframe(violations_data, width='stretch', hide_index=True)
+            st.dataframe(violations_data, use_container_width=True, hide_index=True)
             
             st.markdown("---")
             
@@ -2403,7 +2403,7 @@ with tab3:
                     # Display the data in a nice table
                     st.dataframe(
                         df,
-                        width='stretch',
+                        use_container_width=True,
                         hide_index=True,
                         column_config={
                             "Progress": st.column_config.ProgressColumn(
@@ -2466,7 +2466,7 @@ with tab3:
                 
                 st.dataframe(
                     corrective_actions,
-                    width='stretch',
+                    use_container_width=True,
                     hide_index=True,
                     column_config={
                         "Progress": st.column_config.ProgressColumn(
@@ -2494,7 +2494,7 @@ with tab3:
         
         with col1:
             st.markdown("**Executive Summary**")
-            if st.button("📊 Generate Executive Report", width='stretch'):
+            if st.button("📊 Generate Executive Report", use_container_width=True):
                 with st.spinner("Generating executive summary..."):
                     # Fetch summarized metrics
                     metrics = get_classification_requirements_metrics(db)
@@ -2536,7 +2536,7 @@ with tab3:
         
         with col2:
             st.markdown("**Detailed Compliance**")
-            if st.button("📋 Generate Detailed Report", width='stretch'):
+            if st.button("📋 Generate Detailed Report", use_container_width=True):
                 with st.spinner("Fetching full asset inventory..."):
                     try:
                         # Full asset dump
@@ -2562,7 +2562,7 @@ with tab3:
         
         with col3:
             st.markdown("**Audit Package**")
-            if st.button("📦 Generate Audit Package", width='stretch'):
+            if st.button("📦 Generate Audit Package", use_container_width=True):
                  with st.spinner("Compiling audit evidence..."):
                     # Use policy violations as the core evidence log
                     violations_log = get_policy_violations(db)
@@ -2654,7 +2654,7 @@ with tab3:
                 )
             )
             
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
             
             # Detailed Trend Table
             st.write("#### Detailed Trend Analysis")
@@ -2691,7 +2691,7 @@ with tab3:
             
             st.dataframe(
                 display_df, 
-                width='stretch', 
+                use_container_width=True, 
                 hide_index=True,
                 column_config={
                     "Overall Score": st.column_config.ProgressColumn(
@@ -2730,7 +2730,7 @@ with tab3:
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            if st.button("📥 Export as CSV", width='stretch'):
+            if st.button("📥 Export as CSV", use_container_width=True):
                 csv = trend_df.to_csv(index=False)
                 st.download_button(
                     label="Download CSV",
@@ -2740,11 +2740,11 @@ with tab3:
                 )
         
         with col2:
-            if st.button("📥 Export as Excel", width='stretch'):
+            if st.button("📥 Export as Excel", use_container_width=True):
                 st.info("Excel export functionality would be implemented here")
         
         with col3:
-            if st.button("📥 Export as PDF", width='stretch'):
+            if st.button("📥 Export as PDF", use_container_width=True):
                 st.info("PDF export functionality would be implemented here")
 
 # ============================================================================

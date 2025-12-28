@@ -269,7 +269,7 @@ def _login_section():
     # Place Login button centered directly under inputs using columns
     _lc1, _lc2, _lc3 = st.columns([1, 2, 1])
     with _lc2:
-        _login_clicked = st.button("Login", type="primary", width='content')
+        _login_clicked = st.button("Login", type="primary")
     if _login_clicked:
         if not (acct and user):
             st.error("Please provide Account and User")
@@ -658,13 +658,13 @@ else:
     st.markdown("**Quick Links**")
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("Dashboard", width='stretch'):
+        if st.button("Dashboard", use_container_width=True):
             try:
                 st.switch_page("pages/1_Dashboard.py")
             except Exception:
                 st.rerun()
     with c2:
-        if can_data and st.button("Data Assets", width='stretch'):
+        if can_data and st.button("Data Assets", use_container_width=True):
             try:
                 st.switch_page("pages/2_Data_Assets.py")
             except Exception:
@@ -672,14 +672,14 @@ else:
         elif not can_data:
             st.caption("")
     with c3:
-        if can_classify and st.button("Classification", width='stretch'):
+        if can_classify and st.button("Classification", use_container_width=True):
             try:
                 st.switch_page("pages/3_Classification.py")
             except Exception:
                 st.rerun()
         elif not can_classify:
             st.caption("")
-        if can_compliance and st.button("Compliance", width='stretch'):
+        if can_compliance and st.button("Compliance", use_container_width=True):
             try:
                 st.switch_page("pages/4_Compliance.py")
             except Exception:
@@ -688,7 +688,7 @@ else:
             st.caption("")
     c3, c4 = st.columns(2)
     with c3:
-        if can_discovery and st.button("Data Discovery", width='stretch'):
+        if can_discovery and st.button("Data Discovery", use_container_width=True):
             try:
                 # Redirect to the unified Classification module (Discovery tab lives there)
                 st.switch_page("pages/3_Classification.py")
@@ -697,7 +697,7 @@ else:
         elif not can_discovery:
             st.caption("")
     with c4:
-        if can_admin and st.button("Administration", width='stretch'):
+        if can_admin and st.button("Administration", use_container_width=True):
             try:
                 st.switch_page("pages/10_Administration.py")
             except Exception:

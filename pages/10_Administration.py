@@ -150,19 +150,19 @@ if st.session_state.admin_view == 'Dashboard':
     with col1:
         st.subheader("👥 User Management")
         st.write("Manage roles, permissions, and access controls")
-        if st.button("Manage Users", width='stretch'):
+        if st.button("Manage Users", use_container_width=True):
             set_view('Users')
     
     with col2:
         st.subheader("⚙️ System Config")
         st.write("Configure classification schema and business rules")
-        if st.button("View Settings", width='stretch'):
+        if st.button("View Settings", use_container_width=True):
             set_view('Config')
     
     with col3:
         st.subheader("🏷️ Tag Management")
         st.write("Manage Snowflake tags and metadata templates")
-        if st.button("Manage Tags", width='stretch'):
+        if st.button("Manage Tags", use_container_width=True):
             set_view('Tags')
     
     st.markdown("---")
@@ -240,7 +240,7 @@ elif st.session_state.admin_view == 'Users':
             
             with col1:
                 if roles:
-                    st.dataframe(pd.DataFrame(roles), width='stretch')
+                    st.dataframe(pd.DataFrame(roles), use_container_width=True)
                 else:
                     st.warning("No roles found. Please add a role using the form.")
             
@@ -278,7 +278,7 @@ elif st.session_state.admin_view == 'Users':
             assigns = snowflake_connector.execute_query(
                 f"SELECT USER_EMAIL, ROLE_NAME, ASSIGNED_AT FROM {db_name}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS ORDER BY ASSIGNED_AT DESC LIMIT 200"
             ) or []
-            st.dataframe(pd.DataFrame(assigns), width='stretch')
+            st.dataframe(pd.DataFrame(assigns), use_container_width=True)
             
             # Add Assignment
             cA, cB, cC = st.columns(3)
@@ -331,7 +331,7 @@ elif st.session_state.admin_view == 'Users':
                                     'Created': u.get('created_on'),
                                     'Disabled': u.get('disabled')
                                 })
-                            st.dataframe(pd.DataFrame(users_clean), width='stretch', height=300)
+                            st.dataframe(pd.DataFrame(users_clean), use_container_width=True, height=300)
                         else:
                             st.info("No users found or insufficient permissions.")
                     except Exception as ex:
@@ -380,7 +380,7 @@ elif st.session_state.admin_view == 'Users':
                                 'Owner': r.get('owner'),
                                 'Created': r.get('created_on')
                             } for r in roles_data]
-                            st.dataframe(pd.DataFrame(roles_clean), width='stretch', height=300)
+                            st.dataframe(pd.DataFrame(roles_clean), use_container_width=True, height=300)
                     except Exception as ex:
                         st.info(f"Could not list roles: {ex}")
 
@@ -432,7 +432,7 @@ elif st.session_state.admin_view == 'Config':
         try:
             snowflake_connector.execute_non_query(f"CREATE TABLE IF NOT EXISTS {db_name}.DATA_GOVERNANCE.IA_RULES (TYPE STRING, PATTERN STRING, I_LEVEL NUMBER, A_LEVEL NUMBER, PRIORITY NUMBER, UPDATED_AT TIMESTAMP_NTZ)")
             rules = snowflake_connector.execute_query(f"SELECT * FROM {db_name}.DATA_GOVERNANCE.IA_RULES ORDER BY PRIORITY DESC") or []
-            st.dataframe(pd.DataFrame(rules), width='stretch')
+            st.dataframe(pd.DataFrame(rules), use_container_width=True)
             
             with st.form("add_rule"):
                 c1, c2 = st.columns(2)
@@ -471,7 +471,7 @@ elif st.session_state.admin_view == 'Tags':
         with st.spinner("Loading labels..."):
             labels = label_service.list_labels()
         if labels:
-            st.dataframe(pd.DataFrame(labels), width='stretch')
+            st.dataframe(pd.DataFrame(labels), use_container_width=True)
         else:
             st.info("No labels found.")
             

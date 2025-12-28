@@ -1,4 +1,4 @@
-ï»¿from pathlib import Path as _Path
+from pathlib import Path as _Path
 import sys
 import os
 
@@ -26,7 +26,7 @@ import streamlit as st
 # Page configuration - MUST be the first Streamlit command
 st.set_page_config(
     page_title="Data Classification",
-    page_icon="ðŸ”",
+    page_icon="??",
     layout="wide",
 )
 
@@ -1024,14 +1024,14 @@ def render_live_feed():
     if df_live.empty:
         st.info("No rows returned for the selected source/filters.")
     else:
-        st.dataframe(df_live, width='stretch')
+        st.dataframe(df_live, use_container_width=True)
 
     # Simple auto-refresh loop (blocking) only when enabled
     if auto:
         placeholder = st.empty()
         for i in range(int(interval), 0, -1):
             try:
-                placeholder.caption(f"Refreshing in {i}sâ€¦")
+                placeholder.caption(f"Refreshing in {i}s…")
                 _time.sleep(1)
             except Exception:
                 break
@@ -1060,23 +1060,23 @@ with tab_new:
         st.markdown("#### Bulk Classification Tool")
         st.markdown("""
 **Review Your Data**  
-â€¢ Ensure you have the necessary permissions to classify this data  
-â€¢ Verify no sensitive credentials are included
+• Ensure you have the necessary permissions to classify this data  
+• Verify no sensitive credentials are included
 
 **Required Columns**  
-â€¢ `DATA_ASSET_PATH` (format: `DATABASE.SCHEMA.TABLE`)  
-â€¢ `BUSINESS_CONTEXT` (describe the data's purpose)  
-â€¢ `DATA_OWNER_EMAIL` (must be @avendra.com)
+• `DATA_ASSET_PATH` (format: `DATABASE.SCHEMA.TABLE`)  
+• `BUSINESS_CONTEXT` (describe the data's purpose)  
+• `DATA_OWNER_EMAIL` (must be @avendra.com)
 
 **Optional Columns**  
-â€¢ `C`/`I`/`A`: 0-3 (leave blank for auto-suggestion)  
-â€¢ `BUSINESS_RATIONALE` (required for overrides)
+• `C`/`I`/`A`: 0-3 (leave blank for auto-suggestion)  
+• `BUSINESS_RATIONALE` (required for overrides)
 
 **File Requirements**  
-â€¢ Max size: 10MB  
-â€¢ Format: CSV (UTF-8)  
-â€¢ No special characters in headers  
-â€¢ No empty rows between data
+• Max size: 10MB  
+• Format: CSV (UTF-8)  
+• No special characters in headers  
+• No empty rows between data
 
 **What Happens Next**  
 1. Instant validation  
@@ -1426,7 +1426,7 @@ _Download the template below to begin_
                         bad_rows.append(full)
 
                 vdf = _pd.DataFrame(rows_view)
-                st.dataframe(vdf, width='stretch')
+                st.dataframe(vdf, use_container_width=True)
                 st.caption("Rows with errors cannot be submitted. Routes: AUTO_APPROVE, EXPEDITED (1 day), STANDARD (2 days), ENHANCED (committee)")
 
                 can_submit = not vdf.empty and all(not str(e or "").strip() for e in vdf["ERRORS"].tolist())
@@ -1533,9 +1533,9 @@ _Download the template below to begin_
                                 continue
                         
                         if failed == 0:
-                            st.success(f"Batch processed successfully â€” Applied: {applied}, Queued: {queued}")
+                            st.success(f"Batch processed successfully — Applied: {applied}, Queued: {queued}")
                         else:
-                            st.warning(f"Batch processed with errors â€” Applied: {applied}, Queued: {queued}, Failed: {failed}")
+                            st.warning(f"Batch processed with errors — Applied: {applied}, Queued: {queued}, Failed: {failed}")
 
                 # Submit valid rows only (skips rows with errors)
                 if st.session_state.get('trigger_bulk_valid_processing'):
@@ -1612,9 +1612,9 @@ _Download the template below to begin_
                                 failed += 1
                                 st.error(f"Failed row for {rr.get('FULL_NAME')}: {e}")
                         if failed == 0:
-                            st.success(f"Submitted valid rows â€” Applied: {applied}, Queued: {queued}")
+                            st.success(f"Submitted valid rows — Applied: {applied}, Queued: {queued}")
                         else:
-                            st.warning(f"Submitted valid rows with some errors â€” Applied: {applied}, Queued: {queued}, Failed: {failed}")
+                            st.warning(f"Submitted valid rows with some errors — Applied: {applied}, Queued: {queued}, Failed: {failed}")
 
     # AI Assistant tab
     with sub_ai:
@@ -1717,13 +1717,13 @@ _Download the template below to begin_
                             _tf = str(sel_table_filter).upper()
                             specials = [r for r in specials if _tf in str(r.get('TABLE') or '').upper()]
                         st.markdown("#### Special Categories Detected (Preview)")
-                        st.caption("CIA ? Label rules: ?? Confidential (C3,I3,A2â€“A3) | ?? Restricted (C2,I2,A1â€“A2) | ?? Internal (C1,I1,A1) | ?? Public (C0,I0,A0)")
+                        st.caption("CIA ? Label rules: ?? Confidential (C3,I3,A2–A3) | ?? Restricted (C2,I2,A1–A2) | ?? Internal (C1,I1,A1) | ?? Public (C0,I0,A0)")
                         st.caption("Risk rules: High (any CIA=3) ? Strict governance; Medium (any CIA=2) ? Moderate controls; Low (all =1) ? Standard")
                         if specials and _pd is not None:
                             df_spec = _pd.DataFrame(specials)
                             st.dataframe(df_spec[[
                                 'FULLY_QUALIFIED_NAME','CATEGORY','CONFIDENCE','C','I','A','RULE_LABEL','RISK_LEVEL','RISK_ACTION','COMPLIANCE','REVIEW_STATUS','ROW_COUNT'
-                            ]], width='stretch', hide_index=True)
+                            ]], use_container_width=True, hide_index=True)
                             # Optional: generate tag SQL for selected tables
                             try:
                                 _choices_sql = df_spec['FULLY_QUALIFIED_NAME'].dropna().astype(str).tolist()
@@ -1829,8 +1829,8 @@ _Download the template below to begin_
                             if _svc is not None:
                                 _options = [r['FULLY_QUALIFIED_NAME'] for r in specials if r.get('FULLY_QUALIFIED_NAME')]
                                 if _options:
-                                    sel_tbl = st.selectbox("Drill down to column-level for:", options=["â€” Select â€”"] + _options, index=0, key="ai_spec_drill_sel")
-                                    if sel_tbl and sel_tbl != "â€” Select â€”":
+                                    sel_tbl = st.selectbox("Drill down to column-level for:", options=["— Select —"] + _options, index=0, key="ai_spec_drill_sel")
+                                    if sel_tbl and sel_tbl != "— Select —":
                                         try:
                                             # Load column data types for the table once
                                             try:
@@ -1920,15 +1920,15 @@ _Download the template below to begin_
                                                 })
                                             if rows_dd:
                                                 df_dd = _pd.DataFrame(rows_dd)
-                                                st.dataframe(df_dd[['COLUMN_NAME','DATA_TYPE','CATEGORIES','LABEL','CIA','COMPLIANCE','SOURCE','CONFIDENCE','TAG_SQL']], width='stretch', hide_index=True)
+                                                st.dataframe(df_dd[['COLUMN_NAME','DATA_TYPE','CATEGORIES','LABEL','CIA','COMPLIANCE','SOURCE','CONFIDENCE','TAG_SQL']], use_container_width=True, hide_index=True)
                                                 # Column-level tagging: select column and apply label (derived from CIA or fallback to Internal)
                                                 try:
                                                     col_options = df_dd['COLUMN_NAME'].dropna().astype(str).tolist()
                                                 except Exception:
                                                     col_options = []
                                                 if col_options:
-                                                    sel_col = st.selectbox("Select a column to tag:", options=["â€” Select â€”"] + col_options, index=0, key="ai_col_tag_sel")
-                                                    if sel_col and sel_col != "â€” Select â€”":
+                                                    sel_col = st.selectbox("Select a column to tag:", options=["— Select —"] + col_options, index=0, key="ai_col_tag_sel")
+                                                    if sel_col and sel_col != "— Select —":
                                                         # Derive CIA from CIA text if available
                                                         def _parse_cia(txt: str):
                                                             try:
@@ -1966,7 +1966,7 @@ _Download the template below to begin_
                                                         c_txt = str(rowc.get('CIA') or '')
                                                         c_val,i_val,a_val = _parse_cia(c_txt)
                                                         lbl_col = _label_from_cia2(c_val,i_val,a_val)
-                                                        st.caption(f"Proposed column label: {lbl_col} (C{c_val}/I{i_val}/A{a_val}) â€” fallback to Internal if invalid")
+                                                        st.caption(f"Proposed column label: {lbl_col} (C{c_val}/I{i_val}/A{a_val}) — fallback to Internal if invalid")
                                                         if st.button("Apply Column Tag", key="btn_apply_col_tag"):
                                                             try:
                                                                 from src.services.tagging_service import tagging_service as _tag_svc
@@ -2105,7 +2105,7 @@ _Download the template below to begin_
                                     if fb_specials:
                                         st.info("Fallback results shown (pattern/keyword CTE). Semantic search returned no special-category tables.")
                                         df_fb = _pd.DataFrame(fb_specials)
-                                        st.dataframe(df_fb[['FULLY_QUALIFIED_NAME','CATEGORY','CONFIDENCE']], width='stretch', hide_index=True)
+                                        st.dataframe(df_fb[['FULLY_QUALIFIED_NAME','CATEGORY','CONFIDENCE']], use_container_width=True, hide_index=True)
                                     else:
                                         st.caption("No special-category tables found by fallback detection.")
                                 else:
@@ -2269,12 +2269,12 @@ _Download the template below to begin_
             sel_table = None
         st.caption("Scope is controlled by the sidebar global filter (Database/Schema).")
 
-        # Level 1 â€” Sensitive Tables Overview (removed)
+        # Level 1 — Sensitive Tables Overview (removed)
         st.markdown("####  Sensitive Tables Overview")
         st.caption("This AI Assistant feature has been removed. Use Data Assets and Classification pages for sensitive table reports.")
         selected_full_name = ""
 
-        # Level 2 â€” Drill-Down: Sensitive Columns View (editable)
+        # Level 2 — Drill-Down: Sensitive Columns View (editable)
         if selected_full_name:
             st.markdown("#### Sensitive Columns Drill-down")
             cols_detect = []
@@ -2482,7 +2482,7 @@ _Download the template below to begin_
                             END                                               AS "Need Review",
                             CASE 
                                 WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 100) THEN 'Column contains high-sensitivity data (PII/Financial/RegEx Match)'
-                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 100 * 0.6) THEN 'Column partially matches sensitive patterns â€” manual review recommended'
+                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 100 * 0.6) THEN 'Column partially matches sensitive patterns — manual review recommended'
                                 ELSE 'Column appears safe under current detection thresholds'
                             END                                               AS "Reason / Justification",
                             CASE 
@@ -2657,7 +2657,7 @@ _Download the template below to begin_
             }
             edited = st.data_editor(
                 df_edit,
-                width='stretch',
+                use_container_width=True,
                 num_rows="fixed",
                 hide_index=True,
                 column_config=editor_conf_ai,
@@ -2879,7 +2879,7 @@ _Download the template below to begin_
         _gf = st.session_state.get("global_filters") or {}
         inv_rows = _inventory_assets(_db_active, _gv, _gf)
         inv_options_real = [ (r.get("FULLY_QUALIFIED_NAME") or r.get("FULL_NAME")) for r in (inv_rows or []) if (r.get("FULLY_QUALIFIED_NAME") or r.get("FULL_NAME")) ]
-        placeholder = "â€” Select an asset â€”"
+        placeholder = "— Select an asset —"
         inv_options = ([placeholder] + inv_options_real) if inv_options_real else ["No assets available"]
         sel_asset_nc = st.selectbox("Asset (from Inventory)", options=inv_options, index=0, key="nc_asset")
         # Track last selection to gate prefill
@@ -2904,10 +2904,10 @@ _Download the template below to begin_
         if valid_asset_selected:
             with st.expander("Asset Metadata", expanded=False):
                 m = inv_map.get(sel_asset_nc) or {}
-                st.markdown(f"- Type: `{(m.get('ASSET_TYPE') or m.get('OBJECT_TYPE') or 'â€”')}`")
-                st.markdown(f"- Domain: `{(m.get('DATA_DOMAIN') or m.get('OBJECT_DOMAIN') or 'â€”')}`")
-                st.markdown(f"- Source: `{(m.get('SOURCE_SYSTEM') or 'â€”')}`")
-                st.markdown(f"- Owner: `{(m.get('OWNER') or m.get('CUSTODIAN') or 'â€”')}`")
+                st.markdown(f"- Type: `{(m.get('ASSET_TYPE') or m.get('OBJECT_TYPE') or '—')}`")
+                st.markdown(f"- Domain: `{(m.get('DATA_DOMAIN') or m.get('OBJECT_DOMAIN') or '—')}`")
+                st.markdown(f"- Source: `{(m.get('SOURCE_SYSTEM') or '—')}`")
+                st.markdown(f"- Owner: `{(m.get('OWNER') or m.get('CUSTODIAN') or '—')}`")
 
         # Gate: render form only after valid selection
         if valid_asset_selected:
@@ -2948,13 +2948,13 @@ _Download the template below to begin_
                         bdays_remaining = 0
                     # Deadline status coloring
                     if bdays_remaining <= 0:
-                        st.error(f"Deadline Status: Overdue â€” {bdays_remaining} business days remaining")
+                        st.error(f"Deadline Status: Overdue — {bdays_remaining} business days remaining")
                         nc_deadline_status = "Overdue"
                     elif bdays_remaining <= 5:
-                        st.warning(f"Deadline Status: Due Soon â€” {bdays_remaining} business days remaining")
+                        st.warning(f"Deadline Status: Due Soon — {bdays_remaining} business days remaining")
                         nc_deadline_status = "Due Soon"
                     else:
-                        st.success(f"Deadline Status: On Track â€” {bdays_remaining} business days remaining")
+                        st.success(f"Deadline Status: On Track — {bdays_remaining} business days remaining")
                         nc_deadline_status = "On Track"
 
                 # Heuristic signals from inventory
@@ -3009,7 +3009,7 @@ _Download the template below to begin_
                         st.info("Detected special categories: " + ", ".join([f"`{c}`" for c in ai_categories]))
                         _det_df = _pd.DataFrame([{"Category": k, "Confidence": round(v, 2)} for k, v in (ai_confidence.items() or [])])
                         if not _det_df.empty:
-                            st.dataframe(_det_df, hide_index=True, width='stretch')
+                            st.dataframe(_det_df, hide_index=True, use_container_width=True)
                     except Exception:
                         pass
                 # Persist detected categories for downstream tagging review
@@ -3017,8 +3017,8 @@ _Download the template below to begin_
                     st.session_state["nc_ai_categories"] = list(ai_categories)
                 except Exception:
                     pass
-                # Step 2: C, Step 3: I, Step 4: A â€” Guided Questions with automatic scoring
-                st.markdown("##### Step 2: Confidentiality (C0â€“C3)")
+                # Step 2: C, Step 3: I, Step 4: A — Guided Questions with automatic scoring
+                st.markdown("##### Step 2: Confidentiality (C0–C3)")
                 st.caption("C0: Public | C1: Internal | C2: Restricted (PII/Financial) | C3: Confidential/Highly Sensitive")
                 # Confidentiality questions
                 c_q_unauth = st.selectbox(
@@ -3059,8 +3059,8 @@ _Download the template below to begin_
                 except Exception:
                     pass
                 # Integrity questions
-                st.markdown("##### Step 3: Integrity (I0â€“I3)")
-                st.caption("I0: Low | I1: Moderate | I2: High | I3: Critical â€” impact if data is inaccurate or corrupted")
+                st.markdown("##### Step 3: Integrity (I0–I3)")
+                st.caption("I0: Low | I1: Moderate | I2: High | I3: Critical — impact if data is inaccurate or corrupted")
                 i_q_wrong = st.selectbox(
                     "What happens if this data is wrong or gets changed?",
                     ["No impact", "Minor", "Significant", "Severe"],
@@ -3090,8 +3090,8 @@ _Download the template below to begin_
                 except Exception:
                     pass
                 # Availability questions
-                st.markdown("##### Step 4: Availability (A0â€“A3)")
-                st.caption("A0: Days+ | A1: Hours | A2: <1 hour | A3: Near real-time â€” operational need to access data promptly")
+                st.markdown("##### Step 4: Availability (A0–A3)")
+                st.caption("A0: Days+ | A1: Hours | A2: <1 hour | A3: Near real-time — operational need to access data promptly")
                 a_q_noaccess = st.selectbox(
                     "What happens if we can't access this data during work hours?",
                     ["Minimal", "Disruptive", "Severe"],
@@ -4073,7 +4073,7 @@ if False:
             
             st.dataframe(
                 pd.DataFrame(summary_data),
-                width='stretch',
+                use_container_width=True,
                 hide_index=True
             )
             
@@ -4094,7 +4094,7 @@ if False:
                     if col_details:
                         st.dataframe(
                             pd.DataFrame(col_details),
-                            width='stretch',
+                            use_container_width=True,
                             hide_index=True
                         )
                     else:
@@ -4360,7 +4360,7 @@ if False:
                 except Exception:
                     return ['' for _ in row]
 
-            st.markdown("##### Sensitive Tables â€” AI Suggestions")
+            st.markdown("##### Sensitive Tables — AI Suggestions")
             # Compute and display Actual Row Count for each sensitive table (auto)
             st.session_state.setdefault("ai_actual_counts", {})
             try:
@@ -4403,7 +4403,7 @@ if False:
                         {"selector": "td", "props": "color: #000000;"},
                     ])
                     .hide(axis="index"),
-                width='stretch',
+                use_container_width=True,
             )
             try:
                 names = sum_df["FULL_NAME"].dropna().astype(str).tolist()
@@ -4504,7 +4504,7 @@ if False:
                                 st.markdown("###### Review and edit column classifications")
                                 edited = st.data_editor(
                                     cdf[editable_cols],
-                                    width='stretch',
+                                    use_container_width=True,
                                     key=f"ai_edit_drill_{sel}",
                                 )
                                 if st.button(f"Approve and Apply for {sel}", type="primary", key=f"ai_approve_{sel}"):
@@ -4570,7 +4570,7 @@ if False:
                             except Exception:
                                 # Fallback read-only view
                                 show_cols = ["Column Name","Detected Category","Confidence","CIA","Recommended Policies","Review Flag","Bundle"]
-                                st.dataframe(cdf[show_cols], width='stretch')
+                                st.dataframe(cdf[show_cols], use_container_width=True)
             except Exception:
                 pass
         else:
@@ -4796,7 +4796,7 @@ if False:
                             "ISSUE": issue,
                         })
                     vdf = _pd.DataFrame(view)
-                    st.dataframe(vdf, width='stretch')
+                    st.dataframe(vdf, use_container_width=True)
                     try:
                         df_failed = vdf[vdf["PRE_VALIDATION_OK"] == False] if "PRE_VALIDATION_OK" in vdf.columns else _pd.DataFrame()
                         df_manual = vdf[(vdf.get("PRE_VALIDATION_OK", True)) & (vdf.get("POLICY_OK", False) == False)] if not vdf.empty else _pd.DataFrame()
@@ -4806,21 +4806,21 @@ if False:
                     try:
                         if not df_success.empty:
                             st.markdown("##### Successfully validated")
-                            st.dataframe(df_success, width='stretch')
+                            st.dataframe(df_success, use_container_width=True)
                             st.download_button("Download Success Report", df_success.to_csv(index=False), "bulk_success.csv", "text/csv", key="bulk_succ_dl")
                     except Exception:
                         pass
                     try:
                         if not df_manual.empty:
                             st.markdown("##### Requires manual review")
-                            st.dataframe(df_manual, width='stretch')
+                            st.dataframe(df_manual, use_container_width=True)
                             st.download_button("Download Manual Review Report", df_manual.to_csv(index=False), "bulk_manual.csv", "text/csv", key="bulk_man_dl")
                     except Exception:
                         pass
                     try:
                         if not df_failed.empty:
                             st.markdown("##### Failed validations")
-                            st.dataframe(df_failed, width='stretch')
+                            st.dataframe(df_failed, use_container_width=True)
                             st.download_button("Download Failed Report", df_failed.to_csv(index=False), "bulk_failed.csv", "text/csv", key="bulk_fail_dl")
                     except Exception:
                         pass
@@ -5186,7 +5186,7 @@ with tab_tasks:
                 .map(_style_deadline, subset=[c for c in ["Deadline Status"] if c in disp.columns])
                 .map(_style_compliance, subset=[c for c in ["Policy Compliance"] if c in disp.columns])
                 .hide(axis="index"),
-                width='stretch',
+                use_container_width=True,
             )
 
             # Click-to-open wizard
@@ -5421,7 +5421,7 @@ with tab_tasks:
             ] if c in view.columns]
             if not disp_cols:
                 disp_cols = list(view.columns)
-            st.dataframe(view[disp_cols].style.map(_style_status, subset=[c for c in ["Tag"] if c in view.columns]).hide(axis="index"), width='stretch')
+            st.dataframe(view[disp_cols].style.map(_style_status, subset=[c for c in ["Tag"] if c in view.columns]).hide(axis="index"), use_container_width=True)
 
             # Actions: Approve / Request Changes / Reject
             sel_id_col = "review_id" if "review_id" in view.columns else None
@@ -5691,7 +5691,7 @@ with tab_tasks:
                     "PREVIOUS_AVAILABILITY","NEW_AVAILABILITY",
                     "CHANGED_BY","CHANGE_REASON","CHANGE_TIMESTAMP"
                 ] if c in d1.columns]
-                st.dataframe(d1[show_cols] if show_cols else d1, width='stretch')
+                st.dataframe(d1[show_cols] if show_cols else d1, use_container_width=True)
                 try:
                     csv = (d1[show_cols] if show_cols else d1).to_csv(index=False).encode("utf-8")
                     st.download_button("Download Change Log (CSV)", data=csv, file_name="classification_change_log.csv", mime="text/csv")
@@ -5705,7 +5705,7 @@ with tab_tasks:
                 st.info("No audit activity for the selected period.")
             else:
                 show_cols = [c for c in ["ASSET_ID","OBJECT_NAME","ACTION_TYPE","ACTION","DETAILS","CREATED_AT","ACTION_DATE"] if c in d2.columns]
-                st.dataframe(d2[show_cols] if show_cols else d2, width='stretch')
+                st.dataframe(d2[show_cols] if show_cols else d2, use_container_width=True)
                 try:
                     csv = (d2[show_cols] if show_cols else d2).to_csv(index=False).encode("utf-8")
                     st.download_button("Download Audit Trail (CSV)", data=csv, file_name="classification_audit_trail.csv", mime="text/csv")
@@ -5730,7 +5730,7 @@ with tab_tasks:
                         cnts = bx.groupby(key).size().reset_index(name='VERSION_COUNT')
                         view = latest.merge(cnts, on=key, how='left')
                         cols_show = [c for c in [key, 'NEW_CLASSIFICATION','NEW_CONFIDENTIALITY','NEW_INTEGRITY','NEW_AVAILABILITY', ts, 'VERSION_COUNT'] if c in view.columns]
-                        st.dataframe(view[cols_show] if cols_show else view, width='stretch')
+                        st.dataframe(view[cols_show] if cols_show else view, use_container_width=True)
                         try:
                             csv = (view[cols_show] if cols_show else view).to_csv(index=False).encode("utf-8")
                             st.download_button("Download Versions (CSV)", data=csv, file_name="classification_versions.csv", mime="text/csv")
@@ -5741,7 +5741,7 @@ with tab_tasks:
                             timeline = bx[bx[key] == sel].sort_values(ts, ascending=True)
                             tcols = [c for c in [ts,'PREVIOUS_CLASSIFICATION','NEW_CLASSIFICATION','CHANGED_BY','CHANGE_REASON'] if c in timeline.columns]
                             st.markdown("**Timeline**")
-                            st.dataframe(timeline[tcols] if tcols else timeline, width='stretch')
+                            st.dataframe(timeline[tcols] if tcols else timeline, use_container_width=True)
                 except Exception as e:
                     st.info(f"Version history unavailable: {e}")
 
@@ -5853,7 +5853,7 @@ with tab_tasks:
 
         # Display table
         show_cols = ["DATASET", "CIA_SCORES", "OVERALL_CLASSIFICATION", "REVIEWER", "STATUS", "DUE_DATE"]
-        st.dataframe(df[show_cols] if not df.empty else pd.DataFrame(columns=show_cols), width='stretch')
+        st.dataframe(df[show_cols] if not df.empty else pd.DataFrame(columns=show_cols), use_container_width=True)
 
         # Action panel for a selected review
         if not df.empty:
@@ -6123,7 +6123,7 @@ with tab_tasks:
 
             # Present unified view (read-only for now); keep bulk actions minimal
             show_cols = [c for c in ["Asset Name","Type","Due Date","Priority2","Assignment","Task Type","Status","Source"] if c in df.columns]
-            st.dataframe(df[show_cols].rename(columns={"Priority2":"Priority"}), width='stretch')
+            st.dataframe(df[show_cols].rename(columns={"Priority2":"Priority"}), use_container_width=True)
 
     st.markdown("---")
     st.caption("Use the New Classification wizard for detailed workflows. This My Tasks table supports quick updates and submissions.")
@@ -6180,7 +6180,7 @@ if False:
         if rdf.empty:
             st.info("No review items for current filters.")
         else:
-            st.dataframe(rdf, width='stretch', hide_index=True)
+            st.dataframe(rdf, use_container_width=True, hide_index=True)
             # Reviewer actions
             sel_asset_rev = st.selectbox("Select asset to review", options=rdf.get("asset_name", _pd.Series(dtype=str)).dropna().unique().tolist() if "asset_name" in rdf.columns else [])
             colrv1, colrv2, colrv3 = st.columns(3)
@@ -6295,7 +6295,7 @@ if False:
             df = df[df["STATUS"].isin(f_status2)] if "STATUS" in df.columns else df
         if f_scope:
             df = df[df.apply(lambda r: f_scope.lower() in str(r.get("ASSET_FULL_NAME") or r.get("ASSET") or r.get("FULL_NAME") or "").lower(), axis=1)]
-        st.dataframe(df, width='stretch', hide_index=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
         # Bulk ops
         st.markdown("---")
         sel_ids = st.multiselect("Select requests for bulk action", df["ID"].tolist() if "ID" in df.columns else [])
@@ -6433,7 +6433,7 @@ if False:
     if hdf.empty:
         st.info("No history for current filters.")
     else:
-        st.dataframe(hdf, width='stretch', hide_index=True)
+        st.dataframe(hdf, use_container_width=True, hide_index=True)
 
 if False:
     st.subheader("Snowflake Tag Management")
@@ -6459,7 +6459,7 @@ if False:
     if tdf.empty:
         st.info("No items for current filters.")
     else:
-        st.dataframe(tdf, width='stretch', hide_index=True)
+        st.dataframe(tdf, use_container_width=True, hide_index=True)
 
         # Drift sync tools
         drift_assets = tdf[tdf.get("drift") == True]["asset_name"].dropna().unique().tolist() if "drift" in tdf.columns else []
@@ -6509,7 +6509,7 @@ from typing import Optional, Tuple, Dict
 
 @dataclass
 class CIA:
-    """Implements Section 5.2 CIA Scales: C0â€“C3, I0â€“I3, A0â€“A3."""
+    """Implements Section 5.2 CIA Scales: C0–C3, I0–I3, A0–A3."""
     c: int
     i: int
     a: int
@@ -6782,7 +6782,7 @@ def _stepper_ui():
         stakeholders = st.text_input("Key stakeholders", placeholder="Owners, SMEs, consumers")
 
     st.markdown("---")
-    st.markdown("### Step 2: Confidentiality Assessment (C0â€“C3)")
+    st.markdown("### Step 2: Confidentiality Assessment (C0–C3)")
     with st.expander("Confidentiality", expanded=True):
         c_q1 = st.selectbox("Would unauthorized disclosure cause harm?", ["No/Minimal", "Some", "Material", "Severe"], index=1)
         c_q2 = st.selectbox("Contains PII/financial/proprietary?", ["No", "Possible", "Likely", "Yes"], index=0)
@@ -6793,7 +6793,7 @@ def _stepper_ui():
         st.caption(f"Selected Confidentiality level: C{c_val}")
 
     st.markdown("---")
-    st.markdown("### Step 3: Integrity Assessment (I0â€“I3)")
+    st.markdown("### Step 3: Integrity Assessment (I0–I3)")
     with st.expander("Integrity", expanded=True):
         i_q1 = st.selectbox("How critical is accuracy to operations?", ["Low", "Moderate", "High", "Critical"], index=1)
         i_q2 = st.selectbox("Impact if data is corrupted?", ["Minor", "Moderate", "Major", "Severe"], index=1)
@@ -6802,7 +6802,7 @@ def _stepper_ui():
         st.caption(f"Selected Integrity level: I{i_val}")
 
     st.markdown("---")
-    st.markdown("### Step 4: Availability Assessment (A0â€“A3)")
+    st.markdown("### Step 4: Availability Assessment (A0–A3)")
     with st.expander("Availability", expanded=True):
         a_q1 = st.selectbox("How quickly must data be accessible?", ["Days+", "Hours", "< 1 hour", "Near-realtime"], index=1)
         a_q2 = st.selectbox("Impact if unavailable?", ["Minor", "Moderate", "Major", "Severe"], index=1)
@@ -7067,7 +7067,7 @@ def _ai_assistance_panel():
 
     # Run detection when requested or when no cached results
     if refresh or ai_ss.get("tables") is None or ai_ss.get("tables").empty:
-        with st.spinner(f"Detecting sensitive tables in {db}â€¦"):
+        with st.spinner(f"Detecting sensitive tables in {db}…"):
             tdf = _run_detection(db, int(limit), int(sample))
             # Persist tables and per-table columns
             cols_map = {}
@@ -7087,7 +7087,7 @@ def _ai_assistance_panel():
         tdf[[
             'Table Name','Detected Sensitivity Types','AI_C','AI_I','AI_A','Compliance'
         ]],
-        width='stretch',
+        use_container_width=True,
         hide_index=True,
     )
 
@@ -7119,7 +7119,7 @@ def _ai_assistance_panel():
     st.markdown("### Column-Level Detection (live)")
     st.dataframe(
         cols_df,
-        width='stretch',
+        use_container_width=True,
         hide_index=True,
     )
     # Only show live detection; skip legacy editing UI
@@ -7136,7 +7136,7 @@ def _ai_assistance_panel():
         st.markdown("**Table-level Classification (editable)**")
         table_edit = st.data_editor(
             pd.DataFrame([{'Table Name': sel_tbl, 'Label': tLabel, 'C': tC, 'I': tI, 'A': tA}]),
-            width='stretch',
+            use_container_width=True,
             hide_index=True,
             num_rows="fixed",
             column_config={
@@ -7269,7 +7269,7 @@ def _bulk_classification_panel():
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
         return
-    st.dataframe(df.head(20), width='stretch')
+    st.dataframe(df.head(20), use_container_width=True)
     missing = [c for c in ["FULL_NAME","C","I","A"] if c not in [x.upper() for x in df.columns]]
     if missing:
         st.error(f"Missing required columns: {', '.join(missing)}")
@@ -7505,7 +7505,7 @@ def _management_panel():
                     color = "#10b981"
                 return f"color: {color}; font-weight: 700;"
             styler = df[["Asset Name","Type","Due Date","Priority2","Assignment","Task Type","Status"]].rename(columns={"Priority2":"Priority"}).style.applymap(_style_priority, subset=["Priority"]).hide(axis="index")
-            st.dataframe(styler, width='stretch')
+            st.dataframe(styler, use_container_width=True)
 
             # Quick actions
             sel_asset = st.selectbox("Select a task", options=df["Asset Name"].tolist(), key="tasks_sel_asset")
@@ -7535,23 +7535,23 @@ def _management_panel():
 
         if action == "classify" or target_asset:
             st.markdown("---")
-            st.subheader(f"Classification Wizard â€” {target_asset}")
+            st.subheader(f"Classification Wizard — {target_asset}")
             with st.form(key="task_wizard_form", clear_on_submit=False):
                 # Step A: Confidentiality
-                st.markdown("### Step 1: Confidentiality Assessment (C0â€“C3)")
+                st.markdown("### Step 1: Confidentiality Assessment (C0–C3)")
                 c_q1 = st.selectbox("Unauthorized disclosure impact", ["No/Minimal","Some","Material","Severe"], index=1, key="wiz_cq1")
                 c_q2 = st.selectbox("Contains sensitive data (PII/financial/proprietary)", ["No","Possible","Likely","Yes"], index=0, key="wiz_cq2")
                 c_q3 = st.selectbox("Regulatory requirements present", ["None","Some","Multiple","Strict"], index=0, key="wiz_cq3")
                 c_val = max(["No/Minimal","Some","Material","Severe"].index(c_q1), ["No","Possible","Likely","Yes"].index(c_q2), ["None","Some","Multiple","Strict"].index(c_q3))
 
                 # Step B: Integrity
-                st.markdown("### Step 2: Integrity Assessment (I0â€“I3)")
+                st.markdown("### Step 2: Integrity Assessment (I0–I3)")
                 i_q1 = st.selectbox("Accuracy criticality to operations", ["Low","Moderate","High","Critical"], index=1, key="wiz_iq1")
                 i_q2 = st.selectbox("Impact if data is corrupted", ["Minor","Moderate","Major","Severe"], index=1, key="wiz_iq2")
                 i_val = max(["Low","Moderate","High","Critical"].index(i_q1), ["Minor","Moderate","Major","Severe"].index(i_q2))
 
                 # Step C: Availability
-                st.markdown("### Step 3: Availability Assessment (A0â€“A3)")
+                st.markdown("### Step 3: Availability Assessment (A0–A3)")
                 a_q1 = st.selectbox("Required accessibility timeframe", ["Days+","Hours","< 1 hour","Near-realtime"], index=1, key="wiz_aq1")
                 a_q2 = st.selectbox("Impact if unavailable", ["Minor","Moderate","Major","Severe"], index=1, key="wiz_aq2")
                 a_val = max(["Days+","Hours","< 1 hour","Near-realtime"].index(a_q1), ["Minor","Moderate","Major","Severe"].index(a_q2))
@@ -7810,7 +7810,7 @@ def _management_panel():
             view = view.copy()
             view["Review Type"] = view.apply(_badge_type, axis=1)
             cols_show = [c for c in ["ID","ASSET_FULL_NAME","PROPOSED_LABEL_N","PC","PI","PA","CREATED_BY","CREATED_AT","Review Type"] if c in view.columns]
-            st.dataframe(view[cols_show], width='stretch')
+            st.dataframe(view[cols_show], use_container_width=True)
         else:
             st.info("No pending reviews found for the selected filters.")
 
@@ -7963,7 +7963,7 @@ def _management_panel():
                     except Exception:
                         labels.append(None)
                 sim_df["DATA_CLASSIFICATION"] = labels
-                st.dataframe(sim_df[[c for c in ["FULL_NAME","OBJECT_DOMAIN","DATA_CLASSIFICATION","CIA_CONF","CIA_INT","CIA_AVAIL"] if c in sim_df.columns]], width='stretch')
+                st.dataframe(sim_df[[c for c in ["FULL_NAME","OBJECT_DOMAIN","DATA_CLASSIFICATION","CIA_CONF","CIA_INT","CIA_AVAIL"] if c in sim_df.columns]], use_container_width=True)
 
                 # Inconsistency hint
                 try:
@@ -8066,7 +8066,7 @@ def _management_panel():
                 rdf = rdf[rdf["Risk"].isin([r.replace("Impact", "").strip() for r in risk_level])]
 
             cols = [c for c in ["ID","ASSET_FULL_NAME","Risk","Trigger Source","Impact Scope","Implementation Status","STATUS","CREATED_AT"] if c in rdf.columns]
-            st.dataframe(rdf[cols], width='stretch')
+            st.dataframe(rdf[cols], use_container_width=True)
         else:
             st.info("No reclassification requests found.")
 
@@ -8123,7 +8123,7 @@ def _management_panel():
                         else:
                             cutoff = now - pd.Timedelta(days=30)
                         reqs_df = reqs_df[pd.to_datetime(reqs_df["CREATED_AT"], errors='coerce') >= cutoff]
-                st.dataframe(reqs_df, width='stretch')
+                st.dataframe(reqs_df, use_container_width=True)
             except Exception as e:
                 st.info(f"No reclassification history: {e}")
             try:
@@ -8158,7 +8158,7 @@ def _management_panel():
                     logs_df = logs_df[logs_df["Activity Type"].isin(activity_type)]
                 # User role filter is best-effort without directory: show unchanged
                 # Change magnitude placeholder: treat High CIA deltas as Major (not derivable here) -> skip
-                st.dataframe(logs_df, width='stretch')
+                st.dataframe(logs_df, use_container_width=True)
             except Exception as e:
                 st.info(f"No audit logs: {e}")
 
@@ -8246,7 +8246,7 @@ def _management_panel():
                     tdf = tdf[pd.to_datetime(tdf["Last Sync"], errors='coerce') >= cutoff]
                 else:
                     tdf = tdf[pd.to_datetime(tdf["Last Sync"], errors='coerce') < (now - pd.Timedelta(days=7))]
-            st.dataframe(tdf, width='stretch')
+            st.dataframe(tdf, use_container_width=True)
         else:
             st.info("No tag data available to display.")
 
@@ -8292,7 +8292,7 @@ def _compliance_panel():
     c2.metric("Classified", metrics.get("classified", 0))
     c3.metric("Overdue (SLA 5d)", metrics.get("overdue", 0))
     if not df.empty:
-        st.dataframe(df[[c for c in ["FULL_NAME","FIRST_DISCOVERED","CLASSIFIED","CIA_CONF","CIA_INT","CIA_AVAIL","DUE_BY","OVERDUE"] if c in df.columns]], width='stretch')
+        st.dataframe(df[[c for c in ["FULL_NAME","FIRST_DISCOVERED","CLASSIFIED","CIA_CONF","CIA_INT","CIA_AVAIL","DUE_BY","OVERDUE"] if c in df.columns]], use_container_width=True)
 
 # ---------------------------
 # Page Render
@@ -8348,7 +8348,7 @@ with tab0:
             idf = pd.DataFrame(rows)
             idf.rename(columns={"FULL_NAME":"Asset","OBJECT_DOMAIN":"Type"}, inplace=True)
             idf["Status"] = idf["CLASSIFIED"].apply(lambda x: "Classified " if x else "Unclassified ")
-            st.dataframe(idf[["Asset","Type","FIRST_DISCOVERED","LAST_SEEN","Status"]], width='stretch')
+            st.dataframe(idf[["Asset","Type","FIRST_DISCOVERED","LAST_SEEN","Status"]], use_container_width=True)
         else:
             st.info("No assets in inventory yet. Run a scan below.")
     except Exception as e:
@@ -8410,9 +8410,9 @@ with tab0:
         except Exception:
             pass
         st.markdown("**Tables**")
-        st.dataframe(tdf, width='stretch')
+        st.dataframe(tdf, use_container_width=True)
         st.markdown("**Columns**")
-        st.dataframe(cdf, width='stretch')
+        st.dataframe(cdf, use_container_width=True)
     else:
         st.info("Enter a search string above to find tables and columns.")
 
@@ -9231,7 +9231,7 @@ with tab1:
         edited_df = st.data_editor(
             df_grid,
             num_rows="dynamic",
-            width='stretch',
+            use_container_width=True,
             column_config=editor_conf,
             disabled=["Column","Type","Suggested Label","Current Tags"],
             key="col_editor",
@@ -9256,7 +9256,7 @@ with tab1:
                                 """,
                                 {"afn": f"{table_full}.{colnm}"},
                             ) or []
-                            st.dataframe(_pd.DataFrame(rows), width='stretch')
+                            st.dataframe(_pd.DataFrame(rows), use_container_width=True)
                         except Exception as e:
                             st.info(f"No history available: {e}")
             except Exception:
@@ -9606,7 +9606,7 @@ with tab3:
             out = out[out["HIGHEST"] >= int(min_threshold)] if not out.empty else out
             st.markdown("**Legend:** ?? High  ?? Medium  ?? Low")
             show_cols = ["RISK_IND","FULL_NAME","CLASSIFICATION_LEVEL","CIA_CONF","CIA_INT","CIA_AVAIL","RISK","Regulatory","Rationale"]
-            st.dataframe(out[show_cols], width='stretch')
+            st.dataframe(out[show_cols], use_container_width=True)
             try:
                 csv_bytes = out[show_cols].to_csv(index=False).encode("utf-8")
                 st.download_button(
@@ -9716,7 +9716,7 @@ with tab4:
     if prov:
         import pandas as _pd
         pdf = _pd.DataFrame(prov)
-        st.dataframe(pdf[[c for c in ["ID","ASSET_FULL_NAME","REASON","CONFIDENCE","SENSITIVE_CATEGORIES","CREATED_AT"] if c in pdf.columns]], width='stretch')
+        st.dataframe(pdf[[c for c in ["ID","ASSET_FULL_NAME","REASON","CONFIDENCE","SENSITIVE_CATEGORIES","CREATED_AT"] if c in pdf.columns]], use_container_width=True)
         sel_id = st.selectbox("Select provisional item", options=[p.get("ID") for p in prov])
         chosen = next((p for p in prov if p.get("ID") == sel_id), None)
         if chosen:
@@ -9854,7 +9854,7 @@ with tab4:
             for col in ["CURRENT_C","CURRENT_I","CURRENT_A","PROPOSED_C","PROPOSED_I","PROPOSED_A"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-            st.dataframe(df[show_cols], width='stretch')
+            st.dataframe(df[show_cols], use_container_width=True)
             sel = st.selectbox("Select Request", options=[r.get("ID") for r in rows])
             approver = st.text_input("Your email (approver)", key="reclass_approver")
             c1, c2 = st.columns(2)
@@ -9916,7 +9916,7 @@ with tab5:
                 for col in ["CURRENT_C","CURRENT_I","CURRENT_A","PROPOSED_C","PROPOSED_I","PROPOSED_A"]:
                     if col in reqs_df.columns:
                         reqs_df[col] = pd.to_numeric(reqs_df[col], errors="coerce").fillna(0).astype(int)
-                st.dataframe(reqs_df[show_cols], width='stretch')
+                st.dataframe(reqs_df[show_cols], use_container_width=True)
                 try:
                     req_csv = reqs_df[show_cols].to_csv(index=False).encode("utf-8")
                     st.download_button(
@@ -9942,7 +9942,7 @@ with tab5:
                 for c in log_cols:
                     if c not in logs_df.columns:
                         logs_df[c] = None
-                st.dataframe(logs_df[log_cols], width='stretch')
+                st.dataframe(logs_df[log_cols], use_container_width=True)
                 try:
                     logs_csv = logs_df[log_cols].to_csv(index=False).encode("utf-8")
                     st.download_button(

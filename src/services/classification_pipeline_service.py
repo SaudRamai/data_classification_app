@@ -948,7 +948,7 @@ class AIClassificationPipelineService:
         
         # 2. Run Scan Button in second column
         with f_col2:
-            if st.button("?? Run New Scan", type="primary", width='stretch'):
+            if st.button("🔍 Run New Scan", type="primary"):
                 db = self._get_active_database()
                 gov_db = self._get_governance_database(db) if db else None
                 if db:
@@ -1136,7 +1136,7 @@ class AIClassificationPipelineService:
             top_tables.columns = ['Risk Score', 'Sensitive Columns']
 
         # 5. Visual Metrics Dashboard (6 Key Metrics)
-        st.markdown("### ?? Executive Summary")
+        st.markdown("### 📊 Executive Summary")
         
         # First row: 3 metrics
         col1, col2, col3 = st.columns(3)
@@ -1144,7 +1144,7 @@ class AIClassificationPipelineService:
         with col1:
             unique_tables = df_filtered["Table"].nunique()
             st.metric(
-                label="?? Total Sensitive Tables",
+                label="📋 Total Sensitive Tables",
                 value=unique_tables,
                 delta=f"{len(df_filtered)} columns" if total_items > 0 else None,
                 help="Number of tables containing sensitive data"
@@ -1152,7 +1152,7 @@ class AIClassificationPipelineService:
         
         with col2:
             st.metric(
-                label="?? PII Data",
+                label="👤 PII Data",
                 value=pii_count,
                 delta=f"{(pii_count/max(1,total_items)*100):.1f}%" if total_items > 0 else None,
                 help="Personally Identifiable Information"
@@ -1160,7 +1160,7 @@ class AIClassificationPipelineService:
         
         with col3:
             st.metric(
-                label="?? SOX Data",
+                label="💼 SOX Data",
                 value=sox_count,
                 delta=f"{(sox_count/max(1,total_items)*100):.1f}%" if total_items > 0 else None,
                 help="Sarbanes-Oxley financial data"
@@ -1171,7 +1171,7 @@ class AIClassificationPipelineService:
         
         with col4:
             st.metric(
-                label="??? SOC2 Data",
+                label="🛡️ SOC2 Data",
                 value=soc2_count,
                 delta=f"{(soc2_count/max(1,total_items)*100):.1f}%" if total_items > 0 else None,
                 help="SOC2 security and compliance data"
@@ -1179,7 +1179,7 @@ class AIClassificationPipelineService:
         
         with col5:
             st.metric(
-                label="?? Critical Risk Tables",
+                label="🔥 Critical Risk Tables",
                 value=critical_table_count,
                 delta=f"{critical_col_count} columns",
                 delta_color="inverse",
@@ -1188,7 +1188,7 @@ class AIClassificationPipelineService:
         
         with col6:
             st.metric(
-                label="?? High Risk Tables",
+                label="⚠️ High Risk Tables",
                 value=high_table_count,
                 delta=f"{high_risk_col_count} columns",
                 delta_color="inverse",
@@ -1196,7 +1196,7 @@ class AIClassificationPipelineService:
             )
 
         # 6. Detailed Analysis Tabs
-        tab1, tab2 = st.tabs(["?? Data Explorer", "?? Risk Analytics"])
+        tab1, tab2 = st.tabs(["🔍 Data Explorer", "📈 Risk Analytics"])
 
         with tab1:
             # Custom CSS for badges and styling
@@ -1241,7 +1241,7 @@ class AIClassificationPipelineService:
             """, unsafe_allow_html=True)
             
             # Key Findings Panel
-            st.markdown(f"#### ?? {view_mode} Results ({len(df_filtered)} items)")
+            st.markdown(f"#### 📋 {view_mode} Results ({len(df_filtered)} items)")
             
             if critical_col_count > 0 or high_risk_col_count > 0:
                 col_find1, col_find2 = st.columns(2)
@@ -1249,7 +1249,7 @@ class AIClassificationPipelineService:
                 with col_find1:
                     st.markdown(f"""
                         <div class="key-finding-box finding-critical">
-                            <h4 style="margin-top:0;">?? Critical Findings</h4>
+                            <h4 style="margin-top:0;">🔥 Critical Findings</h4>
                             <ul>
                                 <li><strong>{critical_col_count}</strong> critical sensitivity columns detected</li>
                                 <li><strong>{pii_count}</strong> PII columns require immediate attention</li>
@@ -1261,7 +1261,7 @@ class AIClassificationPipelineService:
                 with col_find2:
                     st.markdown(f"""
                         <div class="key-finding-box finding-info">
-                            <h4 style="margin-top:0;">?? Compliance Summary</h4>
+                            <h4 style="margin-top:0;">🛡️ Compliance Summary</h4>
                             <ul>
                                 <li><strong>{sox_count}</strong> SOX-regulated financial data columns</li>
                                 <li><strong>{soc2_count}</strong> SOC2 security-sensitive columns</li>
@@ -1309,11 +1309,11 @@ class AIClassificationPipelineService:
                 
                 for item_upper in sorted_items:
                     if 'PII' in item_upper:
-                        badges.append('?? PII')
+                        badges.append('👤 PII')
                     elif 'SOX' in item_upper:
-                        badges.append('?? SOX')
+                        badges.append('💼 SOX')
                     elif 'SOC2' in item_upper:
-                        badges.append('?? SOC2')
+                        badges.append('🛡️ SOC2')
                     else:
                         badges.append(item_upper)
                 
@@ -1324,13 +1324,13 @@ class AIClassificationPipelineService:
                 for item in items:
                     item_upper = str(item).upper()
                     if 'CRITICAL' in item_upper or 'CONFIDENTIAL' in item_upper:
-                        badges.append('?? CRITICAL')
+                        badges.append('🔥 CRITICAL')
                     elif 'HIGH' in item_upper or 'RESTRICTED' in item_upper:
-                        badges.append('?? HIGH')
+                        badges.append('⚠️ HIGH')
                     elif 'MEDIUM' in item_upper:
-                        badges.append('?? MEDIUM')
+                        badges.append('🟡 MEDIUM')
                     elif 'LOW' in item_upper:
-                        badges.append('?? LOW')
+                        badges.append('🟢 LOW')
                     else:
                         badges.append(item)
                 return ' | '.join(badges)
@@ -1390,7 +1390,7 @@ class AIClassificationPipelineService:
             
             
             # Add Keyword Button (Table View)
-            if st.button("? Add Keyword", key="btn_add_kw_main_btm"):
+            if st.button("➕ Add Keyword", key="btn_add_kw_main_btm"):
                 st.session_state['kw_action_main'] = 'add'
                 # Clear previous input state if exists to ensure "normal" fresh start
                 for k in ["kw_input_main", "kw_cat_main", "kw_match_main", "kw_weight_main"]:
@@ -1402,7 +1402,7 @@ class AIClassificationPipelineService:
 
             # --- Drill Down Functionality ---
             st.divider()
-            st.subheader("?? Table Drill-Down")
+            st.subheader("🔬 Table Drill-Down")
             
             # Get list of tables for dropdown
             table_options = sorted(grouped['Table'].unique().tolist())
@@ -1466,9 +1466,9 @@ class AIClassificationPipelineService:
                         
                         if columns_result and len(columns_result) > 0:
                             all_table_columns = [row['COLUMN_NAME'] for row in columns_result]
-                            logger.info(f"? Successfully fetched {len(all_table_columns)} columns from INFORMATION_SCHEMA")
+                            logger.info(f"✅ Successfully fetched {len(all_table_columns)} columns from INFORMATION_SCHEMA")
                         else:
-                            logger.warning(f"?? INFORMATION_SCHEMA returned no columns for {schema_name}.{table_name}")
+                            logger.warning(f"⚠️ INFORMATION_SCHEMA returned no columns for {schema_name}.{table_name}")
                             # Fallback to table_details
                             if not table_details.empty and 'Column' in table_details.columns:
                                 all_table_columns = table_details['Column'].unique().tolist()
@@ -1478,7 +1478,7 @@ class AIClassificationPipelineService:
                                 logger.error("No columns available from any source!")
                     
                     except Exception as e:
-                        logger.error(f"? Failed to fetch columns from INFORMATION_SCHEMA: {e}")
+                        logger.error(f"❌ Failed to fetch columns from INFORMATION_SCHEMA: {e}")
                         logger.exception("Full error details:")
                         # Fallback to table_details
                         if not table_details.empty and 'Column' in table_details.columns:
@@ -1498,9 +1498,9 @@ class AIClassificationPipelineService:
                 
                 # Display column fetch status for transparency
                 if all_table_columns:
-                    st.caption(f"?? Analyzing {len(all_table_columns)} columns from {selected_table}")
+                    st.caption(f"🔬 Analyzing {len(all_table_columns)} columns from {selected_table}")
                 else:
-                    st.warning("?? No columns found for this table. The table may not exist or you may not have access.")
+                    st.warning("⚠️ No columns found for this table. The table may not exist or you may not have access.")
                 
                 # Format compliance with badges (Inline function to avoid scope issues)
                 def drill_badge_compliance(val):
@@ -1539,8 +1539,8 @@ class AIClassificationPipelineService:
                         check_result = snowflake_connector.execute_query(check_query)
                         if not check_result:
                             logger.warning(f"SENSITIVITY_CATEGORIES table not found in {schema_fqn}")
-                            st.warning(f"?? Governance tables not found in schema: {schema_fqn}")
-                            st.info("?? Run 'Refresh governance (seed/update)' button to create the required tables.")
+                            st.warning(f"⚠️ Governance tables not found in schema: {schema_fqn}")
+                            st.info("💡 Run 'Refresh governance (seed/update)' button to create the required tables.")
                             rules_df = pd.DataFrame()  # Empty dataframe
                             raise ValueError("Governance tables not found")
                     except ValueError:
@@ -1873,7 +1873,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                                 with c_conf1:
                                     st.info(f"**{row_col}**: `{old_val}` ? `{new_val}`")
                                 with c_conf2:
-                                    if st.button("?", key=f"btn_conf_row_{idx}", help="Confirm and Save Changes"):
+                                    if st.button("✔️", key=f"btn_conf_row_{idx}", help="Confirm and Save Changes"):
                                         try:
                                             with st.spinner(f"Saving changes for {row_col}..."):
                                                 # Parse lists
@@ -1906,7 +1906,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                                             st.error(f"Error processing row change: {row_err}")
 
                                 with c_conf3:
-                                    if st.button("", key=f"btn_canc_row_{idx}", help="Cancel Changes"):
+                                    if st.button("❌", key=f"btn_canc_row_{idx}", help="Cancel Changes"):
                                         st.rerun()
                                         
                     except Exception as e:
@@ -1914,7 +1914,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
 
 
                 # Add Keyword Button (Drill-Down View)
-                if st.button(" Add Keyword", key="btn_add_kw_drill_btm"):
+                if st.button("➕ Add Keyword", key="btn_add_kw_drill_btm"):
                     st.session_state['kw_action_drill'] = 'add'
                 
                 if st.session_state.get('kw_action_drill') == 'add':
@@ -1924,11 +1924,11 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
 
                 # --- Tagging Assistant ---
                 st.divider()
-                st.subheader("??? Tagging Assistant")
+                st.subheader("🏷️ Tagging Assistant")
                 st.markdown("""
                 The Tagging Assistant provides a comprehensive solution for managing data classification within the system. """)
                 
-                tag_tab1, tag_tab2 = st.tabs(["?? Generate SQL", "? Apply Tags"])
+                tag_tab1, tag_tab2 = st.tabs(["📄 Generate SQL", "✅ Apply Tags"])
                 
                 # Common Inputs
                 with st.container():
@@ -2170,7 +2170,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
             
             with col_act2:
                 # CANCEL ACTION: clear state
-                if st.button("?", key=f"btn_cancel_final_{context_key}", help="Cancel"):
+                if st.button("❌", key=f"btn_cancel_final_{context_key}", help="Cancel"):
                     st.session_state[action_key] = None
                     st.rerun()
             st.divider()
@@ -2291,7 +2291,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         if "classification_future" in st.session_state:
             future = st.session_state["classification_future"]
             if not future.done():
-                st.info("?? Classification is running in background... You can continue using other tabs.")
+                st.info("⏳ Classification is running in background... You can continue using other tabs.")
                 if st.button("Check Status"):
                     st.rerun()
                 return
@@ -2429,7 +2429,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         # Submit to Background Executor
         future = self._executor.submit(self._classify_assets_local, db=db, assets=assets_to_classify)
         st.session_state["classification_future"] = future
-        st.info("?? Classification started in background! You can navigate away or wait here.")
+        st.info("⏳ Classification started in background! You can navigate away or wait here.")
         if st.button("Refresh Status"):
             st.rerun()
         return

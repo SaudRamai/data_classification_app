@@ -8,6 +8,19 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+st.markdown("""
+<style>
+    /* Force dark theme */
+    [data-theme="light"] {
+        --primary-color: #1E88E5;
+        --background-color: #0E1117;
+        --secondary-background-color: #262730;
+        --text-color: #FAFAFA;
+        --font: "Source Sans Pro", sans-serif;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 import sys
 import os
 import pathlib

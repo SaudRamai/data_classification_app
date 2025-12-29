@@ -26,7 +26,7 @@ import streamlit as st
 # Page configuration - MUST be the first Streamlit command
 st.set_page_config(
     page_title="Data Classification",
-    page_icon="??",
+    page_icon="📊",
     layout="wide",
 )
 
@@ -333,27 +333,11 @@ except Exception as e:
     # (Removed) Sidebar scanning options
 
 with col_db1:
-    if st.button("Re-detect DB", key="btn_redetect_db"):
-        try:
-            _db_new = governance_config_service.resolve_context(force_refresh=True).get('database')
-            if _db_new:
-                st.session_state["sf_database"] = _db_new
-                st.success(f"Detected: {_db_new}")
-            # Removed st.rerun() to prevent no-op warning
-        except Exception as _e:
-            st.warning(f"Re-detect failed: {_e}")
+    pass
 with col_db2:
     pass
 with col_db3:
-    if st.button("Re-detect Schema", key="btn_redetect_schema"):
-        try:
-            _active_db = st.session_state.get("sf_database") or _db_resolved
-            if _active_db:
-                st.session_state["governance_schema"] = _auto_detect_governance_schema(_active_db)
-                st.success(f"Schema: {st.session_state['governance_schema']}")
-            # Removed st.rerun() to prevent no-op warning
-        except Exception as _e:
-            st.warning(f"Schema detect failed: {_e}")
+    pass
 
 # Global Filters (sidebar) and driver for tabs
 with st.sidebar.container():
@@ -455,7 +439,7 @@ except Exception:
 
 def _active_db_from_filter() -> Optional[str]:
     """Resolve active DB for this page, prioritizing the sidebar selection.
-    Order: sidebar/session ? resolver ? None.
+    Order: sidebar/session > resolver > None.
     """
     try:
         db = st.session_state.get("sf_database")
@@ -911,7 +895,7 @@ def _business_days_between(start_d: Union[date, datetime], end_d: Union[date, da
         e = pd.Timestamp(end_d).normalize()
         if pd.isna(s) or pd.isna(e):
             return 0
-        # Inclusive of end? We compute future days remaining from today to due (exclusive of today)
+        # Inclusive of end date; we compute future days remaining from today to due (exclusive of today)
         if e <= s:
             return int(-pd.bdate_range(e, s, freq="B").size)
         return int(pd.bdate_range(s + pd.Timedelta(days=1), e, freq="B").size)
@@ -1032,7 +1016,7 @@ def render_live_feed():
         placeholder = st.empty()
         for i in range(int(interval), 0, -1):
             try:
-                placeholder.caption(f"Refreshing in {i}sï¿½")
+                placeholder.caption(f"⏳ Refreshing in {i}s...")
                 _time.sleep(1)
             except Exception:
                 break
@@ -1043,8 +1027,8 @@ def render_live_feed():
 
 # Primary tabs per requirements
 tab_new, tab_tasks = st.tabs([
-    "New Classification",
-    "Classification Management",
+    "📝 New Classification",
+    "🗂️ Classification Management",
 ])
 
 with tab_new:
@@ -1054,34 +1038,33 @@ with tab_new:
 
 with tab_new:
     st.subheader("New Classification")
-    sub_guided, sub_bulk, sub_ai = st.tabs(["Guided Workflow", "Bulk Upload", "AI Assistant"])
+    sub_guided, sub_bulk, sub_ai = st.tabs(["🧭 Guided Workflow", "📤 Bulk Upload", "🤖 AI Assistant"])
     
     # Bulk Upload
     with sub_bulk:
         st.markdown("#### Bulk Classification Tool")
-        st.markdown("""
-**Review Your Data**  
-ï¿½ Ensure you have the necessary permissions to classify this data  
-ï¿½ Verify no sensitive credentials are included
+        st.markdown("""**Review Your Data**
+- ✅ Ensure you have the necessary permissions to classify this data
+- ✅ Verify no sensitive credentials are included
 
-**Required Columns**  
-ï¿½ `DATA_ASSET_PATH` (format: `DATABASE.SCHEMA.TABLE`)  
-ï¿½ `BUSINESS_CONTEXT` (describe the data's purpose)  
-ï¿½ `DATA_OWNER_EMAIL` (must be @avendra.com)
+**Required Columns**
+- `DATA_ASSET_PATH` (format: `DATABASE.SCHEMA.TABLE`)
+- `BUSINESS_CONTEXT` (describe the data's purpose)
+- `DATA_OWNER_EMAIL` (must be @avendra.com)
 
-**Optional Columns**  
-ï¿½ `C`/`I`/`A`: 0-3 (leave blank for auto-suggestion)  
-ï¿½ `BUSINESS_RATIONALE` (required for overrides)
+**Optional Columns**
+- `C`/`I`/`A`: 0-3 (leave blank for auto-suggestion)
+- `BUSINESS_RATIONALE` (required for overrides)
 
-**File Requirements**  
-ï¿½ Max size: 10MB  
-ï¿½ Format: CSV (UTF-8)  
-ï¿½ No special characters in headers  
-ï¿½ No empty rows between data
+**File Requirements**
+- Max size: 10MB
+- Format: CSV (UTF-8)
+- No special characters in headers
+- No empty rows between data
 
-**What Happens Next**  
-1. Instant validation  
-2. Automatic processing  
+**What Happens Next**
+1. Instant validation
+2. Automatic processing
 3. Email notification with results
 
 _Download the template below to begin_
@@ -1534,9 +1517,9 @@ _Download the template below to begin_
                                 continue
                         
                         if failed == 0:
-                            st.success(f"Batch processed successfully ï¿½ Applied: {applied}, Queued: {queued}")
+                            st.success(f"✅ Batch processed successfully. Applied: {applied}, Queued: {queued}")
                         else:
-                            st.warning(f"Batch processed with errors ï¿½ Applied: {applied}, Queued: {queued}, Failed: {failed}")
+                            st.warning(f"⚠️ Batch processed with errors. Applied: {applied}, Queued: {queued}, Failed: {failed}")
 
                 # Submit valid rows only (skips rows with errors)
                 if st.session_state.get('trigger_bulk_valid_processing'):
@@ -1613,9 +1596,9 @@ _Download the template below to begin_
                                 failed += 1
                                 st.error(f"Failed row for {rr.get('FULL_NAME')}: {e}")
                         if failed == 0:
-                            st.success(f"Submitted valid rows ï¿½ Applied: {applied}, Queued: {queued}")
+                            st.success(f"✅ Submitted valid rows. Applied: {applied}, Queued: {queued}")
                         else:
-                            st.warning(f"Submitted valid rows with some errors ï¿½ Applied: {applied}, Queued: {queued}, Failed: {failed}")
+                            st.warning(f"⚠️ Submitted valid rows with some errors. Applied: {applied}, Queued: {queued}, Failed: {failed}")
 
     # AI Assistant tab
     with sub_ai:
@@ -1718,8 +1701,8 @@ _Download the template below to begin_
                             _tf = str(sel_table_filter).upper()
                             specials = [r for r in specials if _tf in str(r.get('TABLE') or '').upper()]
                         st.markdown("#### Special Categories Detected (Preview)")
-                        st.caption("CIA ? Label rules: ?? Confidential (C3,I3,A2ï¿½A3) | ?? Restricted (C2,I2,A1ï¿½A2) | ?? Internal (C1,I1,A1) | ?? Public (C0,I0,A0)")
-                        st.caption("Risk rules: High (any CIA=3) ? Strict governance; Medium (any CIA=2) ? Moderate controls; Low (all =1) ? Standard")
+                        st.caption("CIA to Label rules: 🔴 Confidential (C3,I3,A2-A3) | 🟠 Restricted (C2,I2,A1-A2) | 🟡 Internal (C1,I1,A1) | 🟢 Public (C0,I0,A0)")
+                        st.caption("Risk rules: High (any CIA=3) → Strict governance; Medium (any CIA=2) → Moderate controls; Low (all =1) → Standard")
                         if specials and _pd is not None:
                             df_spec = _pd.DataFrame(specials)
                             st.dataframe(df_spec[[
@@ -1830,8 +1813,8 @@ _Download the template below to begin_
                             if _svc is not None:
                                 _options = [r['FULLY_QUALIFIED_NAME'] for r in specials if r.get('FULLY_QUALIFIED_NAME')]
                                 if _options:
-                                    sel_tbl = st.selectbox("Drill down to column-level for:", options=["ï¿½ Select ï¿½"] + _options, index=0, key="ai_spec_drill_sel")
-                                    if sel_tbl and sel_tbl != "ï¿½ Select ï¿½":
+                                    sel_tbl = st.selectbox("Drill down to column-level for:", options=["--- Select ---"] + _options, index=0, key="ai_spec_drill_sel")
+                                    if sel_tbl and sel_tbl != "--- Select ---":
                                         try:
                                             # Load column data types for the table once
                                             try:
@@ -1885,16 +1868,16 @@ _Download the template below to begin_
                                                     
                                                     # Map scores to labels with emojis and descriptions
                                                     if max_score == 0:
-                                                        return "?? Public (C0) - Data is public; no confidentiality risk. Example: Public holidays, published press release dates"
+                                                        return "🟢 Public (C0) - Data is public; no confidentiality risk. Example: Public holidays, published press release dates"
                                                     elif max_score == 1:
-                                                        return "?? Internal (C1) - For internal use only; minor impact if leaked. Example: Employee training schedule dates, internal project timelines"
+                                                        return "🟡 Internal (C1) - For internal use only; minor impact if leaked. Example: Employee training schedule dates, internal project timelines"
                                                     elif max_score == 2:
-                                                        return "?? Restricted (C2) - Sensitive data; unauthorized disclosure could cause moderate to significant harm. Example: Customer contract start/end dates, financial reporting period dates"
+                                                        return "🟠 Restricted (C2) - Sensitive data; unauthorized disclosure could cause moderate to significant harm. Example: Customer contract start/end dates, financial reporting period dates"
                                                     else:  # max_score >= 3
-                                                        return "?? Confidential (C3) - Highly sensitive or regulated data; severe business, financial, or legal impact if disclosed. Example: Employee date of birth, social security numbers, payroll dates"
+                                                        return "🔴 Confidential (C3) - Highly sensitive or regulated data; severe business, financial, or legal impact if disclosed. Example: Employee date of birth, social security numbers, payroll dates"
                                                     elif max_score >= 3:
-                                                        return "?? Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
-                                                    return "?? Internal (C1) - Default classification"
+                                                        return "🔴 Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
+                                                    return "🟡 Internal (C1) - Default classification"
                                                 c_val,i_val,a_val = int(cia.get('C',0)), int(cia.get('I',0)), int(cia.get('A',0))
                                                 _lbl = _label_from_cia2(c_val,i_val,a_val)
                                                 # Generate tag SQL for column
@@ -1928,8 +1911,8 @@ _Download the template below to begin_
                                                 except Exception:
                                                     col_options = []
                                                 if col_options:
-                                                    sel_col = st.selectbox("Select a column to tag:", options=["ï¿½ Select ï¿½"] + col_options, index=0, key="ai_col_tag_sel")
-                                                    if sel_col and sel_col != "ï¿½ Select ï¿½":
+                                                    sel_col = st.selectbox("Select a column to tag:", options=["--- Select ---"] + col_options, index=0, key="ai_col_tag_sel")
+                                                    if sel_col and sel_col != "--- Select ---":
                                                         # Derive CIA from CIA text if available
                                                         def _parse_cia(txt: str):
                                                             try:
@@ -1955,19 +1938,19 @@ _Download the template below to begin_
                                                             
                                                             # Map scores to labels
                                                             if max_score == 0:
-                                                                return "?? Public (C0) - Data is public, no confidentiality risk"
+                                                                return "🟢 Public (C0) - Data is public, no confidentiality risk"
                                                             elif max_score == 1:
-                                                                return "?? Internal (C1) - For internal use, minor impact if leaked"
+                                                                return "🟡 Internal (C1) - For internal use, minor impact if leaked"
                                                             elif max_score == 2:
-                                                                return "?? Restricted (C2) - Sensitive business info, moderate to significant impact if disclosed"
+                                                                return "🟠 Restricted (C2) - Sensitive business info, moderate to significant impact if disclosed"
                                                             elif max_score >= 3:
-                                                                return "?? Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
-                                                            return "?? Internal (C1) - Default classification"
+                                                                return "🔴 Confidential (C3) - Highly sensitive or regulated data, severe impact if disclosed"
+                                                            return "🟡 Internal (C1) - Default classification"
                                                         rowc = df_dd[df_dd['COLUMN_NAME'] == sel_col].iloc[0]
                                                         c_txt = str(rowc.get('CIA') or '')
                                                         c_val,i_val,a_val = _parse_cia(c_txt)
                                                         lbl_col = _label_from_cia2(c_val,i_val,a_val)
-                                                        st.caption(f"Proposed column label: {lbl_col} (C{c_val}/I{i_val}/A{a_val}) ï¿½ fallback to Internal if invalid")
+                                                        st.caption(f"Proposed column label: {lbl_col} (C{c_val}/I{i_val}/A{a_val}) - fallback to Internal if invalid")
                                                         if st.button("Apply Column Tag", key="btn_apply_col_tag"):
                                                             try:
                                                                 from src.services.tagging_service import tagging_service as _tag_svc
@@ -2270,14 +2253,14 @@ _Download the template below to begin_
             sel_table = None
         st.caption("Scope is controlled by the sidebar global filter (Database/Schema).")
 
-        # Level 1 ï¿½ Sensitive Tables Overview (removed)
-        st.markdown("####  Sensitive Tables Overview")
+        # Level 1 - Sensitive Tables Overview (removed)
+        st.markdown("#### 📈 Sensitive Tables Overview")
         st.caption("This AI Assistant feature has been removed. Use Data Assets and Classification pages for sensitive table reports.")
         selected_full_name = ""
 
-        # Level 2 ï¿½ Drill-Down: Sensitive Columns View (editable)
+        # Level 2 - Drill-Down: Sensitive Columns View (editable)
         if selected_full_name:
-            st.markdown("#### Sensitive Columns Drill-down")
+            st.markdown("#### 🔬 Sensitive Columns Drill-down")
             cols_detect = []
             try:
                 db, sc, tbl = selected_full_name.split('.')
@@ -2298,7 +2281,7 @@ _Download the template below to begin_
                         raise RuntimeError("Invalid context (db/schema/table)")
                     cte_sql = f"""
                         WITH
-                        -- 1?? Active sensitivity categories (with default CIA levels)
+                        -- #1. Active sensitivity categories (with default CIA levels)
                         CATEGORIES AS (
                           SELECT 
                               CATEGORY_ID,
@@ -2311,7 +2294,7 @@ _Download the template below to begin_
                           WHERE IS_ACTIVE = TRUE
                         ),
 
-                        -- 2?? Rule-based keyword matches
+                        -- 2. Rule-based keyword matches
                         RULE_BASED AS (
                           SELECT
                               c.TABLE_CATALOG AS DATABASE_NAME,
@@ -2340,7 +2323,7 @@ _Download the template below to begin_
                             ON k.CATEGORY_ID = cat.CATEGORY_ID
                         ),
 
-                        -- 4?? Pattern-based detections
+                        -- 4. Pattern-based detections
                         PATTERN_BASED AS (
                           SELECT
                               c.TABLE_CATALOG AS DATABASE_NAME,
@@ -2365,14 +2348,14 @@ _Download the template below to begin_
                             ON p.CATEGORY_ID = cat.CATEGORY_ID
                         ),
 
-                        -- 5?? Combine detections
+                        -- 5. Combine detections
                         COMBINED AS (
                           SELECT * FROM RULE_BASED
                           UNION ALL
                           SELECT * FROM PATTERN_BASED
                         ),
 
-                        -- 6?? Rank detections per column
+                        -- 6. Rank detections per column
                         RANKED_DETECTIONS AS (
                           SELECT
                               DATABASE_NAME,
@@ -2396,14 +2379,14 @@ _Download the template below to begin_
                           FROM COMBINED
                         ),
 
-                        -- 7?? Take top detection per column
+                        -- 7. Take top detection per column
                         TOP_DETECTIONS AS (
                           SELECT *
                           FROM RANKED_DETECTIONS
                           WHERE RANK_ORDER = 1
                         ),
 
-                        -- 8?? Aggregate detections
+                        -- 8. Aggregate detections
                         AGGREGATED AS (
                           SELECT
                               DATABASE_NAME,
@@ -2424,7 +2407,7 @@ _Download the template below to begin_
                           GROUP BY DATABASE_NAME, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, CATEGORY_NAME
                         ),
 
-                        -- 9?? Compute weighted confidence score
+                        -- 9. Compute weighted confidence score
                         SCORED AS (
                           SELECT
                               a.*,
@@ -2483,7 +2466,7 @@ _Download the template below to begin_
                             END                                               AS "Need Review",
                             CASE 
                                 WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 100) THEN 'Column contains high-sensitivity data (PII/Financial/RegEx Match)'
-                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 100 * 0.6) THEN 'Column partially matches sensitive patterns ï¿½ manual review recommended'
+                                WHEN CONFIDENCE_SCORE >= (DETECTION_THRESHOLD * 100 * 0.6) THEN 'Column partially matches sensitive patterns - manual review recommended'
                                 ELSE 'Column appears safe under current detection thresholds'
                             END                                               AS "Reason / Justification",
                             CASE 
@@ -2833,7 +2816,7 @@ _Download the template below to begin_
         # Minimal debug expander
         show_debug = st.checkbox("Show Debug Info", value=False)
         if show_debug:
-            with st.expander("?? Debug Information", expanded=False):
+            with st.expander("🐞 Debug Information", expanded=False):
                 try:
                     cfg = getattr(ai_classification_service, '_sensitivity_config', {})
                     st.json({
@@ -2880,7 +2863,7 @@ _Download the template below to begin_
         _gf = st.session_state.get("global_filters") or {}
         inv_rows = _inventory_assets(_db_active, _gv, _gf)
         inv_options_real = [ (r.get("FULLY_QUALIFIED_NAME") or r.get("FULL_NAME")) for r in (inv_rows or []) if (r.get("FULLY_QUALIFIED_NAME") or r.get("FULL_NAME")) ]
-        placeholder = "ï¿½ Select an asset ï¿½"
+        placeholder = "Select an asset"
         inv_options = ([placeholder] + inv_options_real) if inv_options_real else ["No assets available"]
         sel_asset_nc = st.selectbox("Asset (from Inventory)", options=inv_options, index=0, key="nc_asset")
         # Track last selection to gate prefill
@@ -2903,12 +2886,12 @@ _Download the template below to begin_
 
         # Show metadata context
         if valid_asset_selected:
-            with st.expander("Asset Metadata", expanded=False):
+            with st.expander("📄 Asset Metadata", expanded=False):
                 m = inv_map.get(sel_asset_nc) or {}
-                st.markdown(f"- Type: `{(m.get('ASSET_TYPE') or m.get('OBJECT_TYPE') or 'ï¿½')}`")
-                st.markdown(f"- Domain: `{(m.get('DATA_DOMAIN') or m.get('OBJECT_DOMAIN') or 'ï¿½')}`")
-                st.markdown(f"- Source: `{(m.get('SOURCE_SYSTEM') or 'ï¿½')}`")
-                st.markdown(f"- Owner: `{(m.get('OWNER') or m.get('CUSTODIAN') or 'ï¿½')}`")
+                st.markdown(f"- 🏷️ Type: `{(m.get('ASSET_TYPE') or m.get('OBJECT_TYPE') or 'N/A')}`")
+                st.markdown(f"- 🌐 Domain: `{(m.get('DATA_DOMAIN') or m.get('OBJECT_DOMAIN') or 'N/A')}`")
+                st.markdown(f"- 🏢 Source: `{(m.get('SOURCE_SYSTEM') or 'N/A')}`")
+                st.markdown(f"- 👤 Owner: `{(m.get('OWNER') or m.get('CUSTODIAN') or 'N/A')}`")
 
         # Gate: render form only after valid selection
         if valid_asset_selected:
@@ -2949,13 +2932,13 @@ _Download the template below to begin_
                         bdays_remaining = 0
                     # Deadline status coloring
                     if bdays_remaining <= 0:
-                        st.error(f"Deadline Status: Overdue ï¿½ {bdays_remaining} business days remaining")
+                        st.error(f"⏰ Deadline Status: Overdue - {bdays_remaining} business days remaining")
                         nc_deadline_status = "Overdue"
                     elif bdays_remaining <= 5:
-                        st.warning(f"Deadline Status: Due Soon ï¿½ {bdays_remaining} business days remaining")
+                        st.warning(f"⚠️ Deadline Status: Due Soon - {bdays_remaining} business days remaining")
                         nc_deadline_status = "Due Soon"
                     else:
-                        st.success(f"Deadline Status: On Track ï¿½ {bdays_remaining} business days remaining")
+                        st.success(f"✅ Deadline Status: On Track - {bdays_remaining} business days remaining")
                         nc_deadline_status = "On Track"
 
                 # Heuristic signals from inventory
@@ -3018,31 +3001,31 @@ _Download the template below to begin_
                     st.session_state["nc_ai_categories"] = list(ai_categories)
                 except Exception:
                     pass
-                # Step 2: C, Step 3: I, Step 4: A ï¿½ Guided Questions with automatic scoring
-                st.markdown("##### Step 2: Confidentiality (C0ï¿½C3)")
+                # Step 2: C, Step 3: I, Step 4: A - Guided Questions with automatic scoring
+                st.markdown("##### Step 2: Confidentiality (C0-C3)")
                 st.caption("C0: Public | C1: Internal | C2: Restricted (PII/Financial) | C3: Confidential/Highly Sensitive")
                 # Confidentiality questions
                 c_q_unauth = st.selectbox(
-                    "What happens if this data is seen by unauthorized people?",
+                    "1. What happens if this data is seen by unauthorized people?", 
                     ["No impact", "Minor", "Significant", "Severe"],
                     index=1,
                     key=f"nc_c_unauth_{_aid}",
                     help="Assess business, legal, and reputational impact of unauthorized disclosure"
                 )
                 c_q_pii = st.radio(
-                    "Does this contain personal customer information?",
+                    "2. Does this contain personal customer information?", 
                     ["No", "Yes"],
                     index=(1 if (pii_flag or ("PII" in [str(x).upper() for x in ai_categories])) else 0),
                     key=f"nc_c_pii_{_aid}"
                 )
                 c_q_competitor = st.selectbox(
-                    "Would competitors benefit from accessing this data?",
+                    "3. Would competitors benefit from accessing this data?", 
                     ["No", "Some", "High"],
                     index=0,
                     key=f"nc_c_comp_{_aid}"
                 )
                 c_q_legal = st.selectbox(
-                    "Are there legal requirements to protect this data?",
+                    "4. Are there legal requirements to protect this data?", 
                     ["No", "Contractual", "Regulatory"],
                     index=0,
                     key=f"nc_c_legal_{_aid}"
@@ -3060,22 +3043,22 @@ _Download the template below to begin_
                 except Exception:
                     pass
                 # Integrity questions
-                st.markdown("##### Step 3: Integrity (I0ï¿½I3)")
-                st.caption("I0: Low | I1: Moderate | I2: High | I3: Critical ï¿½ impact if data is inaccurate or corrupted")
+                st.markdown("##### Step 3: Integrity (I0-I3)")
+                st.caption("I0: Low | I1: Moderate | I2: High | I3: Critical - impact if data is inaccurate or corrupted")
                 i_q_wrong = st.selectbox(
-                    "What happens if this data is wrong or gets changed?",
+                    "1. What happens if this data is wrong or gets changed?", 
                     ["No impact", "Minor", "Significant", "Severe"],
                     index=1,
                     key=f"nc_i_wrong_{_aid}"
                 )
                 i_q_accuracy = st.selectbox(
-                    "How critical is 100% accuracy for business decisions?",
+                    "2. How critical is 100% accuracy for business decisions?", 
                     ["Not critical", "Important", "Critical"],
                     index=1,
                     key=f"nc_i_acc_{_aid}"
                 )
                 i_q_finlegal = st.selectbox(
-                    "Would incorrect data cause financial or legal problems?",
+                    "3. Would incorrect data cause financial or legal problems?", 
                     ["No", "Possibly", "Likely"],
                     index=1,
                     key=f"nc_i_fin_{_aid}"
@@ -3091,22 +3074,22 @@ _Download the template below to begin_
                 except Exception:
                     pass
                 # Availability questions
-                st.markdown("##### Step 4: Availability (A0ï¿½A3)")
-                st.caption("A0: Days+ | A1: Hours | A2: <1 hour | A3: Near real-time ï¿½ operational need to access data promptly")
+                st.markdown("##### Step 4: Availability (A0-A3)")
+                st.caption("A0: Days+ | A1: Hours | A2: <1 hour | A3: Near real-time - operational need to access data promptly")
                 a_q_noaccess = st.selectbox(
-                    "What happens if we can't access this data during work hours?",
+                    "1. What happens if we can't access this data during work hours?", 
                     ["Minimal", "Disruptive", "Severe"],
                     index=1,
                     key=f"nc_a_nowork_{_aid}"
                 )
                 a_q_restore = st.selectbox(
-                    "How quickly do we need this data restored if unavailable?",
+                    "2. How quickly do we need this data restored if unavailable?", 
                     ["Days", "Hours", "<1 hour", "Real-time"],
                     index=1,
                     key=f"nc_a_restore_{_aid}"
                 )
                 a_q_ops = st.selectbox(
-                    "Would business operations stop without this data?",
+                    "3. Would business operations stop without this data?", 
                     ["No", "Partial", "Yes"],
                     index=1,
                     key=f"nc_a_ops_{_aid}"
@@ -4036,7 +4019,7 @@ if False:
                 st.error(f"Error during sensitive table detection: {str(e)}")
     
     # Manual scan button
-    if st.button("?? Scan for Sensitive Tables"):
+    if st.button("Scan for Sensitive Tables"):
         st.session_state["trigger_sensitive_scan"] = True
         st.experimental_rerun()
     
@@ -4361,7 +4344,7 @@ if False:
                 except Exception:
                     return ['' for _ in row]
 
-            st.markdown("##### Sensitive Tables ï¿½ AI Suggestions")
+            st.markdown("##### 🤖 Sensitive Tables – AI Suggestions")
             # Compute and display Actual Row Count for each sensitive table (auto)
             st.session_state.setdefault("ai_actual_counts", {})
             try:
@@ -4921,11 +4904,11 @@ with tab_tasks:
                         CREATED_AT,
                         UPDATED_AT,
                         case 
-                            when upper(coalesce(STATUS,'')) like '%PENDING%' then '?? Pending Review'
-                            when upper(coalesce(STATUS,'')) like '%APPROVED%' then '?? Approved'
-                            when upper(coalesce(STATUS,'')) like '%REJECTED%' then '?? Rejected'
-                            when upper(coalesce(STATUS,'')) like '%COMPLETED%' then '? Completed'
-                            else '? Unknown'
+                            when upper(coalesce(STATUS,'')) like '%PENDING%' then '⏳ Pending Review'
+                            when upper(coalesce(STATUS,'')) like '%APPROVED%' then '✅ Approved'
+                            when upper(coalesce(STATUS,'')) like '%REJECTED%' then '❌ Rejected'
+                            when upper(coalesce(STATUS,'')) like '%COMPLETED%' then '✅ Completed'
+                            else '❔ Unknown'
                         end as STATUS_LABEL,
                         DETAILS
                     from {db}.{gv}.CLASSIFICATION_TASKS
@@ -5150,7 +5133,7 @@ with tab_tasks:
             import pandas as _pd
             sort_opts = ["Due Date (asc)"]
             if "overall_risk" in disp.columns:
-                sort_opts.append("Risk (High?Low)")
+                sort_opts.append("Risk (High to Low)")
             if "Priority" in disp.columns:
                 sort_opts.append("Priority")
             sort_by = st.selectbox("Sort by", options=sort_opts, index=0, key="mt_sort_mytasks")
@@ -6465,7 +6448,7 @@ if False:
         # Drift sync tools
         drift_assets = tdf[tdf.get("drift") == True]["asset_name"].dropna().unique().tolist() if "drift" in tdf.columns else []
         sel_drift = st.selectbox("Select drifted asset to sync", options=drift_assets)
-        if sel_drift and st.button("Sync Governance ? Tag"):
+        if sel_drift and st.button("Sync Governance → Tag"):
             try:
                 row = tdf[tdf["asset_name"] == sel_drift].head(1)
                 gov_val = row.iloc[0]["governance_classification"] if not row.empty else None
@@ -6510,7 +6493,7 @@ from typing import Optional, Tuple, Dict
 
 @dataclass
 class CIA:
-    """Implements Section 5.2 CIA Scales: C0ï¿½C3, I0ï¿½I3, A0ï¿½A3."""
+    """Implements CIA Scales: C0-C3, I0-I3, A0-I3."""
     c: int
     i: int
     a: int
@@ -6783,36 +6766,36 @@ def _stepper_ui():
         stakeholders = st.text_input("Key stakeholders", placeholder="Owners, SMEs, consumers")
 
     st.markdown("---")
-    st.markdown("### Step 2: Confidentiality Assessment (C0ï¿½C3)")
+    st.markdown("### Step 2: Confidentiality Assessment (C0-C3)")
     with st.expander("Confidentiality", expanded=True):
-        c_q1 = st.selectbox("Would unauthorized disclosure cause harm?", ["No/Minimal", "Some", "Material", "Severe"], index=1)
-        c_q2 = st.selectbox("Contains PII/financial/proprietary?", ["No", "Possible", "Likely", "Yes"], index=0)
-        c_q3 = st.selectbox("Regulatory requirements present?", ["None", "Some", "Multiple", "Strict"], index=0)
+        c_q1 = st.selectbox("1. What is the impact of unauthorized disclosure?", ["No/Minimal", "Some", "Material", "Severe"], index=1, help="Assess the potential harm if this data were to be exposed to unauthorized individuals.")
+        c_q2 = st.selectbox("2. Does it contain PII, financial, or proprietary data?", ["No", "Possible", "Likely", "Yes"], index=0, help="Determine if the data falls into sensitive categories that require special handling.")
+        c_q3 = st.selectbox("3. Are there regulatory requirements to protect this data?", ["None", "Some", "Multiple", "Strict"], index=0, help="Consider legal and compliance obligations for protecting this data.")
         c_val = max(["No/Minimal","Some","Material","Severe"].index(c_q1),
                     ["No","Possible","Likely","Yes"].index(c_q2),
                     ["None","Some","Multiple","Strict"].index(c_q3))
         st.caption(f"Selected Confidentiality level: C{c_val}")
 
     st.markdown("---")
-    st.markdown("### Step 3: Integrity Assessment (I0ï¿½I3)")
+    st.markdown("### Step 3: Integrity Assessment (I0-I3)")
     with st.expander("Integrity", expanded=True):
-        i_q1 = st.selectbox("How critical is accuracy to operations?", ["Low", "Moderate", "High", "Critical"], index=1)
-        i_q2 = st.selectbox("Impact if data is corrupted?", ["Minor", "Moderate", "Major", "Severe"], index=1)
+        i_q1 = st.selectbox("1. How critical is data accuracy for operations?", ["Low", "Moderate", "High", "Critical"], index=1, help="Assess the importance of the data being correct for business processes.")
+        i_q2 = st.selectbox("2. What is the impact if this data is corrupted?", ["Minor", "Moderate", "Major", "Severe"], index=1, help="Evaluate the consequences of data being altered or destroyed.")
         i_val = max(["Low","Moderate","High","Critical"].index(i_q1),
                     ["Minor","Moderate","Major","Severe"].index(i_q2))
         st.caption(f"Selected Integrity level: I{i_val}")
 
     st.markdown("---")
-    st.markdown("### Step 4: Availability Assessment (A0ï¿½A3)")
+    st.markdown("### Step 4: Availability Assessment (A0-A3)")
     with st.expander("Availability", expanded=True):
-        a_q1 = st.selectbox("How quickly must data be accessible?", ["Days+", "Hours", "< 1 hour", "Near-realtime"], index=1)
-        a_q2 = st.selectbox("Impact if unavailable?", ["Minor", "Moderate", "Major", "Severe"], index=1)
+        a_q1 = st.selectbox("1. How quickly must data be accessible?", ["Days+", "Hours", "< 1 hour", "Near-realtime"], index=1, help="Determine the time frame in which the data must be available to users.")
+        a_q2 = st.selectbox("2. What is the impact if this data is unavailable?", ["Minor", "Moderate", "Major", "Severe"], index=1, help="Assess the consequences of users not being able to access the data when needed.")
         a_val = max(["Days+","Hours","< 1 hour","Near-realtime"].index(a_q1),
                     ["Minor","Moderate","Major","Severe"].index(a_q2))
         st.caption(f"Selected Availability level: A{a_val}")
 
     st.markdown("---")
-    st.markdown("### Step 5: Overall Risk Classification (Section 5.3)")
+    st.markdown("### Step 5: Overall Risk Classification")
     cia = CIA(c=c_val, i=i_val, a=a_val)
     risk = cia.risk_level()
     ok_dm, reasons = dm_validate(risk, cia.c, cia.i, cia.a)
@@ -6893,7 +6876,7 @@ def _ai_assistance_panel():
     # Resolve active DB from Global Filters/session
     db = _active_db_from_filter() or _get_current_db()
     if not db:
-        st.info("Select a database from the ?? Global Filters to enable detection.")
+        st.info("Select a database from the 🌐 Global Filters to enable detection.")
         return
 
     # Track DB in session to trigger refresh on change
@@ -7068,7 +7051,7 @@ def _ai_assistance_panel():
 
     # Run detection when requested or when no cached results
     if refresh or ai_ss.get("tables") is None or ai_ss.get("tables").empty:
-        with st.spinner(f"Detecting sensitive tables in {db}ï¿½"):
+        with st.spinner(f"Detecting sensitive tables in {db}..."):
             tdf = _run_detection(db, int(limit), int(sample))
             # Persist tables and per-table columns
             cols_map = {}
@@ -7536,23 +7519,23 @@ def _management_panel():
 
         if action == "classify" or target_asset:
             st.markdown("---")
-            st.subheader(f"Classification Wizard ï¿½ {target_asset}")
+            st.subheader(f"Classification Wizard – {target_asset}")
             with st.form(key="task_wizard_form", clear_on_submit=False):
                 # Step A: Confidentiality
-                st.markdown("### Step 1: Confidentiality Assessment (C0ï¿½C3)")
+                st.markdown("### Step 1: Confidentiality Assessment (C0-C3)")
                 c_q1 = st.selectbox("Unauthorized disclosure impact", ["No/Minimal","Some","Material","Severe"], index=1, key="wiz_cq1")
                 c_q2 = st.selectbox("Contains sensitive data (PII/financial/proprietary)", ["No","Possible","Likely","Yes"], index=0, key="wiz_cq2")
                 c_q3 = st.selectbox("Regulatory requirements present", ["None","Some","Multiple","Strict"], index=0, key="wiz_cq3")
                 c_val = max(["No/Minimal","Some","Material","Severe"].index(c_q1), ["No","Possible","Likely","Yes"].index(c_q2), ["None","Some","Multiple","Strict"].index(c_q3))
 
                 # Step B: Integrity
-                st.markdown("### Step 2: Integrity Assessment (I0ï¿½I3)")
+                st.markdown("### Step 2: Integrity Assessment (I0-I3)")
                 i_q1 = st.selectbox("Accuracy criticality to operations", ["Low","Moderate","High","Critical"], index=1, key="wiz_iq1")
                 i_q2 = st.selectbox("Impact if data is corrupted", ["Minor","Moderate","Major","Severe"], index=1, key="wiz_iq2")
                 i_val = max(["Low","Moderate","High","Critical"].index(i_q1), ["Minor","Moderate","Major","Severe"].index(i_q2))
 
                 # Step C: Availability
-                st.markdown("### Step 3: Availability Assessment (A0ï¿½A3)")
+                st.markdown("### Step 3: Availability Assessment (A0-A3)")
                 a_q1 = st.selectbox("Required accessibility timeframe", ["Days+","Hours","< 1 hour","Near-realtime"], index=1, key="wiz_aq1")
                 a_q2 = st.selectbox("Impact if unavailable", ["Minor","Moderate","Major","Severe"], index=1, key="wiz_aq2")
                 a_val = max(["Days+","Hours","< 1 hour","Near-realtime"].index(a_q1), ["Minor","Moderate","Major","Severe"].index(a_q2))
@@ -7863,7 +7846,7 @@ def _management_panel():
                     cv = int(cur.get(k)) if cur.get(k) is not None else None
                     pv = int(proposed.get(k)) if proposed.get(k) is not None else None
                     if cv is not None and pv is not None and pv != cv:
-                        deltas[k] = f"{cv} ? {pv}"
+                        deltas[k] = f"{cv} → {pv}"
                 if deltas:
                     st.warning("Changes detected: " + ", ".join([f"{k}: {v}" for k, v in deltas.items()]))
             except Exception:
@@ -9598,14 +9581,14 @@ with tab3:
                 if any(k in up for k in ["HIPAA","PHI","HEALTH","MEDICAL"]):
                     regs.append("HIPAA")
                 # Risk indicator emoji
-                emoji = '??' if level == 'Low' else ('??' if level == 'Medium' else '??')
+                emoji = '🟢' if level == 'Low' else ('🟡' if level == 'Medium' else '🔴')
                 return pd.Series({"RISK": level, "RISK_IND": emoji, "Regulatory": ", ".join(regs), "RegsList": regs, "Rationale": rationale, "HIGHEST": highest})
             risk = df.apply(risk_row, axis=1)
             out = pd.concat([df, risk], axis=1)
             # Min CIA threshold filter
             min_threshold = st.slider("Min CIA threshold", min_value=0, max_value=3, value=0, help="Show assets with max(C,I,A) >= threshold")
             out = out[out["HIGHEST"] >= int(min_threshold)] if not out.empty else out
-            st.markdown("**Legend:** ?? High  ?? Medium  ?? Low")
+            st.markdown("**Legend:** 🔴 High  🟡 Medium  🟢 Low")
             show_cols = ["RISK_IND","FULL_NAME","CLASSIFICATION_LEVEL","CIA_CONF","CIA_INT","CIA_AVAIL","RISK","Regulatory","Rationale"]
             st.dataframe(out[show_cols], use_container_width=True)
             try:

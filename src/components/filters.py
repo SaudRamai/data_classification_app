@@ -114,7 +114,7 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
     sel_col = "" if sel_col_raw == "All" else sel_col_raw
 
     # Compliance helpers area (small inline actions)
-    with st.expander("Compliance helpers", expanded=False):
+    with st.container():
         st.caption("Use these quick helpers to view/apply compliance metadata on the selected object.")
         fqtn = f"{sel_db}.{sel_schema}.{sel_table}" if sel_db and sel_schema and sel_table else ""
         col_a, col_b = st.columns(2)

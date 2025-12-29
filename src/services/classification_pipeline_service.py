@@ -1824,7 +1824,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
 
                 edited_df = st.data_editor(
                     table_details[['Column', 'All Categories', 'Sensitivity', 'Confidentiality', 'Integrity', 'Availability']],
-                    width='stretch',
+                    use_container_width=True,
                     hide_index=True,
                     key="drill_down_editor",
                     # Disable direct editing in the grid to encourage using the cleaner form
@@ -2064,7 +2064,8 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                     st.info("No data to display")
             
             st.markdown("#### Top High-Risk Tables")
-            st.dataframe(top_tables, width='stretch')
+            # Use container width instead of invalid string width to avoid type errors
+            st.dataframe(top_tables, use_container_width=True)
 
 
     def _check_keyword_exists(self, keyword: str) -> bool:
@@ -7303,9 +7304,9 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
 
             try:
                 styled = results_df.style.apply(_apply_classification_style, axis=1)
-                st.dataframe(styled, width='stretch', hide_index=True)
+                st.dataframe(styled, use_container_width=True, hide_index=True)
             except Exception as e:
-                st.dataframe(results_df, width='stretch', hide_index=True)
+                st.dataframe(results_df, use_container_width=True, hide_index=True)
                 logger.warning(f"Error applying styles to dataframe: {str(e)}")
 
         # Dropdown for Table Selection
@@ -7587,7 +7588,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                                     return styles
                                 
                                 styled_df = col_df.style.apply(_apply_column_label_style, axis=1)
-                                st.dataframe(styled_df, hide_index=True, width='stretch')
+                                st.dataframe(styled_df, hide_index=True, use_container_width=True)
                                 
                                 # Summary statistics
                                 confident = sum(1 for c in col_rows_clean if c.get('confidence_pct', 0) >= 80)

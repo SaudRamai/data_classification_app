@@ -703,13 +703,6 @@ def render_realtime_dashboard():
             # Formatting the dataframe display
             st.dataframe(
                 df_uncl,
-                column_config={
-                    "ASSET_NAME": st.column_config.TextColumn("Asset Name", width="medium"),
-                    "SCOPE": st.column_config.TextColumn("Database/Schema", width="medium"),
-                    "OWNER": st.column_config.TextColumn("Owner Accountable"),
-                    "DAYS_UNCLASSIFIED": st.column_config.NumberColumn("Age (Days)", format="%d"),
-                    "RISK_STATUS": st.column_config.TextColumn("SLA Status")
-                },
                 hide_index=True
             )
             
@@ -755,13 +748,6 @@ def render_realtime_dashboard():
             df_review = pd.DataFrame(review_data['assets'])
             st.dataframe(
                 df_review,
-                column_config={
-                    "ASSET_NAME": st.column_config.TextColumn("Asset Name", width="medium"),
-                    "OWNER": st.column_config.TextColumn("Owner Accountable"),
-                    "NEXT_REVIEW_DATE": st.column_config.DateColumn("Due Date"),
-                    "DAYS_REMAINING": st.column_config.NumberColumn("Days Remaining"),
-                    "STATUS": st.column_config.TextColumn("Review Status")
-                },
                 use_container_width=True,
                 hide_index=True
             )
@@ -797,13 +783,6 @@ def render_realtime_dashboard():
             # Styling the dataframe
             st.dataframe(
                 df_viol,
-                column_config={
-                    "PRIORITY": st.column_config.TextColumn("Priority", width="small"),
-                    "ASSET_NAME": st.column_config.TextColumn("Asset", width="medium"),
-                    "REASON": st.column_config.TextColumn("Policy Violation", width="large"),
-                    "OWNER": st.column_config.TextColumn("Accountable Owner"),
-                    "SCOPE": st.column_config.TextColumn("Database/Schema")
-                },
                 use_container_width=True,
                 hide_index=True
             )

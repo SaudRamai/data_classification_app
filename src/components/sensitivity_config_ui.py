@@ -351,11 +351,6 @@ def render_keywords_tab():
     # Display the table with edit/delete actions
     st.data_editor(
         df.drop(columns=["_id"]),
-        column_config={
-            "Active": st.column_config.TextColumn("Active"),
-            "Weight": st.column_config.NumberColumn("Weight", format="%.1f"),
-            "Last Updated": st.column_config.DatetimeColumn("Last Updated")
-        },
         hide_index=True,
         use_container_width=True,
         key="keywords_table"
@@ -431,12 +426,6 @@ def render_patterns_tab():
     # Display the table with edit/delete actions
     st.data_editor(
         df.drop(columns=["_id"]),
-        column_config={
-            "Active": st.column_config.TextColumn("Active"),
-            "Weight": st.column_config.NumberColumn("Weight", format="%.1f"),
-            "Last Updated": st.column_config.DatetimeColumn("Last Updated"),
-            "Pattern": st.column_config.TextColumn("Pattern")
-        },
         hide_index=True,
         use_container_width=True,
         key="patterns_table"

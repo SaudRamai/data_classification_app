@@ -2404,25 +2404,7 @@ with tab3:
                     st.dataframe(
                         df,
                         use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Progress": st.column_config.ProgressColumn(
-                                "Progress",
-                                help="Progress of the corrective action",
-                                format="%.0f%%",
-                                min_value=0,
-                                max_value=100,
-                            ),
-                            "Status": st.column_config.TextColumn(
-                                "Status",
-                                help="Current status of the action",
-                            ),
-                            "Due Date": st.column_config.DateColumn(
-                                "Due Date",
-                                help="Due date for the action",
-                                format="YYYY-MM-DD"
-                            )
-                        }
+                        hide_index=True
                     )
                     
                     # Add summary metrics
@@ -2467,16 +2449,7 @@ with tab3:
                 st.dataframe(
                     corrective_actions,
                     use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Progress": st.column_config.ProgressColumn(
-                            "Progress",
-                            help="Progress of the corrective action",
-                            format="%.0f%%",
-                            min_value=0,
-                            max_value=100,
-                        )
-                    }
+                    hide_index=True
                 )
 
 # ============================================================================
@@ -2692,31 +2665,7 @@ with tab3:
             st.dataframe(
                 display_df, 
                 use_container_width=True, 
-                hide_index=True,
-                column_config={
-                    "Overall Score": st.column_config.ProgressColumn(
-                        "Overall Score",
-                        format="%.1f%%",
-                        min_value=0,
-                        max_value=100
-                    ),
-                    "Policy %": st.column_config.NumberColumn(
-                        "Policy %",
-                        format="%.1f%%"
-                    ),
-                    "Governance %": st.column_config.NumberColumn(
-                        "Governance %",
-                        format="%.1f%%"
-                    ),
-                    "Audit %": st.column_config.NumberColumn(
-                        "Audit %",
-                        format="%.1f%%"
-                    ),
-                    "Risk Score": st.column_config.NumberColumn(
-                        "Risk Score",
-                        format="%.1f"
-                    )
-                }
+                hide_index=True
             )
             
         else:

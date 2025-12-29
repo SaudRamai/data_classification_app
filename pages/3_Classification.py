@@ -1087,7 +1087,11 @@ _Download the template below to begin_
         except Exception:
             pass
 
-        up = st.file_uploader("Upload CSV/XLSX for semantic bulk processing", type=["csv","xlsx"], key="nc_bulk_upl")
+        try:
+            up = st.file_uploader("Upload CSV/XLSX for semantic bulk processing", type=["csv","xlsx"], key="nc_bulk_upl")
+        except Exception:
+            up = None
+            st.info("File upload not supported in this Streamlit version. Please upgrade to 1.26+ or use manual input.")
         if up is not None:
             import pandas as _pd
             import re as _re
@@ -2634,17 +2638,11 @@ _Download the template below to begin_
                 except Exception:
                     pass
                 st.session_state[_orig_key] = df_edit.copy()
-            editor_conf_ai = {
-                "C": st.column_config.SelectboxColumn(options=["0 - Public","1 - Internal","2 - Restricted","3 - Confidential"], help="Confidentiality: 0=Public, 1=Internal, 2=Restricted, 3=Confidential"),
-                "I": st.column_config.SelectboxColumn(options=["0 - Low","1 - Standard","2 - High","3 - Critical"], help="Integrity: 0=Low, 1=Standard, 2=High, 3=Critical"),
-                "A": st.column_config.SelectboxColumn(options=["0 - Low","1 - Standard","2 - High","3 - Critical"], help="Availability: 0=Low, 1=Standard, 2=High, 3=Critical"),
-            }
             edited = st.data_editor(
                 df_edit,
                 use_container_width=True,
                 num_rows="fixed",
                 hide_index=True,
-                column_config=editor_conf_ai,
                 key=f"cia_editor_{selected_full_name}",
             ) if not df_edit.empty else None
 
@@ -3242,7 +3240,11 @@ _Download the template below to begin_
                 st.markdown("##### Step 7: Documentation & Approval")
                 rationale = st.text_area("Additional Notes", key=f"nc_rationale_{_aid}", help="Any additional context (optional)")
                 refs = st.text_area("References", key=f"nc_refs_{_aid}", help="Links to policies, Jira tickets, runbooks, etc.")
-                attachments = st.file_uploader("Attachments", accept_multiple_files=True, key=f"nc_files_{_aid}")
+                try:
+                    attachments = st.file_uploader("Attachments", accept_multiple_files=True, key=f"nc_files_{_aid}")
+                except Exception:
+                    attachments = None
+                    st.info("Attachments are not supported in this Streamlit version.")
                 st.session_state["nc_rationale"] = rationale
                 st.session_state["nc_refs"] = refs
                 st.session_state["nc_files"] = attachments
@@ -4564,7 +4566,11 @@ if False:
     # Bulk Upload
     with sub_bulk:
         st.markdown("#### Bulk Classification Tool")
-        up = st.file_uploader("Upload CSV/XLSX template", type=["csv","xlsx"], key="nc_bulk_upl")
+        try:
+            up = st.file_uploader("Upload CSV/XLSX template", type=["csv","xlsx"], key="nc_bulk_upl")
+        except Exception:
+            up = None
+            st.info("File upload not supported in this Streamlit version. Provide data via other means.")
         if up is not None:
             import pandas as _pd
             try:
@@ -5405,7 +5411,11 @@ with tab_tasks:
             ] if c in view.columns]
             if not disp_cols:
                 disp_cols = list(view.columns)
-            st.dataframe(view[disp_cols].style.map(_style_status, subset=[c for c in ["Tag"] if c in view.columns]).hide(axis="index"), use_container_width=True)
+            if "Tag" in view.columns:
+                styled = view[disp_cols].style.applymap(_style_status, subset=["Tag"]).hide(axis="index")
+                st.dataframe(styled, use_container_width=True)
+            else:
+                st.dataframe(view[disp_cols], use_container_width=True)
 
             # Actions: Approve / Request Changes / Reject
             sel_id_col = "review_id" if "review_id" in view.columns else None
@@ -7123,13 +7133,6 @@ def _ai_assistance_panel():
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
-            column_config={
-                'Table Name': st.column_config.TextColumn(disabled=True),
-                'Label': st.column_config.SelectboxColumn(options=["Public","Internal","Restricted","Confidential"]),
-                'C': st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-                'I': st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-                'A': st.column_config.NumberColumn(min_value=0, max_value=3, step=1),
-            },
             key=f"tbl_edit_{sel_tbl}",
         )
         try:
@@ -7244,7 +7247,11 @@ def _ai_assistance_panel():
 def _bulk_classification_panel():
     st.subheader("Bulk Classification")
     st.caption("Upload CSV with columns: FULL_NAME, C, I, A; optional: RATIONALE")
-    f = st.file_uploader("Upload template (CSV)", type=["csv"], key="bulk_csv_center")
+    try:
+        f = st.file_uploader("Upload template (CSV)", type=["csv"], key="bulk_csv_center")
+    except Exception:
+        f = None
+        st.info("File upload not supported in this Streamlit version.")
     dry_run = st.checkbox("Dry run (validate only)", value=True)
     if not f:
         return
@@ -7694,7 +7701,7 @@ def _management_panel():
             }, inplace=True)
             # Derive proposed label/C/I/A when possible
             def _proposed_label(row):
-                for k in ["PROPOSED_LABEL", "LABEL", "CLASSIFICATION", "PROPOSED_CLASSIFICATION"]:
+                for k in ["PROPOSED_LABEL", "LABEL", "CLASSIFICATION"]:
                     if k in row and pd.notna(row[k]):
                         return str(row[k])
                 return None
@@ -7819,7 +7826,7 @@ def _management_panel():
                 try:
                     refs = tagging_service.get_object_tags(asset, "TABLE") if asset else []
                     for t in (refs or []):
-                        nm = str((t.get("TAG_NAME") or t.get("TAG") or "")).upper()
+                        nm = str((t.get("TAG_NAME") or t.get("TAG") or "").upper())
                         val = t.get("TAG_VALUE") or t.get("VALUE")
                         if nm.endswith("DATA_CLASSIFICATION"): cur["Label"] = val
                         if nm.endswith("CONFIDENTIALITY_LEVEL"): cur["C"] = int(str(val)) if str(val).isdigit() else None
@@ -7939,7 +7946,7 @@ def _management_panel():
                         refs = tagging_service.get_object_tags(fn, "TABLE")
                         lbl = None
                         for t in refs or []:
-                            nm = str((t.get("TAG_NAME") or t.get("TAG") or "")).upper()
+                            nm = str((t.get("TAG_NAME") or t.get("TAG") or "").upper())
                             if nm.endswith("DATA_CLASSIFICATION"):
                                 lbl = t.get("TAG_VALUE") or t.get("VALUE")
                                 break
@@ -8191,7 +8198,7 @@ def _management_panel():
                     refs = []
                 found = {"Asset": a, "Environment": "Production", "Sync": "Success", "Last Sync": pd.Timestamp.utcnow()}
                 for t in refs or []:
-                    nm = str((t.get("TAG_NAME") or t.get("TAG") or "")).upper()
+                    nm = str((t.get("TAG_NAME") or t.get("TAG") or "").upper())
                     val = t.get("TAG_VALUE") or t.get("VALUE")
                     if nm.endswith("DATA_CLASSIFICATION"):
                         found["Classification"] = val
@@ -8432,7 +8439,7 @@ with tab1:
         if not inv_assets:
             tables = snowflake_connector.execute_query(
                 f"""
-                SELECT "TABLE_CATALOG" || '.' || "TABLE_SCHEMA" || '.' || "TABLE_NAME" AS full_name
+                SELECT "TABLE_CATALOG"||'.'||"TABLE_SCHEMA"||'.'||"TABLE_NAME" AS full_name
                 FROM {_get_current_db()}.INFORMATION_SCHEMA.TABLES
                 WHERE "TABLE_SCHEMA" NOT IN ('INFORMATION_SCHEMA')
                 ORDER BY "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME"
@@ -8515,7 +8522,7 @@ with tab1:
                 "PII": ["PII","SSN","NATIONAL_ID","PASSPORT","EMAIL","PHONE","ADDRESS","DOB","PERSON","EMPLOYEE","CUSTOMER","AADHAAR","PAN"],
                 "PHI": ["PHI","HIPAA","MEDICAL","HEALTH","PATIENT"],
                 "PCI": ["PCI","CARD","CREDIT","CVV"],
-                "SOX": ["SOX","FINANCIAL_REPORT","AUDIT","IFRS","GAAP"],
+                "SOX": ["SOX","FINANCIAL_REPORT","GAAP","IFRS","AUDIT"],
                 "Financial": ["FINANCIAL","PAYROLL","LEDGER","GL","REVENUE","EXPENSE"],
             }
             # Light sampling for performance
@@ -8828,7 +8835,11 @@ with tab1:
     st.markdown("---")
     st.write("**Bulk Assignment via CSV**")
     st.caption("CSV columns required: FULL_NAME, DATA_CLASSIFICATION, C, I, A; optional: JUSTIFICATION. Rationale is REQUIRED for Restricted/Confidential.")
-    bulk_file = st.file_uploader("Upload CSV for bulk tagging", type=["csv"], key="bulk_csv")
+    try:
+        bulk_file = st.file_uploader("Upload CSV for bulk tagging", type=["csv"], key="bulk_csv")
+    except Exception:
+        bulk_file = None
+        st.info("File upload not supported in this Streamlit version.")
     dry_run = st.checkbox("Dry run (validate only)", value=True)
     if bulk_file is not None:
         try:
@@ -9193,10 +9204,10 @@ with tab1:
 
         # Interactive editor with constrained choices for Label and CIA
         editor_conf = {
-            "Label": st.column_config.SelectboxColumn(options=ALLOWED_CLASSIFICATIONS, help="Classification label"),
-            "C": st.column_config.SelectboxColumn(options=["0 - Public","1 - Internal","2 - Restricted","3 - Confidential"], help="Confidentiality: 0=Public, 1=Internal, 2=Restricted, 3=Confidential"),
-            "I": st.column_config.SelectboxColumn(options=["0 - Low","1 - Standard","2 - High","3 - Critical"], help="Integrity: 0=Low, 1=Standard, 2=High, 3=Critical"),
-            "A": st.column_config.SelectboxColumn(options=["0 - Low","1 - Standard","2 - High","3 - Critical"], help="Availability: 0=Low, 1=Standard, 2=High, 3=Critical"),
+            "Label": st.selectbox(options=ALLOWED_CLASSIFICATIONS, help="Classification label"),
+            "C": st.selectbox(options=["0 - Public","1 - Internal","2 - Restricted","3 - Confidential"], help="Confidentiality: 0=Public, 1=Internal, 2=Restricted, 3=Confidential"),
+            "I": st.selectbox(options=["0 - Low","1 - Standard","2 - High","3 - Critical"], help="Integrity: 0=Low, 1=Standard, 2=High, 3=Critical"),
+            "A": st.selectbox(options=["0 - Low","1 - Standard","2 - High","3 - Critical"], help="Availability: 0=Low, 1=Standard, 2=High, 3=Critical"),
         }
         # If bulk apply flag set, override grid_rows before rendering
         _bulk = st.session_state.get("col_bulk") or {}
@@ -9216,7 +9227,6 @@ with tab1:
             df_grid,
             num_rows="dynamic",
             use_container_width=True,
-            column_config=editor_conf,
             disabled=["Column","Type","Suggested Label","Current Tags"],
             key="col_editor",
         )

@@ -942,7 +942,6 @@ class AIClassificationPipelineService:
             selected_categories = st.multiselect(
                 "Filter by Category",
                 options=available_categories,
-                placeholder="All Categories (Select to filter)",
                 help="Filter the results by specific sensitive categories (e.g., PII, SOX)."
             )
         
@@ -1378,14 +1377,7 @@ class AIClassificationPipelineService:
             
             st.dataframe(
                 grouped[['Schema', 'Table', 'Sensitive Cols', 'Category', 'Confidentiality', 'Integrity', 'Availability']],
-                width='stretch',
-                hide_index=True,
-                column_config={
-                    "Sensitive Cols": st.column_config.NumberColumn(
-                        "Sensitive Columns",
-                        format="%d"
-                    ),
-                }
+                hide_index=True
             )
             
             

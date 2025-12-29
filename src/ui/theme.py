@@ -23,7 +23,15 @@ def _apply_fonts_and_css() -> None:
         html, body, [class*="css"] {
             font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, 'Noto Sans', 'Apple Color Emoji','Segoe UI Emoji','Segoe UI Symbol' !important;
         }
-        h1, h2, h3, h4, h5, h6 { font-weight: 700; }
+        /* High-contrast typography defaults for Snowflake dark surfaces */
+        :root {
+            --text-strong: #E6EEF3;  /* primary text */
+            --text-muted: #A7B2BA;   /* secondary text */
+            --text-accent: #F2F6F8;  /* headings */
+        }
+        h1, h2, h3, h4, h5, h6 { font-weight: 700; color: var(--text-accent) !important; }
+        p, li, span, div, code, pre { color: var(--text-strong); }
+        small, .stCaption, .caption, .st-emotion-cache-16idsys { color: var(--text-muted) !important; }
         a { color: #4DA6FF; }
         </style>
         """,
@@ -86,6 +94,16 @@ def _apply_streamlit_safety_patch() -> None:
         /* Transparent header */
         div[data-testid="stHeader"] { background: transparent !important; }
 
+        /* Global text within main panel: ensure high contrast on dark bg */
+        div[data-testid="stAppViewContainer"] *:not(svg):not(path) {
+            color: #E6EEF3; /* primary text */
+        }
+        /* Headings inside main content */
+        div[data-testid="stAppViewContainer"] h1,
+        div[data-testid="stAppViewContainer"] h2,
+        div[data-testid="stAppViewContainer"] h3,
+        div[data-testid="stAppViewContainer"] h4 { color: #F2F6F8 !important; }
+
         /* Cards and tables */
         .card, .stMetric, .stDataFrame, div[data-testid="stTable"] {
             background: var(--card-bg) !important;
@@ -107,11 +125,30 @@ def _apply_streamlit_safety_patch() -> None:
             border-color: var(--accent) !important;
             box-shadow: 0 0 0 2px rgba(46,212,198,0.15) inset !important;
         }
-        div[data-baseweb="input"] input, textarea {
+        /* Unified filter/input styling (applies to selectbox, multiselect, text inputs) */
+        label, .stMarkdown p label { color: #E6EEF3 !important; font-weight: 600; }
+        div[data-baseweb="select"],
+        div[data-baseweb="select"] > div,
+        div[data-baseweb="select"] div[role="combobox"],
+        div[data-baseweb="input"],
+        div[data-baseweb="input"] > div,
+        div[data-baseweb="input"] input,
+        textarea {
             background: #15202B !important;
             border: 1px solid var(--card-border) !important;
             color: #EAF4F7 !important;
             border-radius: 12px !important;
+        }
+        /* Placeholder & helper text */
+        input::placeholder, textarea::placeholder { color: var(--muted) !important; opacity: 0.9 !important; }
+        .stCaption, .caption { color: var(--muted) !important; }
+        /* Multiselect chips */
+        div[data-baseweb="tag"] { background: #22313F !important; color: #EAF4F7 !important; border-radius: 10px !important; }
+        /* Focus states */
+        div[data-baseweb="select"]:focus-within,
+        div[data-baseweb="input"]:focus-within {
+            box-shadow: 0 0 0 2px rgba(46,212,198,0.22) inset !important;
+            border-color: var(--accent) !important;
         }
 
         /* Tables */

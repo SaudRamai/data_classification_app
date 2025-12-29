@@ -2694,10 +2694,14 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
             # Create a 384-dimensional vector (matching E5-Large output size)
             # Each dimension is derived from the hash in a deterministic way
             vector_dim = 384
-            synthetic_vec = np.zeros(vector_dim, dtype=np.float32)
+            try:
+                vector_dim = int(vector_dim)
+            except Exception:
+                vector_dim = 384
+            synthetic_vec = np.zeros(int(vector_dim), dtype=np.float32)
             
             # Use characters from the hash to populate the vector
-            for i in range(vector_dim):
+            for i in range(int(vector_dim)):
                 char_idx = i % len(text_hash)
                 char_val = int(text_hash[char_idx], 16)  # 0-15
                 
@@ -5421,9 +5425,14 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         # Batch processing
         batch_size = 50
         total_saved = 0
+        # Ensure integer step and slicing even if batch_size is overridden from config/session as string
+        try:
+            _bs = int(batch_size)
+        except Exception:
+            _bs = 50
         
-        for i in range(0, len(all_columns), batch_size):
-            batch = all_columns[i:i+batch_size]
+        for i in range(0, len(all_columns), _bs):
+            batch = all_columns[i:i+_bs]
             
             # Build VALUES string
             values = []
@@ -8849,9 +8858,14 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         # 2. Process missing assets in chunks
         batch_size = 50 
         logger.info(f"Batch fetching columns for {len(to_fetch)}/{len(assets)} tables in chunks of {batch_size}...")
+        # Normalize batch size for safe range and slicing
+        try:
+            _bs_cols = int(batch_size)
+        except Exception:
+            _bs_cols = 50
         
-        for i in range(0, len(to_fetch), batch_size):
-            chunk = to_fetch[i:i+batch_size]
+        for i in range(0, len(to_fetch), _bs_cols):
+            chunk = to_fetch[i:i+_bs_cols]
             conds = []
             params = []
             
@@ -9027,8 +9041,12 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
             needed = [t for t in embedding_requests if t not in getattr(self, '_embedding_cache', {})]
             if needed:
                 emb_batch_size = 256
-                for i in range(0, len(needed), emb_batch_size):
-                    batch = needed[i:i+emb_batch_size]
+                try:
+                    _ebs = int(emb_batch_size)
+                except Exception:
+                    _ebs = 256
+                for i in range(0, len(needed), _ebs):
+                    batch = needed[i:i+_ebs]
                     try:
                         embeddings = self._embedder.encode(batch, normalize_embeddings=True)
                         if not hasattr(self, '_embedding_cache'): self._embedding_cache = {}

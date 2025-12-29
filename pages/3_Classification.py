@@ -356,7 +356,8 @@ with col_db3:
             st.warning(f"Schema detect failed: {_e}")
 
 # Global Filters (sidebar) and driver for tabs
-with st.sidebar.expander("?? Global Filters", expanded=True):
+with st.sidebar.container():
+    st.subheader("Global Filters")
     # Warehouse selector (optional, shown by default)
     try:
         wh_rows = snowflake_connector.execute_query("SHOW WAREHOUSES") or []

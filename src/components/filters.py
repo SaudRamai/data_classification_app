@@ -114,38 +114,37 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
     sel_col = "" if sel_col_raw == "All" else sel_col_raw
 
     # Compliance helpers area (small inline actions)
-    with st.container():
-        st.caption("Use these quick helpers to view/apply compliance metadata on the selected object.")
-        fqtn = f"{sel_db}.{sel_schema}.{sel_table}" if sel_db and sel_schema and sel_table else ""
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("View Tags", key=f"{key_prefix}_view_tags", disabled=not fqtn):
-                try:
-                    from src.services.tagging_service import tagging_service
-                    refs = tagging_service.get_object_tags(fqtn, object_type="TABLE")
-                    # Render tag references in a tabular format
-                    df = pd.DataFrame(refs or [])
-                    if df.empty:
-                        st.info("No tags found for the selected object.")
-                    else:
-                        preferred_cols = [
-                            "TAG_DATABASE", "TAG_SCHEMA", "TAG_NAME", "TAG_VALUE",
-                            "OBJECT_DATABASE", "OBJECT_SCHEMA", "OBJECT_NAME", "COLUMN_NAME",
-                            "DOMAIN", "TAG_OWNER", "COLUMN_ID",
-                        ]
-                        show_cols = [c for c in preferred_cols if c in df.columns]
-                        st.dataframe(df[show_cols] if show_cols else df, use_container_width=True, hide_index=True)
-                except Exception as e:
-                    st.warning(f"Unable to fetch tags: {e}")
-        with col_b:
-            if st.button("Suggest Classification", key=f"{key_prefix}_suggest", disabled=not fqtn):
-                try:
-                    from src.services.classification_pipeline_service import ai_classification_service
-                    detections = ai_classification_service.detect_sensitive_columns(fqtn, sample_size=50)
-                    cats = sorted({c for r in (detections or []) for c in (r.get('categories') or [])})
-                    st.write({"detected_categories": cats})
-                except Exception as e:
-                    st.warning(f"Suggestion failed: {e}")
+    st.caption("Use these quick helpers to view/apply compliance metadata on the selected object.")
+    fqtn = f"{sel_db}.{sel_schema}.{sel_table}" if sel_db and sel_schema and sel_table else ""
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("View Tags", key=f"{key_prefix}_view_tags", disabled=not fqtn):
+            try:
+                from src.services.tagging_service import tagging_service
+                refs = tagging_service.get_object_tags(fqtn, object_type="TABLE")
+                # Render tag references in a tabular format
+                df = pd.DataFrame(refs or [])
+                if df.empty:
+                    st.info("No tags found for the selected object.")
+                else:
+                    preferred_cols = [
+                        "TAG_DATABASE", "TAG_SCHEMA", "TAG_NAME", "TAG_VALUE",
+                        "OBJECT_DATABASE", "OBJECT_SCHEMA", "OBJECT_NAME", "COLUMN_NAME",
+                        "DOMAIN", "TAG_OWNER", "COLUMN_ID",
+                    ]
+                    show_cols = [c for c in preferred_cols if c in df.columns]
+                    st.dataframe(df[show_cols] if show_cols else df, use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.warning(f"Unable to fetch tags: {e}")
+    with col_b:
+        if st.button("Suggest Classification", key=f"{key_prefix}_suggest", disabled=not fqtn):
+            try:
+                from src.services.classification_pipeline_service import ai_classification_service
+                detections = ai_classification_service.detect_sensitive_columns(fqtn, sample_size=50)
+                cats = sorted({c for r in (detections or []) for c in (r.get('categories') or [])})
+                st.write({"detected_categories": cats})
+            except Exception as e:
+                st.warning(f"Suggestion failed: {e}")
 
     return {
         "database": sel_db or "",

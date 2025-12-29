@@ -40,11 +40,13 @@ st.title("Data Intelligence")
 st.caption("Unified Quality and Lineage powered by Snowflake metadata and account usage views")
 
 # Require Snowflake credentials before running any queries on this page
-_has_user = bool(st.session_state.get("sf_user") or getattr(settings, "SNOWFLAKE_USER", None))
-_has_account = bool(st.session_state.get("sf_account") or getattr(settings, "SNOWFLAKE_ACCOUNT", None))
-if not (_has_user and _has_account):
-    st.info("Please login on the Home page to establish a Snowflake session (or set SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER in environment). Then return here.")
-    st.stop()
+# Skip this check if running in Snowflake SiS (auto-authenticated)
+if not snowflake_connector.is_sis():
+    _has_user = bool(st.session_state.get("sf_user") or getattr(settings, "SNOWFLAKE_USER", None))
+    _has_account = bool(st.session_state.get("sf_account") or getattr(settings, "SNOWFLAKE_ACCOUNT", None))
+    if not (_has_user and _has_account):
+        st.info("Please login on the Home page to establish a Snowflake session (or set SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER in environment). Then return here.")
+        st.stop()
 
 # ------------- Helpers -------------
 DEFAULT_TTL = 1800  # 30 minutes for most caches

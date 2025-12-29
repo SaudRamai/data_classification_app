@@ -64,6 +64,48 @@ def _apply_streamlit_safety_patch() -> None:
         div[data-testid="stSidebar"] * {
             color: var(--sidebar-text) !important;
         }
+        /* Sidebar-specific form controls: enforce readable labels and inputs */
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] .stMarkdown p,
+        section[data-testid="stSidebar"] .stCaption,
+        section[data-testid="stSidebar"] .caption {
+            color: var(--sidebar-text) !important;
+            font-weight: 600;
+        }
+        section[data-testid="stSidebar"] div[data-baseweb="select"],
+        section[data-testid="stSidebar"] div[data-baseweb="select"] > div,
+        section[data-testid="stSidebar"] div[data-baseweb="select"] div[role="combobox"],
+        section[data-testid="stSidebar"] div[data-baseweb="input"],
+        section[data-testid="stSidebar"] div[data-baseweb="input"] > div,
+        section[data-testid="stSidebar"] div[data-baseweb="input"] input,
+        section[data-testid="stSidebar"] textarea {
+            background: #14202A !important;
+            border: 1px solid rgba(255,255,255,0.10) !important;
+            color: #EAF4F7 !important;
+            border-radius: 10px !important;
+        }
+        section[data-testid="stSidebar"] input::placeholder,
+        section[data-testid="stSidebar"] textarea::placeholder {
+            color: #BFD0D8 !important;
+            opacity: 1 !important;
+        }
+        /* Sidebar multiselect chips */
+        section[data-testid="stSidebar"] div[data-baseweb="tag"] {
+            background: #22313F !important; color: #EAF4F7 !important; border-radius: 10px !important;
+        }
+        /* Sidebar focus ring */
+        section[data-testid="stSidebar"] div[data-baseweb="select"]:focus-within,
+        section[data-testid="stSidebar"] div[data-baseweb="input"]:focus-within {
+            box-shadow: 0 0 0 2px rgba(46,212,198,0.22) inset !important;
+            border-color: var(--accent) !important;
+        }
+        /* Dropdown menus (listbox) often render in a portal; apply high-contrast theme */
+        div[role="listbox"] {
+            background: #0F1A22 !important;
+            color: #EAF4F7 !important;
+            border: 1px solid rgba(255,255,255,0.10) !important;
+        }
+        div[role="listbox"] * { color: #EAF4F7 !important; }
 
         /* Sidebar active link */
         nav[aria-label="Sidebar Navigation"] a[aria-current="page"],
@@ -115,9 +157,12 @@ def _apply_streamlit_safety_patch() -> None:
         .kpi-value { color: var(--heading) !important; }
 
         /* Buttons and inputs */
-        .stButton > button {
+        .stButton > button,
+        .stDownloadButton > button,
+        .stLinkButton > a,
+        div[data-testid="stAppViewContainer"] button {
             background: #22313F !important;
-            color: #EAF4F7 !important;
+            color: #DCE7ED !important; /* light grey, not white */
             border: 1px solid var(--card-border) !important;
             border-radius: 10px !important;
         }
@@ -151,9 +196,15 @@ def _apply_streamlit_safety_patch() -> None:
             border-color: var(--accent) !important;
         }
 
+        /* Avoid pure white text in common custom classes */
+        .pillar-value, .main-score-header, .info-panel, .kpi-value {
+            color: #DCE7ED !important;
+        }
+        
         /* Tables */
         .stDataFrame thead tr th { background: #22313F !important; color: #DCE7ED !important; }
-        .stDataFrame tbody tr { background: var(--card-bg) !important; color: #EAF4F7 !important; }
+        .stDataFrame tbody tr { background: var(--card-bg) !important; color: #B8C2CC !important; }
+        div[data-testid="stTable"] td, div[data-testid="stTable"] th { color: #B8C2CC !important; }
         </style>
         """,
         unsafe_allow_html=True,

@@ -58,10 +58,19 @@ def _apply_streamlit_safety_patch() -> None:
         }
 
         /* Sidebar */
-        div[data-testid="stSidebar"] > div {
+        /* Cover multiple possible containers (div/section/aside) to avoid light theme leakage in Snowflake */
+        div[data-testid="stSidebar"],
+        div[data-testid="stSidebar"] > div,
+        section[data-testid="stSidebar"],
+        aside[data-testid="stSidebar"] {
             background: var(--sidebar-bg) !important;
+            box-shadow: none !important;
+            border: none !important;
         }
-        div[data-testid="stSidebar"] * {
+        /* Ensure all descendants use the sidebar text color by default */
+        div[data-testid="stSidebar"] *,
+        section[data-testid="stSidebar"] *,
+        aside[data-testid="stSidebar"] * {
             color: var(--sidebar-text) !important;
         }
         /* Sidebar-specific form controls: enforce readable labels and inputs */
@@ -107,6 +116,17 @@ def _apply_streamlit_safety_patch() -> None:
         }
         div[role="listbox"] * { color: #EAF4F7 !important; }
 
+        /* Sidebar links */
+        nav[aria-label="Sidebar Navigation"] a,
+        div[data-testid="stSidebarNav"] a {
+            color: var(--sidebar-text) !important;
+            opacity: 0.9 !important;
+        }
+        nav[aria-label="Sidebar Navigation"] a:hover,
+        div[data-testid="stSidebarNav"] a:hover {
+            background: rgba(46,212,198,0.10) !important;
+            border-radius: 10px !important;
+        }
         /* Sidebar active link */
         nav[aria-label="Sidebar Navigation"] a[aria-current="page"],
         div[data-testid="stSidebarNav"] a[aria-current="page"] {

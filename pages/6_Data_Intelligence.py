@@ -39,14 +39,41 @@ apply_global_theme()
 st.title("Data Intelligence")
 st.caption("Unified Quality and Lineage powered by Snowflake metadata and account usage views")
 
-# Require Snowflake credentials before running any queries on this page
-# Skip this check if running in Snowflake SiS (auto-authenticated)
-if not snowflake_connector.is_sis():
-    _has_user = bool(st.session_state.get("sf_user") or getattr(settings, "SNOWFLAKE_USER", None))
-    _has_account = bool(st.session_state.get("sf_account") or getattr(settings, "SNOWFLAKE_ACCOUNT", None))
-    if not (_has_user and _has_account):
-        st.info("Please login on the Home page to establish a Snowflake session (or set SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER in environment). Then return here.")
-        st.stop()
+# Check if we're running in Snowflake SiS (auto-authenticated)
+is_sis = snowflake_connector.is_sis()
+
+# Check for user in session state or environment
+sf_user = st.session_state.get("sf_user") or getattr(settings, "SNOWFLAKE_USER", None)
+sf_account = st.session_state.get("sf_account") or getattr(settings, "SNOWFLAKE_ACCOUNT", None)
+
+# Store in session for future use
+st.session_state.sf_user = sf_user
+st.session_state.sf_account = sf_account
+
+# Check if we have the minimum required credentials
+if not is_sis and not (sf_user and sf_account):
+    st.error("""
+    ## 🔐 Authentication Required
+    
+    To access the Data Intelligence features, please:
+    
+    1. Go to the **Home** page
+    2. Log in with your Snowflake credentials
+    3. Return to this page
+    
+    Or set these environment variables:
+    - `SNOWFLAKE_ACCOUNT`
+    - `SNOWFLAKE_USER`
+    - `SNOWFLAKE_PASSWORD` (or use keypair authentication)
+    
+    If you've already logged in, try refreshing the page.
+    """)
+    
+    # Add a button to go to the home page
+    if st.button("🔄 Go to Home Page", type="primary"):
+        st.switch_page("Home.py")
+        
+    st.stop()
 
 # ------------- Helpers -------------
 DEFAULT_TTL = 1800  # 30 minutes for most caches

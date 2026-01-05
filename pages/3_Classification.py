@@ -4949,7 +4949,7 @@ with tab_tasks:
         import pandas as _pd
         svc_df = _pd.DataFrame(svc_tasks)
         if svc_df.empty:
-            # Fallback to Snowflake governance view VW_CLASSIFICATION_REVIEWS
+            # Fallback to Snowflake governance view VW_MY_CLASSIFICATION_TASKS
             try:
                 db = st.session_state.get('sf_database') or _active_db_from_filter()
                 gv = st.session_state.get('governance_schema') or 'DATA_CLASSIFICATION_GOVERNANCE'
@@ -4968,44 +4968,44 @@ with tab_tasks:
                     
                     # Owner filter
                     if owner_q:
-                        where.append("upper(coalesce(REVIEWER,'')) like upper(%(owner)s)")
+                        where.append("upper(coalesce(OWNER,'')) like upper(%(owner)s)")
                         params["owner"] = f"%{owner_q}%"
                     elif me_user:
-                        where.append("upper(coalesce(REVIEWER,'')) = upper(%(me)s)")
+                        where.append("upper(coalesce(OWNER,'')) = upper(%(me)s)")
                         params["me"] = me_user
                     
                     # Classification level
                     if sel_level and sel_level != "All":
-                        where.append("upper(coalesce(REQUESTED_LABEL,'')) = upper(%(level)s)")
+                        where.append("upper(coalesce(CLASSIFICATION_LEVEL,'')) = upper(%(level)s)")
                         params["level"] = sel_level
                     
                     # Date range filter
                     if dr_start:
-                        where.append("coalesce(REVIEW_DUE_DATE, current_date()) >= %(start_date)s")
+                        where.append("coalesce(DUE_DATE, current_date()) >= %(start_date)s")
                         params["start_date"] = str(dr_start)
                     if dr_end:
-                        where.append("coalesce(REVIEW_DUE_DATE, current_date()) <= %(end_date)s")
+                        where.append("coalesce(DUE_DATE, current_date()) <= %(end_date)s")
                         params["end_date"] = str(dr_end)
                     
-                    # Main query using VW_CLASSIFICATION_REVIEWS
+                    # Main query using VW_MY_CLASSIFICATION_TASKS
                     q = f"""
                         SELECT 
-                            REVIEW_ID,
-                            ASSET_FULL_NAME,
-                            REQUESTED_LABEL as CLASSIFICATION_LEVEL,
-                            CONFIDENTIALITY_LEVEL as C,
-                            INTEGRITY_LEVEL as I,
-                            AVAILABILITY_LEVEL as A,
-                            REVIEWER as ASSIGNED_TO,
+                            TASK_ID,
+                            ASSET_ID,
+                            ASSET_NAME,
+                            CLASSIFICATION_LEVEL,
+                            C,
+                            I,
+                            A,
+                            OWNER,
                             STATUS,
-                            CREATED_AT,
-                            UPDATED_AT,
-                            REVIEW_DUE_DATE as DUE_DATE,
-                            STATUS_LABEL,
+                            CREATED,
+                            DUE_DATE,
+                            PRIORITY,
                             LAST_COMMENT as DETAILS
-                        FROM {db}.{gv}.VW_CLASSIFICATION_REVIEWS
+                        FROM {db}.{gv}.VW_MY_CLASSIFICATION_TASKS
                         WHERE {' AND '.join(where)}
-                        ORDER BY COALESCE(REVIEW_DUE_DATE, current_date()) ASC
+                        ORDER BY COALESCE(DUE_DATE, current_date()) ASC
                         LIMIT 500
                     """
                     rows = snowflake_connector.execute_query(q, params) or []
@@ -5039,10 +5039,13 @@ with tab_tasks:
                 "PRIORITY":"Priority",
                 "status":"Status",
                 "STATUS":"Status",
+                "OWNER":"Owner",
                 "ASSIGNED_TO":"Owner",
                 "CLASSIFICATION_LEVEL":"Classification Level",
                 "TASK_ID":"Task ID",
                 "ASSET_ID":"Asset ID",
+                "CREATED":"Created",
+                "CREATED_AT":"Created",
             }, inplace=True)
             display_cols = [
                 c for c in [
@@ -5403,7 +5406,12 @@ with tab_tasks:
                 v = str(val)
                 return "color:#10b981;font-weight:700;" if v == "Approved" else ("color:#ef4444;font-weight:700;" if v == "Rejected" else "color:#3b82f6;font-weight:700;")
 
-            view["Tag"] = view.get("status", "").apply(_status_tag)
+            try:
+                _status_col = next((c for c in ["status", "Status", "review_status"] if c in view.columns), None)
+                if _status_col:
+                    view["Tag"] = view[_status_col].apply(_status_tag)
+            except Exception:
+                pass
 
             # Columns to display per spec
             disp_cols = [c for c in [

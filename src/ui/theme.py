@@ -168,6 +168,66 @@ def _apply_streamlit_safety_patch() -> None:
             background: linear-gradient(135deg, var(--main-grad-start) 0%, var(--main-grad-end) 60%) !important;
         }
 
+        /* ========================================================= */
+        /* NUCLEAR OPTION: FORCE MAIN CONTENT AREA TO BE DARK ALWAYS */
+        /* ========================================================= */
+        
+        /* Target EVERYTHING in the main content area */
+        html, body {
+            background-color: #0E141B !important;
+            background: #0E141B !important;
+        }
+
+        /* Main app container - MUST be dark */
+        div[data-testid="stApp"],
+        div.stApp,
+        .main,
+        section.main,
+        div.main,
+        [data-testid="stMain"],
+        main {
+            background-color: #0E141B !important;
+            background: linear-gradient(135deg, #0E141B 0%, #1A2732 60%) !important;
+        }
+
+        /* All children of main - force transparent so gradient shows */
+        section.main > div,
+        section.main > div > div,
+        section.main > div > div > div,
+        .main > div,
+        .main > div > div,
+        [data-testid="stMain"] > div,
+        [data-testid="stMain"] > div > div {
+            background-color: transparent !important;
+            background: transparent !important;
+        }
+
+        /* Force block container to be transparent */
+        [data-testid="block-container"],
+        div.block-container,
+        section.main [data-testid="block-container"] {
+            background-color: transparent !important;
+            background: transparent !important;
+        }
+
+        /* All vertical and horizontal blocks */
+        [data-testid="stVerticalBlock"],
+        [data-testid="stHorizontalBlock"] {
+            background-color: transparent !important;
+            background: transparent !important;
+        }
+
+        /* Catch any white or light colored sections */
+        section[style*="255"],
+        div[style*="255"],
+        section[style*="background"],
+        div[style*="240"],
+        div[style*="245"],
+        div[style*="250"] {
+            background-color: transparent !important;
+            background: transparent !important;
+        }
+
         /* Transparent header */
         div[data-testid="stHeader"] { background: transparent !important; }
 
@@ -385,6 +445,133 @@ def _apply_streamlit_safety_patch() -> None:
         /* Ensure ALL divs default to visible text */
         div {
             color: #E6EEF3 !important;
+        }
+
+        /* ================================================ */
+        /* ULTRA-AGGRESSIVE: CATCH ALL REMAINING WHITE BOXES */
+        /* ================================================ */
+        
+        /* Target Snowflake-rendered white containers */
+        div.main .block-container,
+        div.main section,
+        div.main > div,
+        section.main > div > div,
+        [data-testid="stVerticalBlock"] > div,
+        [data-testid="stHorizontalBlock"] > div {
+            background-color: transparent !important;
+            background: transparent !important;
+        }
+
+        /* File uploader - force dark */
+        div[data-testid="stFileUploader"],
+        section[data-testid="stFileUploadDropzone"],
+        div[data-testid="stFileUploadDropzone"] {
+            background-color: var(--card-bg) !important;
+            background: var(--card-bg) !important;
+            border: 1px dashed var(--card-border) !important;
+            color: #DCE7ED !important;
+        }
+
+        /* Upload button */
+        label[data-testid="stFileUploader"] button,
+        div[data-testid="stFileUploader"] button {
+            background: #22313F !important;
+            color: #DCE7ED !important;
+            border: 1px solid var(--card-border) !important;
+        }
+
+        /* ALL sections and articles */
+        section, article, main, aside {
+            background-color: transparent !important;
+            color: #DCE7ED !important;
+        }
+
+        /* Catch any element with light grey or white background colors */
+        [style*="background-color: rgb(240"],
+        [style*="background-color: rgb(245"],
+        [style*="background-color: rgb(250"],
+        [style*="background: rgb(240"],
+        [style*="background: rgb(245"],
+        [style*="background: rgb(250"],
+        [style*="background-color: #f0"],
+        [style*="background-color: #f5"],
+        [style*="background-color: #fa"],
+        [style*="background: #f0"],
+        [style*="background: #f5"],
+        [style*="background: #fa"] {
+            background-color: var(--card-bg) !important;
+            background: var(--card-bg) !important;
+            color: #DCE7ED !important;
+        }
+
+        /* Force minimum background darkness on ALL block elements */
+        div[class*="element-container"],
+        div[class*="stBlock"],
+        div[class*="block-container"],
+        section[class*="main"],
+        div[class*="main"] {
+            background-color: transparent !important;
+        }
+
+        /* Text area and all inputs */
+        textarea, input, select {
+            background: #15202B !important;
+            color: #DCE7ED !important;
+            border: 1px solid var(--card-border) !important;
+        }
+
+        /* Form labels */
+        label {
+            color: #DCE7ED !important;
+            font-weight: 600 !important;
+        }
+
+        /* Selectbox dropdown items */
+        ul[role="listbox"] li,
+        div[role="option"] {
+            background: #0F1A22 !important;
+            color: #DCE7ED !important;
+        }
+
+        ul[role="listbox"] li:hover,
+        div[role="option"]:hover {
+            background: #22313F !important;
+            color: #DCE7ED !important;
+        }
+
+        /* Pandas dataframes - force dark */
+        .dataframe, table {
+            background-color: var(--card-bg) !important;
+            color: #DCE7ED !important;
+        }
+
+        .dataframe thead th {
+            background-color: #22313F !important;
+            color: #DCE7ED !important;
+        }
+
+        .dataframe tbody td, .dataframe tbody tr {
+            background-color: var(--card-bg) !important;
+            color: #DCE7ED !important;
+        }
+
+        /* Any remaining white or very light elements */
+        div[style*="255, 255, 255"],
+        span[style*="255, 255, 255"],
+        section[style*="255, 255, 255"] {
+            background: var(--card-bg) !important;
+            color: #DCE7ED !important;
+        }
+
+        /* Streamlit widgets container */
+        .stMarkdown, .stText {
+            color: #DCE7ED !important;
+        }
+
+        /* Override any CSS class that sets white/light backgrounds */
+        [class*="css"][style*="background"],
+        [class*="st-"][style*="background"] {
+            background-color: transparent !important;
         }
         
         </style>

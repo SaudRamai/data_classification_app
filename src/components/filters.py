@@ -1,5 +1,5 @@
 """
-Reusable multi-level data filters for Database → Schema → Table → Column selection,
+Reusable multi-level data filters for Database -> Schema -> Table -> Column selection,
 with compliance hooks (tagging/classification/masking-aware).
 """
 from __future__ import annotations
@@ -47,10 +47,13 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
     )
     sel_db = "" if sel_db_raw == "All" else sel_db_raw
 
-    # Schemas with 'All' — if no database selected, list account-level schemas
+    # Schemas with 'All' - if no database selected, list account-level schemas
     schemas: List[str] = []
     if sel_db:
-        schemas = [r.get("name") or r.get("NAME") for r in _safe_query(f"SHOW SCHEMAS IN DATABASE {sel_db}") if (r.get("name") or r.get("NAME"))]
+        try:
+            schemas = [r.get("name") or r.get("NAME") for r in _safe_query(f"SHOW SCHEMAS IN DATABASE {sel_db}") if (r.get("name") or r.get("NAME"))]
+        except Exception:
+            schemas = []
     else:
         # No database selected: show schemas available in the account (best-effort)
         schemas = [r.get("name") or r.get("NAME") for r in _safe_query("SHOW SCHEMAS IN ACCOUNT") if (r.get("name") or r.get("NAME"))]
@@ -71,10 +74,13 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
     # Tables with 'All'
     tables = []
     if sel_db and sel_schema:
-        trows = _safe_query(f"SHOW TABLES IN {sel_db}.{sel_schema}")
-        # Include views as well for broader coverage
-        vrows = _safe_query(f"SHOW VIEWS IN {sel_db}.{sel_schema}")
-        tables = [r.get("name") or r.get("NAME") for r in (trows + vrows) if (r.get("name") or r.get("NAME"))]
+        try:
+            trows = _safe_query(f"SHOW TABLES IN {sel_db}.{sel_schema}")
+            # Include views as well for broader coverage
+            vrows = _safe_query(f"SHOW VIEWS IN {sel_db}.{sel_schema}")
+            tables = [r.get("name") or r.get("NAME") for r in (trows + vrows) if (r.get("name") or r.get("NAME"))]
+        except Exception:
+            tables = []
     table_options = (["All"] + tables) if tables else ["All"]
     prev_table = st.session_state.get(f"{key_prefix}_table") or "All"
     try:
@@ -92,11 +98,14 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
     # Columns with 'All'
     columns: List[str] = []
     if sel_db and sel_schema and sel_table:
-        crow = _safe_query(
-            f"SELECT COLUMN_NAME FROM {sel_db}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=%(s)s AND TABLE_NAME=%(t)s ORDER BY ORDINAL_POSITION",
-            {"s": sel_schema, "t": sel_table},
-        )
-        columns = [c.get("COLUMN_NAME") for c in crow]
+        try:
+            crow = _safe_query(
+                f"SELECT COLUMN_NAME FROM {sel_db}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=%(s)s AND TABLE_NAME=%(t)s ORDER BY ORDINAL_POSITION",
+                {"s": sel_schema, "t": sel_table},
+            )
+            columns = [c.get("COLUMN_NAME") for c in crow]
+        except Exception:
+            columns = []
     col_options = (["All"] + columns) if columns else ["All"]
     prev_col = st.session_state.get(f"{key_prefix}_column") or "All"
     try:
@@ -209,8 +218,13 @@ def render_global_filters(key_prefix: str = "global") -> Dict[str, str]:
     """
     st.subheader("Global Filters")
     # Warehouse selector
-    wh_rows = _safe_query("SHOW WAREHOUSES")
-    wh_opts = [r.get("name") or r.get("NAME") for r in wh_rows if (r.get("name") or r.get("NAME"))]
+    wh_opts = []
+    try:
+        wh_rows = _safe_query("SHOW WAREHOUSES")
+        wh_opts = [r.get("name") or r.get("NAME") for r in wh_rows if (r.get("name") or r.get("NAME"))]
+    except Exception:
+        wh_opts = []
+        
     cur_wh = st.session_state.get('sf_warehouse')
     
     # Build unique display list
@@ -242,25 +256,25 @@ def render_global_filters(key_prefix: str = "global") -> Dict[str, str]:
     st.markdown("---")
     # Refresh / apply actions
     col_a, col_b = st.columns(2)
-    if col_a.button("🔄 Refresh", key=f"{key_prefix}_refresh_btn", use_container_width=True):
+    if col_a.button("Refresh", key=f"{key_prefix}_refresh_btn", use_container_width=True):
         st.rerun()
-    if col_b.button("🧹 Clear", key=f"{key_prefix}_clear_btn", help="Clear cache and refresh", use_container_width=True):
+    if col_b.button("Clear", key=f"{key_prefix}_clear_btn", help="Clear cache and refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     # Common Persistence Logic
-    if filters.get("database"):
-        db = filters["database"]
-        st.session_state["sf_database"] = db
-        try:
+    try:
+        if filters.get("database"):
+            db = filters["database"]
+            st.session_state["sf_database"] = db
             if _conn:
                 _conn.execute_non_query(f"USE DATABASE {db}")
-        except Exception:
-            pass
+                
+        if filters.get("schema"):
+            st.session_state["sf_schema"] = filters["schema"]
             
-    if filters.get("schema"):
-        st.session_state["sf_schema"] = filters["schema"]
-        
-    st.session_state["global_filters"] = filters
+        st.session_state["global_filters"] = filters
+    except Exception:
+        pass
     
     return filters

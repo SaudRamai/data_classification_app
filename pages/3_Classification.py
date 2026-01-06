@@ -4972,6 +4972,8 @@ with tab_tasks:
         if not db:
             st.warning("No active database selected. Please select a database in the sidebar.")
             st.stop()
+            
+        st.caption(f"Signed in as: **{me_user}** | Filtering tasks assigned to your identity.")
         # Enhanced filters for My Tasks with additional options
         f1, f2, f3, f4, f5 = st.columns([1, 1, 1, 1, 2])
         with f1:
@@ -5087,13 +5089,13 @@ with tab_tasks:
                         -- Extract compliance frameworks
                         TRY_PARSE_JSON(DETAILS):"compliance_frameworks" AS COMPLIANCE_FRAMEWORKS
                         
-                FROM {db}.{gv}.CLASSIFICATION_TASKS
-                WHERE 
-                    -- Filter for current user's tasks
-                    ASSIGNED_TO = %(current_user)s
-                    
-                    -- Show only active/incomplete tasks by default
-                    AND STATUS NOT IN ('Completed', 'Closed', 'Cancelled')
+            FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_TASKS
+            WHERE 
+                -- Filter for current user's tasks
+                (ASSIGNED_TO = %(current_user)s OR ASSIGNED_TO = CURRENT_USER())
+                
+                -- Show only active/incomplete tasks by default
+                AND STATUS NOT IN ('Completed', 'Closed', 'Cancelled')
             )
             SELECT * FROM task_data
             WHERE {" AND ".join(where)}

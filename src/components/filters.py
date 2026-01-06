@@ -30,8 +30,6 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
     Returns a dict with keys: database, schema, table, column.
     All values are strings (may be empty if nothing selected).
     """
-    st.markdown("**Filters**")
-
     # Databases (best-effort) with 'All'
     db_rows = _safe_query("SHOW DATABASES")
     dbs = [r.get("name") or r.get("NAME") for r in db_rows if (r.get("name") or r.get("NAME"))]
@@ -112,39 +110,6 @@ def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
         key=f"{key_prefix}_column",
     )
     sel_col = "" if sel_col_raw == "All" else sel_col_raw
-
-    # Compliance helpers area (small inline actions)
-    st.caption("Use these quick helpers to view/apply compliance metadata on the selected object.")
-    fqtn = f"{sel_db}.{sel_schema}.{sel_table}" if sel_db and sel_schema and sel_table else ""
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("View Tags", key=f"{key_prefix}_view_tags", disabled=not fqtn):
-            try:
-                from src.services.tagging_service import tagging_service
-                refs = tagging_service.get_object_tags(fqtn, object_type="TABLE")
-                # Render tag references in a tabular format
-                df = pd.DataFrame(refs or [])
-                if df.empty:
-                    st.info("No tags found for the selected object.")
-                else:
-                    preferred_cols = [
-                        "TAG_DATABASE", "TAG_SCHEMA", "TAG_NAME", "TAG_VALUE",
-                        "OBJECT_DATABASE", "OBJECT_SCHEMA", "OBJECT_NAME", "COLUMN_NAME",
-                        "DOMAIN", "TAG_OWNER", "COLUMN_ID",
-                    ]
-                    show_cols = [c for c in preferred_cols if c in df.columns]
-                    st.dataframe(df[show_cols] if show_cols else df, use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.warning(f"Unable to fetch tags: {e}")
-    with col_b:
-        if st.button("Suggest Classification", key=f"{key_prefix}_suggest", disabled=not fqtn):
-            try:
-                from src.services.classification_pipeline_service import ai_classification_service
-                detections = ai_classification_service.detect_sensitive_columns(fqtn, sample_size=50)
-                cats = sorted({c for r in (detections or []) for c in (r.get('categories') or [])})
-                st.write({"detected_categories": cats})
-            except Exception as e:
-                st.warning(f"Suggestion failed: {e}")
 
     return {
         "database": sel_db or "",
@@ -235,3 +200,67 @@ def render_compliance_facets(key_prefix: str = "facets") -> Dict[str, object]:
         "severity": by_severity,
         "time": by_time,
     }
+
+
+def render_global_filters(key_prefix: str = "global") -> Dict[str, str]:
+    """
+    Standardize Global Filters UI across all pages.
+    Includes Warehouse selection and the cascading Database selectors.
+    """
+    st.subheader("Global Filters")
+    # Warehouse selector
+    wh_rows = _safe_query("SHOW WAREHOUSES")
+    wh_opts = [r.get("name") or r.get("NAME") for r in wh_rows if (r.get("name") or r.get("NAME"))]
+    cur_wh = st.session_state.get('sf_warehouse')
+    
+    # Build unique display list
+    wh_display = []
+    if cur_wh:
+        wh_display.append(cur_wh)
+    for w in wh_opts:
+        if w not in wh_display:
+            wh_display.append(w)
+            
+    sel_wh = st.selectbox(
+        "Warehouse",
+        options=(wh_display or [""]),
+        index=0 if wh_display else 0,
+        key=f"{key_prefix}_wh",
+        help="Select a Snowflake warehouse to run queries",
+    )
+    if sel_wh and sel_wh != cur_wh:
+        try:
+            if _conn:
+                _conn.execute_non_query(f"USE WAREHOUSE {sel_wh}")
+            st.session_state['sf_warehouse'] = sel_wh
+        except Exception as e:
+            st.error(f"Failed to switch to warehouse {sel_wh}: {str(e)}")
+
+    # Cascading selectors
+    filters = render_data_filters(key_prefix=key_prefix)
+    
+    st.markdown("---")
+    # Refresh / apply actions
+    col_a, col_b = st.columns(2)
+    if col_a.button("🔄 Refresh", key=f"{key_prefix}_refresh_btn", use_container_width=True):
+        st.rerun()
+    if col_b.button("🧹 Clear", key=f"{key_prefix}_clear_btn", help="Clear cache and refresh", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    # Common Persistence Logic
+    if filters.get("database"):
+        db = filters["database"]
+        st.session_state["sf_database"] = db
+        try:
+            if _conn:
+                _conn.execute_non_query(f"USE DATABASE {db}")
+        except Exception:
+            pass
+            
+    if filters.get("schema"):
+        st.session_state["sf_schema"] = filters["schema"]
+        
+    st.session_state["global_filters"] = filters
+    
+    return filters

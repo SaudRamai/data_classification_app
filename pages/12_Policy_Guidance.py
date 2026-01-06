@@ -29,11 +29,83 @@ from src.ui.theme import apply_global_theme
 from src.services.compliance_service import compliance_service as _ncs
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
+from src.components.filters import render_global_filters
 
 # Apply centralized theme
 apply_global_theme()
-st.title("Handling Rules & Policy Guidance")
+# Global Filters
+with st.sidebar:
+    g_filters = render_global_filters(key_prefix="policy")
+
+st.markdown("""
+<div class="page-hero">
+    <div style="display: flex; align-items: center; gap: 1.5rem;">
+        <div class="hero-icon-box">📘</div>
+        <div>
+            <h1 class="hero-title">Handling Rules & Policy Guidance</h1>
+            <p class="hero-subtitle">Decision frameworks and handling requirements for sensitive data.</p>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 render_quick_links()
+
+st.markdown("""
+<style>
+    /* Standardized Dashboard-style Card System */
+    .pillar-card {
+        background: linear-gradient(145deg, rgba(26, 32, 44, 0.6), rgba(17, 21, 28, 0.8));
+        border-radius: 20px;
+        padding: 22px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        text-align: center;
+        transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        position: relative;
+        overflow: hidden;
+        height: 100%;
+        margin-bottom: 1rem;
+    }
+    
+    .pillar-card:hover {
+        transform: translateY(-8px);
+        border-color: rgba(79, 209, 197, 0.4);
+        background: linear-gradient(145deg, rgba(30, 39, 54, 0.8), rgba(20, 26, 35, 0.9));
+        box-shadow: 0 15px 35px rgba(0, 0, 0, 0.4), 0 0 20px rgba(79, 209, 197, 0.1);
+    }
+    
+    .pillar-icon {
+        font-size: 28px;
+        margin-bottom: 12px;
+        opacity: 0.9;
+    }
+    
+    .pillar-value {
+        font-size: 34px;
+        font-weight: 800;
+        color: #FFFFFF;
+        margin: 5px 0;
+    }
+    
+    .pillar-label {
+        font-size: 11px;
+        font-weight: 700;
+        color: rgba(255, 255, 255, 0.5);
+        text-transform: uppercase;
+        letter-spacing: 1.2px;
+    }
+
+    .pillar-status {
+        font-size: 11px;
+        font-weight: 600;
+        color: #38bdf8;
+        margin-top: 10px;
+        padding: 4px 10px;
+        background: rgba(56, 189, 248, 0.1);
+        border-radius: 20px;
+        display: inline-block;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # DATABASE RESOLUTION
@@ -152,10 +224,46 @@ with tab_dash:
 
     with col2:
         st.subheader("👥 Roles & Responsibilities")
-        st.info(f"**Data Owner** - {role_counts['Data Owner']} users")
-        st.info(f"**Data Custodian** - {role_counts['Data Custodian']} users")
-        st.info(f"**Classification Specialist** - {role_counts['Classification Specialist']} users")
-        st.info(f"**Data Consumer** - {role_counts['Data Consumer']} users")
+        
+        # User Distribution Cards
+        r1, r2 = st.columns(2)
+        with r1:
+            st.markdown(f"""
+            <div class="pillar-card">
+                <div class="pillar-icon">👑</div>
+                <div class="pillar-label">Data Owner</div>
+                <div class="pillar-value">{role_counts['Data Owner']}</div>
+                <div class="pillar-status">Accountable</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown(f"""
+            <div class="pillar-card">
+                <div class="pillar-icon">🛠️</div>
+                <div class="pillar-label">Custodian</div>
+                <div class="pillar-value">{role_counts['Data Custodian']}</div>
+                <div class="pillar-status">Technical Lead</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        with r2:
+            st.markdown(f"""
+            <div class="pillar-card">
+                <div class="pillar-icon">🛡️</div>
+                <div class="pillar-label">Specialist</div>
+                <div class="pillar-value">{role_counts['Classification Specialist']}</div>
+                <div class="pillar-status">Governance</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown(f"""
+            <div class="pillar-card">
+                <div class="pillar-icon">👥</div>
+                <div class="pillar-label">Consumer</div>
+                <div class="pillar-value">{role_counts['Data Consumer']}</div>
+                <div class="pillar-status">Reader</div>
+            </div>
+            """, unsafe_allow_html=True)
     
     st.markdown("---")
     

@@ -94,7 +94,7 @@ import plotly.graph_objects as go
 
 try:
     from src.ui.theme import apply_global_theme
-    from src.components.filters import render_data_filters
+    from src.components.filters import render_global_filters
     from src.config.settings import settings
     from src.models.data_models import User
     from src.services.authorization_service import authz
@@ -557,8 +557,12 @@ else:
         pass
 
     with st.sidebar:
-        # Role & Session (in sidebar)
-        with st.expander("Role & Session", expanded=True):
+        # Standardized Global Filters
+        g_filters = render_global_filters(key_prefix="home")
+        
+        st.markdown("---")
+        # Role switching (remains as it's not in global filters)
+        with st.expander("🔐 Role Management", expanded=False):
             try:
                 from src.connectors.snowflake_connector import snowflake_connector as _conn
                 user_upper = ident.user if 'ident' in locals() and ident and ident.user else None
@@ -573,17 +577,8 @@ else:
                     for r in roles_rows if (r.get('ROLE') or r.get('ROLE_NAME') or r.get('GRANTED_ROLE'))
                 }) if roles_rows else []
                 current_role = ident.current_role if 'ident' in locals() and ident else ''
-                sel_role = st.selectbox("Active Role", options=[current_role] + [r for r in role_names if r != current_role] if current_role else role_names, key="sel_role")
-                # Warehouse selector (best-effort discovery)
-                warehouses = []
-                try:
-                    wh_rows = _conn.execute_query("SHOW WAREHOUSES") or []
-                    warehouses = [w.get('name') or w.get('NAME') for w in wh_rows if (w.get('name') or w.get('NAME'))]
-                except Exception:
-                    warehouses = []
-                current_wh = st.session_state.get("sf_warehouse", "")
-                sel_wh = st.selectbox("Active Warehouse", options=[current_wh] + [w for w in warehouses if w != current_wh] if current_wh else warehouses, key="sel_wh")
-                if st.button("Set Role", key="btn_set_role") and sel_role:
+                sel_role = st.selectbox("Active Role", options=[current_role] + [r for r in role_names if r != current_role] if current_role else role_names, key="sel_role_home")
+                if st.button("Switch Role", key="btn_set_role_home") and sel_role:
                     try:
                         _ = _conn.execute_non_query(f"USE ROLE {sel_role}")
                     except Exception:
@@ -591,39 +586,16 @@ else:
                     st.session_state["sf_role"] = sel_role
                     st.success(f"Role switched to {sel_role}.")
                     st.rerun()
-                if st.button("Set Warehouse", key="btn_set_wh") and sel_wh:
-                    try:
-                        _ = _conn.execute_non_query(f"USE WAREHOUSE {sel_wh}")
-                    except Exception:
-                        pass
-                    st.session_state["sf_warehouse"] = sel_wh
-                    st.success(f"Warehouse set to {sel_wh}.")
-                    st.rerun()
-                # Database selector (best-effort)
-                databases = []
-                try:
-                    db_rows = _conn.execute_query("SHOW DATABASES") or []
-                    databases = [d.get('name') or d.get('NAME') for d in db_rows if (d.get('name') or d.get('NAME'))]
-                except Exception:
-                    databases = []
-                current_db = st.session_state.get("sf_database", "")
-                sel_db = st.selectbox("Active Database", options=[current_db] + [d for d in databases if d != current_db] if current_db else databases, key="sel_db")
-                if st.button("Set Database", key="btn_set_db") and sel_db:
-                    try:
-                        _ = _conn.execute_non_query(f"USE DATABASE {sel_db}")
-                    except Exception:
-                        pass
-                    st.session_state["sf_database"] = sel_db
-                    st.success(f"Database set to {sel_db}.")
-                    st.rerun()
-                try:
-                    info = _conn.execute_query("select current_user() as U, current_role() as R, current_warehouse() as W, current_region() as RG") or []
-                    if info:
-                        st.caption(f"Session → USER={info[0].get('U')}, ROLE={info[0].get('R')}, WAREHOUSE={info[0].get('W')}, REGION={info[0].get('RG')}")
-                except Exception:
-                    pass
             except Exception as e:
-                st.warning(f"Role & Session panel failed: {e}")
+                st.warning(f"Role tracking panel issue: {e}")
+
+        # Session Information
+        try:
+            info = _conn.execute_query("select current_user() as U, current_role() as R, current_warehouse() as W, current_region() as RG") or []
+            if info:
+                st.caption(f"Session → USER={info[0].get('U')}, ROLE={info[0].get('R')}, WAREHOUSE={info[0].get('W')}, REGION={info[0].get('RG')}")
+        except Exception:
+            pass
 
         # Explicit Logout control (only logs out when clicked)
         st.markdown("---")
@@ -644,18 +616,18 @@ else:
             st.success("You have been logged out.")
             st.rerun()
 
-    # MAIN PAGE: Welcome text and Quick Links
-    st.markdown(
-        """
-        <div style="padding: 0 0 6px 0; display:flex; align-items:center; justify-content:center;">
-            <div style="display:flex; flex-direction:column; align-items:center;">
-                <div style="font-size:28px;font-weight:800;">Welcome to Data Classification App</div>
-                <div style="color:#9ca3af;font-size:15px;margin-top:6px;">Navigate to the section you need. Access is tailored to your Snowflake role.</div>
+    # MAIN PAGE: Welcome section
+    st.markdown("""
+    <div class="page-hero">
+        <div style="display: flex; align-items: center; gap: 1.5rem;">
+            <div class="hero-icon-box">🛡️</div>
+            <div>
+                <h1 class="hero-title">Data Governance Center</h1>
+                <p class="hero-subtitle">Unified platform for data classification, compliance orchestration, and discovery.</p>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    </div>
+    """, unsafe_allow_html=True)
 
     # Role-aware quick links on the main page
     roles_lower = set([r.lower() for r in (ident.roles or [])]) if 'ident' in locals() and ident and getattr(ident, 'roles', None) else set()

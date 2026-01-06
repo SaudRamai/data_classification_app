@@ -33,11 +33,92 @@ from src.ui.theme import apply_global_theme
 from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
 from src.services.asset_utils import get_asset_counts
+from src.components.filters import render_global_filters
 
 # ------------- Page Setup -------------
 apply_global_theme()
-st.title("Data Intelligence")
-st.caption("Unified Quality and Lineage powered by Snowflake metadata and account usage views")
+st.markdown("""
+<div class="page-hero">
+    <div style="display: flex; align-items: center; gap: 1.5rem;">
+        <div class="hero-icon-box">🧠</div>
+        <div>
+            <h1 class="hero-title">Data Intelligence</h1>
+            <p class="hero-subtitle">Unified Quality and Lineage powered by Snowflake metadata and account usage views.</p>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+    /* Standardized Dashboard-style Card System */
+    .pillar-card {
+        background: linear-gradient(145deg, rgba(26, 32, 44, 0.6), rgba(17, 21, 28, 0.8));
+        border-radius: 20px;
+        padding: 22px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        text-align: center;
+        transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        position: relative;
+        overflow: hidden;
+        height: 100%;
+    }
+    
+    .pillar-card:hover {
+        transform: translateY(-8px);
+        border-color: rgba(79, 209, 197, 0.4);
+        background: linear-gradient(145deg, rgba(30, 39, 54, 0.8), rgba(20, 26, 35, 0.9));
+        box-shadow: 0 15px 35px rgba(0, 0, 0, 0.4), 0 0 20px rgba(79, 209, 197, 0.1);
+    }
+    
+    .pillar-icon {
+        font-size: 28px;
+        margin-bottom: 12px;
+        opacity: 0.9;
+    }
+    
+    .pillar-value {
+        font-size: 34px;
+        font-weight: 800;
+        color: #FFFFFF;
+        margin: 5px 0;
+    }
+    
+    .pillar-label {
+        font-size: 11px;
+        font-weight: 700;
+        color: rgba(255, 255, 255, 0.5);
+        text-transform: uppercase;
+        letter-spacing: 1.2px;
+    }
+
+    .pillar-status {
+        font-size: 11px;
+        font-weight: 600;
+        color: #38bdf8;
+        margin-top: 10px;
+        padding: 4px 10px;
+        background: rgba(56, 189, 248, 0.1);
+        border-radius: 20px;
+        display: inline-block;
+    }
+    
+    /* Asset/Issue Card Variant */
+    .asset-card {
+        background: linear-gradient(145deg, rgba(26, 32, 44, 0.6), rgba(17, 21, 28, 0.8));
+        border-radius: 12px;
+        padding: 15px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        margin: 8px 0;
+        transition: all 0.3s ease;
+    }
+    .asset-card:hover {
+         transform: translateY(-2px);
+         box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+         border-color: rgba(56, 189, 248, 0.3);
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Check if we're running in Snowflake SiS (auto-authenticated)
 is_sis = snowflake_connector.is_sis()
@@ -1395,145 +1476,19 @@ def _table_rowcount(db: str, schema: str, name: str) -> Optional[int]:
         return None
     return None
 with st.sidebar:
-    st.header("Filters")
+    # Standardized Global Filters
+    g_filters = render_global_filters(key_prefix="intel")
     
-    # Warehouse Selection
-    with st.spinner("Loading warehouses..."):
-        try:
-            # Get available warehouses
-            wh_opts = _warehouses()
-            cur_wh = st.session_state.get('sf_warehouse')
-            
-            # If we have a current warehouse but it's not in the options, add it
-            if cur_wh and cur_wh not in (wh_opts or []):
-                wh_display = [cur_wh] + (wh_opts or [])
-            else:
-                wh_display = wh_opts or []
-            
-            # Show warehouse selector with 'All' default
-            options_wh = ["All"] + (wh_display or [])
-            default_wh_idx = options_wh.index(cur_wh) if (cur_wh and cur_wh in options_wh) else 0
-            sel_wh = st.selectbox(
-                "Warehouse", 
-                options=options_wh,
-                index=default_wh_idx,
-                key="int_warehouse",
-                help="Select a warehouse to run queries against"
-            )
-            
-            # Update warehouse in session state if changed
-            if sel_wh and sel_wh != "All" and sel_wh != cur_wh:
-                try:
-                    _use_warehouse(sel_wh)
-                    st.session_state['sf_warehouse'] = sel_wh
-                    st.caption(f"Using warehouse: {sel_wh}")
-                    # Clear database cache when warehouse changes
-                    st.cache_data.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.warning(f"Failed to set warehouse: {e}")
-                    # If warehouse change fails, revert to previous selection
-                    if cur_wh:
-                        st.session_state['int_warehouse'] = cur_wh
-            
-            # No manual warehouse input, only use the dropdown
-            
-            # If no warehouses found at all, show a warning
-            if not wh_display and not cur_wh:
-                st.warning("No warehouses found. Please enter a warehouse name manually.")
-                
-        except Exception as e:
-            error_msg = str(e).replace('\n', ' ').strip()
-            st.error(f"Error loading warehouses: {error_msg}")
-            st.stop()
+    sel_wh = st.session_state.get('sf_warehouse')
+    active_db = g_filters.get("database") or "All"
+    sel_schema = g_filters.get("schema") or "All"
+    sel_object = g_filters.get("table") or "All"
     
-    # Set the selected warehouse
-    sel_wh = st.session_state.get('sf_warehouse') or _current_warehouse()
-    
-    # 1. Warehouse Selection
-    
-    # 2. Database Selection (filtered by selected warehouse)
-    db_opts = []
-    if sel_wh and sel_wh not in ("All", "(none)"):
-        try:
-            db_opts = _databases(warehouse=sel_wh)
-        except Exception as e:
-            st.error(f"Error loading databases: {str(e)}")
-    
-    cur_db = st.session_state.get('sf_database')
-    active_db = st.selectbox(
-        "Database",
-        options=["All"] + (db_opts or []),
-        index=((["All"] + (db_opts or [])).index(cur_db) if (cur_db and cur_db in (["All"] + (db_opts or []))) else 0),
-        key="int_database",
-        help="Select a database to filter schemas and objects"
-    )
-    
-    # Update database in session state if changed
-    if active_db and active_db not in ("All", "(none)") and active_db != cur_db:
-        st.session_state['sf_database'] = active_db
-        # Clear schema and object selections when database changes
-        if 'prev_schema' in st.session_state:
-            del st.session_state['prev_schema']
-        if 'prev_object' in st.session_state:
-            del st.session_state['prev_object']
-    
-    # 3. Schema Selection (shows even when database is none)
-    with st.spinner("Loading schemas..."):
-        schemas = _schemas(active_db if active_db and active_db not in ("All", "(none)") else None, warehouse=sel_wh if sel_wh not in ("All", "(none)") else None)
-    sch_opts = ["All"] + (schemas or [])
-    prev_schema = st.session_state.get('prev_schema')
-    default_schema_idx = sch_opts.index(prev_schema) if (prev_schema and prev_schema in sch_opts) else 0
-    sel_schema = st.selectbox(
-        "Schema",
-        options=sch_opts,
-        index=default_schema_idx,
-        key="int_schema",
-        help="Select a schema to filter objects"
-    )
+    # Store in session for consistency with other pages
+    st.session_state["sf_database"] = None if active_db == "All" else active_db
+    st.session_state["sf_schema"] = None if sel_schema == "All" else sel_schema
     st.session_state.prev_schema = sel_schema
-    if 'prev_schema' in st.session_state and prev_schema != sel_schema and 'prev_object' in st.session_state:
-        del st.session_state['prev_object']
-
-    # 4. Object Selection (works when schema is 'All' by listing across all schemas)
-    objects_typed: List[Dict[str, str]] = []
-    if active_db and active_db not in ("All", "(none)"):
-        with st.spinner("Loading objects..."):
-            objects_typed = _objects_with_types(
-                active_db,
-                None if sel_schema == "All" else sel_schema,
-                warehouse=sel_wh if sel_wh not in ("All", "(none)") else None,
-            )
-    display_names = ["All"]
-    obj_map = {"All": "All"}
-    for o in (objects_typed or []):
-        try:
-            fqn = o.get("FQN")
-            obj_schema = o.get("SCHEMA")
-            obj_name = o.get("NAME")
-            obj_type = o.get("TYPE") or "UNKNOWN"
-            display_name = f"{obj_schema}.{obj_name} ({obj_type})"
-            display_names.append(display_name)
-            obj_map[display_name] = fqn
-        except Exception:
-            if fqn:
-                display_names.append(fqn)
-                obj_map[fqn] = fqn
-    prev_object = st.session_state.get('prev_object')
-    prev_display_name = next((k for k,v in obj_map.items() if v == prev_object), "All") if prev_object else "All"
-    try:
-        selected_display = st.selectbox(
-            "Object (table/view)",
-            options=display_names,
-            index=(display_names.index(prev_display_name) if prev_display_name in display_names else 0),
-            key="int_object_display_2",
-            help="Select a table or view to analyze"
-        )
-        sel_object = obj_map.get(selected_display, "All")
-        st.session_state.prev_object = sel_object
-    except Exception as e:
-        st.error(f"Error loading objects: {str(e)}")
-        sel_object = "All"
+    st.session_state.prev_object = sel_object
     
     # Time Range selector at the bottom of Filters section
     st.markdown("---")
@@ -1545,12 +1500,6 @@ with st.sidebar:
         help="Select the time range for the data analysis"
     )
     
-    # Clear cache button
-    st.markdown("---")
-    if st.button("🔄 Refresh Now", help="Clear cached data and refresh from Snowflake"):
-        st.cache_data.clear()
-        st.rerun()
-
 # Helper to split FQN
 
 def _split_fqn(fqn: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -1590,19 +1539,46 @@ with q_tab:
             )
 
         if health_metrics:
-            col1, col2 = st.columns([2, 1])
+            c1, c2, c3, c4 = st.columns(4)
 
-            with col1:
-                st.metric(label="Overall Health Score", value=f"{health_metrics.get('health_score', 0):.1f}%")
-                st.metric(label="Credits Used (Today)", value=f"{health_metrics.get('credits_used_today', 0):.2f}")
+            with c1:
+                st.markdown(f"""
+                <div class="pillar-card">
+                    <div class="pillar-icon">❤️</div>
+                    <div class="pillar-label">Health Score</div>
+                    <div class="pillar-value">{health_metrics.get('health_score', 0):.1f}%</div>
+                </div>
+                """, unsafe_allow_html=True)
 
-            with col2:
-                st.metric(label="Critical Alerts", value=health_metrics.get('critical_alerts', 0))
-                st.metric(
-                    label="Success / Failure Count",
-                    value=f"{health_metrics.get('successful_queries', 0):,} / {health_metrics.get('failed_queries', 0):,}"
-                )
-                st.caption(f"Last Updated: {health_metrics.get('last_updated', 'N/A')}")
+            with c2:
+                st.markdown(f"""
+                <div class="pillar-card">
+                    <div class="pillar-icon">💳</div>
+                    <div class="pillar-label">Credits / Day</div>
+                    <div class="pillar-value">{health_metrics.get('credits_used_today', 0):.2f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with c3:
+                st.markdown(f"""
+                <div class="pillar-card">
+                    <div class="pillar-icon">🚨</div>
+                    <div class="pillar-label">Critical Alerts</div>
+                    <div class="pillar-value">{health_metrics.get('critical_alerts', 0)}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with c4:
+                st.markdown(f"""
+                <div class="pillar-card">
+                    <div class="pillar-icon">✅</div>
+                    <div class="pillar-label">Success Rate</div>
+                    <div class="pillar-value">{health_metrics.get('successful_queries', 0)}</div>
+                    <div class="pillar-status" style="font-size:0.7rem;">{health_metrics.get('failed_queries', 0)} Failed</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+            st.caption(f"Last Updated: {health_metrics.get('last_updated', 'N/A')}")
 
         else:
             st.info("No health metrics available. Please configure Snowflake connection.")
@@ -1629,13 +1605,13 @@ with q_tab:
                 }.get(issue['severity'], '#95a5a6')
 
                 st.markdown(f"""
-                <div style="background: white; border-left: 4px solid {severity_color}; 
-                            padding: 10px 15px; margin: 5px 0; border-radius: 0 4px 4px 0;
-                            box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-                    <div style="font-weight: 600; margin-bottom: 5px;">{issue['issue']}</div>
-                    <div style="display: flex; justify-content: space-between; font-size: 12px; color: #7f8c8d;">
-                        <span style="color: {severity_color};">● {issue['severity']}</span>
-                        <span>{issue['affected']}</span>
+                <div class="asset-card" style="border-left: 4px solid {severity_color}; display:flex; justify-content:space-between; align-items:center;">
+                    <div>
+                        <div style="font-weight: 700; color: #f8fafc; font-size: 0.95rem;">{issue['issue']}</div>
+                        <div style="font-size: 0.8rem; color: #94a3b8; margin-top:2px;">Affected: {issue['affected']}</div>
+                    </div>
+                    <div style="background:{severity_color}20; color:{severity_color}; padding:4px 10px; border-radius:12px; font-size:0.75rem; font-weight:700;">
+                        {issue['severity']}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -2180,16 +2156,46 @@ with q_tab:
                     pass
             # Render if we have any metrics
             if d:
-                # Top metric cards
+                # Top metric cards with Dashboard-style pillars
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
-                    st.metric("Uniqueness %", f"{float(d.get('UNIQUENESS_PCT') or 0):.2f}%")
+                    st.markdown(f"""
+                        <div class="pillar-card">
+                            <div class="pillar-icon">💎</div>
+                            <div class="pillar-label">Uniqueness</div>
+                            <div class="pillar-value">{float(d.get('UNIQUENESS_PCT') or 0):.1f}%</div>
+                            <div class="pillar-status">Unique Records</div>
+                        </div>
+                    """, unsafe_allow_html=True)
                 with c2:
-                    st.metric("Duplicate Records", f"{int(d.get('DUPLICATE_RECORDS') or 0):,}")
+                    st.markdown(f"""
+                        <div class="pillar-card">
+                            <div class="pillar-icon">👯</div>
+                            <div class="pillar-label">Duplicates</div>
+                            <div class="pillar-value">{int(d.get('DUPLICATE_RECORDS') or 0):,}</div>
+                            <div class="pillar-status">Redundant rows</div>
+                        </div>
+                    """, unsafe_allow_html=True)
                 with c3:
-                    st.metric("Total Rows", f"{int(d.get('TOTAL_ROWS') or 0):,}")
+                    st.markdown(f"""
+                        <div class="pillar-card">
+                            <div class="pillar-icon">📊</div>
+                            <div class="pillar-label">Volume</div>
+                            <div class="pillar-value">{int(d.get('TOTAL_ROWS') or 0):,}</div>
+                            <div class="pillar-status">Total instances</div>
+                        </div>
+                    """, unsafe_allow_html=True)
                 with c4:
-                    st.metric("Distinct Assets", f"{int(d.get('DISTINCT_ASSETS') or 0):,}")
+                    st.markdown(f"""
+                        <div class="pillar-card">
+                            <div class="pillar-icon">🔍</div>
+                            <div class="pillar-label">Distinct</div>
+                            <div class="pillar-value">{int(d.get('DISTINCT_ASSETS') or 0):,}</div>
+                            <div class="pillar-status">Unique items</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                st.markdown("<br>", unsafe_allow_html=True)
 
                 # Completeness mini-chart (null % by key attributes)
                 null_df = pd.DataFrame([
@@ -2199,27 +2205,74 @@ with q_tab:
                 ])
                 st.plotly_chart(
                     px.bar(null_df, x="DIMENSION", y="NULL_PCT", title="Completeness: % Nulls by Attribute", text="NULL_PCT")
-                    .update_traces(texttemplate='%{text:.2f}%', textposition='outside'),
+                    .update_traces(marker_color='#2ED4C6', texttemplate='%{text:.1f}%', textposition='outside'),
                     use_container_width=True
                 )
 
                 # Validity mini-cards
                 v1, v2, v3 = st.columns(3)
                 with v1:
-                    st.metric("Invalid Email %", f"{float(d.get('INVALID_EMAIL_PCT') or 0):.2f}%")
+                    st.markdown(f"""
+                        <div class="pillar-card">
+                            <div class="pillar-icon">📧</div>
+                            <div class="pillar-label">Email Validity</div>
+                            <div class="pillar-value">{float(d.get('INVALID_EMAIL_PCT') or 0):.1f}%</div>
+                            <div class="pillar-status">Format violations</div>
+                        </div>
+                    """, unsafe_allow_html=True)
                 with v2:
-                    st.metric("Out-of-range Review Freq %", f"{float(d.get('OUT_OF_RANGE_REVIEW_FREQ_PCT') or 0):.2f}%")
+                    st.markdown(f"""
+                        <div class="pillar-card">
+                            <div class="pillar-icon">📅</div>
+                            <div class="pillar-label">Review Window</div>
+                            <div class="pillar-value">{float(d.get('OUT_OF_RANGE_REVIEW_FREQ_PCT') or 0):.1f}%</div>
+                            <div class="pillar-status">Policy exceptions</div>
+                        </div>
+                    """, unsafe_allow_html=True)
                 with v3:
-                    st.metric("Classification Change %", f"{float(d.get('CLASSIFICATION_CHANGE_PCT') or 0):.2f}%")
+                    st.markdown(f"""
+                        <div class="pillar-card">
+                            <div class="pillar-icon">🔄</div>
+                            <div class="pillar-label">Drift Velocity</div>
+                            <div class="pillar-value">{float(d.get('CLASSIFICATION_CHANGE_PCT') or 0):.1f}%</div>
+                            <div class="pillar-status">Label transitions</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                st.markdown("<br>", unsafe_allow_html=True)
 
                 # Timeliness
                 t1, t2, t3 = st.columns(3)
                 with t1:
-                    st.metric("Avg Record Age (days)", f"{float(d.get('AVG_RECORD_AGE_DAYS') or 0):.1f}")
+                    st.markdown(f"""
+                        <div class="pillar-card" style="background: rgba(56, 189, 248, 0.05);">
+                            <div class="pillar-icon">⌛</div>
+                            <div class="pillar-label">Average Age</div>
+                            <div class="pillar-value">{float(d.get('AVG_RECORD_AGE_DAYS') or 0):.1f}</div>
+                            <div class="pillar-status">Days since entry</div>
+                        </div>
+                    """, unsafe_allow_html=True)
                 with t2:
-                    st.metric("Last Updated", str(d.get('LAST_UPDATED') or '—'))
+                    last_upd = str(d.get('LAST_UPDATED') or '—')
+                    if ' ' in last_upd: last_upd = last_upd.split(' ')[0]
+                    st.markdown(f"""
+                        <div class="pillar-card" style="background: rgba(56, 189, 248, 0.05);">
+                            <div class="pillar-icon">🔔</div>
+                            <div class="pillar-label">Last Updated</div>
+                            <div class="pillar-value" style="font-size: 1.5rem;">{last_upd}</div>
+                            <div class="pillar-status">Latest modification</div>
+                        </div>
+                    """, unsafe_allow_html=True)
                 with t3:
-                    st.metric("Data Staleness (days)", f"{int(d.get('DATA_STALENESS_DAYS') or 0)}")
+                    st.markdown(f"""
+                        <div class="pillar-card" style="background: rgba(239, 68, 68, 0.05);">
+                            <div class="pillar-icon">❄️</div>
+                            <div class="pillar-label">Staleness</div>
+                            <div class="pillar-value">{int(d.get('DATA_STALENESS_DAYS') or 0)}</div>
+                            <div class="pillar-status">Days inactive</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+
             else:
                 st.info("No metrics available for the selected table.")
             # Column metadata (ACCOUNT_USAGE only)

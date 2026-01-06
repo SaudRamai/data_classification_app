@@ -42,12 +42,69 @@ from src.services.compliance_service import compliance_service
 from src.services.authorization_service import authz
 # Removed broken system_classify_service import
 from src.ui.quick_links import render_quick_links
+from src.components.filters import render_global_filters
 
 # Use tagging_service for label registry operations (backward-compatible alias)
 label_service = tagging_service
 
 # Apply centralized theme
 apply_global_theme()
+
+st.markdown("""
+<style>
+    /* Standardized Dashboard-style Card System */
+    .pillar-card {
+        background: linear-gradient(145deg, rgba(26, 32, 44, 0.6), rgba(17, 21, 28, 0.8));
+        border-radius: 20px;
+        padding: 22px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        text-align: center;
+        transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        position: relative;
+        overflow: hidden;
+        height: 100%;
+    }
+    
+    .pillar-card:hover {
+        transform: translateY(-8px);
+        border-color: rgba(79, 209, 197, 0.4);
+        background: linear-gradient(145deg, rgba(30, 39, 54, 0.8), rgba(20, 26, 35, 0.9));
+        box-shadow: 0 15px 35px rgba(0, 0, 0, 0.4), 0 0 20px rgba(79, 209, 197, 0.1);
+    }
+    
+    .pillar-icon {
+        font-size: 28px;
+        margin-bottom: 12px;
+        opacity: 0.9;
+    }
+    
+    .pillar-value {
+        font-size: 34px;
+        font-weight: 800;
+        color: #FFFFFF;
+        margin: 5px 0;
+    }
+    
+    .pillar-label {
+        font-size: 11px;
+        font-weight: 700;
+        color: rgba(255, 255, 255, 0.5);
+        text-transform: uppercase;
+        letter-spacing: 1.2px;
+    }
+
+    .pillar-status {
+        font-size: 11px;
+        font-weight: 600;
+        color: #38bdf8;
+        margin-top: 10px;
+        padding: 4px 10px;
+        background: rgba(56, 189, 248, 0.1);
+        border-radius: 20px;
+        display: inline-block;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Resolve database name
 db_name = settings.SNOWFLAKE_DATABASE
@@ -128,7 +185,21 @@ except Exception as _auth_err:
 # MAIN RENDERER
 # -----------------------------------------------------------------------------
 
-st.title("Administration")
+st.markdown("""
+<div class="page-hero">
+    <div style="display: flex; align-items: center; gap: 1.5rem;">
+        <div class="hero-icon-box">🛠️</div>
+        <div>
+            <h1 class="hero-title">Administration</h1>
+            <p class="hero-subtitle">System configuration, user management, and tag governance controls.</p>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# Global Filters (In Sidebar)
+with st.sidebar:
+    g_filters = render_global_filters(key_prefix="admin")
 
 # Quick Links usually stay at top
 render_quick_links()
@@ -177,25 +248,56 @@ if st.session_state.admin_view == 'Dashboard':
         auto_ok, auto_msg = get_auto_classification_status()
 
     # Display Status
-    if sf_ok:
-        st.success(f"✓ Snowflake Connection - {sf_msg}")
-    else:
-        st.error(f"✗ Snowflake Connection - {sf_msg}")
+    # Display Status using Pillar Cards
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    
+    with sc1:
+        color = "#10b981" if sf_ok else "#ef4444"
+        icon = "🔌"
+        st.markdown(f"""
+        <div class="pillar-card">
+            <div class="pillar-icon">{icon}</div>
+            <div class="pillar-label">Snowflake Connection</div>
+            <div class="pillar-value" style="font-size: 1.2rem;">{sf_msg}</div>
+            <div class="pillar-status" style="color: {color}; background: {color}20;">Status</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    if tag_ok:
-        st.success(f"✓ Tag Synchronization - {tag_msg}")
-    else:
-        st.warning(f"⚠ Tag Synchronization - {tag_msg}")
+    with sc2:
+        color = "#10b981" if tag_ok else "#f59e0b"
+        icon = "🏷️"
+        st.markdown(f"""
+        <div class="pillar-card">
+            <div class="pillar-icon">{icon}</div>
+            <div class="pillar-label">Tag Sync</div>
+            <div class="pillar-value" style="font-size: 1.2rem;">{tag_msg}</div>
+            <div class="pillar-status" style="color: {color}; background: {color}20;">Metadata</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    if meta_ok:
-        st.success(f"✓ Metadata Harvesting - {meta_msg}")
-    else:
-        st.warning(f"⚠ Metadata Harvesting - {meta_msg}")
+    with sc3:
+        color = "#10b981" if meta_ok else "#f59e0b"
+        icon = "📦"
+        st.markdown(f"""
+        <div class="pillar-card">
+            <div class="pillar-icon">{icon}</div>
+            <div class="pillar-label">Assets</div>
+            <div class="pillar-value" style="font-size: 1.2rem;">{meta_msg.split('(')[0].strip()}</div>
+            <div class="pillar-status" style="color: {color}; background: {color}20;">Inventory</div>
+        </div>
+        """, unsafe_allow_html=True)
         
-    if auto_ok:
-        st.success(f"✓ Automated Classification - {auto_msg}")
-    else:
-        st.info(f"ℹ Automated Classification - {auto_msg}")
+    with sc4:
+        color = "#10b981" if auto_ok else "#3b82f6"
+        icon = "🤖"
+        st.markdown(f"""
+        <div class="pillar-card">
+            <div class="pillar-icon">{icon}</div>
+            <div class="pillar-label">Auto-Classification</div>
+            <div class="pillar-value" style="font-size: 1.2rem;">{auto_msg}</div>
+            <div class="pillar-status" style="color: {color}; background: {color}20;">Service</div>
+        </div>
+        """, unsafe_allow_html=True)
 
 
 

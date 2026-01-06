@@ -32,6 +32,7 @@ from src.connectors.snowflake_connector import snowflake_connector
 from src.ui.theme import apply_global_theme
 from src.config.settings import settings
 from src.services.compliance_service import compliance_service
+from src.components.filters import render_global_filters
 # Removed broken tag_drift_service import
 try:
     from src.services.authorization_service import authz as _authz
@@ -202,7 +203,17 @@ def _rt_paginate_df(df: pd.DataFrame, page: int, page_size: int) -> Tuple[pd.Dat
 
 def render_realtime_dashboard():
     apply_global_theme()
-    st.title("Dashboard")
+    st.markdown("""
+    <div class="page-hero">
+        <div style="display: flex; align-items: center; gap: 1.5rem;">
+            <div class="hero-icon-box">📊</div>
+            <div>
+                <h1 class="hero-title">Dashboard</h1>
+                <p class="hero-subtitle">Real-time overview of data classification and compliance status.</p>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # Require Snowflake session before any queries
     has_session = False
@@ -247,25 +258,11 @@ def render_realtime_dashboard():
     # Global Filters sidebar (restored)
     _rt_ensure_session_context()
     with st.sidebar:
-        st.header("filters")
-        # Load selectable options from Snowflake (best-effort)
-        try:
-            db_rows = snowflake_connector.execute_query("SHOW DATABASES") or []
-            db_opts = [r.get("name") or r.get("NAME") for r in db_rows if (r.get("name") or r.get("NAME"))]
-        except Exception:
-            db_opts = []
-
-        # Database
-        cur_db = st.session_state.get("sf_database") or (db_opts[0] if db_opts else None)
-        sel_db = st.selectbox("Database", options=db_opts or ([cur_db] if cur_db else []), index=((db_opts.index(cur_db)) if (cur_db in db_opts) else 0) if (db_opts) else None, key="rt_db")
-
-        # Schemas for selected database
-        try:
-            sch_rows = snowflake_connector.execute_query(f"SELECT SCHEMA_NAME FROM {sel_db}.INFORMATION_SCHEMA.SCHEMATA ORDER BY 1") if sel_db else []
-            schema_opts = ["All"] + [r.get("SCHEMA_NAME") for r in (sch_rows or []) if r.get("SCHEMA_NAME")]
-        except Exception:
-            schema_opts = ["All"]
-        sel_schema = st.selectbox("Schema", options=schema_opts, index=0, key="rt_schema")
+        # Standardized Global Filters
+        g_filters = render_global_filters(key_prefix="dashboard")
+        sel_db = g_filters.get("database")
+        sel_schema = g_filters.get("schema") or "All"
+        
 
         # Business Unit options from ASSETS
         try:
@@ -331,13 +328,6 @@ def render_realtime_dashboard():
         st.session_state.setdefault("rt_framework", "All")
         st.session_state.setdefault("rt_cstatus", "All")
 
-        # Refresh / apply actions
-        colA1, colA2 = st.columns(2)
-        refresh = colA1.button("Apply / Refresh")
-        if colA2.button("Clear Cache"):
-            st.cache_data.clear()
-            refresh = True
-            
         st.markdown("---")
         st.subheader("🛠️ Developer Tools")
         if st.button("Refresh Demo Data", key="refresh_demo_btn"):
@@ -348,13 +338,6 @@ def render_realtime_dashboard():
             else:
                 st.success("Sample data seeded! Refreshing...")
                 st.rerun()
-
-    if refresh:
-        st.cache_data.clear()
-        try:
-            st.rerun()
-        except Exception:
-            pass
 
     # If user selected a database filter, switch session and rebuild FQNs
     try:

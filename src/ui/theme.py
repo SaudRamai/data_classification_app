@@ -49,14 +49,8 @@ def _apply_fonts_and_css() -> None:
             color: var(--text-strong) !important;
         }
 
-        /* ===================================================== */
-        /* ULTIMATE NUCLEAR OPTION: FORCE EVERYTHING TO BE DARK */
-        /* ===================================================== */
-        
-        /* Use universal selector with maximum priority */
-        *, *::before, *::after {
-            background-color: transparent !important;
-        }
+        /* Removed aggressive universal transparency to fix UI layering issues */
+
 
         /* Exception: these specific elements can have dark backgrounds */
         html, body {
@@ -66,44 +60,7 @@ def _apply_fonts_and_css() -> None:
 
         </style>
         
-        <script>
-        // JavaScript to forcefully remove white backgrounds after load
-        (function() {
-            function forceD arkTheme() {
-                // Get all elements
-                const all = document.querySelectorAll('*');
-                all.forEach(el => {
-                    const style = window.getComputedStyle(el);
-                    const bg = style.backgroundColor;
-                    
-                    // Check if background is white or very light
-                    if (bg === 'rgb(255, 255, 255)' || 
-                        bg === 'white' ||
-                        bg === '#fff' ||
-                        bg === '#ffffff' ||
-                        bg.match(/rgb\(25[0-5], 25[0-5], 25[0-5]\)/) ||
-                        bg.match(/rgb\(24[0-9], 24[0-9], 24[0-9]\)/) ||
-                        bg.match(/rgb\(23[0-9], 23[0-9], 23[0-9]\)/)) {
-                        
-                        // Force to transparent or dark
-                        el.style.setProperty('background-color', 'transparent', 'important');
-                        el.style.setProperty('background', 'transparent', 'important');
-                    }
-                });
-            }
-            
-            // Run immediately
-            forceDarkTheme();
-            
-            // Run again after DOM loads
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', forceDarkTheme);
-            }
-            
-            // Run periodically to catch dynamically added content
-            setInterval(forceDarkTheme, 1000);
-        })();
-        </script>
+
         """,
         unsafe_allow_html=True,
     )
@@ -245,18 +202,6 @@ def _apply_streamlit_safety_patch() -> None:
             background: linear-gradient(135deg, #0E141B 0%, #1A2732 60%) !important;
         }
 
-        /* All children of main - force transparent so gradient shows */
-        section.main > div,
-        section.main > div > div,
-        section.main > div > div > div,
-        .main > div,
-        .main > div > div,
-        [data-testid="stMain"] > div,
-        [data-testid="stMain"] > div > div {
-            background-color: transparent !important;
-            background: transparent !important;
-        }
-
         /* Force block container to be transparent */
         [data-testid="block-container"],
         div.block-container,
@@ -360,31 +305,12 @@ def _apply_streamlit_safety_patch() -> None:
         /* FORCE DARK MODE ON ALL CONTAINERS/BLOCKS */
         /* ========================================= */
         
-        /* All containers, columns, and expanders - force dark backgrounds */
-        div[data-testid="stContainer"],
-        div[data-testid="column"],
-        div[data-testid="stVerticalBlock"],
-        div[data-testid="stHorizontalBlock"],
         div[data-testid="stExpander"],
         div.stExpander,
-        div[data-testid="stExpanderDetails"],
-        section[data-testid="stContainer"],
-        section.main > div,
-        .element-container,
-        .stMarkdown,
-        div[class*="st-emotion"],
-        div[data-testid="stMarkdownContainer"] {
+        div[data-testid="stExpanderDetails"] {
             background-color: transparent !important;
             background: transparent !important;
             color: #E6EEF3 !important;
-        }
-
-        /* Force all block containers to be dark */
-        [data-testid="block-container"],
-        div.block-container,
-        section.main [data-testid="block-container"] {
-            background-color: transparent !important;
-            background: transparent !important;
         }
 
         /* Expander headers and content */
@@ -502,20 +428,7 @@ def _apply_streamlit_safety_patch() -> None:
             color: #E6EEF3 !important;
         }
 
-        /* ================================================ */
-        /* ULTRA-AGGRESSIVE: CATCH ALL REMAINING WHITE BOXES */
-        /* ================================================ */
-        
-        /* Target Snowflake-rendered white containers */
-        div.main .block-container,
-        div.main section,
-        div.main > div,
-        section.main > div > div,
-        [data-testid="stVerticalBlock"] > div,
-        [data-testid="stHorizontalBlock"] > div {
-            background-color: transparent !important;
-            background: transparent !important;
-        }
+        /* Removed ULTRA-AGGRESSIVE block to fix rendering issues */
 
         /* File uploader - force dark */
         div[data-testid="stFileUploader"],
@@ -559,14 +472,7 @@ def _apply_streamlit_safety_patch() -> None:
             color: #DCE7ED !important;
         }
 
-        /* Force minimum background darkness on ALL block elements */
-        div[class*="element-container"],
-        div[class*="stBlock"],
-        div[class*="block-container"],
-        section[class*="main"],
-        div[class*="main"] {
-            background-color: transparent !important;
-        }
+
 
         /* Text area and all inputs */
         textarea, input, select {
@@ -628,7 +534,182 @@ def _apply_streamlit_safety_patch() -> None:
         [class*="st-"][style*="background"] {
             background-color: transparent !important;
         }
+        /* Common Premium UI Components */
+        .info-panel {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 12px;
+            padding: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            height: 100%;
+        }
         
+        .info-title {
+            font-size: 12px;
+            font-weight: 800;
+            color: var(--accent);
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin-bottom: 10px;
+        }
+        
+        .info-item {
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.8);
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+        }
+        
+        .info-bullet {
+            color: var(--accent);
+            margin-right: 10px;
+            font-weight: bold;
+        }
+        
+        .pillar-card {
+            background: linear-gradient(145deg, rgba(26, 32, 44, 0.6), rgba(17, 21, 28, 0.8));
+            border-radius: 20px;
+            padding: 22px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            text-align: center;
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            position: relative;
+            overflow: hidden;
+            height: 100%;
+        }
+        
+        .pillar-card:hover {
+            transform: translateY(-8px);
+            border-color: rgba(46, 212, 198, 0.4);
+            background: linear-gradient(145deg, rgba(30, 39, 54, 0.8), rgba(20, 26, 35, 0.9));
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.4), 0 0 20px rgba(46, 212, 198, 0.1);
+        }
+        
+        .pillar-icon {
+            font-size: 28px;
+            margin-bottom: 12px;
+            opacity: 0.9;
+        }
+        
+        .pillar-value {
+            font-size: 34px;
+            font-weight: 800;
+            color: #FFFFFF !important;
+            margin: 5px 0;
+        }
+        
+        .pillar-label {
+            font-size: 12px;
+            font-weight: 700;
+            color: rgba(255, 255, 255, 0.5) !important;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+        }
+        
+        .pillar-status {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--accent) !important;
+            margin-top: 10px;
+            padding: 4px 10px;
+            background: rgba(46, 212, 198, 0.1);
+            border-radius: 20px;
+            display: inline-block;
+        }
+
+        /* Sidebar multiselect chips - UNIFIED DRILL-DOWN STYLE */
+        section[data-testid="stSidebar"] div[data-baseweb="tag"],
+        div[data-baseweb="tag"] {
+            background: rgba(255, 255, 255, 0.15) !important;
+            color: #FFFFFF !important;
+            border-radius: 6px !important;
+            border: 1px solid rgba(255, 255, 255, 0.2) !important;
+            font-weight: 600 !important;
+        }
+
+        /* Reusable Drill-Down Pill Class */
+        .active-filter-pill {
+            font-weight: 800;
+            background-color: rgba(255, 255, 255, 0.15);
+            padding: 4px 10px;
+            border-radius: 6px;
+            color: #FFFFFF;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            display: inline-block;
+            margin: 0 2px;
+            font-size: 0.85rem;
+            letter-spacing: 0.5px;
+        }
+
+        /* Sidebar focus ring */
+        section[data-testid="stSidebar"] div[data-baseweb="select"]:focus-within,
+        section[data-testid="stSidebar"] div[data-baseweb="input"]:focus-within {
+            box-shadow: 0 0 0 2px rgba(46,212,198,0.22) inset !important;
+            border-color: var(--accent) !important;
+        }
+
+        .filter-tag {
+            background: rgba(148, 163, 184, 0.1);
+            color: #f1f5f9 !important;
+            padding: 0.35rem 0.75rem;
+            border-radius: 6px;
+            font-size: 0.813rem;
+            font-weight: 600;
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .filter-tag span {
+            font-size: 1rem;
+        }
+
+        .divider-glow {
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(46, 212, 198, 0.3), transparent);
+            margin: 30px 0;
+        }
+
+        /* Standardized Page Hero (Premium Header) */
+        .page-hero {
+            background: linear-gradient(135deg, rgba(15, 23, 42, 0.9) 0%, rgba(30, 41, 59, 0.8) 100%);
+            padding: 2rem 2.5rem;
+            border-radius: 20px;
+            color: white;
+            margin-bottom: 2rem;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+        }
+
+        .hero-icon-box {
+            background: rgba(56, 189, 248, 0.15);
+            width: 80px;
+            height: 80px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 20px;
+            font-size: 2.5rem;
+            box-shadow: 0 0 30px rgba(56, 189, 248, 0.2);
+        }
+        
+        .hero-title {
+            margin: 0 !important;
+            color: white !important;
+            font-size: 2.5rem !important;
+            font-weight: 900 !important;
+            letter-spacing: -0.04em !important;
+            line-height: 1.2 !important;
+        }
+
+        .hero-subtitle {
+            margin: 6px 0 0 0 !important;
+            color: #94a3b8 !important;
+            font-size: 1.1rem !important;
+            font-weight: 500 !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,

@@ -36,7 +36,7 @@ import json
 from datetime import date, datetime, timedelta
 from typing import Optional, List, Dict, Tuple, Set, Union, Any, AnyStr
 from src.ui.theme import apply_global_theme
-from src.components.filters import render_data_filters
+from src.components.filters import render_global_filters
 from src.connectors.snowflake_connector import snowflake_connector
 from src.services.authorization_service import authz
 try:
@@ -196,8 +196,116 @@ except Exception:
 # Apply centralized theme (fonts, CSS variables, Plotly template)
 apply_global_theme()
 
-# Top-level title and signed-in banner (placed above content per requirements)
-st.title("Data Classification")
+# Page-specific premium styles
+st.markdown("""
+<style>
+    /* Premium Header Styling */
+    .compliance-header {
+        background: linear-gradient(135deg, rgba(15, 23, 42, 0.9) 0%, rgba(30, 41, 59, 0.8) 100%);
+        padding: 2.5rem;
+        border-radius: 20px;
+        color: white;
+        margin-bottom: 2rem;
+        box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(10px);
+    }
+    
+    /* Tab Optimization */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 1.5rem;
+        margin-bottom: 2rem;
+    }
+    .stTabs [data-baseweb="tab"] {
+        padding: 1rem 1.5rem;
+        border-radius: 8px;
+        font-weight: 600;
+        background: rgba(255,255,255,0.03);
+        transition: all 0.2s;
+    }
+
+    /* Standardized Dashboard-style Card System */
+    .pillar-card {
+        background: linear-gradient(145deg, rgba(26, 32, 44, 0.6), rgba(17, 21, 28, 0.8));
+        border-radius: 20px;
+        padding: 22px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        text-align: center;
+        transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        position: relative;
+        overflow: hidden;
+        height: 100%;
+    }
+    
+    .pillar-card:hover {
+        transform: translateY(-8px);
+        border-color: rgba(79, 209, 197, 0.4);
+        background: linear-gradient(145deg, rgba(30, 39, 54, 0.8), rgba(20, 26, 35, 0.9));
+        box-shadow: 0 15px 35px rgba(0, 0, 0, 0.4), 0 0 20px rgba(79, 209, 197, 0.1);
+    }
+    
+    .pillar-icon {
+        font-size: 28px;
+        margin-bottom: 12px;
+        opacity: 0.9;
+    }
+    
+    .pillar-value {
+        font-size: 34px;
+        font-weight: 800;
+        color: #FFFFFF;
+        margin: 5px 0;
+    }
+    
+    .pillar-label {
+        font-size: 11px;
+        font-weight: 700;
+        color: rgba(255, 255, 255, 0.5);
+        text-transform: uppercase;
+        letter-spacing: 1.2px;
+    }
+
+    .pillar-status {
+        font-size: 11px;
+        font-weight: 600;
+        color: #38bdf8;
+        margin-top: 10px;
+        padding: 4px 10px;
+        background: rgba(56, 189, 248, 0.1);
+        border-radius: 20px;
+        display: inline-block;
+    }
+    
+    /* Asset Card Variant */
+    .asset-card {
+        background: linear-gradient(145deg, rgba(26, 32, 44, 0.6), rgba(17, 21, 28, 0.8));
+        border-radius: 16px;
+        padding: 1.5rem;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        margin-bottom: 1rem;
+        transition: all 0.3s ease;
+    }
+    .asset-card:hover {
+         transform: translateY(-4px);
+         box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+         border-color: rgba(56, 189, 248, 0.3);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Hero Section
+st.markdown("""
+<div class="page-hero">
+    <div style="display: flex; align-items: center; gap: 1.5rem;">
+        <div class="hero-icon-box">🏷️</div>
+        <div>
+            <h1 class="hero-title">Classification Center</h1>
+            <p class="hero-subtitle">Multi-layer sensitivity analysis, automated tagging pipeline, and governance enforcement engine.</p>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
 try:
     _ident_top = authz.get_current_identity()
     st.caption(f"Signed in as: {_ident_top.user or 'Unknown'} | Role: {_ident_top.current_role or 'Unknown'}")
@@ -340,43 +448,10 @@ with col_db3:
     pass
 
 # Global Filters (sidebar) and driver for tabs
-with st.sidebar.container():
-    st.subheader("Global Filters")
-    # Warehouse selector (optional, shown by default)
-    try:
-        wh_rows = snowflake_connector.execute_query("SHOW WAREHOUSES") or []
-        wh_opts = [r.get("name") or r.get("NAME") for r in wh_rows if (r.get("name") or r.get("NAME"))]
-    except Exception:
-        wh_opts = []
-
-    # Get current warehouse from session state or use first available
-    cur_wh = st.session_state.get('sf_warehouse')
-    wh_display = ([cur_wh] + [w for w in wh_opts if w != cur_wh]) if cur_wh else wh_opts
-
-    # Create warehouse selection dropdown
-    sel_wh = st.selectbox(
-        "Warehouse",
-        options=(wh_display or [""]),
-        index=(wh_display.index(cur_wh) if (cur_wh and cur_wh in wh_display) else 0) if wh_display else 0,
-        key="global_wh",
-        help="Select a Snowflake warehouse to run queries",
-    )
-
-    # Update warehouse if selection changes
-    if sel_wh and sel_wh != cur_wh:
-        try:
-            snowflake_connector.execute_non_query(f"USE WAREHOUSE {sel_wh}")
-            st.session_state['sf_warehouse'] = sel_wh
-        except Exception as e:
-            st.error(f"Failed to switch to warehouse {sel_wh}: {str(e)}")
-
-    # Database, Schema, Table/View, Column
-    global_sel = render_data_filters(key_prefix="global")
-    try:
-        if "virtual_mode" not in st.session_state:
-            st.session_state["virtual_mode"] = False
-    except Exception:
-        pass
+with st.sidebar:
+    # Standardized Global Filters
+    global_sel = render_global_filters(key_prefix="global")
+    
     # Persist the selected database to session to drive services that rely on it
     if global_sel.get("database"):
         _db_sel = str(global_sel.get("database") or "").strip()
@@ -396,6 +471,7 @@ with st.sidebar.container():
                 ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn_sel)
             except Exception:
                 pass
+    
     # Persist selected schema to session if provided
     try:
         _sc_sel = str(global_sel.get("schema") or "").strip()
@@ -403,6 +479,7 @@ with st.sidebar.container():
             st.session_state["sf_schema"] = _sc_sel
     except Exception:
         pass
+        
     # Persist all filters for downstream queries
     try:
         st.session_state["global_filters"] = {
@@ -4888,316 +4965,266 @@ with tab_tasks:
             me_user = (ident_tasks.user or "").strip()
         except Exception:
             me_user = str(st.session_state.get("user") or "")
-        # Ensure the My Tasks view exists (create or replace to user's spec)
+        # Database and Governance context
+        db = st.session_state.get('sf_database') or _active_db_from_filter()
+        gv = st.session_state.get('governance_schema') or 'DATA_CLASSIFICATION_GOVERNANCE'
+        
+        if not db:
+            st.warning("No active database selected. Please select a database in the sidebar.")
+            st.stop()
+        # Enhanced filters for My Tasks with additional options
+        f1, f2, f3, f4, f5 = st.columns([1, 1, 1, 1, 2])
+        with f1:
+            status_map = {"All": None, "Pending": "pending", "Overdue": "overdue", "Completed": "completed"}
+            sel_status = st.selectbox("Status", list(status_map.keys()), index=0)
+        with f2:
+            priority_map = {"All": None, "High": "High", "Medium": "Medium", "Low": "Low", "Normal": "Normal"}
+            sel_priority = st.selectbox("Priority", list(priority_map.keys()), index=0)
+        with f3:
+            completion_map = {"All": None, "Complete": "Complete", "Partial": "Partial", "Not Started": "Not Started"}
+            sel_completion = st.selectbox("Classification", list(completion_map.keys()), index=0)
+        with f4:
+            sel_level = st.selectbox("Sensitivity", ["All","Public","Internal","Restricted","Confidential"], index=0)
+        with f5:
+            c1, c2 = st.columns(2)
+            with c1:
+                dr_start = st.date_input("Due After", value=None, key="task_due_start")
+            with c2:
+                dr_end = st.date_input("Due Before", value=None, key="task_due_end")
+
         try:
-            db = st.session_state.get('sf_database') or _active_db_from_filter()
-            gv = st.session_state.get('governance_schema') or 'DATA_CLASSIFICATION_GOVERNANCE'
-            if db:
-                snowflake_connector.execute_non_query(
-                    f"""
-                    create schema if not exists {db}.{gv};
-                    create or replace view {db}.{gv}.VW_MY_CLASSIFICATION_TASKS as
-                    select
+            # Build WHERE conditions
+            where = ["1=1"]
+            params = {"current_user": me_user}
+            
+            # Status filter
+            if sel_status and sel_status != "All":
+                if sel_status == "Overdue":
+                    where.append("STATUS = 'Overdue'")
+                elif sel_status == "Pending":
+                    where.append("STATUS NOT IN ('Completed', 'Closed', 'Cancelled')")
+                else:
+                    where.append(f"UPPER(STATUS) LIKE UPPER('%{sel_status}%')")
+            
+            # Priority filter
+            if sel_priority and sel_priority != "All":
+                where.append(f"PRIORITY = '{sel_priority}'")
+            
+            # Classification completeness filter
+            if sel_completion and sel_completion != "All":
+                where.append(f"CLASSIFICATION_COMPLETENESS = '{sel_completion}'")
+            
+            # Sensitivity level filter
+            if sel_level and sel_level != "All":
+                where.append(f"CONFIDENTIALITY_LEVEL = '{sel_level}'")
+            
+            # Date range filter
+            if dr_start:
+                where.append("DUE_DATE >= %(start_date)s")
+                params["start_date"] = dr_start.strftime('%Y-%m-%d')
+            if dr_end:
+                where.append("DUE_DATE <= %(end_date)s")
+                params["end_date"] = dr_end.strftime('%Y-%m-%d')
+            
+            # Build the full query
+            query = f"""
+                WITH task_data AS (
+                    SELECT 
                         TASK_ID,
-                        coalesce(DATASET_NAME, split_part(coalesce(ASSET_FULL_NAME, ''), '.', 3)) as DATASET_NAME,
+                        DATASET_NAME,
                         ASSET_FULL_NAME,
-                        coalesce(ASSIGNED_TO, '') as OWNER,
-                        coalesce(STATUS, 'Pending') as STATUS,
+                        ASSIGNED_TO,
+                        STATUS,
                         CONFIDENTIALITY_LEVEL,
                         INTEGRITY_LEVEL,
                         AVAILABILITY_LEVEL,
                         DUE_DATE,
                         CREATED_AT,
                         UPDATED_AT,
-                        case 
-                            when upper(coalesce(STATUS,'')) like '%PENDING%' then '⏳ Pending Review'
-                            when upper(coalesce(STATUS,'')) like '%APPROVED%' then '✅ Approved'
-                            when upper(coalesce(STATUS,'')) like '%REJECTED%' then '❌ Rejected'
-                            when upper(coalesce(STATUS,'')) like '%COMPLETED%' then '✅ Completed'
-                            else '❔ Unknown'
-                        end as STATUS_LABEL,
-                        DETAILS
-                    from {db}.{gv}.CLASSIFICATION_TASKS
-                    """
-                )
-        except Exception:
-            pass
-        # Filters for My Tasks table
-        f1, f2, f3, f4 = st.columns([1,1,1,2])
-        with f1:
-            status_map = {"All": None, "Draft": "draft", "Pending": "pending", "Completed": "completed"}
-            sel_status = st.selectbox("Status", list(status_map.keys()), index=0)
-        with f2:
-            owner_q = st.text_input("Owner contains", value="")
-        with f3:
-            sel_level = st.selectbox("Classification Level", ["All","Public","Internal","Restricted","Confidential"], index=0)
-        with f4:
-            c1, c2 = st.columns(2)
-            with c1:
-                dr_start = st.date_input("Start", value=None)
-            with c2:
-                dr_end = st.date_input("End", value=None)
-
-        svc_tasks = my_fetch_tasks(
-            current_user=me_user,
-            status=status_map.get(sel_status),
-            owner=(owner_q or None),
-            classification_level=(None if sel_level == "All" else sel_level),
-            date_range=((str(dr_start) if dr_start else None), (str(dr_end) if dr_end else None)),
-            limit=500,
-        ) or []
-        import pandas as _pd
-        svc_df = _pd.DataFrame(svc_tasks)
-        if svc_df.empty:
-            # Fallback to Snowflake governance view VW_MY_CLASSIFICATION_TASKS
-            try:
-                db = st.session_state.get('sf_database') or _active_db_from_filter()
-                gv = st.session_state.get('governance_schema') or 'DATA_CLASSIFICATION_GOVERNANCE'
-                if db:
-                    where = ["1=1"]
-                    params = {}
+                        DETAILS,
+                        
+                        -- Priority calculation based on due date and status
+                        CASE 
+                            WHEN STATUS = 'Overdue' THEN '🔴 High'
+                            WHEN DUE_DATE <= CURRENT_DATE() + 2 THEN '🟡 Medium'
+                            WHEN DUE_DATE <= CURRENT_DATE() + 7 THEN '🟢 Low'
+                            ELSE '⚪ Normal'
+                        END AS PRIORITY,
+                        
+                        -- Days until due (or overdue - negative means overdue)
+                        DATEDIFF('day', CURRENT_DATE(), DUE_DATE) AS DAYS_UNTIL_DUE,
+                        
+                        -- Age of task (days since creation)
+                        DATEDIFF('day', CREATED_AT, CURRENT_DATE()) AS TASK_AGE_DAYS,
+                        
+                        -- Completion urgency indicator
+                        CASE 
+                            WHEN DUE_DATE < CURRENT_DATE() THEN CONCAT('Overdue by ', ABS(DATEDIFF('day', CURRENT_DATE(), DUE_DATE)), ' days')
+                            WHEN DUE_DATE = CURRENT_DATE() THEN 'Due Today'
+                            WHEN DUE_DATE = CURRENT_DATE() + 1 THEN 'Due Tomorrow'
+                            ELSE CONCAT('Due in ', DATEDIFF('day', CURRENT_DATE(), DUE_DATE), ' days')
+                        END AS DUE_STATUS,
+                        
+                        -- Classification completeness
+                        CASE 
+                            WHEN CONFIDENTIALITY_LEVEL IS NOT NULL 
+                                 AND INTEGRITY_LEVEL IS NOT NULL 
+                                 AND AVAILABILITY_LEVEL IS NOT NULL 
+                            THEN 'Complete'
+                            WHEN CONFIDENTIALITY_LEVEL IS NULL 
+                                 AND INTEGRITY_LEVEL IS NULL 
+                                 AND AVAILABILITY_LEVEL IS NULL 
+                            THEN 'Not Started'
+                            ELSE 'Partial'
+                        END AS CLASSIFICATION_COMPLETENESS,
+                        
+                        -- Extract priority from DETAILS JSON
+                        TRY_PARSE_JSON(DETAILS):"priority"::STRING AS DETAILS_PRIORITY,
+                        
+                        -- Extract sensitive columns count
+                        ARRAY_SIZE(TRY_PARSE_JSON(DETAILS):"sensitive_columns") AS SENSITIVE_COLUMNS_COUNT,
+                        
+                        -- Extract compliance frameworks
+                        TRY_PARSE_JSON(DETAILS):"compliance_frameworks" AS COMPLIANCE_FRAMEWORKS
+                        
+                FROM {db}.{gv}.CLASSIFICATION_TASKS
+                WHERE 
+                    -- Filter for current user's tasks
+                    ASSIGNED_TO = %(current_user)s
                     
-                    # Status filter
-                    if sel_status and sel_status != "All":
-                        if sel_status.lower() == "pending":
-                            where.append("upper(coalesce(STATUS,'')) like '%PENDING%'")
-                        elif sel_status.lower() == "completed":
-                            where.append("upper(coalesce(STATUS,'')) in ('APPROVED', 'REJECTED')")
-                        elif sel_status.lower() == "draft":
-                            where.append("upper(coalesce(STATUS,'')) = 'DRAFT'")
-                    
-                    # Owner filter
-                    if owner_q:
-                        where.append("upper(coalesce(OWNER,'')) like upper(%(owner)s)")
-                        params["owner"] = f"%{owner_q}%"
-                    elif me_user:
-                        where.append("upper(coalesce(OWNER,'')) = upper(%(me)s)")
-                        params["me"] = me_user
-                    
-                    # Classification level
-                    if sel_level and sel_level != "All":
-                        where.append("upper(coalesce(CLASSIFICATION_LEVEL,'')) = upper(%(level)s)")
-                        params["level"] = sel_level
-                    
-                    # Date range filter
-                    if dr_start:
-                        where.append("coalesce(DUE_DATE, current_date()) >= %(start_date)s")
-                        params["start_date"] = str(dr_start)
-                    if dr_end:
-                        where.append("coalesce(DUE_DATE, current_date()) <= %(end_date)s")
-                        params["end_date"] = str(dr_end)
-                    
-                    # Main query using VW_MY_CLASSIFICATION_TASKS
-                    q = f"""
-                        SELECT 
-                            TASK_ID,
-                            ASSET_ID,
-                            ASSET_NAME,
-                            CLASSIFICATION_LEVEL,
-                            C,
-                            I,
-                            A,
-                            OWNER,
-                            STATUS,
-                            CREATED,
-                            DUE_DATE,
-                            PRIORITY,
-                            LAST_COMMENT as DETAILS
-                        FROM {db}.{gv}.VW_MY_CLASSIFICATION_TASKS
-                        WHERE {' AND '.join(where)}
-                        ORDER BY COALESCE(DUE_DATE, current_date()) ASC
-                        LIMIT 500
-                    """
-                    rows = snowflake_connector.execute_query(q, params) or []
-                    svc_df = _pd.DataFrame(rows)
-                    
-                    # Apply global filters client-side
-                    try:
-                        gf = st.session_state.get('global_filters') or {}
-                        if gf and not svc_df.empty:
-                            svc_df = svc_df[[
-                                _matches_global(row._asdict() if hasattr(row, '_asdict') else row.to_dict(), gf)
-                                for _, row in svc_df.iterrows()
-                            ]]
-                    except Exception:
-                        pass
-            except Exception as e:
-                st.caption(f"Error loading classification reviews: {e}")
-                svc_df = _pd.DataFrame()  # Ensure empty DataFrame on error
-        if svc_df.empty:
-            st.info("No tasks found for the selected filters.")
-        else:
-            # Normalize common column names from view/table variants
-            svc_df.rename(columns={
-                "asset_name":"Asset Name",
-                "ASSET_NAME":"Asset Name",
-                "object_type":"Type",
-                "OBJECT_TYPE":"Type",
-                "due_date":"Due Date",
-                "DUE_DATE":"Due Date",
-                "priority":"Priority",
-                "PRIORITY":"Priority",
-                "status":"Status",
-                "STATUS":"Status",
-                "OWNER":"Owner",
-                "ASSIGNED_TO":"Owner",
-                "CLASSIFICATION_LEVEL":"Classification Level",
-                "TASK_ID":"Task ID",
-                "ASSET_ID":"Asset ID",
-                "CREATED":"Created",
-                "CREATED_AT":"Created",
-            }, inplace=True)
-            display_cols = [
-                c for c in [
-                    "Asset Name","Type","Due Date","Priority","Status",
-                    "Task ID","Asset ID","Owner","Classification Level","Created"
-                ] if c in svc_df.columns
-            ]
-            if not display_cols:
-                display_cols = list(svc_df.columns)
-            # Derive CIA and Tag columns where possible
-            def _cia_str_from_row(r):
-                try:
-                    c = r.get("c", r.get("C", 0))
-                    i = r.get("i", r.get("I", 0))
-                    a = r.get("a", r.get("A", 0))
-                    return f"C{int(c)}/I{int(i)}/A{int(a)}"
-                except Exception:
-                    return None
-            def _status_tag(v):
-                s = str(v or "").strip().lower()
-                if s == "draft":
-                    return "Draft"
-                if s in ("pending", "awaiting review"):
-                    return "Pending"
-                return "Assigned"
-            def _style_tag(val):
-                v = str(val)
-                color = "#9ca3af" if v == "Draft" else ("#f59e0b" if v == "Pending" else "#3b82f6")
-                return f"color: {color}; font-weight: 700;"
-            def _derive_deadline_status_due(due_val):
-                try:
-                    if pd.isna(due_val):
-                        return None
-                    due_d = pd.to_datetime(due_val).date()
-                    rem = _business_days_between(date.today(), due_d)
-                    if rem <= 0:
-                        return "Overdue"
-                    if rem <= 5:
-                        return "Due Soon"
-                    return "On Track"
-                except Exception:
-                    return None
-            def _style_deadline(val):
-                v = str(val or "")
-                color = "#ef4444" if v == "Overdue" else ("#f59e0b" if v == "Due Soon" else ("#10b981" if v == "On Track" else "#6b7280"))
-                return f"color: {color}; font-weight: 700;"
-            def _derive_policy_compliance(row):
-                try:
-                    for k in ["policy_compliance","POLICY_COMPLIANCE","Policy Compliance"]:
-                        if k in row.index:
-                            v = row.get(k)
-                            if v is None or (isinstance(v, float) and pd.isna(v)):
-                                continue
-                            b = bool(v) if not isinstance(v, str) else (v.strip().lower() in ("true","1","yes","y","compliant"))
-                            return "Compliant" if b else "Violation"
-                except Exception:
-                    pass
-                return None
-            def _style_compliance(val):
-                v = str(val or "")
-                color = "#10b981" if v == "Compliant" else ("#ef4444" if v == "Violation" else "#6b7280")
-                return f"color: {color}; font-weight: 700;"
-
-            disp = svc_df.copy()
-            # CIA
-            try:
-                cia_series = disp.apply(lambda r: _cia_str_from_row(r), axis=1)
-                if cia_series.notna().any():
-                    disp["CIA"] = cia_series
-            except Exception:
-                pass
-            # Tag from Status
-            if "Status" in disp.columns:
-                try:
-                    disp["Tag"] = disp["Status"].apply(_status_tag)
-                except Exception:
-                    pass
-
-            # Deadline Status (derived from Due Date when available)
-            if "Due Date" in disp.columns:
-                try:
-                    disp["Deadline Status"] = disp["Due Date"].apply(_derive_deadline_status_due)
-                except Exception:
-                    pass
-            # Policy Compliance (best-effort from available columns)
-            try:
-                pc_series = disp.apply(lambda r: _derive_policy_compliance(r), axis=1)
-                if pc_series.notna().any():
-                    disp["Policy Compliance"] = pc_series
-            except Exception:
-                pass
-
-            # Sorting controls
-            import pandas as _pd
-            sort_opts = ["Due Date (asc)"]
-            if "overall_risk" in disp.columns:
-                sort_opts.append("Risk (High to Low)")
-            if "Priority" in disp.columns:
-                sort_opts.append("Priority")
-            sort_by = st.selectbox("Sort by", options=sort_opts, index=0, key="mt_sort_mytasks")
-            if sort_by.startswith("Risk") and "overall_risk" in disp.columns:
-                risk_order = _pd.Categorical(disp["overall_risk"], categories=["High","Medium","Low"], ordered=True)
-                disp = disp.assign(_risk=risk_order)
-                if "Due Date" in disp.columns:
-                    disp = disp.sort_values(["_risk","Due Date"])  # tie-breaker by due
-                else:
-                    disp = disp.sort_values(["_risk"]) 
-                disp.drop(columns=["_risk"], inplace=True, errors='ignore')
-            elif sort_by == "Priority" and "Priority" in disp.columns:
-                pri_order = _pd.Categorical(disp["Priority"], categories=["High","Medium","Low"], ordered=True)
-                disp = disp.assign(_pri=pri_order)
-                if "Due Date" in disp.columns:
-                    disp = disp.sort_values(["_pri","Due Date"]) 
-                else:
-                    disp = disp.sort_values(["_pri"]) 
-                disp.drop(columns=["_pri"], inplace=True, errors='ignore')
-            elif "Due Date" in disp.columns:
-                disp = disp.sort_values("Due Date")
-
-            # Choose final columns, including CIA and Tag if present
-            final_cols = [c for c in [
-                "Asset Name","Type","CIA","Due Date","Deadline Status","Priority","Status","Tag","Policy Compliance",
-                "Task ID","Asset ID","Owner","Classification Level","Created"
-            ] if c in disp.columns]
-            if not final_cols:
-                final_cols = display_cols
-            st.dataframe(
-                disp[final_cols]
-                .style
-                .map(_style_tag, subset=[c for c in ["Tag"] if c in disp.columns])
-                .map(_style_deadline, subset=[c for c in ["Deadline Status"] if c in disp.columns])
-                .map(_style_compliance, subset=[c for c in ["Policy Compliance"] if c in disp.columns])
-                .hide(axis="index"),
-                use_container_width=True,
+                    -- Show only active/incomplete tasks by default
+                    AND STATUS NOT IN ('Completed', 'Closed', 'Cancelled')
             )
-
-            # Click-to-open wizard
-            # Prefer full name when available
-            select_col = None
-            for copt in ["ASSET_FULL_NAME","asset_full_name","Asset Name","asset_name"]:
-                if copt in svc_df.columns:
-                    select_col = copt
-                    break
-            options = disp[select_col].astype(str).unique().tolist() if select_col and select_col in disp.columns else []
-            sel_asset = st.selectbox("Select an asset", options=options, key="mt_sel_asset_mytasks")
-            if st.button("Open Classification Wizard", type="primary", key="mt_open_mytasks") and sel_asset:
-                st.session_state["task_wizard_asset"] = sel_asset
-                try:
-                    st.experimental_set_query_params(sub="tasks", action="classify", asset=sel_asset)
-                except Exception:
-                    pass
-                # Removed st.rerun() to prevent no-op warning
+            SELECT * FROM task_data
+            WHERE {" AND ".join(where)}
+            ORDER BY 
+                -- Sort by priority: Overdue first, then nearest due dates
+                CASE 
+                    WHEN STATUS = 'Overdue' THEN 1
+                    WHEN DUE_DATE < CURRENT_DATE() THEN 2  -- Technically shouldn't happen if not 'Overdue'
+                    WHEN DUE_DATE = CURRENT_DATE() THEN 3
+                    WHEN DUE_DATE <= CURRENT_DATE() + 2 THEN 4
+                    ELSE 5
+                END,
+                DUE_DATE ASC,
+                CREATED_AT DESC
+            LIMIT 500
+            """
+            
+            # Execute the query
+            params["current_user"] = me_user
+            tasks = snowflake_connector.execute_query(query, params) or []
+            svc_df = pd.DataFrame(tasks)
+            
+        except Exception as e:
+            st.error(f"Error loading tasks: {str(e)}")
+            st.exception(e)
+            svc_df = pd.DataFrame()
+            
+        if svc_df.empty:
+            st.info("No tasks found matching the selected filters.")
+        else:
+            # Display task cards with enhanced information
+            st.markdown("### My Classification Tasks")
+            
+            if not svc_df.empty:
+                # Group tasks by status for better organization
+                status_groups = svc_df.groupby('STATUS')
+                
+                for status, tasks in status_groups:
+                    with st.expander(f"{status} ({len(tasks)})", expanded=status in ['Pending', 'Overdue']):
+                        for _, task in tasks.iterrows():
+                            # Create a card for each task
+                            with st.container():
+                                # Card header with priority and due date
+                                st.markdown(f"""
+                                <div style="
+                                    border-left: 4px solid {'#ff4b4b' if task['PRIORITY'] == '🔴 High' else '#ffa500' if task['PRIORITY'] == '🟡 Medium' else '#4CAF50'};
+                                    padding: 10px 15px;
+                                    margin: 5px 0;
+                                    background-color: #f8f9fa;
+                                    border-radius: 0 5px 5px 0;
+                                ">
+                                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                                        <h4 style="margin: 0;">{task['DATASET_NAME'] or task['ASSET_FULL_NAME']}</h4>
+                                        <div>
+                                            <span style="margin-right: 10px;">{task['PRIORITY']} {task['DUE_STATUS']}</span>
+                                            <span style="color: #666;">Due: {task['DUE_DATE'].strftime('%b %d, %Y') if not pd.isna(task['DUE_DATE']) else 'No due date'}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div style="padding: 10px 15px; margin-bottom: 15px; background-color: #fff; border: 1px solid #e0e0e0; border-radius: 0 0 5px 5px;">
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                                        <div>
+                                            <strong>Classification:</strong> {task['CLASSIFICATION_COMPLETENESS']}<br>
+                                            <strong>Sensitivity:</strong> {task['CONFIDENTIALITY_LEVEL'] or 'Not set'}<br>
+                                            <strong>Created:</strong> {task['CREATED_AT'].strftime('%b %d, %Y') if not pd.isna(task['CREATED_AT']) else 'N/A'}
+                                        </div>
+                                        <div style="text-align: right;">
+                                            <strong>Task ID:</strong> {task['TASK_ID']}<br>
+                                            <strong>Last Updated:</strong> {task['UPDATED_AT'].strftime('%b %d, %Y') if not pd.isna(task['UPDATED_AT']) else 'N/A'}
+                                        </div>
+                                    </div>
+                                    
+                                    <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee;">
+                                        <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                                            <span class="badge" style="background-color: #e3f2fd; color: #1976d2; padding: 3px 8px; border-radius: 12px; font-size: 0.8em;">
+                                                C: {task.get('CONFIDENTIALITY_LEVEL', '?')}
+                                            </span>
+                                            <span class="badge" style="background-color: #e8f5e9; color: #388e3c; padding: 3px 8px; border-radius: 12px; font-size: 0.8em;">
+                                                I: {task.get('INTEGRITY_LEVEL', '?')}
+                                            </span>
+                                            <span class="badge" style="background-color: #fff3e0; color: #e65100; padding: 3px 8px; border-radius: 12px; font-size: 0.8em;">
+                                                A: {task.get('AVAILABILITY_LEVEL', '?')}
+                                            </span>
+                                        </div>
+                                        
+                                        <div style="display: flex; gap: 10px;">
+                                            <button class="stButton" style="background-color: #4CAF50; color: white; border: none; padding: 5px 12px; text-align: center; text-decoration: none; display: inline-block; font-size: 0.9em; border-radius: 4px; cursor: pointer;">
+                                                View Details
+                                            </button>
+                                            <button class="stButton" style="background-color: #2196F3; color: white; border: none; padding: 5px 12px; text-align: center; text-decoration: none; display: inline-block; font-size: 0.9em; border-radius: 4px; cursor: pointer;">
+                                                Start Classification
+                                            </button>
+                                            <button class="stButton" style="background-color: #f44336; color: white; border: none; padding: 5px 12px; text-align: center; text-decoration: none; display: inline-block; font-size: 0.9em; border-radius: 4px; cursor: pointer; float: right;">
+                                                Reassign
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Add some space between cards
+                                st.markdown("<div style='margin-bottom: 20px;'></div>", unsafe_allow_html=True)
+            
+            # Add some custom CSS for better styling
+            st.markdown("""
+            <style>
+                .stButton>button {
+                    transition: all 0.3s ease;
+                }
+                .stButton>button:hover {
+                    opacity: 0.9;
+                    transform: translateY(-1px);
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+                }
+                .badge {
+                    font-weight: 500;
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+                .task-card {
+                    transition: all 0.3s ease;
+                    margin-bottom: 15px;
+                }
+                .task-card:hover {
+                    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                }
+            </style>
+            """, unsafe_allow_html=True)
+    
     # Pending Reviews (using VW_CLASSIFICATION_REVIEWS if available)
     with sub_pending:
         st.markdown("#### Pending Reviews")
@@ -9666,21 +9693,42 @@ with tab3:
                         elif r == "GDPR": cls = "chip-gdpr"
                         elif r == "HIPAA": cls = "chip-hipaa"
                         chips.append(f"<span class=\"chip {cls}\">{r}</span>")
-                    chips_html = " ".join(chips) if chips else "<span class='chip chip-other'>None</span>"
-                    risk_cls = "risk-high" if row.get("RISK") == "High" else ("risk-med" if row.get("RISK") == "Medium" else "risk-low")
+                    chips_html = " ".join(chips) if chips else "<span style='opacity:0.5; font-size:0.8rem;'>No regulatory tags</span>"
+                    
+                    if row.get("RISK") == "High":
+                        color_b = "#ef4444"
+                        color_bg = "rgba(239, 68, 68, 0.2)"
+                        color_fg = "#ef4444"
+                    elif row.get("RISK") == "Medium":
+                        color_b = "#f59e0b"
+                        color_bg = "rgba(245, 158, 11, 0.2)"
+                        color_fg = "#f59e0b"
+                    else:
+                        color_b = "#10b981"
+                        color_bg = "rgba(16, 185, 129, 0.2)"
+                        color_fg = "#10b981"
+
                     risk_ind = row.get('RISK_IND','')
                     full_name = row.get('FULL_NAME','')
                     cls_level = row.get('CLASSIFICATION_LEVEL','-')
                     c_val = row.get('CIA_CONF',0)
                     i_val = row.get('CIA_INT',0)
                     a_val = row.get('CIA_AVAIL',0)
-                    rationale = row.get('Rationale','')
+                    rationale = row.get('Rationale','') or "No rationale provided"
                     html = f"""
-                    <div class='card {risk_cls}'>
-                      <div><b>{risk_ind} {full_name}</b></div>
-                      <div>Classification: {cls_level} | C:{c_val} I:{i_val} A:{a_val}</div>
-                      <div>Regulatory: {chips_html}</div>
-                      <div style='color:#636e72;font-size:12px'>Rationale: {rationale}</div>
+                    <div class='asset-card' style='border-left: 4px solid {color_b};'>
+                      <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;'>
+                          <div style='font-weight:700; font-size:1.1rem; color:#f8fafc;'>{full_name}</div>
+                          <div style='background:{color_bg}; color:{color_fg}; padding:4px 12px; border-radius:20px; font-size:0.75rem; font-weight:800; text-transform:uppercase;'>{risk_ind}</div>
+                      </div>
+                      <div style='margin-bottom:12px; font-size:0.9rem; color:#cbd5e1;'>
+                          <span style='opacity:0.7;'>Class:</span> <b>{cls_level}</b> &nbsp;|&nbsp; 
+                          <span style='opacity:0.7;'>C:</span>{c_val} <span style='opacity:0.7;'>I:</span>{i_val} <span style='opacity:0.7;'>A:</span>{a_val}
+                      </div>
+                      <div style='margin-bottom:12px;'>{chips_html}</div>
+                      <div style='color:#94a3b8; font-size:0.8rem; font-style:italic; border-top:1px solid rgba(255,255,255,0.1); padding-top:8px;'>
+                          {rationale}
+                      </div>
                     </div>
                     """
                     st.markdown(html, unsafe_allow_html=True)

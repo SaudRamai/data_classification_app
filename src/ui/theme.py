@@ -48,7 +48,62 @@ def _apply_fonts_and_css() -> None:
         * {
             color: var(--text-strong) !important;
         }
+
+        /* ===================================================== */
+        /* ULTIMATE NUCLEAR OPTION: FORCE EVERYTHING TO BE DARK */
+        /* ===================================================== */
+        
+        /* Use universal selector with maximum priority */
+        *, *::before, *::after {
+            background-color: transparent !important;
+        }
+
+        /* Exception: these specific elements can have dark backgrounds */
+        html, body {
+            background-color: #0E141B !important;
+            background: #0E141B !important;
+        }
+
         </style>
+        
+        <script>
+        // JavaScript to forcefully remove white backgrounds after load
+        (function() {
+            function forceD arkTheme() {
+                // Get all elements
+                const all = document.querySelectorAll('*');
+                all.forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    const bg = style.backgroundColor;
+                    
+                    // Check if background is white or very light
+                    if (bg === 'rgb(255, 255, 255)' || 
+                        bg === 'white' ||
+                        bg === '#fff' ||
+                        bg === '#ffffff' ||
+                        bg.match(/rgb\(25[0-5], 25[0-5], 25[0-5]\)/) ||
+                        bg.match(/rgb\(24[0-9], 24[0-9], 24[0-9]\)/) ||
+                        bg.match(/rgb\(23[0-9], 23[0-9], 23[0-9]\)/)) {
+                        
+                        // Force to transparent or dark
+                        el.style.setProperty('background-color', 'transparent', 'important');
+                        el.style.setProperty('background', 'transparent', 'important');
+                    }
+                });
+            }
+            
+            // Run immediately
+            forceDarkTheme();
+            
+            // Run again after DOM loads
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', forceDarkTheme);
+            }
+            
+            // Run periodically to catch dynamically added content
+            setInterval(forceDarkTheme, 1000);
+        })();
+        </script>
         """,
         unsafe_allow_html=True,
     )

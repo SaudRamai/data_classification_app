@@ -225,6 +225,123 @@ def _apply_streamlit_safety_patch() -> None:
         .stDataFrame thead tr th { background: #22313F !important; color: #DCE7ED !important; }
         .stDataFrame tbody tr { background: var(--card-bg) !important; color: #B8C2CC !important; }
         div[data-testid="stTable"] td, div[data-testid="stTable"] th { color: #B8C2CC !important; }
+
+        /* ========================================= */
+        /* FORCE DARK MODE ON ALL CONTAINERS/BLOCKS */
+        /* ========================================= */
+        
+        /* All containers, columns, and expanders - force dark backgrounds */
+        div[data-testid="stContainer"],
+        div[data-testid="column"],
+        div[data-testid="stVerticalBlock"],
+        div[data-testid="stHorizontalBlock"],
+        div[data-testid="stExpander"],
+        div.stExpander,
+        div[data-testid="stExpanderDetails"],
+        section[data-testid="stContainer"],
+        section.main > div,
+        .element-container,
+        .stMarkdown,
+        div[class*="st-emotion"],
+        div[data-testid="stMarkdownContainer"] {
+            background-color: transparent !important;
+            background: transparent !important;
+            color: #E6EEF3 !important;
+        }
+
+        /* Force all block containers to be dark */
+        [data-testid="block-container"],
+        div.block-container,
+        section.main [data-testid="block-container"] {
+            background-color: transparent !important;
+            background: transparent !important;
+        }
+
+        /* Expander headers and content */
+        div[data-testid="stExpander"] > div,
+        div[data-testid="stExpander"] summary,
+        div[data-testid="stExpander"] details,
+        summary[data-testid="stExpanderToggleIcon"] {
+            background: var(--card-bg) !important;
+            color: #E6EEF3 !important;
+            border: 1px solid var(--card-border) !important;
+        }
+
+        /* All text elements - ensure visibility */
+        p, span, div, label, li, td, th, a {
+            color: #E6EEF3 !important;
+        }
+
+        /* Specifically target markdown content */
+        .stMarkdown p,
+        .stMarkdown span,
+        .stMarkdown div,
+        .stMarkdown li {
+            color: #E6EEF3 !important;
+        }
+
+        /* All white or light backgrounds - force to dark */
+        [style*="background: white"],
+        [style*="background-color: white"],
+        [style*="background: #fff"],
+        [style*="background-color: #fff"],
+        [style*="background: #FFF"],
+        [style*="background-color: #FFF"],
+        [style*="background: rgb(255, 255, 255)"],
+        [style*="background-color: rgb(255, 255, 255)"] {
+            background: var(--card-bg) !important;
+            background-color: var(--card-bg) !important;
+            color: #E6EEF3 !important;
+        }
+
+        /* Column containers */
+        div[data-testid="column"] > div {
+            background: transparent !important;
+        }
+
+        /* Info/warning/success/error boxes */
+        div[data-testid="stNotification"],
+        div[data-testid="stInfo"],
+        div[data-testid="stWarning"],
+        div[data-testid="stSuccess"],
+        div[data-testid="stError"] {
+            background: var(--card-bg) !important;
+            color: #E6EEF3 !important;
+        }
+
+        /* Code blocks */
+        code, pre, .stCodeBlock {
+            background: #0F1A22 !important;
+            color: #DCE7ED !important;
+        }
+
+        /* Tab content */
+        div[data-baseweb="tab-panel"],
+        div[role="tabpanel"] {
+            background: transparent !important;
+            color: #E6EEF3 !important;
+        }
+
+        /* Tab buttons */
+        button[data-baseweb="tab"],
+        button[role="tab"] {
+            background: #22313F !important;
+            color: #E6EEF3 !important;
+            border: 1px solid var(--card-border) !important;
+        }
+
+        button[data-baseweb="tab"][aria-selected="true"],
+        button[role="tab"][aria-selected="true"] {
+            background: var(--accent) !important;
+            color: #0E141B !important;
+            border-color: var(--accent) !important;
+        }
+
+        /* Ensure ALL divs default to visible text */
+        div {
+            color: #E6EEF3 !important;
+        }
+        
         </style>
         """,
         unsafe_allow_html=True,

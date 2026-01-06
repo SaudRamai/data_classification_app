@@ -4383,10 +4383,10 @@ if False:
                 sum_df[display_cols]
                     .style
                     .apply(_style_row, axis=1)
-                    .set_properties(**{"color": "#000000"})
+                    .set_properties(**{"color": "#DCE7ED"})
                     .set_table_styles([
-                        {"selector": "th", "props": "color: #000000;"},
-                        {"selector": "td", "props": "color: #000000;"},
+                        {"selector": "th", "props": "color: #DCE7ED; background-color: #22313F;"},
+                        {"selector": "td", "props": "color: #DCE7ED;"},
                     ])
                     .hide(axis="index"),
                 use_container_width=True,

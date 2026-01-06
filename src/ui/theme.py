@@ -24,15 +24,30 @@ def _apply_fonts_and_css() -> None:
             font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, 'Noto Sans', 'Apple Color Emoji','Segoe UI Emoji','Segoe UI Symbol' !important;
         }
         /* High-contrast typography defaults for Snowflake dark surfaces */
+        /* NEVER use pure white (#FFF) - use visible light greys */
         :root {
-            --text-strong: #E6EEF3;  /* primary text */
+            --text-strong: #DCE7ED;  /* primary text - visible light grey */
             --text-muted: #A7B2BA;   /* secondary text */
-            --text-accent: #F2F6F8;  /* headings */
+            --text-accent: #E6EEF3;  /* headings - lighter but still visible */
         }
-        h1, h2, h3, h4, h5, h6 { font-weight: 700; color: var(--text-accent) !important; }
-        p, li, span, div, code, pre { color: var(--text-strong); }
-        small, .stCaption, .caption, .st-emotion-cache-16idsys { color: var(--text-muted) !important; }
-        a { color: #4DA6FF; }
+        /* All text must be visible - NO pure white */
+        h1, h2, h3, h4, h5, h6 { 
+            font-weight: 700; 
+            color: var(--text-accent) !important; 
+        }
+        p, li, span, div, code, pre, label, td, th, a { 
+            color: var(--text-strong) !important; 
+        }
+        small, .stCaption, .caption, .st-emotion-cache-16idsys { 
+            color: var(--text-muted) !important; 
+        }
+        a { 
+            color: #4DA6FF !important; 
+        }
+        /* Prevent white text globally */
+        * {
+            color: var(--text-strong) !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -267,8 +282,22 @@ def _apply_streamlit_safety_patch() -> None:
             border: 1px solid var(--card-border) !important;
         }
 
-        /* All text elements - ensure visibility */
-        p, span, div, label, li, td, th, a {
+        /* ================================================ */
+        /* NUCLEAR OPTION: PREVENT WHITE TEXT & BACKGROUNDS */
+        /* ================================================ */
+        
+        /* NEVER allow pure white text (it's invisible on white backgrounds) */
+        * {
+            color: #DCE7ED !important;
+        }
+
+        /* All text elements - use visible light grey, NEVER white */
+        p, span, div, label, li, td, th, a, h1, h2, h3, h4, h5, h6 {
+            color: #DCE7ED !important;
+        }
+
+        /* Headings get slightly lighter but still visible */
+        h1, h2, h3, h4, h5, h6 {
             color: #E6EEF3 !important;
         }
 
@@ -276,22 +305,38 @@ def _apply_streamlit_safety_patch() -> None:
         .stMarkdown p,
         .stMarkdown span,
         .stMarkdown div,
-        .stMarkdown li {
-            color: #E6EEF3 !important;
+        .stMarkdown li,
+        .stMarkdown * {
+            color: #DCE7ED !important;
         }
 
-        /* All white or light backgrounds - force to dark */
-        [style*="background: white"],
-        [style*="background-color: white"],
-        [style*="background: #fff"],
-        [style*="background-color: #fff"],
-        [style*="background: #FFF"],
-        [style*="background-color: #FFF"],
-        [style*="background: rgb(255, 255, 255)"],
-        [style*="background-color: rgb(255, 255, 255)"] {
+        /* FORCE all white or light backgrounds to dark grey */
+        *[style*="background: white"],
+        *[style*="background-color: white"],
+        *[style*="background: #fff"],
+        *[style*="background-color: #fff"],
+        *[style*="background: #FFF"],
+        *[style*="background-color: #FFF"],
+        *[style*="background: #FFFFFF"],
+        *[style*="background-color: #FFFFFF"],
+        *[style*="background: rgb(255, 255, 255)"],
+        *[style*="background-color: rgb(255, 255, 255)"],
+        *[style*="color: white"],
+        *[style*="color: #fff"],
+        *[style*="color: #FFF"],
+        *[style*="color: #FFFFFF"],
+        *[style*="color: rgb(255, 255, 255)"] {
             background: var(--card-bg) !important;
             background-color: var(--card-bg) !important;
-            color: #E6EEF3 !important;
+            color: #DCE7ED !important;
+        }
+
+        /* Force ALL possible background variations to dark */
+        *[style*="background"],
+        div[style*="background"],
+        section[style*="background"],
+        span[style*="background"] {
+            background-color: var(--card-bg) !important;
         }
 
         /* Column containers */

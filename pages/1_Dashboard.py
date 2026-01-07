@@ -249,15 +249,53 @@ def render_realtime_dashboard():
     if not has_session:
         has_session = bool(st.session_state.get("sf_user") and st.session_state.get("sf_account"))
     # If Snowflake session is missing, render UI but disable data access
+    # If Snowflake session is missing, render UI but disable data access
     if not has_session:
-        if st.session_state.get("user") is not None:
-            if _authz_error:
-                st.warning(f"Snowflake session is not active (Auth Init Failed: {_authz_error}). Some data may not load. Use Home to re-authenticate when ready.")
-            else:
-                st.warning("Snowflake session is not active. Some data may not load. Use Home to re-authenticate when ready.")
-        else:
-            st.warning("You are not signed in. Data access is disabled until login.")
-            st.caption("Open Home and login with your Snowflake account or SSO to enable live data.")
+        # Diagnostic block
+        st.warning("Snowflake session is not active. Some data may not load.")
+        
+        with st.expander("🔎 Troubleshoot Connection (Click for details)"):
+            st.markdown("### Diagnostics")
+            st.write(f"**Auth Module Import Error:** `{_authz_error}`")
+            
+            # 1. Check module imports
+            try:
+                import snowflake.snowpark
+                st.write(f"✅ `snowflake.snowpark` imported (Version: {snowflake.snowpark.__version__})")
+            except ImportError:
+                st.error("❌ `snowflake.snowpark` import failed")
+
+            # 2. Check Connector status
+            try:
+                from src.connectors.snowflake_connector import snowflake_connector
+                sess = snowflake_connector.get_active_session()
+                st.write(f"**Snowpark Session Object:** `{sess}`")
+                st.write(f"**Is SiS Detected:** `{snowflake_connector.is_sis()}`")
+                
+                if sess:
+                    # 3. Try a direct query if session exists
+                    try:
+                        res = sess.sql("SELECT CURRENT_USER() AS ME, CURRENT_ROLE() AS ROLE").collect()
+                        st.write(f"✅ **Session Test Query:** Success")
+                        st.json([r.as_dict() for r in res])
+                    except Exception as qe:
+                        st.error(f"❌ **Session Test Query Failed:** {qe}")
+                else:
+                    st.error("❌ No active Snowpark session returned by `get_active_session()`.")
+                    
+            except Exception as e:
+                st.error(f"❌ **Connector Diagnostic Failed:** {e}")
+
+            # 4. Check Authorization Service
+            if _authz:
+                try:
+                    ident = _authz.get_current_identity()
+                    st.write(f"**Identity Resolved:** User=`{ident.user}`, Role=`{ident.current_role}`")
+                except Exception as ide:
+                    st.error(f"❌ **Identity Resolution Failed:** {ide}")
+
+        st.caption("Open Home and login with your Snowflake account or SSO to enable live data.")
+        
         # Render lightweight, non-query placeholders and exit the function to avoid queries
         st.markdown("---")
         st.subheader("Overview")

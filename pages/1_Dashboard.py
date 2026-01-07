@@ -37,10 +37,13 @@ from src.config.settings import settings
 from src.services.compliance_service import compliance_service
 from src.components.filters import render_global_filters
 # Removed broken tag_drift_service import
+_authz_error = None
 try:
     from src.services.authorization_service import authz as _authz
-except Exception:
+except Exception as e:
     _authz = None
+    _authz_error = str(e)
+
 
 # ==============================
 # Real-time Dashboard (embedded)
@@ -248,7 +251,10 @@ def render_realtime_dashboard():
     # If Snowflake session is missing, render UI but disable data access
     if not has_session:
         if st.session_state.get("user") is not None:
-            st.warning("Snowflake session is not active. Some data may not load. Use Home to re-authenticate when ready.")
+            if _authz_error:
+                st.warning(f"Snowflake session is not active (Auth Init Failed: {_authz_error}). Some data may not load. Use Home to re-authenticate when ready.")
+            else:
+                st.warning("Snowflake session is not active. Some data may not load. Use Home to re-authenticate when ready.")
         else:
             st.warning("You are not signed in. Data access is disabled until login.")
             st.caption("Open Home and login with your Snowflake account or SSO to enable live data.")

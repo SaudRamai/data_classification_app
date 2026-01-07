@@ -31,9 +31,29 @@ from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
 from src.components.filters import render_global_filters
 
+from src.services.authorization_service import authz
+
 # Apply centralized theme
 apply_global_theme()
+
+# ============================================================================
+# RBAC CHECK
+# ============================================================================
+try:
+    _ident = authz.get_current_identity()
+    if not authz.is_consumer(_ident):
+        if authz._is_bypass():
+            st.warning("RBAC bypass active (testing). UI is visible for verification.")
+        else:
+            st.error("You do not have permission to access the Policy module.")
+            st.stop()
+except Exception as _auth_err:
+    if not authz._is_bypass():
+        st.warning(f"Authorization check failed: {_auth_err}")
+        st.stop()
+
 # Global Filters
+
 with st.sidebar:
     g_filters = render_global_filters(key_prefix="policy")
 

@@ -7,6 +7,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import textwrap
 
 import streamlit as st
+import logging
+
+logger = logging.getLogger(__name__)
 
 # MUST be the first Streamlit command
 st.set_page_config(page_title="Data Intelligence", page_icon="🧠", layout="wide")
@@ -131,8 +134,16 @@ sf_account = st.session_state.get("sf_account") or getattr(settings, "SNOWFLAKE_
 st.session_state.sf_user = sf_user
 st.session_state.sf_account = sf_account
 
-# Check if we have the minimum required credentials
-if not is_sis and not (sf_user and sf_account):
+from src.services.authorization_service import authz
+
+# Check if we have the minimum required credentials or if bypass is active
+is_bypassed = False
+try:
+    is_bypassed = authz._is_bypass()
+except Exception:
+    is_bypassed = False
+
+if not is_sis and not (sf_user and sf_account) and not is_bypassed:
     st.error("""
     ## 🔐 Authentication Required
     
@@ -155,6 +166,8 @@ if not is_sis and not (sf_user and sf_account):
         st.switch_page("Home.py")
         
     st.stop()
+
+
 
 # ------------- Helpers -------------
 DEFAULT_TTL = 1800  # 30 minutes for most caches
@@ -183,16 +196,23 @@ def _run(query: str, params: Optional[Dict] = None) -> List[Dict]:
         # e.g. "from None.INFORMATION_SCHEMA..." or "from NONE.INFORMATION_SCHEMA..."
         q_upper = (query or '').upper()
         if ('NONE.INFORMATION_SCHEMA' in q_upper) or (' NONE.' in q_upper) or (' FROM NONE.' in q_upper):
-            st.info("Select a database to view details.")
+            if not is_bypassed:
+                st.info("Select a database to view details.")
             return []
         # Defensive: do not attempt a connection if credentials are missing
         if not _has_sf_creds():
-            st.info("Snowflake session not established. Please login first.")
+            if not is_bypassed:
+                st.info("Snowflake session not established. Please login first.")
+            else:
+                st.toast("⚠️ Snowflake session missing - showing UI only", icon="⚠️")
             return []
         # Get the active Snowflake connection context manager
         with snowflake_connector.get_connection() as conn:
             if not conn:
-                st.error("❌ No active Snowflake connection. Please check your connection settings.")
+                if not is_bypassed:
+                    st.error("❌ No active Snowflake connection. Please check your connection settings.")
+                else:
+                    st.toast("❌ Connection failed (bypassed)", icon="❌")
                 return []
                 
             # Execute the query
@@ -209,11 +229,15 @@ def _run(query: str, params: Optional[Dict] = None) -> List[Dict]:
                 return []
                 
     except Exception as e:
-        st.error(f"❌ Error executing query: {str(e)}")
-        st.error(f"Query: {query[:500]}")  # Show first 500 chars of the query
-        if hasattr(e, 'snowflake_messages'):
-            st.error(f"Snowflake messages: {e.snowflake_messages}")
+        if not is_bypassed:
+            st.error(f"❌ Error executing query: {str(e)}")
+            st.error(f"Query: {query[:500]}")  # Show first 500 chars of the query
+            if hasattr(e, 'snowflake_messages'):
+                st.error(f"Snowflake messages: {e.snowflake_messages}")
+        else:
+            logger.warning(f"Query failed (suppressed in bypass): {str(e)}")
         return []
+
 FAST_TTL = 300  # 5 minutes for frequently changing data
 
 @st.cache_data(ttl=FAST_TTL)  # Cache for 5 minutes
@@ -280,7 +304,10 @@ def _get_quality_dimensions(database: str = None, schema: str = None, table: str
             }
             
     except Exception as e:
-        st.warning(f"Could not fetch quality dimensions: {e}")
+        if not is_bypassed:
+            st.warning(f"Could not fetch quality dimensions: {e}")
+        else:
+            logger.warning(f"Could not fetch quality dimensions: {e}")
 
     # Return simple flat default values if there's an error or no data
     return {
@@ -856,7 +883,10 @@ def _get_overall_health(
         health_metrics['last_updated'] = datetime.utcnow().isoformat()
 
     except Exception as exc:
-        st.warning(f"Could not fetch overall health metrics: {exc}")
+        if not is_bypassed:
+            st.warning(f"Could not fetch overall health metrics: {exc}")
+        else:
+            logger.warning(f"Could not fetch overall health metrics: {exc}")
 
     return health_metrics
 
@@ -878,7 +908,10 @@ def _warehouses() -> List[str]:
                 st.session_state.cached_warehouses = result
                 return result
         except Exception as e:
-            st.warning(f"SHOW WAREHOUSES failed, falling back to INFORMATION_SCHEMA: {str(e)[:200]}")
+            if not is_bypassed:
+                st.warning(f"SHOW WAREHOUSES failed, falling back to INFORMATION_SCHEMA: {str(e)[:200]}")
+            else:
+                logger.warning(f"SHOW WAREHOUSES failed: {str(e)[:200]}")
             
         # Fallback to INFORMATION_SCHEMA if SHOW fails
         try:
@@ -894,7 +927,10 @@ def _warehouses() -> List[str]:
                 st.session_state.cached_warehouses = result
                 return result
         except Exception as e:
-            st.warning(f"INFORMATION_SCHEMA query failed: {str(e)[:200]}")
+            if not is_bypassed:
+                st.warning(f"INFORMATION_SCHEMA query failed: {str(e)[:200]}")
+            else:
+                logger.warning(f"INFORMATION_SCHEMA query failed: {str(e)[:200]}")
             
         # If we still don't have warehouses, try to get the current warehouse
         current = _current_warehouse()
@@ -905,7 +941,10 @@ def _warehouses() -> List[str]:
         return []
     except Exception as e:
         error_msg = str(e).replace('\n', ' ').strip()
-        st.warning(f"Could not list warehouses: {error_msg[:200]}")
+        if not is_bypassed:
+            st.warning(f"Could not list warehouses: {error_msg[:200]}")
+        else:
+            logger.warning(f"Could not list warehouses: {error_msg[:200]}")
         return []
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -926,7 +965,10 @@ def _current_warehouse() -> Optional[str]:
             return wh
         return None
     except Exception as e:
-        st.warning(f"Could not get current warehouse: {str(e)[:200]}")
+        if not is_bypassed:
+            st.warning(f"Could not get current warehouse: {str(e)[:200]}")
+        else:
+            logger.warning(f"Could not get current warehouse: {str(e)[:200]}")
         return None
 
 def _use_warehouse(wh: Optional[str]) -> None:
@@ -941,7 +983,10 @@ def _use_warehouse(wh: Optional[str]) -> None:
             # Best effort: attempt to resume without querying INFORMATION_SCHEMA
             snowflake_connector.execute_non_query(f'ALTER WAREHOUSE "{wh}" RESUME IF SUSPENDED')
         except Exception as e:
-            st.warning(f"Could not resume warehouse {wh}: {e}")
+            if not is_bypassed:
+                st.warning(f"Could not resume warehouse {wh}: {e}")
+            else:
+                logger.warning(f"Could not resume warehouse {wh}: {e}")
             
         try:
             snowflake_connector.execute_non_query(f'USE WAREHOUSE "{wh}"')
@@ -949,9 +994,16 @@ def _use_warehouse(wh: Optional[str]) -> None:
             # Update the current warehouse in session state
             st.session_state.current_warehouse = wh
         except Exception as e:
-            st.warning(f"Could not use warehouse {wh}: {e}")
+            if not is_bypassed:
+                st.warning(f"Could not use warehouse {wh}: {e}")
+            else:
+                logger.warning(f"Could not use warehouse {wh}: {e}")
     except Exception as e:
-        st.warning(f"Error in _use_warehouse: {e}")
+        if not is_bypassed:
+            st.warning(f"Error in _use_warehouse: {e}")
+        else:
+            logger.warning(f"Error in _use_warehouse: {e}")
+
 
 @st.cache_data(ttl=300, show_spinner=False)  # Cache for 5 minutes
 def _databases(warehouse: Optional[str] = None) -> List[str]:

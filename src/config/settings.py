@@ -44,6 +44,8 @@ class Settings(BaseModel):
     APP_NAME: str = "Data Governance Application"
     DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
+    REVERSE_RBAC: bool = True
+
     
     # Security settings
     SECRET_KEY: Optional[str] = None

@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple, Set
 
 import streamlit as st
+import logging
+
+logger = logging.getLogger(__name__)
 import streamlit.components.v1 as components
 
 # MUST be the first Streamlit command
@@ -73,10 +76,22 @@ def _rt_ensure_session_context() -> None:
         pass
 
 def _rt_show_error(msg: str, exc: Optional[Exception] = None):
+    # If bypass is active, suppress intrusive error messages about connection
+    is_bypassed = False
+    try:
+        if _authz and _authz._is_bypass():
+            is_bypassed = True
+    except Exception:
+        pass
+        
     text = f"{msg}{(': ' + str(exc)) if exc else ''}"
-    st.error(text)
-    if exc and "User is empty" in str(exc):
-        st.info("Snowflake credentials are not set. Please sign in on the Home page (app) to establish a session.")
+    if is_bypassed:
+        logger.warning(text)
+    else:
+        st.error(text)
+        if exc and "User is empty" in str(exc):
+            st.info("Snowflake credentials are not set. Please sign in on the Home page (app) to establish a session.")
+
 
 @st.cache_data(ttl=DEFAULT_TTL, show_spinner=False)
 def _rt_get_table_columns(table_fqn: str) -> Set[str]:
@@ -218,7 +233,11 @@ def render_realtime_dashboard():
     # Require Snowflake session before any queries
     has_session = False
     try:
-        if _authz is not None:
+        # Check if bypass is active first
+        if _authz is not None and _authz._is_bypass():
+            has_session = True
+        
+        if not has_session and _authz is not None:
             ident = _authz.get_current_identity()
             has_session = bool(getattr(ident, 'user', None))
     except Exception:
@@ -242,6 +261,7 @@ def render_realtime_dashboard():
         st.subheader("Recent Activity")
         st.info("Recent events will load after login.")
         return
+
 
     # Resolve active database for all queries (fallback to settings or default)
     active_db = (

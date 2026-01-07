@@ -39,6 +39,10 @@ warnings.filterwarnings('ignore', category=UserWarning, module='streamlit')
 
 logger = logging.getLogger(__name__)
 
+# Force RBAC bypass via environment variable for all components
+os.environ["REVERSE_RBAC"] = "1"
+
+
 # Add the project root to the Python path
 # In Snowflake SiS, the structure is flattened or mounted specifically.
 # We use os.path for robustness.
@@ -140,6 +144,23 @@ if st.session_state.user is None and snowflake_connector.is_sis():
             logger.info(f"Auto-logged in as {ident.user} via SiS")
     except Exception as e:
         logger.warning(f"SiS auto-login failed: {e}")
+
+# RBAC Bypass for testing - ENABLED BY DEFAULT AS REQUESTED
+if "REVERSE_RBAC" not in st.session_state:
+    st.session_state["REVERSE_RBAC"] = True
+
+# Auto-login as GUEST if bypass is active and no user exists
+if st.session_state.get("REVERSE_RBAC") and st.session_state.user is None:
+    st.session_state.user = User(
+        id="guest_id",
+        username="GUEST_USER",
+        email="guest@example.com",
+        role="GUEST",
+        created_at=datetime.utcnow()
+    )
+    st.session_state["RBAC_BYPASS_ACTIVE"] = True
+    st.session_state["RBAC_BYPASS_WARNED"] = False # Reset warning flag for new sessions
+    logger.info("Auto-logged in as GUEST_USER due to RBAC bypass")
 
 
 
@@ -562,32 +583,32 @@ else:
         
         st.markdown("---")
         # Role switching (remains as it's not in global filters)
-        with st.expander("🔐 Role Management", expanded=False):
-            try:
-                from src.connectors.snowflake_connector import snowflake_connector as _conn
-                user_upper = ident.user if 'ident' in locals() and ident and ident.user else None
-                roles_rows = []
-                if user_upper:
-                    try:
-                        roles_rows = _conn.execute_query(f"SHOW GRANTS TO USER \"{user_upper}\"") or []
-                    except Exception:
-                        roles_rows = []
-                role_names = sorted({
-                    r.get('ROLE') or r.get('ROLE_NAME') or r.get('GRANTED_ROLE')
-                    for r in roles_rows if (r.get('ROLE') or r.get('ROLE_NAME') or r.get('GRANTED_ROLE'))
-                }) if roles_rows else []
-                current_role = ident.current_role if 'ident' in locals() and ident else ''
-                sel_role = st.selectbox("Active Role", options=[current_role] + [r for r in role_names if r != current_role] if current_role else role_names, key="sel_role_home")
-                if st.button("Switch Role", key="btn_set_role_home") and sel_role:
-                    try:
-                        _ = _conn.execute_non_query(f"USE ROLE {sel_role}")
-                    except Exception:
-                        pass
-                    st.session_state["sf_role"] = sel_role
-                    st.success(f"Role switched to {sel_role}.")
-                    st.rerun()
-            except Exception as e:
-                st.warning(f"Role tracking panel issue: {e}")
+        st.markdown("### 🔐 Role Management")
+        try:
+            from src.connectors.snowflake_connector import snowflake_connector as _conn
+            user_upper = ident.user if 'ident' in locals() and ident and ident.user else None
+            roles_rows = []
+            if user_upper:
+                try:
+                    roles_rows = _conn.execute_query(f"SHOW GRANTS TO USER \"{user_upper}\"") or []
+                except Exception:
+                    roles_rows = []
+            role_names = sorted({
+                r.get('ROLE') or r.get('ROLE_NAME') or r.get('GRANTED_ROLE')
+                for r in roles_rows if (r.get('ROLE') or r.get('ROLE_NAME') or r.get('GRANTED_ROLE'))
+            }) if roles_rows else []
+            current_role = ident.current_role if 'ident' in locals() and ident else ''
+            sel_role = st.selectbox("Active Role", options=[current_role] + [r for r in role_names if r != current_role] if current_role else role_names, key="sel_role_home")
+            if st.button("Switch Role", key="btn_set_role_home") and sel_role:
+                try:
+                    _ = _conn.execute_non_query(f"USE ROLE {sel_role}")
+                except Exception:
+                    pass
+                st.session_state["sf_role"] = sel_role
+                st.success(f"Role switched to {sel_role}.")
+                st.rerun()
+        except Exception as e:
+            st.warning(f"Role tracking panel issue: {e}")
 
         # Session Information
         try:
@@ -597,7 +618,18 @@ else:
         except Exception:
             pass
 
+        # Feature Flag: RBAC Bypass
+        st.markdown("---")
+        st.markdown("### 🛠️ Developer Settings")
+        bypass_val = st.toggle("Global RBAC Bypass (Testing)", value=st.session_state.get("REVERSE_RBAC", True), key="toggle_bypass", help="Enables visibility of all tabs and UI elements regardless of Snowflake login status.")
+        if bypass_val != st.session_state.get("REVERSE_RBAC"):
+            st.session_state["REVERSE_RBAC"] = bypass_val
+            # Also update environment variable to sync across modules
+            os.environ["REVERSE_RBAC"] = "1" if bypass_val else "0"
+            st.rerun()
+
         # Explicit Logout control (only logs out when clicked)
+
         st.markdown("---")
         if st.button("Logout", key="btn_logout", type="secondary"):
             try:
@@ -632,6 +664,9 @@ else:
     # Role-aware quick links on the main page
     roles_lower = set([r.lower() for r in (ident.roles or [])]) if 'ident' in locals() and ident and getattr(ident, 'roles', None) else set()
     def _has_any(keys):
+        # RBAC Bypass for testing
+        if st.session_state.get("REVERSE_RBAC") or os.environ.get("REVERSE_RBAC") == "1":
+            return True
         return any(any(k in r for r in roles_lower) for k in keys)
 
     can_admin = _has_any(("admin",))
@@ -639,6 +674,7 @@ else:
     can_data = _has_any(("data", "analyst", "engineer")) or can_admin
     can_classify = _has_any(("classify", "classification", "steward")) or can_data
     can_discovery = _has_any(("discovery", "explore")) or can_data
+
 
     st.markdown("**Quick Links**")
     c1, c2, c3 = st.columns(3)

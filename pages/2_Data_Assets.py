@@ -22,6 +22,9 @@ for _ in range(3):
     _dir = _dir.parent
 
 import streamlit as st
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Page configuration - MUST be the first Streamlit command
 st.set_page_config(
@@ -72,23 +75,29 @@ st.markdown("""
 
 # Default debug flag to avoid NameError if referenced in exception handlers
 show_debug_det = False
-
-# Feature flag to temporarily bypass RBAC for verification of tabs/UI only
-# Set to True to bypass stop() when role is not consumer. Do NOT leave enabled in production.
-REVERSE_DATA_ASSETS_RBAC = True
+is_bypassed = False
+try:
+    is_bypassed = authz._is_bypass()
+except Exception:
+    is_bypassed = False
 
 # Ensure UI renders even when unauthenticated; disable data access until login
 has_session = False
 try:
-    ident_probe = authz.get_current_identity()
-    has_session = bool(getattr(ident_probe, 'user', None))
+    if authz._is_bypass():
+        has_session = True
+    else:
+        ident_probe = authz.get_current_identity()
+        has_session = bool(getattr(ident_probe, 'user', None))
 except Exception:
     has_session = False
+
 if not has_session:
     try:
         has_session = bool(st.session_state.get("sf_user") and st.session_state.get("sf_account"))
     except Exception:
         has_session = False
+
 if not has_session:
     st.warning("You are not signed in. Data access is disabled until login.")
     st.caption("Open Home and login with your Snowflake account or SSO to enable live data.")
@@ -104,8 +113,8 @@ if not has_session:
 try:
     _ident = authz.get_current_identity()
     if not authz.is_consumer(_ident):
-        if REVERSE_DATA_ASSETS_RBAC:
-            st.warning("RBAC bypass active (testing). Tabs are visible for verification. Disable REVERSE_DATA_ASSETS_RBAC to enforce access.")
+        if authz._is_bypass():
+            st.warning("RBAC bypass active (testing). Tabs are visible for verification.")
         else:
             st.error("You do not have permission to access Data Assets. Please sign in with a role that has at least consumer-level access.")
             st.stop()
@@ -114,11 +123,14 @@ try:
     if not _can_classify:
         st.info("Your role does not permit classification or tagging actions on this page.")
 except Exception as _rbac_err:
-    if REVERSE_DATA_ASSETS_RBAC:
-        st.warning(f"Authorization check failed (bypassed for testing): {_rbac_err}")
+    if authz._is_bypass():
+        # Fallback for testing
+        _can_classify = True
+        _can_approve = True
     else:
         st.warning(f"Authorization check failed: {_rbac_err}")
         st.stop()
+
 
 # Ensure an active warehouse for queries (auto-use session/env default)
 def _ensure_wh_quick():
@@ -133,7 +145,10 @@ def _ensure_wh_quick():
             if default_wh:
                 snowflake_connector.execute_non_query(f"use warehouse {default_wh}")
         except Exception:
-            st.warning("No active warehouse. Set a warehouse on the Dashboard sidebar (Session) or in login.")
+            if not authz._is_bypass():
+                st.warning("No active warehouse. Set a warehouse on the Dashboard sidebar (Session) or in login.")
+            else:
+                logger.warning("No active warehouse found for bypass mode.")
     # Ensure database is set as well, for INFORMATION_SCHEMA queries
     try:
         db_row = snowflake_connector.execute_query("select current_database() as D") or []
@@ -917,7 +932,10 @@ with tab_inv_browser:
             </div>
             """, unsafe_allow_html=True)
     except Exception as e:
-        st.error(f"KPI rendering failed: {e}")
+        if not is_bypassed:
+            st.warning(f"Could not fetch quality dimensions: {e}")
+        else:
+            logger.warning(f"Could not fetch quality dimensions (bypassed): {e}")
         # pass
     
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1275,7 +1293,10 @@ with tab_inv_browser:
             snowflake_connector.execute_non_query(ddl)
             return True
         except Exception as e:
-            st.error(f"Failed to create inventory view: {e}")
+            if not is_bypassed:
+                st.error(f"Failed to create inventory view: {e}")
+            else:
+                logger.error(f"Failed to create inventory view (bypassed): {e}")
             return False
 
     # Modified summarizer to use the view
@@ -1308,6 +1329,10 @@ with tab_inv_browser:
                 
             return df
         except Exception as e:
+            if not is_bypassed:
+                st.error(f"Failed to fetch inventory view: {e}")
+            else:
+                logger.error(f"Failed to fetch inventory view (bypassed): {e}")
             return pd.DataFrame()
 
     # Database View
@@ -1315,7 +1340,10 @@ with tab_inv_browser:
         st.caption("Aggregated metrics per Database. Actions apply at database scope.")
         db_df = _fetch_inventory_view("DATABASE")
         if db_df.empty:
-            st.info("No data available.")
+            if not is_bypassed:
+                st.info("No data available.")
+            else:
+                logger.info("No data available (bypassed).")
         else:
             # Drop technical columns for cleaner display
             show_cols = ["Database", "Total_Assets", "Classified", "Classification_Coverage", "Accuracy_Percent", "Timeliness_Percent", "Compliance_Status", "Owner_Coverage", "SLA_Breach_Assets", "Avg_Days_To_Classify", "Sensitive_Columns"]
@@ -1337,7 +1365,10 @@ with tab_inv_browser:
         st.caption("Aggregated metrics per Schema. Actions apply at schema scope.")
         sch_df = _fetch_inventory_view("SCHEMA")
         if sch_df.empty:
-            st.info("No data available.")
+            if not is_bypassed:
+                st.info("No data available.")
+            else:
+                logger.info("No data available (bypassed).")
         else:
             show_cols = ["Database", "Schema", "Total_Assets", "Classified", "Classification_Coverage", "Accuracy_Percent", "Timeliness_Percent", "Compliance_Status", "Owner_Coverage", "SLA_Breach_Assets", "Avg_Days_To_Classify", "Sensitive_Columns"]
             st.dataframe(sch_df[show_cols], use_container_width=True, hide_index=True)
@@ -1347,7 +1378,10 @@ with tab_inv_browser:
         st.caption("Detailed asset list with column-level metrics.")
         tbl_df = _fetch_inventory_view("ASSET")
         if tbl_df.empty:
-            st.info("No data available.")
+            if not is_bypassed:
+                st.info("No data available.")
+            else:
+                logger.info("No data available (bypassed).")
         else:
             show_cols = ["Schema", "Asset_Name", "Asset_Type", "Classification_Coverage", "Accuracy_Percent", "Timeliness_Percent", "Compliance_Status", "Owner_Coverage", "SLA_Breach_Assets", "Column_Stats", "Masking_Status", "Sensitive_Columns"]
             st.dataframe(tbl_df[show_cols], use_container_width=True, hide_index=True)
@@ -1463,6 +1497,10 @@ with tab_inv_browser:
             rows = snowflake_connector.execute_query(query) or []
             return pd.DataFrame(rows)
         except Exception as e:
+            if not is_bypassed:
+                st.error(f"Failed to fetch column details: {e}")
+            else:
+                logger.error(f"Failed to fetch column details (bypassed): {e}")
             return pd.DataFrame()
 
     with b_cols:
@@ -1472,7 +1510,10 @@ with tab_inv_browser:
         col_df = _fetch_column_details(active_db)
         
         if col_df.empty:
-            st.info("No column details found for the selected scope.")
+            if not is_bypassed:
+                st.info("No column details found for the selected scope.")
+            else:
+                logger.info("No column details found for the selected scope (bypassed).")
         else:
             # Layout filters for columns
             cf1, cf2, cf3, cf4, cf5 = st.columns([2, 2, 2, 1, 2])
@@ -1668,7 +1709,10 @@ with tab_inv_browser:
             show_cols = ["Asset","Label","C","I","A","Risk","SLA","Compliance","Owner"]
             st.dataframe(vz[show_cols], use_container_width=True, hide_index=True)
         else:
-            st.info("No favorite assets to display.")
+            if not is_bypassed:
+                st.info("No favorite assets to display.")
+            else:
+                logger.info("No favorite assets to display (bypassed).")
 
         # Bulk actions section removed per request
 
@@ -1720,7 +1764,10 @@ with tab_inv_browser:
                 st.markdown(f'<div style="margin-top: 10px;">{comp_badge}</div>', unsafe_allow_html=True)
 
             except Exception as e:
-                pass
+                if not is_bypassed:
+                    st.warning(f"Could not display current classification: {e}")
+                else:
+                    logger.warning(f"Could not display current classification (bypassed): {e}")
 
         # Rationale & Business Impact section removed per request
 
@@ -1758,12 +1805,18 @@ with tab_inv_browser:
                 if hist:
                     st.dataframe(pd.DataFrame(hist), use_container_width=True)
                 else:
-                    st.caption("No classification history found.")
+                    if not is_bypassed:
+                        st.caption("No classification history found.")
+                    else:
+                        logger.info("No classification history found (bypassed).")
                 if hist2:
                     st.markdown("Audit Trail (History)")
                     st.dataframe(pd.DataFrame(hist2), use_container_width=True)
             except Exception as e:
-                st.caption("History unavailable.")
+                if not is_bypassed:
+                    st.caption("History unavailable.")
+                else:
+                    logger.warning(f"History unavailable (bypassed): {e}")
 
         # Ownership & SLA section removed per request
 
@@ -1863,7 +1916,10 @@ with tab_inv_browser:
         st.markdown(f"#### 📄 Results ({len(adv_df)})")
         
         if adv_df.empty:
-            st.info("No assets match your search criteria.")
+            if not is_bypassed:
+                st.info("No assets match your search criteria.")
+            else:
+                logger.info("No assets match your search criteria (bypassed).")
         else:
             # Ensure nice display columns
             try:
@@ -1894,10 +1950,13 @@ with tab_inv_browser:
     
     # Show helpful message if no assets found
     if assets_df.empty:
-        st.info("📊 No data assets found in the current database. Please ensure:\n\n"
-                "1. You have selected a valid database in your session\n"
-                "2. The database contains tables or views\n"
-                "3. You have the necessary permissions to query INFORMATION_SCHEMA")
+        if not is_bypassed:
+            st.info("📊 No data assets found in the current database. Please ensure:\n\n"
+                    "1. You have selected a valid database in your session\n"
+                    "2. The database contains tables or views\n"
+                    "3. You have the necessary permissions to query INFORMATION_SCHEMA")
+        else:
+            logger.info("No data assets found in the current database (bypassed).")
         st.stop()
     
     # Apply sidebar global filters early
@@ -2372,119 +2431,21 @@ with tab_inv_browser:
                             )
                         st.success(f"Reclassification request submitted (ID: {req_id})")
                     except Exception as e:
-                        st.warning(f"Failed to submit reclassification request: {e}")
-        except Exception:
-            pass
+                        if not authz._is_bypass():
+                            st.warning(f"Failed to submit reclassification request: {e}")
+                        else:
+                            logger.warning(f"Failed to submit reclassification request (bypassed): {e}")
+        except Exception as e:
+            if not authz._is_bypass():
+                st.warning(f"Reclassification panel error: {e}")
+            else:
+                logger.warning(f"Reclassification panel error (bypassed): {e}")
+
     
     # Render live column-level details in Column-level Details tab
+    # Render live column-level details in Column-level Details tab
     with b_cols:
-        st.caption("Live column-level details for a selected asset in the current database.")
-        try:
-            asset_opts_tab = page_df['Location'].dropna().tolist() if not page_df.empty else assets_df['Location'].dropna().tolist()
-            if not asset_opts_tab:
-                st.info("No assets available in the current page/filter. Adjust filters.")
-            sel_asset_tab = st.selectbox("Select asset (DB.SCHEMA.TABLE)", options=asset_opts_tab, index=0 if asset_opts_tab else None, key="bcols_asset_live")
-            show_debug = st.checkbox("Show debug details", value=False, key="bcols_debug")
-            if sel_asset_tab:
-                @st.cache_data(ttl=180)
-                def _fetch_cols_and_mask_single(asset_fqn: str) -> Tuple[List[Dict], str]:
-                    try:
-                        db, sch, tbl = asset_fqn.split('.')
-                    except ValueError:
-                        return [], "Invalid asset name format"
-                    # Always query the target asset's database INFORMATION_SCHEMA to avoid cross-db filter mismatch
-                    dbctx = db
-                    try:
-                        rows = snowflake_connector.execute_query(
-                            f"""
-                            SELECT UPPER(COLUMN_NAME) AS COLUMN_NAME, UPPER(DATA_TYPE) AS DATA_TYPE
-                            FROM {dbctx}.INFORMATION_SCHEMA.COLUMNS
-                            WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
-                            ORDER BY ORDINAL_POSITION
-                            """,
-                            {"s": sch, "t": tbl}
-                        ) or []
-                    except Exception as e:
-                        return [], f"COLUMNS query failed: {e}"
-                    try:
-                        refs = snowflake_connector.execute_query(
-                            """
-                            SELECT UPPER(OBJECT_DATABASE||'.'||OBJECT_SCHEMA||'.'||OBJECT_NAME) AS FULL,
-                                   UPPER(COLUMN_NAME) AS COL
-                            FROM SNOWFLAKE.ACCOUNT_USAGE.POLICY_REFERENCES
-                            WHERE POLICY_KIND = 'MASKING POLICY'
-                            """
-                        ) or []
-                    except Exception as e:
-                        refs, err = [], f"POLICY_REFERENCES query failed: {e}"
-                    else:
-                        err = ""
-                    # Column tag references (to detect PII/Financial/Regulatory via tags)
-                    try:
-                        tag_refs = snowflake_connector.execute_query(
-                            """
-                            SELECT UPPER(OBJECT_DATABASE||'.'||OBJECT_SCHEMA||'.'||OBJECT_NAME) AS FULL,
-                                   UPPER(COLUMN_NAME) AS COL,
-                                   UPPER(TAG_DATABASE||'.'||TAG_SCHEMA||'.'||TAG_NAME) AS TAG_NAME
-                            FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
-                            WHERE DOMAIN = 'COLUMN'
-                            """
-                        ) or []
-                    except Exception:
-                        tag_refs = []
-                    tag_map = {}
-                    full_up = sel_asset_tab.upper()
-                    for tr in tag_refs:
-                        if (tr.get('FULL') or '') == full_up:
-                            tag_map.setdefault(tr.get('COL'), set()).add(tr.get('TAG_NAME'))
-                    full_up = sel_asset_tab.upper()
-                    refset = {r.get('COL') for r in refs if (r.get('FULL') or '') == full_up}
-                    out = []
-                    for r in rows:
-                        colname = r.get('COLUMN_NAME')
-                        dtype = r.get('DATA_TYPE')
-                        masked = "Yes" if (colname or '') in refset else "No"
-                        tags_for_col = tag_map.get(colname) or set()
-                        tags_str = ", ".join(sorted(tags_for_col)) if tags_for_col else ""
-                        upn = (colname or '').upper()
-                        # Heuristics plus tags
-                        pii = any(k in upn for k in ["SSN","EMAIL","PHONE","ADDRESS","DOB","PERSON","CUSTOMER","EMPLOYEE"]) or any("PII" in t for t in tags_for_col)
-                        fin = any(k in upn for k in ["GL","LEDGER","INVOICE","PAYROLL","AR","AP","REVENUE","EXPENSE"]) or any("FINANCE" in t or "FINANCIAL" in t for t in tags_for_col)
-                        reg = any(k in upn for k in ["GDPR","HIPAA","PCI","SOX"]) or any(any(x in t for x in ["GDPR","HIPAA","PCI","SOX"]) for t in tags_for_col)
-                        flags = []
-                        if pii: flags.append("PII")
-                        if fin: flags.append("Financial")
-                        if reg: flags.append("Regulatory")
-                        out.append({
-                            "Column": colname,
-                            "Data Type": dtype,
-                            "Masked?": masked,
-                            "Flags": ", ".join(flags),
-                            "Tags": tags_str,
-                        })
-                    return out, err
-                data, err = _fetch_cols_and_mask_single(sel_asset_tab)
-                if data:
-                    # Visual indicators for flags
-                    df_cols = pd.DataFrame(data)
-                    # No heavy styling to keep performance; show flags column with emojis
-                    if 'Flags' in df_cols.columns:
-                        def _flag_emojis(s: str) -> str:
-                            up = (s or '')
-                            icons = []
-                            if 'PII' in up: icons.append('🧍')
-                            if 'Financial' in up: icons.append('💳')
-                            if 'Regulatory' in up: icons.append('⚖️')
-                            return (s + ' ' + ' '.join(icons)).strip()
-                        df_cols['Flags'] = df_cols['Flags'].apply(_flag_emojis)
-                    st.dataframe(df_cols, use_container_width=True)
-                else:
-                    st.info("No columns found or insufficient privileges.")
-                if show_debug and err:
-                    st.code(err)
-        except Exception as ex:
-            st.caption("Column details unavailable.")
-            st.debug(str(ex))
+        st.write("Column-level details are now integrated into the main inventory table view.")
     
     # Redundant display sections and widgets removed per request.
     if assets_df.empty:

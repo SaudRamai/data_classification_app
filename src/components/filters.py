@@ -14,6 +14,7 @@ except Exception:  # During docs/build
     _conn = None
 
 
+
 def _safe_query(sql: str, params: Optional[Dict] = None) -> List[Dict]:
     try:
         if _conn is None:
@@ -21,6 +22,76 @@ def _safe_query(sql: str, params: Optional[Dict] = None) -> List[Dict]:
         return _conn.execute_query(sql, params) or []
     except Exception:
         return []
+
+
+def render_global_filters(key_prefix: str = "global") -> Dict[str, str]:
+    """
+    Standardize Global Filters UI across all pages.
+    Includes Warehouse selection and the cascading Database selectors.
+    """
+    st.subheader("Global Filters")
+    # Warehouse selector
+    wh_opts = []
+    try:
+        wh_rows = _safe_query("SHOW WAREHOUSES")
+        wh_opts = [r.get("name") or r.get("NAME") for r in wh_rows if (r.get("name") or r.get("NAME"))]
+    except Exception:
+        wh_opts = []
+        
+    cur_wh = st.session_state.get('sf_warehouse')
+    
+    # Build unique display list
+    wh_display = []
+    if cur_wh:
+        wh_display.append(cur_wh)
+    for w in wh_opts:
+        if w not in wh_display:
+            wh_display.append(w)
+            
+    sel_wh = st.selectbox(
+        "Warehouse",
+        options=(wh_display or [""]),
+        index=0 if wh_display else 0,
+        key=f"{key_prefix}_wh",
+        help="Select a Snowflake warehouse to run queries",
+    )
+    if sel_wh and sel_wh != cur_wh:
+        try:
+            if _conn:
+                _conn.execute_non_query(f"USE WAREHOUSE {sel_wh}")
+            st.session_state['sf_warehouse'] = sel_wh
+        except Exception as e:
+            st.error(f"Failed to switch to warehouse {sel_wh}: {str(e)}")
+
+    # Cascading selectors
+    filters = render_data_filters(key_prefix=key_prefix)
+    
+    st.markdown("---")
+    # Refresh / apply actions
+    col_a, col_b = st.columns(2)
+    if col_a.button("Refresh", key=f"{key_prefix}_refresh_btn", use_container_width=True):
+        st.rerun()
+    if col_b.button("Clear", key=f"{key_prefix}_clear_btn", help="Clear cache and refresh", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    # Common Persistence Logic
+    try:
+        if filters.get("database"):
+            db = filters["database"]
+            st.session_state["sf_database"] = db
+            if _conn:
+                _conn.execute_non_query(f"USE DATABASE {db}")
+                
+        if filters.get("schema"):
+            st.session_state["sf_schema"] = filters["schema"]
+            
+        st.session_state["global_filters"] = filters
+    except Exception:
+        pass
+    
+    return filters
+
 
 
 def render_data_filters(key_prefix: str = "filters") -> Dict[str, str]:
@@ -210,71 +281,3 @@ def render_compliance_facets(key_prefix: str = "facets") -> Dict[str, object]:
         "time": by_time,
     }
 
-
-def render_global_filters(key_prefix: str = "global") -> Dict[str, str]:
-    """
-    Standardize Global Filters UI across all pages.
-    Includes Warehouse selection and the cascading Database selectors.
-    """
-    st.subheader("Global Filters")
-    # Warehouse selector
-    wh_opts = []
-    try:
-        wh_rows = _safe_query("SHOW WAREHOUSES")
-        wh_opts = [r.get("name") or r.get("NAME") for r in wh_rows if (r.get("name") or r.get("NAME"))]
-    except Exception:
-        wh_opts = []
-        
-    cur_wh = st.session_state.get('sf_warehouse')
-    
-    # Build unique display list
-    wh_display = []
-    if cur_wh:
-        wh_display.append(cur_wh)
-    for w in wh_opts:
-        if w not in wh_display:
-            wh_display.append(w)
-            
-    sel_wh = st.selectbox(
-        "Warehouse",
-        options=(wh_display or [""]),
-        index=0 if wh_display else 0,
-        key=f"{key_prefix}_wh",
-        help="Select a Snowflake warehouse to run queries",
-    )
-    if sel_wh and sel_wh != cur_wh:
-        try:
-            if _conn:
-                _conn.execute_non_query(f"USE WAREHOUSE {sel_wh}")
-            st.session_state['sf_warehouse'] = sel_wh
-        except Exception as e:
-            st.error(f"Failed to switch to warehouse {sel_wh}: {str(e)}")
-
-    # Cascading selectors
-    filters = render_data_filters(key_prefix=key_prefix)
-    
-    st.markdown("---")
-    # Refresh / apply actions
-    col_a, col_b = st.columns(2)
-    if col_a.button("Refresh", key=f"{key_prefix}_refresh_btn", use_container_width=True):
-        st.rerun()
-    if col_b.button("Clear", key=f"{key_prefix}_clear_btn", help="Clear cache and refresh", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-    # Common Persistence Logic
-    try:
-        if filters.get("database"):
-            db = filters["database"]
-            st.session_state["sf_database"] = db
-            if _conn:
-                _conn.execute_non_query(f"USE DATABASE {db}")
-                
-        if filters.get("schema"):
-            st.session_state["sf_schema"] = filters["schema"]
-            
-        st.session_state["global_filters"] = filters
-    except Exception:
-        pass
-    
-    return filters

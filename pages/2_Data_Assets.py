@@ -1060,6 +1060,7 @@ with tab_inv_browser:
                     END as DAYS_TO_CLASSIFY
                     
                 FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                WHERE DATABASE_NAME IS NOT NULL
             ),
             column_metrics AS (
                 SELECT 

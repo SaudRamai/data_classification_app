@@ -3000,6 +3000,13 @@ with tab_new:
             except Exception:
                 pass
 
+        def _sf_audit_log_classification(asset_full_name: str, event_type: str, details: dict):
+            """Audit log wrapper."""
+            try:
+                audit_service.log(str(st.session_state.get("user") or "user"), event_type, "ASSET", asset_full_name, details)
+            except Exception:
+                pass
+
         def _sf_record_decision(asset_full_name: str, label: str, c: int, i: int, a: int, rationale: str, details: dict):
             """Record decision for audit via service or governance table."""
             try:

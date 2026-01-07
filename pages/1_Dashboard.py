@@ -235,6 +235,8 @@ def render_realtime_dashboard():
 
     # Require Snowflake session before any queries
     has_session = False
+    _session_check_error = None
+    
     try:
         # Check if bypass is active first
         if _authz is not None and _authz._is_bypass():
@@ -243,11 +245,28 @@ def render_realtime_dashboard():
         if not has_session and _authz is not None:
             ident = _authz.get_current_identity()
             has_session = bool(getattr(ident, 'user', None))
-    except Exception:
+            # DEBUG: If false, log why
+            if not has_session:
+                _session_check_error = f"Identity resolved but user is empty. Ident: {str(ident.__dict__) if hasattr(ident, '__dict__') else str(ident)}"
+    except Exception as e:
         has_session = False
-    # Fallback: check Streamlit session creds
+        _session_check_error = f"Auth Check Exception: {str(e)}"
+
+    # Fallback 1: Check Streamlit session creds (cached check)
     if not has_session:
         has_session = bool(st.session_state.get("sf_user") and st.session_state.get("sf_account"))
+
+    # Fallback 2: Direct SiS check (The "Save Me" Fallback)
+    # If the smart auth service failed but we clearly have a session, let them in.
+    if not has_session:
+        try:
+            from src.connectors.snowflake_connector import snowflake_connector
+            if snowflake_connector.get_active_session():
+                has_session = True
+                if not _session_check_error:
+                     _session_check_error = "Recovered via SiS Fallback"
+        except Exception:
+            pass
     # If Snowflake session is missing, render UI but disable data access
     # If Snowflake session is missing, render UI but disable data access
     if not has_session:
@@ -256,6 +275,7 @@ def render_realtime_dashboard():
         
         with st.expander("🔎 Troubleshoot Connection (Click for details)"):
             st.markdown("### Diagnostics")
+            st.write(f"**Session Check Error (Root Cause):** `{_session_check_error}`")
             st.write(f"**Auth Module Import Error:** `{_authz_error}`")
             
             # 1. Check module imports

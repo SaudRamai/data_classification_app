@@ -390,7 +390,7 @@ try:
             }
             # Try to load the real config
             try:
-                ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn_init)
+                ai_classification_service.load_sensitivity_config(force_refresh=False, schema_fqn=_sc_fqn_init)
             except Exception as e:
                 if not authz._is_bypass():
                     st.warning(f"Warning: Could not load sensitivity config: {str(e)}. Using default configuration.")
@@ -423,48 +423,50 @@ except Exception as e:
     # [OVERRIDE] Strict PII Configuration Injection
     # Forces PII definition and 65+ specific keywords to EXACT match with 0.95 weight.
     # =================================================================================
-    try:
-        # 1. Override PII Category Definition
-        ai_classification_service._sensitivity_config.setdefault('categories', {})['PII'] = {
-            'CATEGORY_NAME': 'PII',
-            'DESCRIPTION': 'PERSONAL IDENTIFICATION DATA: Individual human identifiers including full names, email addresses, phone numbers, physical street addresses, Social Security Numbers (SSN), passport numbers, driver license IDs, birth dates, biometric signatures (fingerprints, facial recognition), genetic information, medical patient records, individual demographic attributes (gender, ethnicity, marital status), and any data that uniquely identifies or can be traced back to a specific living person. Primary concern: individual privacy and identity protection under privacy laws like GDPR, CCPA, and HIPAA for healthcare information.',
-            'CONFIDENTIALITY_LEVEL': 3,
-            'INTEGRITY_LEVEL': 2,
-            'AVAILABILITY_LEVEL': 2,
-            'DETECTION_THRESHOLD': 0.35,
-            'IS_ACTIVE': True
-        }
-
-        # 2. Inject Strict Keyword Overrides
-        _pii_keywords = [
-            "phone_number", "residential_address", "birth_date", "mobile_number", "date_of_birth",
-            "passport", "email", "user_email", "dob", "fingerprint", "driver_license", "drivers_license",
-            "SOCIAL_SECURITY_NUMBER", "national_id", "passport_number", "tax_id", "home_address",
-            "cell_phone", "biometric", "medical_record", "patient_id", "health_record", "personal_email",
-            "taxpayer_id", "national_id_number", "voter_id_number", "military_id_number", "biometric_hash",
-            "voice_print_id", "fingerprint_hash", "health_condition", "ethnicity", "religion",
-            "disability_status", "two_factor_phone", "two_factor_email", "gps_coordinates",
-            "last_known_location", "device_location_history", "voip_call_records", "credit_card_holder_name",
-            "business_registration_number", "CUSTOMER_ID", "DRIVERS_LICENSE_NUMBER", "LAST_KNOWN_LOCATION",
-            "GPS_COORDINATES", "VOICE_PRINT_ID", "PASSPORT_NUMBER", "VIDEO_CALL_SIGNATURE",
-            "DISABILITY_STATUS", "CREDIT_CARD_HOLDER_NAME", "IP_ADDRESS", "HEALTH_CONDITION",
-            "ANNUAL_INCOME", "NATIONAL_ID_NUMBER", "VOTER_ID_NUMBER", "TWO_FACTOR_PHONE", "RELIGION",
-            "BIOMETRIC_HASH", "VOIP_CALL_RECORDS", "MILITARY_ID_NUMBER", "TAX_IDENTIFICATION_NUMBER",
-            "TWO_FACTOR_EMAIL", "FINGERPRINT_HASH", "DEVICE_LOCATION_HISTORY", "ETHNICITY", "CREDIT_SCORE",
-            "ALIEN_REGISTRATION_NUMBER"
-        ]
-        
-        _kw_store = ai_classification_service._sensitivity_config.setdefault('keywords', {})
-        for _kw in _pii_keywords:
-            _kw_store[_kw.strip().lower()] = {
-                'KEYWORD_STRING': _kw, 
-                'CATEGORY_NAME': 'PII', 
-                'MATCH_TYPE': 'EXACT', 
-                'SENSITIVITY_WEIGHT': 0.95, 
+    if not st.session_state.get("pii_configured"):
+        try:
+            # 1. Override PII Category Definition
+            ai_classification_service._sensitivity_config.setdefault('categories', {})['PII'] = {
+                'CATEGORY_NAME': 'PII',
+                'DESCRIPTION': 'PERSONAL IDENTIFICATION DATA: Individual human identifiers including full names, email addresses, phone numbers, physical street addresses, Social Security Numbers (SSN), passport numbers, driver license IDs, birth dates, biometric signatures (fingerprints, facial recognition), genetic information, medical patient records, individual demographic attributes (gender, ethnicity, marital status), and any data that uniquely identifies or can be traced back to a specific living person. Primary concern: individual privacy and identity protection under privacy laws like GDPR, CCPA, and HIPAA for healthcare information.',
+                'CONFIDENTIALITY_LEVEL': 3,
+                'INTEGRITY_LEVEL': 2,
+                'AVAILABILITY_LEVEL': 2,
+                'DETECTION_THRESHOLD': 0.35,
                 'IS_ACTIVE': True
             }
-    except Exception as _override_err:
-        pass
+
+            # 2. Inject Strict Keyword Overrides
+            _pii_keywords = [
+                "phone_number", "residential_address", "birth_date", "mobile_number", "date_of_birth",
+                "passport", "email", "user_email", "dob", "fingerprint", "driver_license", "drivers_license",
+                "SOCIAL_SECURITY_NUMBER", "national_id", "passport_number", "tax_id", "home_address",
+                "cell_phone", "biometric", "medical_record", "patient_id", "health_record", "personal_email",
+                "taxpayer_id", "national_id_number", "voter_id_number", "military_id_number", "biometric_hash",
+                "voice_print_id", "fingerprint_hash", "health_condition", "ethnicity", "religion",
+                "disability_status", "two_factor_phone", "two_factor_email", "gps_coordinates",
+                "last_known_location", "device_location_history", "voip_call_records", "credit_card_holder_name",
+                "business_registration_number", "CUSTOMER_ID", "DRIVERS_LICENSE_NUMBER", "LAST_KNOWN_LOCATION",
+                "GPS_COORDINATES", "VOICE_PRINT_ID", "PASSPORT_NUMBER", "VIDEO_CALL_SIGNATURE",
+                "DISABILITY_STATUS", "CREDIT_CARD_HOLDER_NAME", "IP_ADDRESS", "HEALTH_CONDITION",
+                "ANNUAL_INCOME", "NATIONAL_ID_NUMBER", "VOTER_ID_NUMBER", "TWO_FACTOR_PHONE", "RELIGION",
+                "BIOMETRIC_HASH", "VOIP_CALL_RECORDS", "MILITARY_ID_NUMBER", "TAX_IDENTIFICATION_NUMBER",
+                "TWO_FACTOR_EMAIL", "FINGERPRINT_HASH", "DEVICE_LOCATION_HISTORY", "ETHNICITY", "CREDIT_SCORE",
+                "ALIEN_REGISTRATION_NUMBER"
+            ]
+            
+            _kw_store = ai_classification_service._sensitivity_config.setdefault('keywords', {})
+            for _kw in _pii_keywords:
+                _kw_store[_kw.strip().lower()] = {
+                    'KEYWORD_STRING': _kw, 
+                    'CATEGORY_NAME': 'PII', 
+                    'MATCH_TYPE': 'EXACT', 
+                    'SENSITIVITY_WEIGHT': 0.95, 
+                    'IS_ACTIVE': True
+                }
+            st.session_state["pii_configured"] = True
+        except Exception as _override_err:
+            pass
     # =================================================================================
 
 # Add verification of AI service readiness
@@ -531,7 +533,7 @@ with st.sidebar:
                 if hasattr(ai_classification_service, "set_mode"):
                     ai_classification_service.set_mode(True)
                 _sc_fqn_sel = f"{_db_sel}.DATA_CLASSIFICATION_GOVERNANCE"
-                ai_classification_service.load_sensitivity_config(force_refresh=True, schema_fqn=_sc_fqn_sel)
+                ai_classification_service.load_sensitivity_config(force_refresh=False, schema_fqn=_sc_fqn_sel)
             except Exception:
                 pass
     
@@ -606,7 +608,9 @@ try:
     try:
         _sel_table = (st.session_state.get("global_filters") or {}).get("table")
         if _sel_table and _sel_table.count(".") == 2:
-            _compute_and_store_table_stats(_sel_table)
+            # Performance optimization: disable automatic blocking stats computation
+            # _compute_and_store_table_stats(_sel_table)
+            pass
     except Exception:
         pass
 except Exception:
@@ -1626,12 +1630,12 @@ with tab_new:
                 # Display only the relevant columns to the user
                 _preview_cols = [c for c in vdf.columns if c not in ["CONFIDENCE", "COMPLIANCE"]]
                 st.dataframe(vdf[_preview_cols], use_container_width=True)
-                st.caption("Rows with errors cannot be submitted. Routes: AUTO_APPROVE, EXPEDITED (1 day), STANDARD (2 days), ENHANCED (committee)")
+                st.caption("Rows with errors will be skipped. Routes: AUTO_APPROVE, EXPEDITED (1 day), STANDARD (2 days), ENHANCED (committee)")
 
                 can_submit = not vdf.empty and all(not str(e or "").strip() for e in vdf["ERRORS"].tolist())
                 has_valid_some = not vdf.empty and any(not str(e or "").strip() for e in vdf["ERRORS"].tolist())
                 if not can_submit:
-                    st.warning("Fix validation errors before submitting or submit only valid rows.")
+                    st.warning("⚠️ Contains validation errors. These rows will be skipped if you click 'Submit Valid Rows Only'.")
                     try:
                         import pandas as _pd2
                         err_rows = vdf[vdf["ERRORS"].astype(str).str.strip() != ""]
@@ -1645,97 +1649,14 @@ with tab_new:
                 col1, col2 = st.columns([1, 1])
                 
                 with col1:
-                    if st.button("Submit Valid Rows Only", type="secondary", disabled=not has_valid_some, key="bulk_submit_valid_only"):
+                    # Promoted to Primary action
+                    if st.button("Submit Valid Rows Only", type="primary", disabled=not has_valid_some, key="bulk_submit_valid_only"):
                         # Set a trigger flag for the processing block below
                         st.session_state["trigger_bulk_valid_processing"] = True
                 
                 with col2:
-                    if st.button("Submit Batch", type="primary", disabled=not can_submit, key="bulk_submit_btn"):
-                        # Initialize counters
-                        applied = 0
-                        queued = 0
-                        failed = 0
-                        for _, rr in vdf.iterrows():
-                            full = str(rr.get("FULL_NAME"))
-                            try:
-                                c_s = int(rr.get("SUGGESTED_C"))
-                                i_s = int(rr.get("SUGGESTED_I"))
-                                a_s = int(rr.get("SUGGESTED_A"))
-                                lbl = str(rr.get("SUGGESTED_LABEL") or "Internal")
-                                route = str(rr.get("ROUTE") or "STANDARD_REVIEW")
-                                owner_email = str(rr.get("OWNER_EMAIL") or "system")
-                                rationale = str(rr.get("RATIONALE") or "")
-                                
-                                # Resolve DB for persistence reliability
-                                _bulk_db = full.split('.')[0] if '.' in full else None
-                                
-                                # Tags (uppercase for TaggingService)
-                                tags = {
-                                    "DATA_CLASSIFICATION": lbl,
-                                    "CONFIDENTIALITY_LEVEL": str(c_s),
-                                    "INTEGRITY_LEVEL": str(i_s),
-                                    "AVAILABILITY_LEVEL": str(a_s),
-                                    "COMPLIANCE_FRAMEWORKS": str(rr.get("COMPLIANCE") or "NONE"),
-                                }
-                                
-                                if route == "AUTO_APPROVE":
-                                    try:
-                                        if not authz.can_apply_tags_for_object(full, object_type="TABLE"):
-                                            raise Exception("Insufficient privileges to apply tags")
-                                        tagging_service.apply_tags_to_object(full, "TABLE", tags)
-                                        try:
-                                            classification_decision_service.record(
-                                                asset_full_name=full,
-                                                decision_by=owner_email,
-                                                source="BULK_SEMANTIC",
-                                                status="Applied",
-                                                label=lbl,
-                                                c=int(c_s), i=int(i_s), a=int(a_s),
-                                                rationale=rationale,
-                                                details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE"), "compliance": rr.get("COMPLIANCE")},
-                                                database=_bulk_db
-                                            )
-                                        except Exception:
-                                            pass
-                                        try:
-                                            _sf_audit_log_classification(full, "BULK_AUTO_APPROVED", {"label": lbl, "c": c_s, "i": i_s, "a": a_s, "confidence": rr.get("CONFIDENCE")})
-                                        except Exception:
-                                            pass
-                                        applied += 1
-                                    except Exception as e:
-                                        st.error(f"Failed to process auto-approval for {full}: {str(e)}")
-                                        failed += 1
-                                else:
-                                    # Queue for review via decision service
-                                    try:
-                                        classification_decision_service.record(
-                                            asset_full_name=full,
-                                            decision_by=owner_email,
-                                            source="BULK_SEMANTIC",
-                                            status="Submitted",
-                                            label=lbl,
-                                            c=int(c_s), i=int(i_s), a=int(a_s),
-                                            rationale=rationale or f"Routed to {route}",
-                                            details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE"), "compliance": rr.get("COMPLIANCE")},
-                                            database=_bulk_db
-                                        )
-                                        try:
-                                            _sf_audit_log_classification(full, "BULK_QUEUED_REVIEW", {"label": lbl, "c": c_s, "i": i_s, "a": a_s, "route": route, "confidence": rr.get("CONFIDENCE")})
-                                        except Exception:
-                                            pass
-                                        queued += 1
-                                    except Exception as e:
-                                        st.error(f"Failed to queue {full} for review: {str(e)}")
-                                        failed += 1
-                            except Exception as e:
-                                failed += 1
-                                st.error(f"Failed to process row for {full}: {str(e)}")
-                                continue
-                        
-                        if failed == 0:
-                            st.success(f"✅ Batch processed successfully. Applied: {applied}, Queued: {queued}")
-                        else:
-                            st.warning(f"⚠️ Batch processed with errors. Applied: {applied}, Queued: {queued}, Failed: {failed}")
+                    pass # 'Submit Batch' disabled in favor of 'Submit Valid Rows Only'
+
 
                 # Submit valid rows only (skips rows with errors)
                 if st.session_state.get('trigger_bulk_valid_processing'):
@@ -1785,7 +1706,7 @@ with tab_new:
                                     except Exception:
                                         pass
                                     try:
-                                        _sf_audit_log_classification(full, "BULK_AUTO_APPROVED", {"label": lbl, "c": c_s, "i": i_s, "a": a_s, "confidence": rr.get("CONFIDENCE")})
+                                        audit_service.log(owner_email, "BULK_AUTO_APPROVED", "ASSET", full, {"label": lbl, "c": c_s, "i": i_s, "a": a_s, "confidence": rr.get("CONFIDENCE")})
                                     except Exception:
                                         pass
                                     applied += 1
@@ -1805,7 +1726,7 @@ with tab_new:
                                     except Exception:
                                         pass
                                     try:
-                                        _sf_audit_log_classification(full, "BULK_QUEUED_REVIEW", {"label": lbl, "c": c_s, "i": i_s, "a": a_s, "route": route, "confidence": rr.get("CONFIDENCE")})
+                                        audit_service.log(owner_email, "BULK_QUEUED_REVIEW", "ASSET", full, {"label": lbl, "c": c_s, "i": i_s, "a": a_s, "route": route, "confidence": rr.get("CONFIDENCE")})
                                     except Exception:
                                         pass
                                     queued += 1

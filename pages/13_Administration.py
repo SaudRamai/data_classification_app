@@ -398,19 +398,35 @@ elif st.session_state.admin_view == 'Users':
             with cA: user_email = st.text_input("User Email")
             with cB: role_name = st.selectbox("Role", [r['ROLE_NAME'] for r in roles] if roles else ["Admin","Custodian"])
             with cC:
-                if st.button("Assign Role"):
+                def _local_safe(name: str) -> str:
+                    name = (name or "").strip()
+                    for ch in [';', '\\', '/', '\'', '"', '`']: name = name.replace(ch, '')
+                    return f'"{name.upper()}"'
+
+                if st.button("Assign Role", type="primary"):
                     if _is_admin:
-                        snowflake_connector.execute_non_query(
-                            f"MERGE INTO {db_name}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS t "
-                            f"USING (SELECT %(u)s AS U, %(r)s AS R) s ON t.USER_EMAIL=s.U AND t.ROLE_NAME=s.R "
-                            f"WHEN MATCHED THEN UPDATE SET ASSIGNED_AT=CURRENT_TIMESTAMP "
-                            f"WHEN NOT MATCHED THEN INSERT (USER_EMAIL, ROLE_NAME, ASSIGNED_AT) VALUES (s.U, s.R, CURRENT_TIMESTAMP)",
-                            {"u": user_email, "r": role_name}
-                        )
-                        st.success("Assigned.")
-                        st.rerun()
+                        try:
+                            # 1. Update Application Metadata (Audit/Tracking)
+                            snowflake_connector.execute_non_query(
+                                f"MERGE INTO {db_name}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS t "
+                                f"USING (SELECT %(u)s AS U, %(r)s AS R) s ON t.USER_EMAIL=s.U AND t.ROLE_NAME=s.R "
+                                f"WHEN MATCHED THEN UPDATE SET ASSIGNED_AT=CURRENT_TIMESTAMP "
+                                f"WHEN NOT MATCHED THEN INSERT (USER_EMAIL, ROLE_NAME, ASSIGNED_AT) VALUES (s.U, s.R, CURRENT_TIMESTAMP)",
+                                {"u": user_email, "r": role_name}
+                            )
+                            
+                            # 2. Synchronize with Snowflake (Live Grant)
+                            snowflake_connector.execute_non_query(
+                                f"GRANT ROLE {_local_safe(role_name)} TO USER {_local_safe(user_email)}"
+                            )
+                            
+                            st.success(f"✅ Governance metadata updated and Role '{role_name}' granted to {user_email} in Snowflake.")
+                            time.sleep(1)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Synchronization Error: {e}")
                     else:
-                        st.error("Admin only.")
+                        st.error("Permission Denied: Admin authorization required.")
         except Exception as e:
             st.error(f"Error loading RBAC: {e}")
 
@@ -512,12 +528,21 @@ elif st.session_state.admin_view == 'Users':
 # VIEW: SYSTEM CONFIG (Governance, I/A Rules)
 # -----------------------------------------------------------------------------
 elif st.session_state.admin_view == 'Config':
-    st.header("⚙️ System Configuration")
+    st.markdown(f"""
+    <div style="background: linear-gradient(90deg, rgba(59, 130, 246, 0.1), rgba(0, 0, 0, 0)); padding: 20px; border-radius: 12px; border-left: 4px solid #3b82f6; margin-bottom: 25px;">
+        <h3 style="margin:0; color:white; font-size:1.4rem;">⚙️ Governance Engine Controls</h3>
+        <p style="margin:5px 0 0 0; color:rgba(255,255,255,0.6); font-size:0.9rem;">
+            Configure the <b>intelligence logic</b>, business rules, and <b>security frameworks</b> that power your governance platform.<br>
+            Define discovery thresholds and automate integrity assessments across your data landscape.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    tGov, tIA, tMap = st.tabs(["Governance Settings", "Integrity/Availability Rules", "IdP Mapping"])
+    tGov, tIA, tMap = st.tabs(["🚀 Platform Capabilities", "🧠 Inference Engine", "🛡️ Policy Safeguards"])
     
     with tGov:
-        st.subheader("Global Settings")
+        st.subheader("Core Governance Modules")
+        st.caption("Enable or disable platform features to match your organizational needs.")
         try:
             snowflake_connector.execute_non_query(f"CREATE TABLE IF NOT EXISTS {db_name}.DATA_GOVERNANCE.APP_SETTINGS (KEY STRING PRIMARY KEY, VALUE STRING)")
             
@@ -525,51 +550,99 @@ elif st.session_state.admin_view == 'Config':
                 r = snowflake_connector.execute_query(f"SELECT VALUE FROM {db_name}.DATA_GOVERNANCE.APP_SETTINGS WHERE KEY=%(k)s", {"k":k})
                 return r[0]['VALUE'] if r else d
 
-            en_disc = st.checkbox("Enable Data Discovery Module", value=(get_setting("enable_discovery","true")=="true"))
-            en_flow = st.checkbox("Enable Classification Workflow", value=(get_setting("enable_workflow","true")=="true"))
+            col_set1, col_set2 = st.columns(2)
+            with col_set1:
+                with st.container(border=True):
+                    st.markdown("#### 🔍 Data Discovery")
+                    st.write("Enables the automated scanning and inventory tracking of Snowflake assets.")
+                    en_disc = st.toggle("Activate Discovery Engine", value=(get_setting("enable_discovery","true")=="true"), key="tg_disc")
             
-            if st.button("Save Configuration"):
+            with col_set2:
+                with st.container(border=True):
+                    st.markdown("#### 📝 Classification Workflow")
+                    st.write("Powers the manual review, AI suggestion, and approval cycles for labels.")
+                    en_flow = st.toggle("Activate Workflow Studio", value=(get_setting("enable_workflow","true")=="true"), key="tg_flow")
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("💾 Persist Configuration Changes", type="primary", use_container_width=True):
                 if _is_admin:
                     snowflake_connector.execute_non_query(
                         f"MERGE INTO {db_name}.DATA_GOVERNANCE.APP_SETTINGS t USING (SELECT 'enable_discovery' as K, '{str(en_disc).lower()}' as V) s ON t.KEY=s.K WHEN MATCHED THEN UPDATE SET VALUE=s.V WHEN NOT MATCHED THEN INSERT (KEY, VALUE) VALUES (s.K, s.V)"
                     )
-                    st.success("Saved.")
+                    st.success("✅ Configuration synchronized successfully.")
+                    time.sleep(1)
+                    st.rerun()
                 else:
-                    st.error("Admin only.")
+                    st.error("Permission Denied: Administrator role required.")
         except Exception as e:
-            st.warning(f"Settings unavailable: {e}")
+            st.error(f"Intelligence Sync Failure: {e}")
 
     with tIA:
-        st.subheader("I/A Inference Rules")
-        st.caption("Manage patterns for Integrity and Availability inference.")
+        st.subheader("Integrity & Availability (I/A) Logic")
+        st.caption("Manage automated inference patterns for data importance and reliability.")
+        
         try:
             snowflake_connector.execute_non_query(f"CREATE TABLE IF NOT EXISTS {db_name}.DATA_GOVERNANCE.IA_RULES (TYPE STRING, PATTERN STRING, I_LEVEL NUMBER, A_LEVEL NUMBER, PRIORITY NUMBER, UPDATED_AT TIMESTAMP_NTZ)")
             rules = snowflake_connector.execute_query(f"SELECT * FROM {db_name}.DATA_GOVERNANCE.IA_RULES ORDER BY PRIORITY DESC") or []
-            st.dataframe(pd.DataFrame(rules), use_container_width=True)
             
-            with st.form("add_rule"):
-                c1, c2 = st.columns(2)
-                with c1: patt = st.text_input("Pattern (substring or /regex/)")
-                with c2: pri = st.number_input("Priority", value=100)
-                ci, ca = st.columns(2)
-                with ci: il = st.number_input("I Level", 0, 3, 2)
-                with ca: al = st.number_input("A Level", 0, 3, 2)
-                if st.form_submit_button("Add Rule"):
-                    if _is_admin:
-                        snowflake_connector.execute_non_query(
-                            f"INSERT INTO {db_name}.DATA_GOVERNANCE.IA_RULES (PATTERN, I_LEVEL, A_LEVEL, PRIORITY, UPDATED_AT) VALUES (%(p)s, %(i)s, %(a)s, %(pri)s, CURRENT_TIMESTAMP)",
-                            {"p": patt, "i": il, "a": al, "pri": pri}
-                        )
-                        st.success("Rule Added.")
-                        st.rerun()
+            if rules:
+                st.dataframe(
+                    pd.DataFrame(rules), 
+                    use_container_width=True,
+                    column_config={
+                        "UPDATED_AT": st.column_config.DatetimeColumn("Last Modified"),
+                        "PRIORITY": st.column_config.NumberColumn("Priority Rank", help="Higher numbers execute first")
+                    }
+                )
+            else:
+                st.info("No inference rules defined. Use the console below to create your first safeguard.")
+            
+            with st.expander("🛠️ Rule Authoring Console", expanded=False):
+                with st.form("add_rule", clear_on_submit=True):
+                    c1, c2 = st.columns([3, 1])
+                    with c1: 
+                        patt = st.text_input("Object Name Pattern", placeholder="e.g. %_PAYMENT%, /.*_ID$/", help="Supports SQL ILIKE patterns or regex")
+                    with c2: 
+                        pri = st.number_input("Priority", value=100, step=10)
+                    
+                    st.markdown("---")
+                    st.write("**Inferred Asset Criticality**")
+                    ci, ca = st.columns(2)
+                    with ci: 
+                        il = st.select_slider("Integrity Level (I)", options=[0, 1, 2, 3], value=2, help="0: Low, 3: High")
+                    with ca: 
+                        al = st.select_slider("Availability Level (A)", options=[0, 1, 2, 3], value=2, help="0: Low, 3: High")
+                    
+                    if st.form_submit_button("🚀 Deploy New Inference Rule", use_container_width=True):
+                        if _is_admin:
+                            snowflake_connector.execute_non_query(
+                                f"INSERT INTO {db_name}.DATA_GOVERNANCE.IA_RULES (PATTERN, I_LEVEL, A_LEVEL, PRIORITY, UPDATED_AT) VALUES (%(p)s, %(i)s, %(a)s, %(pri)s, CURRENT_TIMESTAMP)",
+                                {"p": patt, "i": il, "a": al, "pri": pri}
+                            )
+                            st.success(f"Rule for '{patt}' deployed to engine.")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("Admin permissions required to modify engine logic.")
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Inference Engine Fault: {e}")
 
     with tMap:
-        st.subheader("IdP Group Mapping")
-        # Reuse existing logic similarly if needed, or keep simple
-        st.info("Mapping functionality allows syncing Okta/AD groups to Snowflake roles.")
-        # (Simplified for brevity, can verify table exists)
+        st.subheader("External Identity Mapping")
+        st.caption("Synchronize organizational hierarchy and groups with Snowflake identity providers.")
+        
+        st.markdown(f"""
+        <div style="padding: 40px; text-align: center; background: rgba(255,255,255,0.03); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.1);">
+            <div style="font-size: 3rem; margin-bottom: 15px;">🔗</div>
+            <h4 style="color:white;">Identity Synchronization Pending</h4>
+            <p style="color:rgba(255,255,255,0.5); max-width: 500px; margin: 0 auto;">
+                Connect your <b>Okta, Azure AD, or PingFederate</b> instance to automatically map IdP groups to Snowflake governance roles.
+            </p>
+            <br>
+            <button style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; opacity: 0.5;">
+                Configure IdP Provider
+            </button>
+        </div>
+        """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # VIEW: TAG MANAGEMENT

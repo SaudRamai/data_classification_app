@@ -95,6 +95,14 @@ TAG_DEFINITIONS = get_tag_definitions()
 TAG_DEFINITIONS.update({
     "MASKING_EXEMPT": ["TRUE", "FALSE"]
 })
+ALLOWED_TAG_KEYS = {
+    "AVAILABILITY_LEVEL",
+    "COMPLIANCE_FRAMEWORKS",
+    "CONFIDENTIALITY_LEVEL",
+    "DATA_CLASSIFICATION",
+    "INTEGRITY_LEVEL"
+}
+
 # Public constant for allowed classification labels (kept for backward-compatibility)
 # Used by pages (e.g., Administration) and within this module.
 ALLOWED_CLASSIFICATIONS = TAG_DEFINITIONS.get(
@@ -446,12 +454,13 @@ class TaggingService:
         object_type: TABLE|VIEW|SCHEMA|DATABASE
         tags: dict of {TAG_NAME: value}
         """
-        # Auto-augment lifecycle tags when classification/CIA present
-        augmented = dict(tags)
-        if any(k in augmented for k in ("DATA_CLASSIFICATION", "CONFIDENTIALITY_LEVEL", "INTEGRITY_LEVEL", "AVAILABILITY_LEVEL")):
-            today = date.today().isoformat()
-            augmented.setdefault("LAST_CLASSIFIED_DATE", today)
-            augmented.setdefault("REVIEW_STATUS", "Reviewed")
+        # Strictly filter tags to allowed keys requested by USER
+        augmented = {k: v for k, v in tags.items() if k in ALLOWED_TAG_KEYS}
+        
+        if not augmented:
+            logger.warning(f"No allowed tags provided for {full_name}. Skipping application.")
+            return
+
         self.validate_tags(augmented)
         self._enforce_policy_minimums(full_name, augmented)
         self.initialize_tagging()
@@ -477,12 +486,13 @@ class TaggingService:
         column_name: str,
         tags: Dict[str, str],
     ) -> None:
-        # Auto-augment lifecycle tags when classification/CIA present
-        augmented = dict(tags)
-        if any(k in augmented for k in ("DATA_CLASSIFICATION", "CONFIDENTIALITY_LEVEL", "INTEGRITY_LEVEL", "AVAILABILITY_LEVEL")):
-            today = date.today().isoformat()
-            augmented.setdefault("LAST_CLASSIFIED_DATE", today)
-            augmented.setdefault("REVIEW_STATUS", "Reviewed")
+        # Strictly filter tags to allowed keys requested by USER
+        augmented = {k: v for k, v in tags.items() if k in ALLOWED_TAG_KEYS}
+        
+        if not augmented:
+            logger.warning(f"No allowed tags provided for {full_table_name}.{column_name}. Skipping application.")
+            return
+
         self.validate_tags(augmented)
         self._enforce_policy_minimums(full_table_name, augmented)
         self.initialize_tagging()

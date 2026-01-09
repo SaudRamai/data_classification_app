@@ -312,7 +312,8 @@ class ClassificationWorkflowService:
             "DATA_CLASSIFICATION": label,
             "CONFIDENTIALITY_LEVEL": f"C{int(c or 0)}",
             "INTEGRITY_LEVEL": f"I{int(i or 0)}",
-            "AVAILABILITY_LEVEL": f"A{int(a or 0)}"
+            "AVAILABILITY_LEVEL": f"A{int(a or 0)}",
+            "COMPLIANCE_FRAMEWORKS": ""
         }
         tagging_service.apply_tags_to_object(asset, "TABLE", tags)
         
@@ -419,7 +420,13 @@ class ClassificationWorkflowService:
             self.connector.execute_non_query(f"UPDATE {db}.{SCHEMA}.CLASSIFICATION_TASKS SET STATUS = %(st)s WHERE ASSET_FULL_NAME = %(a)s", {"st": ("Completed" if action == "submit" else "Draft"), "a": asset_full_name})
             if action == "submit":
                 from src.services.tagging_service import tagging_service
-                tagging_service.apply_tags_to_object(asset_full_name, "TABLE", {"DATA_CLASSIFICATION": label, "CONFIDENTIALITY_LEVEL": f"C{int(c)}", "INTEGRITY_LEVEL": f"I{int(i)}", "AVAILABILITY_LEVEL": f"A{int(a)}"})
+                tagging_service.apply_tags_to_object(asset_full_name, "TABLE", {
+                    "DATA_CLASSIFICATION": label, 
+                    "CONFIDENTIALITY_LEVEL": f"C{int(c)}", 
+                    "INTEGRITY_LEVEL": f"I{int(i)}", 
+                    "AVAILABILITY_LEVEL": f"A{int(a)}",
+                    "COMPLIANCE_FRAMEWORKS": ""
+                })
             return True
         except Exception: return False
 

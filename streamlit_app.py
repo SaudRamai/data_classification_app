@@ -677,13 +677,17 @@ else:
 
 
     st.markdown("**Quick Links**")
-    c1, c2, c3 = st.columns(3)
+    
+    # First row: Main navigation
+    c1, c2, c3, c4 = st.columns(4)
+    
     with c1:
         if st.button("Dashboard", use_container_width=True):
             try:
                 st.switch_page("pages/1_Dashboard.py")
             except Exception:
                 st.rerun()
+    
     with c2:
         if can_data and st.button("Data Assets", use_container_width=True):
             try:
@@ -692,6 +696,7 @@ else:
                 st.rerun()
         elif not can_data:
             st.caption("")
+    
     with c3:
         if can_classify and st.button("Classification", use_container_width=True):
             try:
@@ -700,15 +705,8 @@ else:
                 st.rerun()
         elif not can_classify:
             st.caption("")
-        if can_compliance and st.button("Compliance", use_container_width=True):
-            try:
-                st.switch_page("pages/4_Compliance.py")
-            except Exception:
-                st.rerun()
-        elif not can_compliance:
-            st.caption("")
-    c3, c4 = st.columns(2)
-    with c3:
+    
+    with c4:
         if can_discovery and st.button("Data Discovery", use_container_width=True):
             try:
                 # Redirect to the unified Classification module (Discovery tab lives there)
@@ -717,10 +715,24 @@ else:
                 st.rerun()
         elif not can_discovery:
             st.caption("")
-    with c4:
+    
+    # Second row: Policy section with Administration
+    st.markdown("### Policy")
+    pc1, pc2 = st.columns(2)
+    
+    with pc1:
+        if can_compliance and st.button("Compliance", use_container_width=True):
+            try:
+                st.switch_page("pages/4_Compliance.py")
+            except Exception:
+                st.rerun()
+        elif not can_compliance:
+            st.caption("")
+    
+    with pc2:
         if can_admin and st.button("Administration", use_container_width=True):
             try:
-                st.switch_page("pages/10_Administration.py")
+                st.switch_page("pages/13_Administration.py")
             except Exception:
                 st.rerun()
         elif not can_admin:

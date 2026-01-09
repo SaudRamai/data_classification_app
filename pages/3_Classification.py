@@ -25,10 +25,50 @@ _project_root = str(_dir) # Define globally as string for downstream use
 import streamlit as st
 
 # Page configuration - MUST be the first Streamlit command
+# Add custom CSS for consistent spacing
+st.markdown("""
+    <style>
+    /* Consistent spacing system */
+    .stApp > div {
+        padding: 0.5rem 1.5rem 1.5rem;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0.5rem;
+        margin-bottom: 1.5rem;
+    }
+    .stTabs [data-baseweb="tab"] {
+        padding: 0.5rem 1.5rem;
+        margin: 0;
+    }
+    .stButton > button {
+        margin: 0.5rem 0;
+    }
+    .stMarkdown {
+        margin: 0.75rem 0;
+    }
+    .stAlert {
+        margin: 1rem 0;
+    }
+    .stDataFrame {
+        margin: 1rem 0;
+    }
+    .stSelectbox, .stTextInput, .stTextArea {
+        margin-bottom: 1rem;
+    }
+    /* Hide horizontal dividers */
+    hr, .stHorizontal {
+        visibility: hidden;
+        height: 0 !important;
+        margin: 0.5rem 0 !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 st.set_page_config(
     page_title="Data Classification",
     page_icon="📊",
     layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 import pandas as pd
@@ -73,6 +113,7 @@ from src.services.classification_pipeline_service import (
     ai_assistant_service,
     ai_classification_service,
     discovery_service,
+    ai_sensitive_detection_service,
 )
 
 def _detect_sensitive_tables(database: str, schema: Optional[str] = None, sample_size: int = 1000) -> List[Dict[str, Any]]:
@@ -1307,23 +1348,13 @@ with tab_new:
                                 continue
                         # Synonym boosts for common phrases (PII/Financial/Regulatory)
                         try:
-                            syn_boosts = {
-                                "PII": [
-                                    "SOCIAL SECURITY", "SSN", "NATIONAL INSURANCE", "NINO", "CUSTOMER CONTACT",
-                                    "EMAIL", "E-MAIL", "PHONE", "CONTACT NUMBER", "ADDRESS", "DATE OF BIRTH", "DOB"
-                                ],
-                                "FINANCIAL": [
-                                    "GL", "LEDGER", "INVOICE", "ACCOUNT NUMBER", "BANK", "IBAN", "SWIFT",
-                                    "TRANSACTION", "PAYMENT", "BALANCE", "CREDIT", "DEBIT"
-                                ],
-                                "REGULATORY": ["GDPR", "CCPA", "HIPAA", "PCI DSS", "REGULATORY", "COMPLIANCE"],
-                                "PCI": ["CREDIT CARD", "CARDHOLDER", "PAN", "CVV", "EXPIRY"],
-                                "SOX": ["SOX", "FINANCIAL REPORT", "AUDIT", "IFRS", "GAAP"],
-                            }
-                            for cat, phrases in syn_boosts.items():
+                            # Dynamic Synonym boosting from SENSITIVE_KEYWORDS table
+                            syn_boosts = getattr(ai_sensitive_detection_service, 'syn_boosts', {})
+                            for cat, phrases in (syn_boosts or {}).items():
                                 for phrase in phrases:
                                     if phrase in t_up:
-                                        base = 0.85 if phrase in ("SOCIAL SECURITY", "SSN", "ACCOUNT NUMBER", "CREDIT CARD", "PAN") else 0.7
+                                        # Use high baseline for direct keyword matches found in context
+                                        base = 0.85 if any(x in phrase for x in ("SOCIAL SECURITY", "SSN", "ACCOUNT NUMBER", "CREDIT CARD", "PAN")) else 0.75
                                         scores[cat] = max(scores.get(cat, 0.0), base)
                         except Exception:
                             pass
@@ -1423,31 +1454,60 @@ with tab_new:
                     if len(context_txt) < 5:
                         errs.append("BUSINESS_CONTEXT too short")
 
-                    # Semantic detection
-                    scores = _semantic_from_context(context_txt)
-                    # Merge with table-level detection (optional boost)
+                    # Hybrid Rule-Based & AI Detection (Integrated Pipeline)
+                    suggestion = {}
                     try:
                         parts = [p.strip('"') for p in full.split('.')]
                         if len(parts) == 3:
                             db, sc, tb = parts
-                            dets = ai_sensitive_detection_service.detect_sensitive_columns(db, sc, tb)
-                            cat_set = set()
-                            for d in (dets or []):
-                                for t in (getattr(d, 'detected_categories', []) or []):
-                                    cat_set.add(str(t).upper())
-                            for cat in cat_set:
-                                scores[cat] = max(scores.get(cat, 0.0), 0.7)  # reinforcement
+                            # get_bulk_suggestions runs keywords, patterns, sampling, source rules, and existing tags
+                            suggestion = ai_sensitive_detection_service.get_bulk_suggestions(db, sc, tb)
                     except Exception:
                         pass
                     
-                    # Normalize category to PII, SOX, SOC2
+                    # Hybrid Detection: Use both Context and Rationale for better coverage
+                    combined_text = f"{context_txt} {rationale}".strip()
+                    scores = _semantic_from_context(combined_text)
+                    
+                    # Manual CIA reinforcement: If user provided CIA values but context is vague, 
+                    # use the CIA levels to back-fill or boost expected categories.
+                    if c_raw is not None or i_raw is not None or a_raw is not None:
+                         # Heuristic: C=3 -> Highly Sensitive (typically PII/SOC2), C=2 -> Restricted (SOX)
+                         if c_raw == 3:
+                             scores["PII"] = max(scores.get("PII", 0.0), 0.7)
+                         elif c_raw == 2:
+                             scores["SOX"] = max(scores.get("SOX", 0.0), 0.6)
+                    
+                    # Reinforce with pipeline results
+                    if suggestion:
+                         cat_u = str(suggestion.get('Category', '')).upper()
+                         if cat_u and cat_u != 'INTERNAL':
+                              scores[cat_u] = max(scores.get(cat_u, 0.0), float(suggestion.get('Confidence', 0.7)))
+                         
+                         # Add column-level category reinforcements if any
+                         for d in (suggestion.get('column_results', []) or []):
+                              for t in (getattr(d, 'detected_categories', []) or []):
+                                   if isinstance(t, dict):
+                                        c_up = str(t.get('category', '')).upper()
+                                        if c_up:
+                                             scores[c_up] = max(scores.get(c_up, 0.0), float(t.get('confidence', 0.6)))
+                    
+                    # Normalize category to PII, SOX, SOC2 using dynamic governance mapping
                     def _normalize_category(c: str) -> str:
-                        u = str(c).upper().strip()
-                        if u in ("PII", "PERSONAL", "GDPR", "CCPA", "HIPAA"):
+                        if not c: return None
+                        u = str(c).upper().replace("_", " ").replace("-", " ").strip()
+                        
+                        # 1. Check direct dynamic mapping from SENSITIVITY_CATEGORIES / SENSITIVE_KEYWORDS
+                        policy_map = getattr(ai_sensitive_detection_service, 'policy_map', {})
+                        if u in policy_map:
+                            return policy_map[u]
+                        
+                        # 2. Hardcoded fallback for common terms if mapping is missing
+                        if any(x in u for x in ("PII", "PERSONAL", "GDPR", "CCPA", "HIPAA", "SENSITIVE", "EMAIL", "PHONE", "ADDRESS", "SSN")):
                             return "PII"
-                        if u in ("FINANCIAL", "SOX", "PCI", "PCI DSS", "CREDIT CARD", "BANKING"):
+                        if any(x in u for x in ("FINANCIAL", "SOX", "PCI", "CREDIT CARD", "BANKING", "REVENUE", "LEDGER", "INVOICE")):
                             return "SOX"
-                        if u in ("SOC2", "SOC", "TYPE2", "TYPE 2", "SECURITY", "AUDIT"):
+                        if any(x in u for x in ("SOC2", "SOC", "TYPE2", "SECURITY", "AUDIT", "SOC32")):
                             return "SOC2"
                         return None
 
@@ -1472,9 +1532,15 @@ with tab_new:
                         c_def, i_def, a_def = _map_category_to_cia(str(top_cat).upper())
                     else:
                         c_def, i_def, a_def = (1,1,1)
-                    c_s = c_raw if c_raw is not None else c_def
-                    i_s = i_raw if i_raw is not None else i_def
-                    a_s = a_raw if a_raw is not None else a_def
+                        
+                    # Suggested CIA: Pipeline suggestion takes priority over basic defaults
+                    sug_c = suggestion.get('c', c_def)
+                    sug_i = suggestion.get('i', i_def)
+                    sug_a = suggestion.get('a', a_def)
+                    
+                    c_s = c_raw if c_raw is not None else sug_c
+                    i_s = i_raw if i_raw is not None else sug_i
+                    a_s = a_raw if a_raw is not None else sug_a
                     # Enforce policy minimums based on any detected categories (not just top category)
                     try:
                         detected_keys = {str(k).upper() for k in (scores or {}).keys()}
@@ -1519,12 +1585,28 @@ with tab_new:
                     if label_s in ("Restricted","Confidential") and not rationale:
                         errs.append("BUSINESS_RATIONALE required for Restricted/Confidential")
 
+                    # Determine the best display category (prioritize PII/SOX/SOC2)
+                    display_cat = top_cat
+                    if not display_cat:
+                        # 1. Fallback to normalized pipeline suggestion
+                        comp = suggestion.get('Compliance')
+                        if comp and comp not in ('NONE', 'NORMAL', 'INTERNAL', 'NON_SENSITIVE'):
+                             display_cat = _normalize_category(comp)
+                        if not display_cat:
+                             display_cat = _normalize_category(suggestion.get('Category'))
+                        
+                        # 2. Final Fallback: If user provided a high CIA level manually, ensure display reflects that
+                        if not display_cat and c_raw is not None:
+                             if c_raw >= 3: display_cat = "PII"
+                             elif c_raw == 2: display_cat = "SOX"
+                    
                     rows_view.append({
                         "FULL_NAME": full,
                         "OWNER_EMAIL": owner_email,
                         "BUSINESS_CONTEXT": context_txt,
-                        "AUTO_CATEGORY": top_cat or "INTERNAL",
-                        "CONFIDENCE": round(float(top_score or 0.0), 3),
+                        "AUTO_CATEGORY": display_cat or "INTERNAL",
+                        "CONFIDENCE": round(float(top_score or suggestion.get('Confidence', 0.0)), 3),
+                        "COMPLIANCE": suggestion.get('Compliance', 'NONE'),
                         "SUGGESTED_C": int(c_s),
                         "SUGGESTED_I": int(i_s),
                         "SUGGESTED_A": int(a_s),
@@ -1541,7 +1623,9 @@ with tab_new:
                         bad_rows.append(full)
 
                 vdf = _pd.DataFrame(rows_view)
-                st.dataframe(vdf, use_container_width=True)
+                # Display only the relevant columns to the user
+                _preview_cols = [c for c in vdf.columns if c not in ["CONFIDENCE", "COMPLIANCE"]]
+                st.dataframe(vdf[_preview_cols], use_container_width=True)
                 st.caption("Rows with errors cannot be submitted. Routes: AUTO_APPROVE, EXPEDITED (1 day), STANDARD (2 days), ENHANCED (committee)")
 
                 can_submit = not vdf.empty and all(not str(e or "").strip() for e in vdf["ERRORS"].tolist())
@@ -1591,6 +1675,7 @@ with tab_new:
                                     "CONFIDENTIALITY_LEVEL": str(c_s),
                                     "INTEGRITY_LEVEL": str(i_s),
                                     "AVAILABILITY_LEVEL": str(a_s),
+                                    "COMPLIANCE_FRAMEWORKS": str(rr.get("COMPLIANCE") or "NONE"),
                                 }
                                 
                                 if route == "AUTO_APPROVE":
@@ -1607,7 +1692,7 @@ with tab_new:
                                                 label=lbl,
                                                 c=int(c_s), i=int(i_s), a=int(a_s),
                                                 rationale=rationale,
-                                                details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE")},
+                                                details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE"), "compliance": rr.get("COMPLIANCE")},
                                                 database=_bulk_db
                                             )
                                         except Exception:
@@ -1631,7 +1716,7 @@ with tab_new:
                                             label=lbl,
                                             c=int(c_s), i=int(i_s), a=int(a_s),
                                             rationale=rationale or f"Routed to {route}",
-                                            details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE")},
+                                            details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE"), "compliance": rr.get("COMPLIANCE")},
                                             database=_bulk_db
                                         )
                                         try:
@@ -1676,6 +1761,7 @@ with tab_new:
                                     "CONFIDENTIALITY_LEVEL": str(c_s),
                                     "INTEGRITY_LEVEL": str(i_s),
                                     "AVAILABILITY_LEVEL": str(a_s),
+                                    "COMPLIANCE_FRAMEWORKS": str(rr.get("COMPLIANCE") or "NONE"),
                                 }
                                 if route == "AUTO_APPROVE":
                                     try:
@@ -1693,7 +1779,7 @@ with tab_new:
                                             label=lbl,
                                             c=int(c_s), i=int(i_s), a=int(a_s),
                                             rationale=rationale,
-                                            details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE")},
+                                            details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE"), "compliance": rr.get("COMPLIANCE")},
                                             database=_bulk_db
                                         )
                                     except Exception:
@@ -1713,7 +1799,7 @@ with tab_new:
                                             label=lbl,
                                             c=int(c_s), i=int(i_s), a=int(a_s),
                                             rationale=rationale or f"Routed to {route}",
-                                            details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE")},
+                                            details={"route": route, "auto_category": rr.get("AUTO_CATEGORY"), "confidence": rr.get("CONFIDENCE"), "compliance": rr.get("COMPLIANCE")},
                                             database=_bulk_db
                                         )
                                     except Exception:
@@ -2121,7 +2207,13 @@ with tab_new:
                                                                     else:
                                                                         try:
                                                                             _cds.record(sel_tbl + "." + str(sel_col), 'USER_OVERRIDE', 'AI_ASSISTANT_OVERRIDE', 'Approved', ov_l, ov_c, ov_i, ov_a, ov_just, {'original': lbl_col})
-                                                                            _tag_svc.apply_tags_to_column(sel_tbl, sel_col, {'DATA_CLASSIFICATION': ov_l, 'CONFIDENTIALITY_LEVEL': str(ov_c), 'INTEGRITY_LEVEL': str(ov_i), 'AVAILABILITY_LEVEL': str(ov_a)})
+                                                                            _tag_svc.apply_tags_to_column(sel_tbl, sel_col, {
+                                                                                'DATA_CLASSIFICATION': ov_l,
+                                                                                'CONFIDENTIALITY_LEVEL': str(ov_c),
+                                                                                'INTEGRITY_LEVEL': str(ov_i),
+                                                                                'AVAILABILITY_LEVEL': str(ov_a),
+                                                                                'COMPLIANCE_FRAMEWORKS': ''
+                                                                            })
                                                                             _aud.log(st.session_state.get("user"), "AI_OVERRIDE_APPLIED", "COLUMN", sel_tbl + "." + str(sel_col), {"old": lbl_col, "new": ov_l})
                                                                             st.success(f"Override applied to {sel_col}")
                                                                             st.session_state.pop(f"ovr_mode_{sel_col}", None)
@@ -2137,7 +2229,13 @@ with tab_new:
                                                                     _aud.log('AI_ASSISTANT','AI_COL_TAG_QUEUED','ASSET',sel_tbl,{'column':sel_col,'label':lbl_col})
                                                                     st.info(f"Queued for review (High Risk): {sel_col}")
                                                                 else:
-                                                                    _tag_svc.apply_tags_to_column(sel_tbl, sel_col, {'DATA_CLASSIFICATION': lbl_col, 'CONFIDENTIALITY_LEVEL': str(c_val), 'INTEGRITY_LEVEL': str(i_val), 'AVAILABILITY_LEVEL': str(a_val)})
+                                                                    _tag_svc.apply_tags_to_column(sel_tbl, sel_col, {
+                                                                        'DATA_CLASSIFICATION': lbl_col,
+                                                                        'CONFIDENTIALITY_LEVEL': str(c_val),
+                                                                        'INTEGRITY_LEVEL': str(i_val),
+                                                                        'AVAILABILITY_LEVEL': str(a_val),
+                                                                        'COMPLIANCE_FRAMEWORKS': ''
+                                                                    })
                                                                     _cds.record(sel_tbl + "." + str(sel_col), 'AI_ASSISTANT', 'AI_ASSISTANT', 'Approved', lbl_col, int(c_val), int(i_val), int(a_val), "AI Approved")
                                                                     _aud.log('AI_ASSISTANT','AI_COL_TAG_APPLIED','ASSET',sel_tbl,{'column':sel_col,'label':lbl_col})
                                                                     st.success(f"Approved and applied tag to {sel_col}")
@@ -2994,11 +3092,15 @@ with tab_new:
         st.markdown("#### Guided Classification Workflow")
         # Snowflake ops via services
         def _sf_apply_tags(asset_full_name: str, tags: dict):
-            """Apply tags to a Snowflake object using tagging service or direct ALTER statements."""
+            """Apply tags to a Snowflake object using tagging service with error reporting."""
             try:
-                tagging_service.apply_tags_to_object(asset_full_name, tags)  # real service call
-            except Exception:
-                pass
+                if tagging_service:
+                    tagging_service.apply_tags_to_object(asset_full_name, "TABLE", tags)
+                else:
+                    st.error("Tagging service is not initialized.")
+            except Exception as e:
+                st.error(f"Snowflake Tag Application Failed: {e}")
+                logger.error(f"Error applying tags to {asset_full_name}: {e}")
 
         def _sf_audit_log_classification(asset_full_name: str, event_type: str, details: dict):
             """Audit log wrapper."""
@@ -3308,6 +3410,7 @@ with tab_new:
                 st.session_state["nc_c"] = c_q
                 st.session_state["nc_i"] = i_q
                 st.session_state["nc_a"] = a_q
+                st.session_state["nc_compliance_frameworks"] = ", ".join(_comp_fw) if _comp_fw else ""
                 st.session_state["nc_c_answers"] = {
                     "unauthorized_view": str(c_q_unauth),
                     "pii_present": str(c_q_pii),
@@ -3530,13 +3633,11 @@ with tab_new:
                         classification_date = date.today().isoformat()
                         review_date = (date.today() + timedelta(days=365)).isoformat()
                         tags = {
-                            "data_classification": final_label,
-                            "confidentiality_level": f"C{int(st.session_state.get('nc_c', 0))}",
-                            "integrity_level": f"I{int(st.session_state.get('nc_i', 0))}",
-                            "availability_level": f"A{int(st.session_state.get('nc_a', 0))}",
-                            "business_owner": owner,
-                            "classification_date": classification_date,
-                            "review_date": review_date,
+                            "DATA_CLASSIFICATION": final_label,
+                            "CONFIDENTIALITY_LEVEL": f"C{int(st.session_state.get('nc_c', 0))}",
+                            "INTEGRITY_LEVEL": f"I{int(st.session_state.get('nc_i', 0))}",
+                            "AVAILABILITY_LEVEL": f"A{int(st.session_state.get('nc_a', 0))}",
+                            "COMPLIANCE_FRAMEWORKS": st.session_state.get("nc_compliance_frameworks", ""),
                         }
                         # Persist detailed answers to audit trail
                         _sf_audit_log_classification(sel_asset_nc, "SUBMIT_FOR_APPROVAL", {
@@ -3638,205 +3739,126 @@ with tab_new:
 
         # Final Tagging Review under Guided Workflow
         if valid_asset_selected and st.session_state.get("nc_c") is not None:
-            try:
-                import json as _json
-            except Exception:
-                _json = None
             # Recompute asset-scoped key id
             try:
                 import re as _re
                 _aid2 = _re.sub(r"[^A-Za-z0-9_]", "_", str(sel_asset_nc))
             except Exception:
                 _aid2 = str(sel_asset_nc).replace('.', '_').replace('-', '_').replace(' ', '_')
+            
+            st.markdown("---")
             st.markdown("#### ✅ Ready to Apply?")
-            st.caption("Here is how we will tag this asset in Snowflake based on your inputs.")
             
             # Pull CIA and Labels
             _c_val = int(st.session_state.get("nc_c", 1))
             _i_val = int(st.session_state.get("nc_i", 1))
             _a_val = int(st.session_state.get("nc_a", 1))
-            _default_label = ["Public","Internal","Restricted","Confidential"][max(_c_val, _i_val, _a_val)]
             
-            col_t1, col_t2 = st.columns(2)
-            with col_t1:
-                _cls_choice = st.selectbox(
-                    "Classification Label",
-                    options=ALLOWED_CLASSIFICATIONS,
-                    index=(ALLOWED_CLASSIFICATIONS.index(_default_label) if _default_label in ALLOWED_CLASSIFICATIONS else 1),
-                    key=f"nc_final_cls_{_aid2}"
-                )
-                st.metric("Confidentiality", f"Level {_c_val}")
-            with col_t2:
-                st.metric("Integrity", f"Level {_i_val}")
-                st.metric("Availability", f"Level {_a_val}")
+            def _get_label_pkg(c, i, a):
+                mx = max(int(c), int(i), int(a))
+                if mx == 0: return "🟢 Public", "Low risk; no restrictions."
+                if mx == 1: return "🟡 Internal", "Default; for company use only."
+                if mx == 2: return "🟠 Restricted", "Sensitive; authorized access only."
+                return "🔴 Confidential", "Highly sensitive; PII/PHI/Financial data."
 
-            # Recompute tags based on selection
-            try:
-                _tags_preview = tagging_service.suggest_tags_from_criteria(_cls_choice, _c_val, _i_val, _a_val) if tagging_service else {}
-            except Exception:
-                _tags_preview = {
-                    "DATA_CLASSIFICATION": _cls_choice,
-                    "CONFIDENTIALITY_LEVEL": str(_c_val),
-                    "INTEGRITY_LEVEL": str(_i_val),
-                    "AVAILABILITY_LEVEL": str(_a_val),
-                }
-
-            # Persistence Metadata
-            try:
-                _meta_details = {
-                    "guided_workflow": True,
-                    "draft_id": _aid2,
-                    "ai_categories": st.session_state.get("nc_ai_categories", []),
-                    "answers": {
-                        "confidentiality": st.session_state.get("nc_c_answers", {}),
-                        "integrity": st.session_state.get("nc_i_answers", {}),
-                        "availability": st.session_state.get("nc_a_answers", {}),
-                    }
-                }
-            except Exception:
-                pass
-
-            # Specials
-            try:
-                _ai_specials = st.session_state.get("nc_ai_categories") or []
-                if _ai_specials:
-                    st.info(f"**Special Categories Detected**: {', '.join([str(s) for s in _ai_specials])}")
-                    _tags_preview["SPECIAL_CATEGORY"] = ",".join([str(s) for s in _ai_specials])
-            except Exception:
-                pass
-
-            st.markdown("---")
-            _rat2 = st.text_input("📝 Why did you choose this classification? (Required for audit)", key=f"nc_final_rat_{_aid2}")
+            _lbl_disp, _lbl_desc = _get_label_pkg(_c_val, _i_val, _a_val)
             
-            # Scheduling (hidden by default)
-            with st.expander("🕒 Schedule for Later"):
-                sc1, sc2 = st.columns([1,1])
-                with sc1:
-                    _sched_date2 = st.date_input("Apply date", key=f"nc_final_date_{_aid2}")
-                with sc2:
-                    _sched_time2 = st.time_input("Apply time", key=f"nc_final_time_{_aid2}")
+            # Summary Card
+            st.markdown(f"""
+            <div style="background-color: #1e293b; padding: 1.5rem; border-radius: 0.75rem; border-left: 6px solid #3b82f6; margin-bottom: 1.5rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <h3 style="margin: 0; color: #f8fafc;">Proposed: {_lbl_disp}</h3>
+                        <p style="margin: 0.5rem 0 0 0; color: #94a3b8; font-size: 0.9rem;">{_lbl_desc}</p>
+                    </div>
+                    <div style="text-align: right;">
+                        <span style="background: #334155; padding: 0.4rem 0.8rem; border-radius: 2rem; font-family: monospace; font-weight: bold; color: #3b82f6;">
+                            C{_c_val} / I{_i_val} / A{_a_val}
+                        </span>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-            b1, b2 = st.columns([1,1])
-            with b1:
-                if st.button("🚀 Apply Tags Now", type="primary", key=f"nc_final_apply_{_aid2}"):
-                    if not _rat2.strip():
-                        st.error("Rationale is required for audit logging.")
-                    else:
-                        try:
-                            if not authz.can_apply_tags_for_object(sel_asset_nc, object_type="TABLE"):
-                                st.error("Insufficient privileges to apply tags (ALTER/OWNERSHIP required).")
-                            else:
-                                tagging_service.apply_tags_to_object(sel_asset_nc, "TABLE", _tags_preview)
-                                st.success("Tags applied.")
-                                # Audit
-                                try:
-                                    ident = authz.get_current_identity()
-                                    user_id = getattr(ident, "user", None)
-                                except Exception:
-                                    user_id = None
-                                actor = str(user_id or st.session_state.get("user") or "user")
-                                
-                                # Resolve database for persistence
-                                _db_arg = sel_asset_nc.split('.')[0] if '.' in sel_asset_nc else None
-                                
-                                try:
-                                    classification_decision_service.record(
-                                        asset_full_name=sel_asset_nc,
-                                        decision_by=actor,
-                                        source="GUIDED_TAG_APPLY",
-                                        status="Applied",
-                                        label=str(_cls_choice),
-                                        c=int(_c_val), i=int(_i_val), a=int(_a_val),
-                                        rationale=str(_rat2).strip(),
-                                        details={
-                                            "scope": "TABLE", 
-                                            "tags": _tags_preview,
-                                            "meta": _meta_details if '_meta_details' in locals() else {}
-                                        },
-                                        database=_db_arg
-                                    )
-                                    st.success("Guided Classification decision saved successfully.")
-                                except Exception as e:
-                                    st.error(f"Audit Persistence Failed: {e}")
-                        except Exception as e:
-                            st.error(f"Failed to apply tags: {e}")
-            with b2:
-                if st.button("Schedule for later", key=f"nc_final_sched_{_aid2}"):
-                    try:
-                        _dt2 = None
-                        try:
-                            import datetime as _dtm
-                            if _sched_date2 and _sched_time2:
-                                _dt2 = _dtm.datetime.combine(_sched_date2, _sched_time2)
-                        except Exception:
-                            _dt2 = None
-                        if _dt2 is None:
-                            st.error("Please pick a valid date and time to schedule.")
+            # Action Buttons
+            c1, c2, c3 = st.columns(3)
+            do_approve = c1.button("✅ Approve & Apply", key=f"gu_app_{_aid2}", use_container_width=True, type="primary")
+            do_modify = c2.button("✏️ Override / Edit", key=f"gu_mod_{_aid2}", use_container_width=True)
+            do_escalate = c3.button("🚩 Escalate Review", key=f"gu_esc_{_aid2}", use_container_width=True)
+
+            # Persistence for override mode
+            if do_modify:
+                st.session_state[f"gu_ovr_mode_{_aid2}"] = True
+
+            # Override UI
+            if st.session_state.get(f"gu_ovr_mode_{_aid2}"):
+                with st.expander("Override Classification", expanded=True):
+                    ov_col1, ov_col2 = st.columns([2, 1])
+                    with ov_col1:
+                        _final_label = st.selectbox("Final Label", ["Public", "Internal", "Restricted", "Confidential"], index=(["Public", "Internal", "Restricted", "Confidential"].index(_lbl_disp.split(' ')[1]) if ' ' in _lbl_disp else 1), key=f"gu_ov_l_{_aid2}")
+                        _final_rat = st.text_area("Justification (Required)", placeholder="Provide a reason for the override...", key=f"gu_ov_j_{_aid2}")
+                    with ov_col2:
+                        _final_c = st.number_input("C", 0, 3, _c_val, key=f"gu_ov_c_{_aid2}")
+                        _final_i = st.number_input("I", 0, 3, _i_val, key=f"gu_ov_i_{_aid2}")
+                        _final_a = st.number_input("A", 0, 3, _a_val, key=f"gu_ov_a_{_aid2}")
+                    
+                    if st.button("Apply Manual Classification", key=f"gu_ov_sub_{_aid2}", type="primary", use_container_width=True):
+                        if not _final_rat.strip():
+                            st.error("Please provide a justification.")
                         else:
                             try:
-                                db2 = sel_asset_nc.split('.')[0]
-                            except Exception:
-                                db2 = None
-                            gov_schema2 = st.session_state.get("governance_schema") or "DATA_CLASSIFICATION_GOVERNANCE"
-                            try:
-                                _tags_json2 = _json.dumps(_tags_preview) if _json else str(_tags_preview)
-                            except Exception:
-                                _tags_json2 = str(_tags_preview)
-                            if db2:
-                                try:
-                                    snowflake_connector.execute_non_query(
-                                        f"""
-                                        create schema if not exists {db2}.{gov_schema2};
-                                        create table if not exists {db2}.{gov_schema2}.TAG_APPLY_QUEUE (
-                                          ID string,
-                                          ASSET_FULL_NAME string,
-                                          SCOPE string,
-                                          COLUMN_NAME string,
-                                          TAGS_JSON string,
-                                          APPLY_AT timestamp_ntz,
-                                          STATUS string,
-                                          CREATED_BY string,
-                                          CREATED_AT timestamp_ntz
-                                        );
-                                        insert into {db2}.{gov_schema2}.TAG_APPLY_QUEUE
-                                          (ID, ASSET_FULL_NAME, SCOPE, COLUMN_NAME, TAGS_JSON, APPLY_AT, STATUS, CREATED_BY, CREATED_AT)
-                                        select UUID_STRING(), %(full)s, 'TABLE', NULL, %(tags)s, %(at)s, 'PENDING', %(by)s, CURRENT_TIMESTAMP;
-                                        """,
-                                        {"full": sel_asset_nc, "tags": _tags_json2, "at": _dt2.isoformat(), "by": str(st.session_state.get("user") or "user")}
-                                    )
-                                    st.success("Tag application scheduled.")
-                                    
-                                    # Persist decision for scheduled action
-                                    try:
-                                        # We emulate the actor lookup again locally
-                                        _ident_s = authz.get_current_identity()
-                                        _actor_s = str(getattr(_ident_s, "user", None) or st.session_state.get("user") or "user")
-                                        
-                                        classification_decision_service.record(
-                                            asset_full_name=sel_asset_nc,
-                                            decision_by=_actor_s,
-                                            source="GUIDED_TAG_SCHEDULE",
-                                            status="Scheduled",
-                                            label=str(_cls_choice),
-                                            c=int(_c_val), i=int(_i_val), a=int(_a_val),
-                                            rationale=str(_rat2).strip() or "Scheduled tagging",
-                                            details={
-                                                "scope": "TABLE",
-                                                "tags": _tags_preview,
-                                                "scheduled_at": _dt2.isoformat(),
-                                                "meta": _meta_details if '_meta_details' in locals() else {}
-                                            },
-                                            database=db2
-                                        )
-                                        st.success("Guided Classification decision saved successfully.")
-                                    except Exception as e:
-                                        st.error(f"Audit Persistence Failed: {e}")
-                                except Exception as e:
-                                    st.error(f"Failed to schedule tag apply: {e}")
-                            else:
-                                st.error("Cannot resolve database from asset name.")
-                    except Exception as e:
-                        st.error(f"Schedule flow error: {e}")
+                                _tags = {
+                                    "DATA_CLASSIFICATION": _final_label,
+                                    "CONFIDENTIALITY_LEVEL": f"C{_final_c}",
+                                    "INTEGRITY_LEVEL": f"I{_final_i}",
+                                    "AVAILABILITY_LEVEL": f"A{_final_a}",
+                                    "COMPLIANCE_FRAMEWORKS": st.session_state.get("nc_compliance_frameworks", ""),
+                                }
+                                tagging_service.apply_tags_to_object(sel_asset_nc, "TABLE", _tags)
+                                classification_workflow_service.record_decision(
+                                    asset_full_name=sel_asset_nc, decision_by=str(st.session_state.get("user") or "user"),
+                                    source="GUIDED_OVERRIDE", status="Applied", label=_final_label, c=_final_c, i=_final_i, a=_final_a, rationale=_final_rat
+                                )
+                                st.success("Manual tags applied successfully!")
+                                st.session_state.pop(f"gu_ovr_mode_{_aid2}", None)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+
+            if do_approve:
+                try:
+                    _clean_label = _lbl_disp.split(' ')[1] if ' ' in _lbl_disp else "Internal"
+                    _tags = {
+                        "DATA_CLASSIFICATION": _clean_label,
+                        "CONFIDENTIALITY_LEVEL": f"C{_c_val}",
+                        "INTEGRITY_LEVEL": f"I{_i_val}",
+                        "AVAILABILITY_LEVEL": f"A{_a_val}",
+                        "COMPLIANCE_FRAMEWORKS": st.session_state.get("nc_compliance_frameworks", ""),
+                    }
+                    tagging_service.apply_tags_to_object(sel_asset_nc, "TABLE", _tags)
+                    classification_workflow_service.record_decision(
+                        asset_full_name=sel_asset_nc, decision_by=str(st.session_state.get("user") or "user"),
+                        source="GUIDED_APPROVE", status="Applied", label=_clean_label, c=_c_val, i=_i_val, a=_a_val, rationale="Guided assessment approved"
+                    )
+                    st.toast("✅ Classification applied!", icon="✅")
+                    st.balloons()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+
+            if do_escalate:
+                try:
+                    _clean_label = _lbl_disp.split(' ')[1] if ' ' in _lbl_disp else "Internal"
+                    classification_workflow_service.record_decision(
+                        asset_full_name=sel_asset_nc, decision_by=str(st.session_state.get("user") or "user"),
+                        source="GUIDED_ESCALATE", status="Submitted", label=_clean_label, c=_c_val, i=_i_val, a=_a_val, rationale="User requested manual review"
+                    )
+                    st.info("Escalated to governance team.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+            # Navigation / Completion message if needed
+            pass
                     # Removed st.rerun() to prevent no-op warning
 
 
@@ -5046,10 +5068,11 @@ if False:
                             label = str(r.get("LABEL") or "Internal")
                             try:
                                 _sf_apply_tags(full, {
-                                    "data_classification": label,
-                                    "confidentiality_level": f"C{c}",
-                                    "integrity_level": f"I{i}",
-                                    "availability_level": f"A{a}",
+                                    "DATA_CLASSIFICATION": label,
+                                    "CONFIDENTIALITY_LEVEL": f"C{c}",
+                                    "INTEGRITY_LEVEL": f"I{i}",
+                                    "AVAILABILITY_LEVEL": f"A{a}",
+                                    "COMPLIANCE_FRAMEWORKS": str(r.get("COMPLIANCE") or "").strip(),
                                 })
                                 _sf_audit_log_classification(full, "BULK_CLASSIFICATION_APPLIED", {"label": label, "c": c, "i": i, "a": a})
                                 try:
@@ -5291,7 +5314,7 @@ with tab_tasks:
             st.info("No tasks found matching the selected filters.")
         else:
             # Display tasks in a clean table format
-            st.markdown("### My Classification Tasks")
+            st.markdown("#### My Tasks")
             st.caption("Tasks assigned to your user, email, or current role.")
             
             # Configure column display
@@ -5874,7 +5897,7 @@ with tab_tasks:
                     except Exception as e:
                         st.warning(f"Version history lookup failed: {e}")
                         st.caption("Ensure your history table has the required columns.")
-    # Reclassification Requests (placeholder)
+    # Reclassification tab (empty)
     with sub_reclass:
         st.markdown("#### Reclassification Requests")
         if render_reclassification_requests:
@@ -8931,6 +8954,7 @@ with tab1:
                             "CONFIDENTIALITY_LEVEL": str(int(c_val)),
                             "INTEGRITY_LEVEL": str(int(i_val)),
                             "AVAILABILITY_LEVEL": str(int(a_val)),
+                            "COMPLIANCE_FRAMEWORKS": ""
                         },
                     )
                     from src.services.classification_pipeline_service import discovery_service as _disc

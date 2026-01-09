@@ -902,7 +902,51 @@ class AIClassificationPipelineService:
             return []
 
     def render_classification_pipeline(self) -> None:
-        """Render the Automatic AI Classification Dashboard."""
+        """Render the complete AI Classification Pipeline sub-tab."""
+        # 1. Premium Visual Styling
+        st.markdown("""
+            <style>
+            /* Metric Styling */
+            [data-testid="stMetricValue"] {
+                font-size: 32px;
+                font-weight: 800;
+                letter-spacing: -0.025em;
+                color: #1e293b;
+            }
+            [data-testid="stMetricLabel"] {
+                font-weight: 600;
+                color: #64748b;
+                text-transform: uppercase;
+                font-size: 0.75rem;
+                letter-spacing: 0.05em;
+            }
+            /* Tab Styling */
+            .stTabs [data-baseweb="tab-list"] {
+                gap: 8px;
+                background-color: transparent;
+                border-bottom: 1px solid #e2e8f0;
+            }
+            .stTabs [data-baseweb="tab"] {
+                height: 48px;
+                padding: 0 16px;
+                font-weight: 600;
+                border: none;
+                background-color: transparent;
+            }
+            .stTabs [aria-selected="true"] {
+                color: #4f46e5 !important;
+                border-bottom: 3px solid #4f46e5 !important;
+            }
+            /* Card Containers */
+            div[data-testid="stVerticalBlock"] > div > div[data-testid="stMetric"] {
+                background-color: #f8fafc;
+                padding: 20px;
+                border-radius: 12px;
+                border: 1px solid #f1f5f9;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            }
+            </style>
+        """, unsafe_allow_html=True)
 
         # Initialize metadata if needed
         if not self._embed_ready or not self._category_centroids:
@@ -2048,24 +2092,173 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
 
 
         with tab2:
-            st.markdown("#### Risk Distribution")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**By Compliance Framework**")
-                if not df_filtered.empty:
-                    st.bar_chart(df_filtered["Compliance"].value_counts())
-                else:
-                    st.info("No data to display")
-            with c2:
-                st.markdown("**By Sensitivity Level**")
-                if not df_filtered.empty:
-                    st.bar_chart(df_filtered["Sensitivity"].value_counts())
-                else:
-                    st.info("No data to display")
+            st.markdown("### 🏹 Risk Intelligence Dashboard")
+            st.caption("Deep dive into data exposure risks, compliance hotspots, and security prioritization.")
             
-            st.markdown("#### Top High-Risk Tables")
-            # Use container width instead of invalid string width to avoid type errors
-            st.dataframe(top_tables, use_container_width=True)
+            if df_filtered.empty:
+                st.info("No data available to analyze risk distribution.")
+            else:
+                # 1. Primary Risk Metrics Row
+                rm_col1, rm_col2, rm_col3, rm_col4 = st.columns(4)
+                
+                with rm_col1:
+                    avg_risk = df_risk['Combined_Risk'].mean() if not df_risk.empty else 0
+                    st.metric("Avg Table Risk", f"{avg_risk:.2f}", help="Mean Risk Score across all scanned tables")
+                
+                with rm_col2:
+                    max_risk = df_risk['Combined_Risk'].max() if not df_risk.empty else 0
+                    st.metric("Max Asset Risk", f"{max_risk:.2f}", help="Highest risk score detected in any single asset")
+                
+                with rm_col3:
+                    # Risk Concentration: % of assets that are High/Critical
+                    if not df_risk.empty:
+                        high_risk_pct = (len(df_risk[df_risk['Risk_Level'].isin(['High', 'Critical'])]) / len(df_risk)) * 100
+                    else:
+                        high_risk_pct = 0
+                    st.metric("Risk Concentration", f"{high_risk_pct:.1f}%", help="Percentage of assets classified as High or Critical risk")
+                
+                with rm_col4:
+                    # Security Posture Score (100 - (Avg Risk / Max Possible Risk * 100))
+                    # Assuming 3.0 is max risk
+                    if not df_risk.empty:
+                        posture_score = max(0, 100 - (avg_risk / 3.0 * 100))
+                    else:
+                        posture_score = 100
+                    st.metric("Security Posture", f"{posture_score:.0f}/100", delta=None, help="Inverted risk score representing overall data safety")
+
+                st.divider()
+
+                # 2. Advanced Visualizations
+                v1, v2 = st.columns(2)
+                
+                # Attempt to use Altair for premium charts, fallback to Streamlit native
+                try:
+                    import altair as alt
+                    
+                    with v1:
+                        st.markdown("#### 🛡️ Compliance Hotspots")
+                        comp_counts = df_filtered["Compliance"].value_counts().reset_index()
+                        comp_counts.columns = ['Framework', 'Count']
+                        # Filter out empty/none
+                        comp_counts = comp_counts[comp_counts['Framework'].str.strip() != '']
+                        comp_counts = comp_counts[~comp_counts['Framework'].isin(['None', '-', 'UNKNOWN', 'NAN'])]
+                        
+                        if not comp_counts.empty:
+                            chart = alt.Chart(comp_counts).mark_bar(
+                                cornerRadiusTopLeft=5,
+                                cornerRadiusTopRight=5,
+                                color='#4f46e5'
+                            ).encode(
+                                x=alt.X('Framework:N', sort='-y', title=None, axis=alt.Axis(labelAngle=-45)),
+                                y=alt.Y('Count:Q', title="Affected Columns"),
+                                tooltip=['Framework', 'Count']
+                            ).properties(height=300)
+                            st.altair_chart(chart, use_container_width=True)
+                        else:
+                            st.info("Not enough categorical data for compliance visualization.")
+
+                    with v2:
+                        st.markdown("#### 🌡️ Sensitivity Distribution")
+                        sens_counts = df_filtered["Sensitivity"].value_counts().reset_index()
+                        sens_counts.columns = ['Level', 'Count']
+                        
+                        if not sens_counts.empty:
+                            pie = alt.Chart(sens_counts).mark_arc(innerRadius=60).encode(
+                                theta=alt.Theta(field="Count", type="quantitative"),
+                                color=alt.Color(field="Level", type="nominal", 
+                                              scale=alt.Scale(scheme='plasma'),
+                                              legend=alt.Legend(orient='bottom', title=None)),
+                                tooltip=['Level', 'Count']
+                            ).properties(height=300)
+                            st.altair_chart(pie, use_container_width=True)
+                        else:
+                            st.info("Not enough categorical data for sensitivity visualization.")
+                
+                except Exception as chart_err:
+                    logger.warning(f"Altair visualization failed: {chart_err}")
+                    with v1:
+                        st.markdown("#### 🛡️ Compliance Frameworks")
+                        st.bar_chart(df_filtered["Compliance"].value_counts())
+                        
+                    with v2:
+                        st.markdown("#### 🌡️ Sensitivity Levels")
+                        st.bar_chart(df_filtered["Sensitivity"].value_counts())
+
+                st.divider()
+
+                # 3. Prioritized Action Table
+                st.markdown("#### 🚩 High-Alert Assets (Top Risk Priority)")
+                
+                if not table_risk_agg.empty:
+                    # Enrich the display data
+                    display_tables = table_risk_agg.sort_values('Combined_Risk', ascending=False).head(15).copy()
+                    
+                    def get_status_info(score):
+                        if score >= 2.0: return "🔴 CRITICAL"
+                        if score >= 1.5: return "🟠 HIGH"
+                        if score >= 0.8: return "🟡 MEDIUM"
+                        return "🟢 LOW"
+                        
+                    display_tables['Alert Level'] = display_tables['Combined_Risk'].apply(get_status_info)
+                    
+                    # Columns: Table, Combined_Risk, Column, Alert Level
+                    # Column is 'Sensitive Columns' count
+                    
+                    st.data_editor(
+                        display_tables[['Table', 'Combined_Risk', 'Column', 'Alert Level']],
+                        column_config={
+                            "Table": st.column_config.TextColumn(
+                                "Asset Name",
+                                help="Fully qualified Snowflake table/view",
+                                width="large"
+                            ),
+                            "Combined_Risk": st.column_config.ProgressColumn(
+                                "Risk Index",
+                                help="Calculated Risk Weighted Score (0-3.0)",
+                                min_value=0,
+                                max_value=3.0,
+                                format="%.2f",
+                                width="medium"
+                            ),
+                            "Column": st.column_config.NumberColumn(
+                                "Sensitive Cols",
+                                help="Number of sensitive columns detected in table",
+                                format="%d"
+                            ),
+                            "Alert Level": st.column_config.TextColumn(
+                                "Action Priority",
+                                help="Recommended remediation timeline"
+                            )
+                        },
+                        hide_index=True,
+                        use_container_width=True,
+                        disabled=True,
+                        key="risk_priority_editor"
+                    )
+                else:
+                    st.info("Risk aggregation data is pending...")
+
+                st.divider()
+
+                # 4. Strategic Actions & Recommendations
+                st.markdown("#### 💡 Recommended Next Steps")
+                rec_col1, rec_col2 = st.columns(2)
+                
+                with rec_col1:
+                    st.markdown("""
+                        **Remediation Priority**
+                        1. 🔒 **Critical Assets**: Verify Row-Level Security (RLS) on tables with Risk Index > 2.0.
+                        2. 🏷️ **Tag Native Sync**: Ensure logical tags are synced to Snowflake for Policy enforcement.
+                        3. 🕵️ **Ownership Review**: Assign Data Stewards to top 15 high-risk tables.
+                    """)
+                
+                with rec_col2:
+                    st.markdown(f"""
+                        **Security Health Check**
+                        - **Data Volume**: Analyzing {total_items} sensitive columns.
+                        - **Risk Ceiling**: Highest table risk is {max_risk:.2f}/3.0.
+                        - **Focus Area**: {'Compliance review needed' if high_risk_pct > 20 else 'Steady security posture'}.
+                    """)
 
 
     def _check_keyword_exists(self, keyword: str) -> bool:
@@ -2432,46 +2625,69 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
 
 
 
+    def _ensure_ai_engine_ready(self) -> bool:
+        """
+        Lazily initialize the AI embedding engine if needed.
+        This moves the heavy model loading from startup to first-use.
+        """
+        if self._embed_ready and self._embedder is not None:
+            return True
+        
+        if SentenceTransformer is None:
+            logger.warning("SentenceTransformer not available. AI Engine cannot be initialized.")
+            return False
+            
+        try:
+            # We use an empty container to show a temporary status if called from UI
+            logger.info("🤖 Lazily initializing AI engine (SentenceTransformer)...")
+            # Using the smaller, faster model
+            self._model_name = 'sentence-transformers/all-MiniLM-L6-v2'
+            self._embedder = SentenceTransformer(self._model_name)
+            
+            # Dimension validation
+            tv = self._embedder.encode(["ok"], normalize_embeddings=True)
+            v0 = tv[0] if isinstance(tv, (list, tuple)) else tv
+            dim = int(getattr(v0, "shape", [0])[-1]) if hasattr(v0, "shape") else (len(v0) if isinstance(v0, (list, tuple)) else 0)
+            
+            if dim and dim > 0:
+                self._embed_backend = 'sentence-transformers'
+                self._embed_ready = True
+                
+                # REGENERATE proper centroids now that we have the real model
+                # This replaces the hash-based synthetic centroids with real AI vectors
+                logger.info("AI engine ready. Upgrading synthetic centroids to real embeddings...")
+                self._generate_centroids_from_view_data()
+                
+                logger.info(f"? AI Engine warmed up successfully. Dimension: {dim}")
+                return True
+            else:
+                self._embed_ready = False
+                logger.warning("? AI Engine dimension validation failed")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to lazy-load AI engine: {e}")
+            self._embedder = None
+            self._embed_backend = 'none'
+            self._embed_ready = False
+            return False
+
     def _init_local_embeddings(self) -> None:
         """
-        Initialize embeddings and load ALL classification metadata from governance tables.
-        This is the main entry point for metadata-driven classification.
+        Setup metadata and prepare for classification.
+        Heavy model loading is now LAZY (occurs on first scan).
         """
         try:
             if not hasattr(self, "_embed_cache") or self._embed_cache is None:
                 self._embed_cache = SimpleLRUCache(max_size=1000)
-            self._embed_ready = False
             
-            # Initialize SentenceTransformer embeddings
-            if SentenceTransformer is not None:
-                try:
-                    logger.info("Initializing SentenceTransformer embeddings (all-MiniLM-L6-v2) for Logic Optimization...")
-                    # Optimization #3: Switch to smaller model
-                    self._model_name = 'sentence-transformers/all-MiniLM-L6-v2'
-                    self._embedder = SentenceTransformer(self._model_name)
-                    tv = self._embedder.encode(["ok"], normalize_embeddings=True)
-                    v0 = tv[0] if isinstance(tv, (list, tuple)) else tv
-                    dim = int(getattr(v0, "shape", [0])[-1]) if hasattr(v0, "shape") else (len(v0) if isinstance(v0, (list, tuple)) else 0)
-                    if dim and dim > 0:
-                        self._embed_backend = 'sentence-transformers'
-                        self._embed_ready = True
-                        logger.info(f"? Embeddings initialized successfully. Backend: {self._embed_backend}, Dimension: {dim}")
-                    else:
-                        self._embedder = None
-                        self._embed_backend = 'none'
-                        logger.warning(f"? Embedding dimension validation failed: {dim}")
-                except Exception as _e:
-                    logger.warning(f"? Local embedding initialization failed: {_e}")
-                    self._embedder = None
-                    self._embed_backend = 'none'
-            else:
-                self._embedder = None
-                self._embed_backend = 'none'
-                logger.warning("? SentenceTransformer not available")
-        except Exception as _e2:
-            logger.warning(f"? Embedding setup error: {_e2}")
+            # Metadata is loaded now, but model is skipped
+            self._embed_ready = False
             self._embedder = None
             self._embed_backend = 'none'
+            
+            logger.info("Initializing metadata (AI model will load lazily on first scan)...")
+        except Exception as _e2:
+            logger.warning(f"? Metadata setup error: {_e2}")
             self._embed_ready = False
 
         # Load ALL metadata from governance views (100% data-driven)
@@ -2535,13 +2751,8 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         try:
             logger.info("Loading view-based governance rules from Snowflake...")
             
-            # Load all rules from views
+            # Load only required views (Optimized)
             self._classification_rules = self._rules_loader.load_classification_rules()
-            self._context_aware_rules = self._rules_loader.load_context_aware_rules()
-            self._tiebreaker_keywords = self._rules_loader.load_tiebreaker_keywords()
-            self._address_context_indicators = self._rules_loader.load_address_context_indicators()
-            self._exclusion_patterns = self._rules_loader.load_exclusion_patterns()
-            self._policy_group_keywords = self._rules_loader.load_policy_group_keywords()
             self._category_metadata = self._rules_loader.load_category_metadata()
             
             # Mark as loaded
@@ -2549,21 +2760,11 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
             
             # Log summary
             logger.info(f"? Loaded {len(self._classification_rules)} classification rules")
-            logger.info(f"? Loaded {sum(len(v) for v in self._context_aware_rules.values())} context-aware rules across {len(self._context_aware_rules)} types")
-            logger.info(f"? Loaded {sum(len(v) for v in self._tiebreaker_keywords.values())} tiebreaker keywords across {len(self._tiebreaker_keywords)} policy groups")
-            logger.info(f"? Loaded {len(self._address_context_indicators)} address context indicators")
-            logger.info(f"? Loaded {len(self._exclusion_patterns)} exclusion patterns")
-            logger.info(f"? Loaded {sum(len(v) for v in self._policy_group_keywords.values())} policy group keywords")
             logger.info(f"? Loaded {len(self._category_metadata)} category metadata records")
             
             # Cache the results
             st.session_state[cache_key] = {
                 'classification_rules': self._classification_rules,
-                'context_aware_rules': self._context_aware_rules,
-                'tiebreaker_keywords': self._tiebreaker_keywords,
-                'address_context_indicators': self._address_context_indicators,
-                'exclusion_patterns': self._exclusion_patterns,
-                'policy_group_keywords': self._policy_group_keywords,
                 'category_metadata': self._category_metadata
             }
             
@@ -5063,24 +5264,36 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                 logger.warning("No governance database configured")
                 return pd.DataFrame()
 
-            # First, check which columns exist in CLASSIFICATION_AI_RESULTS
-            try:
-                col_check_query = f"""
-                    SELECT COLUMN_NAME
-                    FROM {gov_db}.INFORMATION_SCHEMA.COLUMNS
-                    WHERE TABLE_SCHEMA = 'DATA_CLASSIFICATION_GOVERNANCE'
-                      AND TABLE_NAME = 'CLASSIFICATION_AI_RESULTS'
-                """
-                available_cols = snowflake_connector.execute_query(col_check_query) or []
-                col_names = {str(c.get('COLUMN_NAME', '')).upper() for c in available_cols}
-                
-                has_schema_name = 'SCHEMA_NAME' in col_names
-                has_sens_cat_id = 'SENSITIVITY_CATEGORY_ID' in col_names
-                
-                logger.info(f"CLASSIFICATION_AI_RESULTS columns: SCHEMA_NAME={has_schema_name}, SENSITIVITY_CATEGORY_ID={has_sens_cat_id}")
-            except Exception as col_err:
-                logger.warning(f"Could not check columns: {col_err}. Using defaults.")
-                has_schema_name = has_sens_cat_id = False
+            # PERFORMANCE: Cache column existence in session state to avoid repeated Information Schema queries
+            cache_col_key = f"db_cols_{gov_db}_classification_ai_results"
+            if cache_col_key in st.session_state:
+                metadata = st.session_state[cache_col_key]
+                has_schema_name = metadata.get('has_schema_name', False)
+                has_sens_cat_id = metadata.get('has_sens_cat_id', False)
+                logger.info(f"Using cached metadata for CLASSIFICATION_AI_RESULTS: {metadata}")
+            else:
+                try:
+                    col_check_query = f"""
+                        SELECT COLUMN_NAME
+                        FROM {gov_db}.INFORMATION_SCHEMA.COLUMNS
+                        WHERE TABLE_SCHEMA = 'DATA_CLASSIFICATION_GOVERNANCE'
+                          AND TABLE_NAME = 'CLASSIFICATION_AI_RESULTS'
+                    """
+                    available_cols = snowflake_connector.execute_query(col_check_query) or []
+                    col_names = {str(c.get('COLUMN_NAME', '')).upper() for c in available_cols}
+                    
+                    has_schema_name = 'SCHEMA_NAME' in col_names
+                    has_sens_cat_id = 'SENSITIVITY_CATEGORY_ID' in col_names
+                    
+                    # Store in cache
+                    st.session_state[cache_col_key] = {
+                        'has_schema_name': has_schema_name,
+                        'has_sens_cat_id': has_sens_cat_id
+                    }
+                    logger.info(f"CLASSIFICATION_AI_RESULTS columns: SCHEMA_NAME={has_schema_name}, SENSITIVITY_CATEGORY_ID={has_sens_cat_id}")
+                except Exception as col_err:
+                    logger.warning(f"Could not check columns: {col_err}. Using defaults.")
+                    has_schema_name = has_sens_cat_id = False
 
             # Build query dynamically based on available columns
             schema_col = "r.SCHEMA_NAME" if has_schema_name else "NULL AS SCHEMA_NAME"
@@ -5218,6 +5431,21 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                         'Rationale': str(row.get('DETAILS', '') or '').strip()
                     }
                     
+                    # CRITICAL FIX: If CIA is empty/dashes, derive from category
+                    if result['CIA'] in ('C:- I:- A:-', 'C: I: A:', ''):
+                        try:
+                            # Get policy info based on the category
+                            policy_info = self._get_category_policy_info(row_data['ai_category'])
+                            if policy_info:
+                                c_val = policy_info.get('c', 1)
+                                i_val = policy_info.get('i', 1)
+                                a_val = policy_info.get('a', 1)
+                                result['CIA'] = f"C:{c_val} I:{i_val} A:{a_val}"
+                        except Exception as e:
+                            logger.debug(f"Failed to derive CIA from category: {e}")
+                            # Final fallback
+                            result['CIA'] = "C:1 I:1 A:1"
+                    
                     # Handle numeric conversion separately
                     try:
                         confidence_val = row.get('FINAL_CONFIDENCE', 0.0)
@@ -5315,13 +5543,14 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                     "DATA_CLASSIFICATION": classification,
                     "CONFIDENTIALITY_LEVEL": c_val,
                     "INTEGRITY_LEVEL": i_val,
-                    "AVAILABILITY_LEVEL": a_val
+                    "AVAILABILITY_LEVEL": a_val,
+                    "COMPLIANCE_FRAMEWORKS": ""
                 }
                 
-                # Add special category tags if applicable
-                if 'PII' in cat_upper: tags_to_apply["SPECIAL_CATEGORY"] = "PII"
-                elif 'SOX' in cat_upper: tags_to_apply["SPECIAL_CATEGORY"] = "SOX"
-                elif 'SOC2' in cat_upper: tags_to_apply["SPECIAL_CATEGORY"] = "SOC"
+                # Add compliance frameworks if detected
+                if 'PII' in cat_upper: tags_to_apply["COMPLIANCE_FRAMEWORKS"] = "PII"
+                elif 'SOX' in cat_upper: tags_to_apply["COMPLIANCE_FRAMEWORKS"] = "SOX"
+                elif 'SOC2' in cat_upper: tags_to_apply["COMPLIANCE_FRAMEWORKS"] = "SOC2"
                 
                 action_desc = f"Tagging {full_table_name}.{column} as {classification} (C{c_val} I{i_val} A{a_val})"
                 
@@ -7159,7 +7388,8 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                         "DATA_CLASSIFICATION": label,
                         "CONFIDENTIALITY_LEVEL": str(c_val),
                         "INTEGRITY_LEVEL": str(i_val),
-                        "AVAILABILITY_LEVEL": str(a_val)
+                        "AVAILABILITY_LEVEL": str(a_val),
+                        "COMPLIANCE_FRAMEWORKS": ""
                     }
                     
                     # Apply to Table
@@ -7180,7 +7410,10 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                         
                         col_tags = {
                             "DATA_CLASSIFICATION": col_label,
-                            "CONFIDENTIALITY_LEVEL": str(col_c)
+                            "CONFIDENTIALITY_LEVEL": str(col_c),
+                            "INTEGRITY_LEVEL": "1",
+                            "AVAILABILITY_LEVEL": "1",
+                            "COMPLIANCE_FRAMEWORKS": ""
                         }
                         
                         tagging_service.apply_tags_to_column(full_name, col_name, col_tags)
@@ -8952,8 +9185,124 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         # Fallback based on text heuristics if Policy metadata is missing (Last Resort)
         if 'CONFIDENTIAL' in pg_key: return defaults['PII']
         if 'RESTRICTED' in pg_key: return defaults['SOX']
+        if 'SENSITIVE' in pg_key: return defaults['SOC2']
         
+        # Safe global default (Internal) if nothing else matches
         return defaults['INTERNAL']
+        
+    def _match_patterns_against_samples(self, samples: List[Any]) -> Optional[Dict[str, Any]]:
+        """Match sample data against patterns in governance rules (Criteria 3)."""
+        if not samples:
+            return None
+            
+        # Ensure rules are loaded
+        if not self._classification_rules:
+            self._classification_rules = self._rules_loader.load_classification_rules()
+            
+        patterns = [r for r in self._classification_rules if r.get('RULE_TYPE') == 'PATTERN']
+        if not patterns:
+            return None
+            
+        counts: Dict[str, int] = {} # category -> match_count
+        for val in samples:
+            val_str = str(val).strip()
+            if not val_str:
+                continue
+            for p in patterns:
+                regex = p.get('RULE_PATTERN')
+                try:
+                    if regex and re.search(regex, val_str, re.IGNORECASE):
+                        cat = p['CATEGORY_NAME']
+                        counts[cat] = counts.get(cat, 0) + 1
+                except Exception:
+                    continue
+        
+        if not counts:
+            return None
+            
+        # Threshold: at least 30% of non-empty samples must match
+        threshold = len(samples) * 0.3
+        best_cat = None
+        max_count = 0
+        for cat, count in counts.items():
+            if count >= threshold and count > max_count:
+                best_cat = cat
+                max_count = count
+        
+        if best_cat:
+            return {
+                'category': best_cat,
+                'confidence': min(0.95, (max_count / len(samples)) + 0.3),
+                'match_type': 'DATA_PATTERN'
+            }
+        return None
+
+    def _get_existing_labels(self, db: str, schema: str, table: str) -> Dict[str, str]:
+        """Fetch existing Snowflake tags for the object and its columns."""
+        try:
+            from src.services.tagging_service import tagging_service
+            if not tagging_service:
+                return {}
+            full_name = f"{db}.{schema}.{table}"
+            tags = tagging_service.get_object_tags(full_name)
+            # Map tag name to value
+            return {str(t['TAG_NAME']).upper(): t['TAG_VALUE'] for t in tags if t.get('TAG_NAME')}
+        except Exception as e:
+            logger.debug(f"Failed to fetch existing labels for {db}.{schema}.{table}: {e}")
+            return {}
+
+    def _get_source_system_sensitivity(self, db: str, schema: str, table: str) -> Optional[Dict[str, Any]]:
+        """Infer sensitivity from source system metadata (DB/Schema names)."""
+        db_u = str(db).upper()
+        sc_u = str(schema).upper()
+        tb_u = str(table).upper()
+        
+        # Rule 1: HR / People Data
+        if any(x in db_u or x in sc_u for x in ["HR", "PEOPLE", "PAYROLL", "EMPLOYEE", "PERSONNEL"]):
+             return {"label": "Confidential", "c": 3, "i": 2, "a": 2, "reason": "HR/Payroll Source System"}
+        
+        # Rule 2: Financial / ERP Data
+        if any(x in db_u or x in sc_u for x in ["FIN", "GL", "ERP", "SAP", "ACCOUNTING", "REVENUE"]):
+             return {"label": "Restricted", "c": 2, "i": 3, "a": 2, "reason": "Financial ERP Source System"}
+        
+        # Rule 3: CRM / Customer Data
+        if any(x in db_u or x in sc_u for x in ["CRM", "SALESFORCE", "MARKETING", "CUSTOMER", "CLIENT"]):
+             return {"label": "Restricted", "c": 2, "i": 2, "a": 2, "reason": "CRM Source System"}
+        
+        # Rule 4: Legal / Compliance
+        if any(x in db_u or x in sc_u for x in ["LEGAL", "COMPLIANCE", "AUDIT"]):
+             return {"label": "Confidential", "c": 3, "i": 3, "a": 3, "reason": "Legal/Compliance Source System"}
+
+        return None
+
+    def _get_category_policy_info(self, category: str) -> Dict[str, Any]:
+        """Fetch policy info (C, I, A, Label) for a category from metadata."""
+        cat_u = str(category).upper()
+        default = {'c': 1, 'i': 1, 'a': 1, 'label': 'Internal'}
+        
+        try:
+            if not self._category_metadata:
+                self._load_metadata_driven_categories()
+                
+            meta = self._category_metadata.get(cat_u)
+            if meta:
+                return {
+                    'c': meta.get('confidentiality_level', 1),
+                    'i': meta.get('integrity_level', 1),
+                    'a': meta.get('availability_level', 1),
+                    'label': self._map_cia_to_label(meta.get('confidentiality_level', 1), meta.get('integrity_level', 1), meta.get('availability_level', 1))
+                }
+        except Exception:
+            pass
+            
+        return default
+
+    def _map_cia_to_label(self, c: int, i: int, a: int) -> str:
+         mx = max(int(c), int(i), int(a))
+         if mx >= 3: return "Confidential"
+         if mx == 2: return "Restricted"
+         if mx == 1: return "Internal"
+         return "Public"
 
     def _run_governance_driven_pipeline(self, db: str, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -8971,9 +9320,13 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
              logger.warning(f"Failed to set Snowflake session parameters: {e}")
         
         # 1. Initialize Governance Metadata (ONCE)
-        if not self._category_centroids:
+        if not self._category_metadata:
             logger.info("Initializing governance metadata...")
-            self._load_metadata_driven_categories()
+            self._init_local_embeddings() # Load metadata (rules, labels)
+            
+        # 2. Warm up AI Engine (Lazily load SentenceTransformer)
+        # This ensures we have the real model for semantic matching
+        self._ensure_ai_engine_ready()
             
         # Ensure keywords are loaded efficiently
         active_keywords = self._load_active_governance_keywords(db)
@@ -9089,6 +9442,21 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                              best_match = best
                              match_method = 'SEMANTIC'
                 
+                if not best_match:
+                    # PASS 1.5: Data Profiling (Criteria 3: Data Profiling Results)
+                    # For performance, we only sample if metadata search wasn't conclusive
+                    try:
+                        col_name = col['COLUMN_NAME']
+                        samples_dict = self._sample_table_values_batch(db, schema, table, [col_name], limit=50)
+                        col_samples = samples_dict.get(col_name, [])
+                        if col_samples:
+                            prof_match = self._match_patterns_against_samples(col_samples)
+                            if prof_match:
+                                best_match = prof_match
+                                match_method = 'DATA_PROFILING'
+                    except Exception as e:
+                        logger.debug(f"Profiling failed for {table}.{col['COLUMN_NAME']}: {e}")
+
                 if best_match:
                     cat = best_match['category']
                     policy_info = self._get_category_policy_info(cat)
@@ -9115,12 +9483,18 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                     }
                     final_column_results.append(col_result)
 
+            # --- Rule-Based Enrichment (Criteria 4 & 5) ---
+            # Criteria 4: Source System Information
+            source_rules = self._get_source_system_sensitivity(db, schema, table)
+            
+            # Criteria 5: Existing Labels
+            existing_tags = self._get_existing_labels(db, schema, table)
+
             if final_column_results:
                 final_column_results.sort(key=lambda x: (x['c'] + x['i'] + x['a'], x['confidence']), reverse=True)
                 top_col = final_column_results[0]
                 
-                # Determine Table Policy Group (Union of column policies)
-                # For simplicity, we take the top column's compliance/policy
+                # Determine Table Policy Group
                 compliance = self._map_category_to_policy_group(top_col['category'])
                 
                 table_result = {
@@ -9139,16 +9513,45 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                     'Status': 'Classified',
                     'Method': top_col['method'],
                     'column_results': final_column_results,
-                    
-                    # Additional metadata for saving
                     'detected_categories': [c['detected_categories'][0] for c in final_column_results],
-                    'policy_group': compliance
+                    'policy_group': compliance,
+                    'existing_tags': existing_tags,
+                    'source_system_rule': source_rules
                 }
+                
+                # Apply priority overrides from source system rules
+                if source_rules:
+                    if source_rules['c'] > table_result['c']:
+                        table_result['c'] = source_rules['c']
+                        table_result['Sensitivity'] = source_rules['label']
+                        table_result['CIA'] = f"C:{table_result['c']} I:{table_result['i']} A:{table_result['a']}"
+                        table_result['Method'] += f" | {source_rules['reason']}"
                 
                 results.append(table_result)
                 passed_count += 1
             else:
-                filtered_count += 1
+                # Even if no columns matched, check source system rules for the table
+                if source_rules:
+                    results.append({
+                        'Schema': schema,
+                        'Table': table,
+                        'Category': 'INFRASTRUCTURE',
+                        'Confidence': 0.7,
+                        'Sensitivity': source_rules['label'],
+                        'Compliance': 'NON_SENSITIVE',
+                        'CIA': f"C:{source_rules['c']} I:{source_rules['i']} A:{source_rules['a']}",
+                        'c': source_rules['c'],
+                        'i': source_rules['i'],
+                        'a': source_rules['a'],
+                        'Status': 'Classified',
+                        'Method': f"RULE: {source_rules['reason']}",
+                        'column_results': [],
+                        'policy_group': 'NON_SENSITIVE',
+                        'existing_tags': existing_tags
+                    })
+                    passed_count += 1
+                else:
+                    filtered_count += 1
                 
         logger.info("=" * 80)
         logger.info(f"Summary: {passed_count} Classified, {filtered_count} Filtered")
@@ -9174,9 +9577,61 @@ class AISensitiveDetectionService:
     """
     def __init__(self) -> None:
         self.sample_size: int = 100
-        # Legacy attributes some UIs read for reinforcement
-        self.keyword_rows = []
-        self.pattern_rows = []
+        self._rules_loaded = False
+        self._keyword_rows = []
+        self._pattern_rows = []
+
+    def _load_rules_if_needed(self):
+        if not self._rules_loaded:
+            try:
+                all_rules = governance_config_service.loader.load_classification_rules()
+                self._keyword_rows = [r for r in all_rules if r.get('RULE_TYPE') == 'KEYWORD']
+                self._pattern_rows = [r for r in all_rules if r.get('RULE_TYPE') == 'PATTERN']
+                self._rules_loaded = True
+            except Exception as e:
+                logger.warning(f"Failed to load rules for shim: {e}")
+
+    @property
+    def keyword_rows(self):
+        self._load_rules_if_needed()
+        return self._keyword_rows
+
+    @keyword_rows.setter
+    def keyword_rows(self, value):
+        self._keyword_rows = value
+
+    @property
+    def pattern_rows(self):
+        self._load_rules_if_needed()
+        return self._pattern_rows
+
+    @pattern_rows.setter
+    def pattern_rows(self, value):
+        self._pattern_rows = value
+
+    @property
+    def syn_boosts(self) -> Dict[str, List[str]]:
+        """Grouping of keywords by category for legacy synonym boosting."""
+        boosts: Dict[str, List[str]] = {}
+        for r in self.keyword_rows:
+            cat = str(r.get('CATEGORY_NAME') or r.get('CATEGORY_ID') or 'UNKNOWN').upper()
+            kw = str(r.get('RULE_PATTERN') or r.get('KEYWORD') or '').strip()
+            if kw:
+                boosts.setdefault(cat, []).append(kw.upper())
+        return boosts
+
+    @property
+    def policy_map(self) -> Dict[str, str]:
+        """Mapping of Category to Policy Group (PII, SOX, SOC2) from governance."""
+        mapping: Dict[str, str] = {}
+        # Use all rules to build a comprehensive mapping
+        rows = self.keyword_rows + self.pattern_rows
+        for r in rows:
+            cat = str(r.get('CATEGORY_NAME') or r.get('CATEGORY_ID') or '').upper().strip()
+            pg = str(r.get('POLICY_GROUP') or '').upper().strip()
+            if cat and pg:
+                mapping[cat] = pg
+        return mapping
 
     def ensure_governance_tables(self) -> None:
         try:
@@ -9202,8 +9657,24 @@ class AISensitiveDetectionService:
         return []
 
     def detect_sensitive_columns(self, database: str, schema_name: str, table_name: str) -> List[Dict[str, Any]]:
-        # Return empty list to indicate no sensitive columns detected by the shim
-        return []
+        """Optimized detection delegating to the unified classification pipeline."""
+        res = self.get_bulk_suggestions(database, schema_name, table_name)
+        return res.get('column_results', [])
+
+    def get_bulk_suggestions(self, database: str, schema_name: str, table_name: str) -> Dict[str, Any]:
+        """Comprehensive suggestion for a table, including rule-based results."""
+        try:
+            asset = {"schema": schema_name, "table": table_name}
+            results = ai_classification_pipeline_service._run_governance_driven_pipeline(database, [asset])
+            if results and len(results) > 0:
+                return results[0]
+            return {
+                'column_results': [],
+                'c': 1, 'i': 1, 'a': 1, 'Sensitivity': 'Internal', 'Compliance': 'NONE'
+            }
+        except Exception as e:
+            logger.error(f"Bulk suggestion failed for {database}.{schema_name}.{table_name}: {e}")
+            return {'column_results': [], 'c': 1, 'i': 1, 'a': 1, 'Sensitivity': 'Internal'}
 
 
 # Singleton instance for compatibility

@@ -12,3 +12,4 @@ plotly
 altair
 python-dateutil
 pytz
+pypdf

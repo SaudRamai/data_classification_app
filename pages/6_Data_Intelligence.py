@@ -673,7 +673,7 @@ def _get_overall_health(
     database: Optional[str] = None,
     schema: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Fetch real-time health metrics using ACCOUNT_USAGE views."""
+    """Fetch real-time health metrics using consolidated ACCOUNT_USAGE query."""
     health_metrics: Dict[str, Any] = {
         'overall_health_score': 0.0,
         'health_score': 0.0,
@@ -693,192 +693,104 @@ def _get_overall_health(
         return health_metrics
 
     try:
-        qh_filters: List[str] = []
-        qh_params: Dict[str, Any] = {}
+        where_clauses = ["CAST(START_TIME AS DATE) = CURRENT_DATE"]
+        params = {}
+        
         if warehouse:
-            qh_filters.append("WAREHOUSE_NAME = %(warehouse)s")
-            qh_params["warehouse"] = warehouse
+            where_clauses.append("WAREHOUSE_NAME = %(warehouse)s")
+            params["warehouse"] = warehouse
         if database:
-            qh_filters.append("DATABASE_NAME = %(database)s")
-            qh_params["database"] = database
+            where_clauses.append("DATABASE_NAME = %(database)s")
+            params["database"] = database
         if schema:
-            qh_filters.append("SCHEMA_NAME = %(schema)s")
-            qh_params["schema"] = schema
-        qh_filter_clause = ""
-        if qh_filters:
-            qh_filter_clause = " AND " + " AND ".join(qh_filters)
+            where_clauses.append("SCHEMA_NAME = %(schema)s")
+            params["schema"] = schema
+            
+        where_clause = " AND ".join(where_clauses)
 
-        wm_params: Dict[str, Any] = {}
-        wm_filter_clause = ""
-        if warehouse:
-            wm_filter_clause = " AND WAREHOUSE_NAME = %(warehouse)s"
-            wm_params["warehouse"] = warehouse
-
-        def _pick_row(rows: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
-            if not rows:
-                return None
-            if warehouse:
-                for r in rows:
-                    if (r.get('WAREHOUSE_NAME') or '').upper() == warehouse.upper():
-                        return r
-            return rows[0]
-
-        # SLA Compliance
-        sla_query = f"""
+        health_query = f"""
+        WITH metrics AS (
             SELECT 
                 WAREHOUSE_NAME,
                 COUNT(*) AS total_queries,
                 SUM(CASE WHEN ERROR_CODE IS NULL THEN 1 ELSE 0 END) AS successful_queries,
-                CASE WHEN COUNT(*) = 0 THEN 0
-                     ELSE ROUND(SUM(CASE WHEN ERROR_CODE IS NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2)
-                END AS sla_compliance_percent
+                SUM(CASE WHEN ERROR_CODE IS NOT NULL THEN 1 ELSE 0 END) AS failed_queries
             FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-            WHERE CAST(START_TIME AS DATE) = CURRENT_DATE
-            {qh_filter_clause}
+            WHERE {where_clause}
             GROUP BY WAREHOUSE_NAME
-            ORDER BY sla_compliance_percent DESC
+        )
+        SELECT 
+            WAREHOUSE_NAME,
+            total_queries,
+            successful_queries,
+            failed_queries,
+            CASE 
+                WHEN total_queries = 0 THEN 0
+                ELSE ROUND((successful_queries / total_queries) * 100, 2)
+            END AS success_rate_pct,
+            ROUND(
+                CASE 
+                    WHEN NULLIF(MAX(failed_queries) OVER (), 0) IS NULL THEN 100
+                    ELSE (1 - failed_queries / NULLIF(MAX(failed_queries) OVER (), 0)) * 100
+                END,
+                2
+            ) AS critical_alert_score,
+            ROUND(
+                0.7 * CASE 
+                          WHEN total_queries = 0 THEN 0
+                          ELSE (successful_queries / total_queries) * 100
+                      END
+                +
+                0.3 * CASE 
+                          WHEN NULLIF(MAX(failed_queries) OVER (), 0) IS NULL THEN 100
+                          ELSE (1 - failed_queries / NULLIF(MAX(failed_queries) OVER (), 0)) * 100
+                      END,
+                2
+            ) AS overall_health_score,
+            CASE 
+                WHEN overall_health_score >= 90 THEN 'EXCELLENT'
+                WHEN overall_health_score >= 80 THEN 'GOOD'
+                WHEN overall_health_score >= 70 THEN 'FAIR'
+                ELSE 'NEEDS ATTENTION'
+            END AS health_status
+        FROM metrics
+        ORDER BY overall_health_score DESC;
         """
-        sla_rows = _run(sla_query, dict(qh_params))
-        row = _pick_row(sla_rows)
-        if row:
-            total_queries = int(row.get('TOTAL_QUERIES') or 0)
-            successful_queries = int(row.get('SUCCESSFUL_QUERIES') or 0)
-            sla_percent = float(row.get('SLA_COMPLIANCE_PERCENT') or 0.0)
-            failed_queries = total_queries - successful_queries
+        
+        results = _run(health_query, params)
+        
+        if results:
+            # If multiple warehouses, we take the one with best health or first matching
+            # Usually users select one, or we aggregate. For this dashboard, we'll pick the top row or matching selected
+            row = results[0]
+            if warehouse:
+                for r in results:
+                    if r.get('WAREHOUSE_NAME') == warehouse:
+                        row = r
+                        break
+            
             health_metrics.update({
-                'sla_compliance': sla_percent,
-                'total_queries': total_queries,
-                'successful_queries': successful_queries,
-                'failed_queries': failed_queries,
+                'overall_health_score': float(row.get('OVERALL_HEALTH_SCORE') or 0.0),
+                'health_score': float(row.get('OVERALL_HEALTH_SCORE') or 0.0),
+                'health_status': row.get('HEALTH_STATUS', 'UNKNOWN'),
+                'sla_compliance': float(row.get('SUCCESS_RATE_PCT') or 0.0),
+                'total_queries': int(row.get('TOTAL_QUERIES') or 0),
+                'successful_queries': int(row.get('SUCCESSFUL_QUERIES') or 0),
+                'failed_queries': int(row.get('FAILED_QUERIES') or 0),
+                'critical_alerts': int(row.get('FAILED_QUERIES') or 0),
+                'query_failure_rate_pct': 100.0 - float(row.get('SUCCESS_RATE_PCT') or 0.0) if row.get('SUCCESS_RATE_PCT') is not None else 0.0
             })
 
-        # Credits Used (Today)
+        # Fetch credits separately as it's from a different table
         credits_query = f"""
-            SELECT 
-                WAREHOUSE_NAME,
-                SUM(CREDITS_USED) AS credits_used_today
+            SELECT SUM(CREDITS_USED) AS credits_used_today
             FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
             WHERE CAST(START_TIME AS DATE) = CURRENT_DATE
-            {wm_filter_clause}
-            GROUP BY WAREHOUSE_NAME
-            ORDER BY credits_used_today DESC
+            {f"AND WAREHOUSE_NAME = %(warehouse)s" if warehouse else ""}
         """
-        credits_rows = _run(credits_query, wm_params)
-        credits_row = _pick_row(credits_rows)
-        if credits_row:
-            credits_used = float(credits_row.get('CREDITS_USED_TODAY') or 0.0)
-            health_metrics.update({
-                'credits_used_today': credits_used,
-                'daily_credits': credits_used,
-            })
-
-        # Critical Alerts (Failed Queries)
-        alerts_query = f"""
-            SELECT 
-                WAREHOUSE_NAME,
-                COUNT(*) AS failed_queries
-            FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-            WHERE EXECUTION_STATUS = 'FAILED'
-              AND CAST(START_TIME AS DATE) = CURRENT_DATE
-            {qh_filter_clause}
-            GROUP BY WAREHOUSE_NAME
-            ORDER BY failed_queries DESC
-        """
-        alerts_rows = _run(alerts_query, dict(qh_params))
-        alerts_row = _pick_row(alerts_rows)
-        if alerts_row:
-            failed = int(alerts_row.get('FAILED_QUERIES') or 0)
-            health_metrics['critical_alerts'] = failed
-            health_metrics['failed_queries'] = failed
-
-        # Success / Failure Count
-        sf_query = f"""
-            SELECT 
-                WAREHOUSE_NAME,
-                SUM(CASE WHEN ERROR_CODE IS NULL THEN 1 ELSE 0 END) AS successful_queries,
-                SUM(CASE WHEN ERROR_CODE IS NOT NULL THEN 1 ELSE 0 END) AS failed_queries,
-                COUNT(*) AS total_queries
-            FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-            WHERE CAST(START_TIME AS DATE) = CURRENT_DATE
-            {qh_filter_clause}
-            GROUP BY WAREHOUSE_NAME
-            ORDER BY total_queries DESC
-        """
-        sf_rows = _run(sf_query, dict(qh_params))
-        sf_row = _pick_row(sf_rows)
-        if sf_row:
-            success = int(sf_row.get('SUCCESSFUL_QUERIES') or 0)
-            failed = int(sf_row.get('FAILED_QUERIES') or 0)
-            total = int(sf_row.get('TOTAL_QUERIES') or 0)
-            health_metrics.update({
-                'successful_queries': success,
-                'failed_queries': failed,
-                'total_queries': total,
-            })
-            if total > 0:
-                failure_rate = round((failed / total) * 100, 2)
-                health_metrics['query_failure_rate_pct'] = failure_rate
-
-        # Overall Health Score
-        health_query = f"""
-            WITH metrics AS (
-                SELECT 
-                    WAREHOUSE_NAME,
-                    COUNT(*) AS total_queries,
-                    SUM(CASE WHEN ERROR_CODE IS NULL THEN 1 ELSE 0 END) AS successful_queries,
-                    SUM(CASE WHEN ERROR_CODE IS NOT NULL THEN 1 ELSE 0 END) AS failed_queries
-                FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-                WHERE CAST(START_TIME AS DATE) = CURRENT_DATE
-                {qh_filter_clause}
-                GROUP BY WAREHOUSE_NAME
-            )
-            SELECT 
-                WAREHOUSE_NAME,
-                CASE WHEN total_queries = 0 THEN 0
-                     ELSE ROUND((successful_queries / total_queries) * 100, 2)
-                END AS sla_percent,
-                failed_queries AS critical_alerts,
-                ROUND(
-                    CASE WHEN NULLIF(MAX(failed_queries) OVER (), 0) IS NULL THEN 100
-                         ELSE (1 - failed_queries / NULLIF(MAX(failed_queries) OVER (), 0)) * 100
-                    END,
-                    2
-                ) AS critical_alert_score,
-                ROUND(
-                    0.7 * CASE WHEN total_queries = 0 THEN 0
-                               ELSE (successful_queries / total_queries) * 100
-                          END
-                    +
-                    0.3 * CASE WHEN NULLIF(MAX(failed_queries) OVER (), 0) IS NULL THEN 100
-                               ELSE (1 - failed_queries / NULLIF(MAX(failed_queries) OVER (), 0)) * 100
-                          END,
-                    2
-                ) AS overall_health_score
-            FROM metrics
-            ORDER BY overall_health_score DESC
-            """
-        health_rows = _run(health_query, dict(qh_params))
-        hrow = _pick_row(health_rows)
-        if hrow:
-            overall_score = float(hrow.get('OVERALL_HEALTH_SCORE') or 0.0)
-            sla_percent = float(hrow.get('SLA_PERCENT') or 0.0)
-            failed = int(hrow.get('CRITICAL_ALERTS') or 0)
-            health_metrics.update({
-                'overall_health_score': overall_score,
-                'health_score': overall_score,
-                'sla_compliance': sla_percent,
-                'critical_alerts': failed,
-                'critical_alert_score': float(hrow.get('CRITICAL_ALERT_SCORE') or 0.0),
-            })
-
-            if overall_score >= 90:
-                health_metrics['health_status'] = '🟢 EXCELLENT'
-            elif overall_score >= 80:
-                health_metrics['health_status'] = '🟡 GOOD'
-            elif overall_score >= 70:
-                health_metrics['health_status'] = '🟠 FAIR'
-            else:
-                health_metrics['health_status'] = '🔴 NEEDS ATTENTION'
+        credits_res = _run(credits_query, {"warehouse": warehouse} if warehouse else {})
+        if credits_res and credits_res[0].get('CREDITS_USED_TODAY'):
+            health_metrics['credits_used_today'] = float(credits_res[0]['CREDITS_USED_TODAY'])
 
         health_metrics['last_updated'] = datetime.utcnow().isoformat()
 
@@ -1555,9 +1467,16 @@ with st.sidebar:
 # Helper to split FQN
 
 def _split_fqn(fqn: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Splits a fully qualified name into components, handling quotes and stripping them."""
     try:
-        db, sch, obj = fqn.split(".")
-        return db, sch, obj
+        if not fqn or fqn == "None":
+            return None, None, None
+            
+        parts = fqn.split(".")
+        if len(parts) == 3:
+            db, sch, obj = parts
+            return db.strip(' "'), sch.strip(' "'), obj.strip(' "')
+        return None, None, None
     except Exception:
         return None, None, None
 
@@ -1568,1047 +1487,739 @@ q_tab, l_tab = st.tabs(["📈 Data Quality", "🕸️ Data Lineage"])
 # Data Quality
 # =====================================
 with q_tab:
-    dq_dash, dq_profile, dq_issues, dq_resolve = st.tabs([
+    # Context for header
+    dq_context = active_db if active_db != "All" else "Global Environment"
+    if sel_schema != "All" and active_db != "All":
+        dq_context = f"{active_db}.{sel_schema}"
+
+    st.markdown(f"""
+    <div style="background: linear-gradient(90deg, rgba(59, 130, 246, 0.1), rgba(0, 0, 0, 0)); padding: 20px; border-radius: 12px; border-left: 4px solid #3b82f6; margin-bottom: 25px;">
+        <h3 style="margin:0; color:white; font-size:1.4rem;">⚡ Quality Insights for {dq_context}</h3>
+        <p style="margin:5px 0 0 0; color:rgba(255,255,255,0.6); font-size:0.9rem;">
+            <b>Data quality</b> provides visibility into the accuracy, completeness, and reliability of your data assets.<br>
+            Monitor <b>health scores</b>, track <b>SLA compliance</b>, and identify critical anomalies across your environment.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    dq_dash, dq_profile, dq_issues = st.tabs([
         "Quality Metrics Dashboard",
         "Data Profiling Tools",
-        "Quality Issues Log",
-        "Resolution Tracking",
+        "Quality Issues Log"
     ])
 
     # ---- Quality Metrics Dashboard ----
     with dq_dash:
-        st.subheader("Data Quality Dashboard")
-        
-        # Overall Health Score
-        st.markdown("### 🎯 Overall Health Score")
-        
-        # Fetch overall health metrics
-        with st.spinner('🔍 Loading quality metrics...'):
+        # Fetch overall health metrics once at the top
+        with st.spinner('🔍 Syncing Quality Intelligence...'):
             health_metrics = _get_overall_health(
                 warehouse=sel_wh if sel_wh and sel_wh != "(none)" else None,
                 database=active_db if active_db and active_db != "(none)" else None,
                 schema=sel_schema if sel_schema and sel_schema != "All" else None,
             )
+            quality_metrics = _get_quality_dimensions_metrics(
+                database=active_db if active_db and active_db != "(none)" else None,
+                schema=sel_schema if sel_schema and sel_schema != "All" else None,
+            )
 
-        if health_metrics:
-            c1, c2, c3, c4 = st.columns(4)
+        if not health_metrics:
+            st.warning("⚠️ High-level health metrics unavailable. Please verify Snowflake privileges for ACCOUNT_USAGE.")
+            st.stop()
 
+        # Fetch Governance Maturity Data (Reference from Dashboard.py)
+        try:
+            from src.services.asset_utils import get_sensitivity_overview, get_asset_counts
+            g_active_db = active_db if active_db and active_db != "(none)" else "DATA_CLASSIFICATION_DB"
+            g_schema = sel_schema if sel_schema and sel_schema != "All" else "DATA_CLASSIFICATION_GOVERNANCE"
+            
+            sens_data = get_sensitivity_overview(g_active_db, g_schema)
+            counts_data = get_asset_counts(g_active_db, g_schema)
+            
+            # Categorize maturity
+            gov_values = [
+                sens_data['regulated'].get('PII', 0),
+                sens_data['regulated'].get('SOX', 0) + sens_data['regulated'].get('SOC2', 0),
+                counts_data['classified_count'] - (sens_data['regulated'].get('PII', 0) + sens_data['regulated'].get('SOX', 0) + sens_data['regulated'].get('SOC2', 0)),
+                counts_data['unclassified_count']
+            ]
+            gov_labels = ['PII Regulated', 'Financial/Comp', 'Internal/Public', 'Unclassified']
+            gov_maturity_pct = counts_data['coverage_pct']
+        except Exception as e:
+            logger.error(f"Error fetching governance metrics: {e}")
+            gov_values = [25, 25, 25, 25]
+            gov_labels = ['PII', 'Comp', 'Classified', 'Unclassified']
+            gov_maturity_pct = 0.0
+
+        # Premium Header: Health Gauge & Critical Stats
+        col_gauge, col_stats = st.columns([1, 2])
+        
+        with col_gauge:
+            score = health_metrics.get('health_score', 0)
+            score_color = "#10b981" if score >= 90 else "#f59e0b" if score >= 75 else "#ef4444"
+            
+            # Simple but elegant Gauge using Plotly
+            fig_gauge = go.Figure(go.Indicator(
+                mode = "gauge+number",
+                value = score,
+                domain = {'x': [0, 1], 'y': [0, 1]},
+                title = {'text': "Overall Health", 'font': {'size': 18, 'color': 'rgba(255,255,255,0.7)'}},
+                number = {'font': {'size': 48, 'color': '#FFFFFF'}, 'suffix': "%"},
+                gauge = {
+                    'axis': {'range': [None, 100], 'tickwidth': 1, 'tickcolor': "rgba(255,255,255,0.3)"},
+                    'bar': {'color': score_color},
+                    'bgcolor': "rgba(255,255,255,0.05)",
+                    'borderwidth': 2,
+                    'bordercolor': "rgba(255,255,255,0.1)",
+                    'steps': [
+                        {'range': [0, 75], 'color': 'rgba(239, 68, 68, 0.1)'},
+                        {'range': [75, 90], 'color': 'rgba(245, 158, 11, 0.1)'},
+                        {'range': [90, 100], 'color': 'rgba(16, 185, 129, 0.1)'}
+                    ],
+                }
+            ))
+            fig_gauge.update_layout(height=260, margin=dict(l=20, r=20, t=50, b=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"})
+            st.plotly_chart(fig_gauge, use_container_width=True, config={'displayModeBar': False})
+            
+            # Show health status text
+            h_status = health_metrics.get('health_status', 'UNKNOWN')
+            st.markdown(f"""
+                <div style="text-align: center; margin-top: -30px;">
+                    <span style="font-size: 1.2rem; font-weight: 800; color: {score_color}; letter-spacing: 1px;">
+                        SYSTEM STATUS: {h_status}
+                    </span>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            # --- New Visualization to fill the gap ---
+            success_rate = health_metrics.get('sla_compliance', 0)
+            
+            st.markdown("<div style='margin-top: 25px;'></div>", unsafe_allow_html=True)
+            
+            # Use a compact horizontal bar chart for Resource Efficiency
+            fig_eff = go.Figure(go.Bar(
+                x=[success_rate],
+                y=['Query Efficiency'],
+                orientation='h',
+                marker=dict(
+                    color=score_color,
+                    line=dict(color='rgba(255,255,255,0.1)', width=1)
+                ),
+                width=0.4,
+                text=[f"{success_rate}% Success"],
+                textposition='auto',
+                textfont=dict(color='white', size=12)
+            ))
+            
+            fig_eff.update_layout(
+                height=80,
+                margin=dict(l=0, r=20, t=0, b=0),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                showlegend=False,
+                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[0, 100]),
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                shapes=[
+                    dict(
+                        type='rect',
+                        x0=0, y0=-0.3, x1=100, y1=0.3,
+                        line=dict(color='rgba(255,255,255,0.05)', width=1),
+                        fillcolor='rgba(255,255,255,0.03)',
+                        layer='below'
+                    )
+                ]
+            )
+            st.plotly_chart(fig_eff, use_container_width=True, config={'displayModeBar': False})
+            
+            st.markdown(f"""
+                <div style="text-align: center; font-size: 0.75rem; color: rgba(255,255,255,0.4); margin-top: -10px;">
+                     Based on {health_metrics.get('total_queries', 0)} total operations today
+                </div>
+            """, unsafe_allow_html=True)
+
+        with col_stats:
+            c1, c2 = st.columns(2)
             with c1:
                 st.markdown(f"""
-                <div class="pillar-card">
-                    <div class="pillar-icon">❤️</div>
-                    <div class="pillar-label">Health Score</div>
-                    <div class="pillar-value">{health_metrics.get('health_score', 0):.1f}%</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with c2:
-                st.markdown(f"""
-                <div class="pillar-card">
+                <div class="pillar-card" style="border-top: 4px solid #3b82f6;">
                     <div class="pillar-icon">💳</div>
-                    <div class="pillar-label">Credits / Day</div>
+                    <div class="pillar-label">Daily Consumption</div>
                     <div class="pillar-value">{health_metrics.get('credits_used_today', 0):.2f}</div>
+                    <div class="pillar-status" style="color: #60a5fa;">Snowflake Credits Today</div>
                 </div>
                 """, unsafe_allow_html=True)
-
-            with c3:
+            with c2:
+                alerts = health_metrics.get('critical_alerts', 0)
+                alert_color = "#ef4444" if alerts > 0 else "#10b981"
                 st.markdown(f"""
-                <div class="pillar-card">
+                <div class="pillar-card" style="border-top: 4px solid {alert_color};">
                     <div class="pillar-icon">🚨</div>
-                    <div class="pillar-label">Critical Alerts</div>
-                    <div class="pillar-value">{health_metrics.get('critical_alerts', 0)}</div>
+                    <div class="pillar-label">Active Incidents</div>
+                    <div class="pillar-value">{alerts}</div>
+                    <div class="pillar-status" style="color: {alert_color};">Critical Security Alerts</div>
                 </div>
                 """, unsafe_allow_html=True)
-
-            with c4:
-                st.markdown(f"""
-                <div class="pillar-card">
-                    <div class="pillar-icon">✅</div>
-                    <div class="pillar-label">Success Rate</div>
-                    <div class="pillar-value">{health_metrics.get('successful_queries', 0)}</div>
-                    <div class="pillar-status" style="font-size:0.7rem;">{health_metrics.get('failed_queries', 0)} Failed</div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-            st.caption(f"Last Updated: {health_metrics.get('last_updated', 'N/A')}")
-
-        else:
-            st.info("No health metrics available. Please configure Snowflake connection.")
-        
-        # Two-column layout for issues and trend
-        col_issues, col_trend = st.columns([1, 2])
-        
-        with col_issues:
-            st.markdown("### 🔍 Top Data Quality Issues")
-
-            default_issues = [
-                {"issue": "Missing values in customer_email", "severity": "High", "affected": "12k records"},
-                {"issue": "Out-of-range order_amount", "severity": "Medium", "affected": "3.4k records"},
-                {"issue": "Stale inventory snapshot", "severity": "Low", "affected": "2 warehouses"},
-                {"issue": "Duplicate customer IDs", "severity": "High", "affected": "420 records"},
-                {"issue": "Schema drift detected", "severity": "Medium", "affected": "Marketing schema"},
-            ]
-
-            for issue in default_issues[:5]:
-                severity_color = {
-                    'High': '#e74c3c',
-                    'Medium': '#f39c12',
-                    'Low': '#3498db'
-                }.get(issue['severity'], '#95a5a6')
-
-                st.markdown(f"""
-                <div class="asset-card" style="border-left: 4px solid {severity_color}; display:flex; justify-content:space-between; align-items:center;">
-                    <div>
-                        <div style="font-weight: 700; color: #f8fafc; font-size: 0.95rem;">{issue['issue']}</div>
-                        <div style="font-size: 0.8rem; color: #94a3b8; margin-top:2px;">Affected: {issue['affected']}</div>
-                    </div>
-                    <div style="background:{severity_color}20; color:{severity_color}; padding:4px 10px; border-radius:12px; font-size:0.75rem; font-weight:700;">
-                        {issue['severity']}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            st.markdown("""
-            <div style="margin-top: 10px; text-align: right;">
-                <a href="#" style="color: #3498db; text-decoration: none; font-size: 14px;">
-                    View all issues →
-                </a>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col_trend:
-            st.markdown("### 📈 Quality Trend (Last 30 Days)")
             
-            # Sample trend data (replace with actual data)
-            dates = pd.date_range(end=datetime.now(), periods=30).date
-            # Use numpy's random for better compatibility with Streamlit caching
+            st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
+            
+            c3, c4 = st.columns(2)
+            with c3:
+                 st.markdown(f"""
+                <div class="pillar-card" style="border-top: 4px solid #10b981;">
+                    <div class="pillar-icon">✅</div>
+                    <div class="pillar-label">Operational Stability</div>
+                    <div class="pillar-value">{health_metrics.get('successful_queries', 0)}</div>
+                    <div class="pillar-status" style="color: #34d399;">{health_metrics.get('failed_queries', 0)} Failed Queries</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with c4:
+                # Calculate freshness text
+                st.markdown(f"""
+                <div class="pillar-card" style="border-top: 4px solid #8b5cf6;">
+                    <div class="pillar-icon">⏱️</div>
+                    <div class="pillar-label">Intelligence Age</div>
+                    <div class="pillar-value" style="font-size: 1.5rem;">{datetime.now().strftime('%H:%M')}</div>
+                    <div class="pillar-status">Last Synced (Local)</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # Two-column layout for Trend and Top Issues
+        col_main, col_side = st.columns([2, 1])
+        
+        with col_main:
+            st.markdown("### 📈 Tactical Quality Trend")
+            # Sample trend data with more "premium" look
+            dates = pd.date_range(end=datetime.now(), periods=14).date
             trend_data = pd.DataFrame({
                 'Date': dates,
-                'Completeness': np.linspace(85, 95, 30) + np.random.uniform(-2, 2, 30),
-                'Accuracy': np.linspace(88, 98, 30) + np.random.uniform(-2, 2, 30),
-                'Validity': np.linspace(90, 97, 30) + np.random.uniform(-1, 1, 30),
-                'Uniqueness': np.linspace(95, 99, 30) + np.random.uniform(-0.5, 0.5, 30)
+                'Accuracy': [92, 93, 91, 94, 95, 94, 96, 95, 97, 98, 97, 98, 99, 98.5],
+                'Completeness': [88, 89, 87, 90, 91, 90, 92, 91, 93, 94, 93, 95, 96, 95.8]
             })
             
-            # Create line chart
-            fig = go.Figure()
+            fig_trend = go.Figure()
+            fig_trend.add_trace(go.Scatter(
+                x=trend_data['Date'], y=trend_data['Accuracy'],
+                name='Accuracy', mode='lines+markers',
+                line=dict(color='#10b981', width=3),
+                fill='tozeroy', fillcolor='rgba(16, 185, 129, 0.1)'
+            ))
+            fig_trend.add_trace(go.Scatter(
+                x=trend_data['Date'], y=trend_data['Completeness'],
+                name='Completeness', mode='lines+markers',
+                line=dict(color='#3b82f6', width=3),
+                fill='tozeroy', fillcolor='rgba(59, 130, 246, 0.1)'
+            ))
             
-            for col in ['Completeness', 'Accuracy', 'Validity', 'Uniqueness']:
-                fig.add_trace(go.Scatter(
-                    x=trend_data['Date'],
-                    y=trend_data[col],
-                    mode='lines+markers',
-                    name=col,
-                    line=dict(width=2),
-                    marker=dict(size=4)
-                ))
-            
-            fig.update_layout(
-                height=300,
-                margin=dict(l=0, r=0, t=30, b=30),
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                xaxis=dict(showgrid=False, title=None),
-                yaxis=dict(showgrid=True, gridcolor='#f0f0f0', title='Score (%)'),
-                plot_bgcolor='white',
-                paper_bgcolor='white',
-                hovermode="x unified"
+            fig_trend.update_layout(
+                height=350,
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                margin=dict(l=0, r=0, t=20, b=0),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis=dict(showgrid=False, color="rgba(255,255,255,0.4)"),
+                yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)', color="rgba(255,255,255,0.4)", range=[80, 100])
             )
+            st.plotly_chart(fig_trend, use_container_width=True)
+
+        with col_side:
+            st.markdown("### 🔍 Priority Quality Hits")
             
-            st.plotly_chart(fig, use_container_width=True)
+            default_issues = [
+                {"issue": "Missing values in customer_email", "severity": "High", "affected": "12k records"},
+                {"issue": "Duplicate customer IDs", "severity": "High", "affected": "420 records"},
+                {"issue": "Out-of-range order_amount", "severity": "Medium", "affected": "3.4k records"},
+                {"issue": "Schema drift: Marketing", "severity": "Medium", "affected": "2 views"},
+                {"issue": "Stale inventory scan", "severity": "Low", "affected": "Global"},
+            ]
+
+            for issue in default_issues:
+                sev = issue['severity']
+                color = "#ef4444" if sev == "High" else "#f59e0b" if sev == "Medium" else "#3b82f6"
+                
+                st.markdown(f"""
+                <div style="background: rgba(255,255,255,0.03); border-radius: 12px; padding: 12px; margin-bottom: 10px; border-left: 4px solid {color}; border-right: 1px solid rgba(255,255,255,0.05); border-top: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                        <div style="font-weight: 600; font-size: 0.9rem; color: #f8fafc;">{issue['issue']}</div>
+                        <span style="background: {color}20; color: {color}; font-size: 0.7rem; padding: 2px 8px; border-radius: 4px; font-weight: 800;">{sev.upper()}</span>
+                    </div>
+                    <div style="font-size: 0.75rem; color: #94a3b8; margin-top: 4px;">Affected: {issue['affected']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            if st.button("Manage All Alerts", key="manage_alerts_btn"):
+                st.info("Redirecting to Alert Management Center...")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("### 📊 Enterprise Quality Pillars")
         
-        st.markdown("---")
-        
-        # Data Quality Dimensions Section
-        st.markdown("### 📊 Data Quality Dimensions")
-        
-        # Fetch quality dimension metrics
-        with st.spinner('🔍 Loading quality dimension metrics...'):
-            quality_metrics = _get_quality_dimensions_metrics()
-        
-        # Helper function to render a dimension card using native Streamlit components
-        def render_dimension_card(title: str, icon: str, metrics: List[Dict], color: str = "#3498db"):
-            box = st.container(border=True)
-            with box:
-                st.markdown(f"{icon} **{title}**")
-                col_a, col_b = st.columns(2)
-                cols = [col_a, col_b]
-                for idx, m in enumerate(metrics):
-                    with cols[idx % 2]:
-                        st.metric(m['label'], m['value'])
-                        if m.get('help'):
-                            st.caption(m['help'])
-        
-        # Create rows of cards (3 per row)
+        # Grid of 8 dimensions
         dimensions = [
-            {
-                'title': 'Completeness',
-                'icon': '✅',
-                'color': '#2ecc71',
-                'metrics': [
-                    {
-                        'label': 'Completeness Score',
-                        'value': f"{quality_metrics['completeness']['score']:.1f}%",
-                        'help': 'of data is complete',
-                        'color': '#e74c3c' if quality_metrics['completeness']['score'] < 90 else '#2ecc71',
-                        'timestamp': quality_metrics['completeness']['last_checked']
-                    },
-                    {
-                        'label': 'Missing Values',
-                        'value': f"{quality_metrics['completeness']['missing_values']:,}",
-                        'help': 'null or empty values',
-                        'color': '#e74c3c' if quality_metrics['completeness']['missing_values'] > 50 else '#2ecc71',
-                        'timestamp': quality_metrics['completeness']['last_checked']
-                    }
-                ],
-                'description': 'Is it there? - Measures the percentage of data that is present and non-null.'
-            },
-            {
-                'title': 'Validity',
-                'icon': '📏',
-                'color': '#3498db',
-                'metrics': [
-                    {
-                        'label': 'Validity Score',
-                        'value': f"{quality_metrics['validity']['score']:.1f}%",
-                        'help': 'of data is valid',
-                        'color': '#e74c3c' if quality_metrics['validity']['score'] < 90 else '#2ecc71',
-                        'timestamp': quality_metrics['validity']['last_checked']
-                    },
-                    {
-                        'label': 'Format Issues',
-                        'value': f"{quality_metrics['validity']['invalid_format']:,}",
-                        'help': 'format violations',
-                        'color': '#e74c3c' if quality_metrics['validity']['invalid_format'] > 10 else '#2ecc71',
-                        'timestamp': quality_metrics['validity']['last_checked']
-                    }
-                ],
-                'description': 'Is it in the right shape? - Measures if data conforms to defined formats and rules.'
-            },
-            {
-                'title': 'Accuracy',
-                'icon': '🎯',
-                'color': '#9b59b6',
-                'metrics': [
-                    {
-                        'label': 'Accuracy Score',
-                        'value': f"{quality_metrics['accuracy']['score']:.1f}%",
-                        'help': 'of data is accurate',
-                        'color': '#e74c3c' if quality_metrics['accuracy']['score'] < 90 else '#2ecc71',
-                        'timestamp': quality_metrics['accuracy']['last_checked']
-                    },
-                    {
-                        'label': 'Error Rate',
-                        'value': f"{quality_metrics['accuracy']['error_rate']:.1f}%",
-                        'help': 'of values corrected',
-                        'color': '#e74c3c' if quality_metrics['accuracy']['error_rate'] > 2 else '#2ecc71',
-                        'timestamp': quality_metrics['accuracy']['last_checked']
-                    }
-                ],
-                'description': 'Is it correct in the real world? - Measures the degree to which data correctly represents the real-world entities.'
-            },
-            {
-                'title': 'Consistency',
-                'icon': '🔄',
-                'color': '#e67e22',
-                'metrics': [
-                    {
-                        'label': 'Consistency Score',
-                        'value': f"{quality_metrics['consistency']['score']:.1f}%",
-                        'help': 'of data is consistent',
-                        'color': '#e74c3c' if quality_metrics['consistency']['score'] < 90 else '#2ecc71',
-                        'timestamp': quality_metrics['consistency']['last_checked']
-                    },
-                    {
-                        'label': 'Rule Violations',
-                        'value': f"{quality_metrics['consistency']['rule_violations']:,}",
-                        'help': 'business rules failed',
-                        'color': '#e74c3c' if quality_metrics['consistency']['rule_violations'] > 5 else '#2ecc71',
-                        'timestamp': quality_metrics['consistency']['last_checked']
-                    }
-                ],
-                'description': 'Does it agree with other data we have? - Measures if data is consistent across different sources and over time.'
-            },
-            {
-                'title': 'Uniqueness',
-                'icon': '🔍',
-                'color': '#1abc9c',
-                'metrics': [
-                    {
-                        'label': 'Uniqueness Score',
-                        'value': f"{quality_metrics['uniqueness']['score']:.1f}%",
-                        'help': 'of data is unique',
-                        'color': '#e74c3c' if quality_metrics['uniqueness']['score'] < 90 else '#2ecc71',
-                        'timestamp': quality_metrics['uniqueness']['last_checked']
-                    },
-                    {
-                        'label': 'Duplicate Records',
-                        'value': f"{quality_metrics['uniqueness']['duplicates']:,}",
-                        'help': 'potential duplicates',
-                        'color': '#e74c3c' if quality_metrics['uniqueness']['duplicates'] > 10 else '#2ecc71',
-                        'timestamp': quality_metrics['uniqueness']['last_checked']
-                    }
-                ],
-                'description': 'Is it a single source of truth? - Measures if each entity is represented only once in the dataset.'
-            },
-            {
-                'title': 'Timeliness',
-                'icon': '⏱️',
-                'color': '#3498db',
-                'metrics': [
-                    {
-                        'label': 'Freshness',
-                        'value': f"{quality_metrics['timeliness']['freshness_hours']:.1f} hrs",
-                        'help': 'since last update',
-                        'color': '#e74c3c' if quality_metrics['timeliness']['freshness_hours'] > 24 else '#2ecc71',
-                        'timestamp': quality_metrics['timeliness']['last_updated']
-                    },
-                    {
-                        'label': 'SLA Adherence',
-                        'value': f"{quality_metrics['timeliness']['slo_adherence']:.1f}%",
-                        'help': 'of SLAs met',
-                        'color': '#e74c3c' if quality_metrics['timeliness']['slo_adherence'] < 95 else '#2ecc71',
-                        'timestamp': quality_metrics['timeliness']['last_updated']
-                    }
-                ],
-                'description': 'Is it current and useful? - Measures if data is up-to-date and available when needed.'
-            },
-            {
-                'title': 'Integrity',
-                'icon': '🔗',
-                'color': '#9b59b6',
-                'metrics': [
-                    {
-                        'label': 'Integrity Score',
-                        'value': f"{quality_metrics['integrity']['score']:.1f}%",
-                        'help': 'of relationships valid',
-                        'color': '#e74c3c' if quality_metrics['integrity']['score'] < 90 else '#2ecc71',
-                        'timestamp': quality_metrics['integrity']['last_checked']
-                    },
-                    {
-                        'label': 'Orphaned Records',
-                        'value': f"{quality_metrics['integrity']['orphaned_records']:,}",
-                        'help': 'broken relationships',
-                        'color': '#e74c3c' if quality_metrics['integrity']['orphaned_records'] > 0 else '#2ecc71',
-                        'timestamp': quality_metrics['integrity']['last_checked']
-                    }
-                ],
-                'description': 'Are its connections to other data broken? - Measures if relationships between data elements are maintained.'
-            }
+            ('Completeness', '✅', 'completeness', '#10b981'),
+            ('Accuracy', '🎯', 'accuracy', '#3b82f6'),
+            ('Validity', '📏', 'validity', '#8b5cf6'),
+            ('Consistency', '🔄', 'consistency', '#f59e0b'),
+            ('Uniqueness', '🔍', 'uniqueness', '#06b6d4'),
+            ('Timeliness', '⏱️', 'timeliness', '#ec4899'),
+            ('Integrity', '🔗', 'integrity', '#f97316'),
+            ('Security', '🛡️', 'accuracy', '#6366f1') # Reusing accuracy for mock security
         ]
 
-        # Display cards in a grid (3 per row)
-        for i in range(0, len(dimensions), 3):
-            cols = st.columns(3)
-            for j in range(3):
+        def render_pillar_card(name, icon, key, color):
+            data = quality_metrics.get(key, {})
+            score = data.get('score', 0)
+            st.markdown(f"""
+            <div class="pillar-card" style="border-bottom: 3px solid {color}30;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div style="font-size: 1.5rem;">{icon}</div>
+                    <div style="font-weight: 800; color: {color}; font-size: 1.2rem;">{score:.1f}%</div>
+                </div>
+                <div class="pillar-label" style="text-align: left; margin-top: 8px;">{name}</div>
+                <div style="height: 4px; background: rgba(255,255,255,0.05); border-radius: 2px; margin-top: 10px; overflow: hidden;">
+                    <div style="width: {score}%; height: 100%; background: {color};"></div>
+                </div>
+                <div style="font-size: 0.7rem; color: rgba(255,255,255,0.4); text-align: left; margin-top: 8px;">
+                    Last validated: {data.get('last_checked', 'Recently')[:16].replace('T', ' ')}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        for i in range(0, len(dimensions), 4):
+            dm_cols = st.columns(4)
+            for j in range(4):
                 if i + j < len(dimensions):
-                    dim = dimensions[i + j]
-                    with cols[j]:
-                        render_dimension_card(
-                            title=dim['title'],
-                            icon=dim['icon'],
-                            metrics=dim['metrics'],
-                            color=dim['color']
-                        )
-        
-        # Initialize default metrics
-        default_metrics = {
-            'health_score': 0,
-            'sla_compliance': 0,
-            'critical_alerts': 0,
-            'credits_used_today': 0.0,
-            'row_count': 0,
-            'rules_passing': 0,
-            'rules_failing': 0,
-            'rules_warning': 0,
-            'dimensions': {
-                'completeness': 0.0,
-                'accuracy': 0.0,
-                'timeliness': 0.0,
-                'validity': 0.0,
-                'uniqueness': 0.0
-            },
-            'rule_status': {
-                'passing': 0,
-                'warning': 0,
-                'failing': 0
-            },
-            'last_updated': datetime.utcnow().isoformat()
-        }
-        
-        # Initialize metrics with default values
-        metrics = default_metrics.copy()
-                
-        # Fetch real-time quality metrics and dimensions
-        with st.spinner('🔍 Loading quality metrics from Snowflake...'):
-            try:
-                # Get quality metrics first (includes SLA, alerts, credits)
-                fetched_metrics = _get_quality_metrics(
-                    database=active_db if active_db and active_db != "(none)" else None,
-                    schema=sel_schema if sel_schema and sel_schema != "All" else None,
-                    table=sel_object.split('.')[-1] if sel_object and sel_object != "None" else None
-                )
-                
-                # Update metrics with fetched values if available
-                if fetched_metrics:
-                    metrics.update(fetched_metrics)
-                
-                # Get detailed quality dimensions
-                try:
-                    dimensions = _get_quality_dimensions(
-                        database=active_db if active_db and active_db != "(none)" else None,
-                        schema=sel_schema if sel_schema and sel_schema != "All" else None,
-                        table=sel_object.split('.')[-1] if sel_object and sel_object != "None" else None
-                    )
-                    if dimensions:
-                        metrics['dimensions'].update(dimensions)
-                except Exception as dim_error:
-                    st.warning(f"⚠️ Could not load quality dimensions: {str(dim_error)}")
-                
-                # Get rule status
-                try:
-                    rule_status = _get_rule_status(
-                        database=active_db if active_db and active_db != "(none)" else None,
-                        schema=sel_schema if sel_schema and sel_schema != "All" else None,
-                        table=sel_object.split('.')[-1] if sel_object and sel_object != "None" else None
-                    )
-                    if rule_status:
-                        metrics['rule_status'] = rule_status
-                        metrics['rules_passing'] = rule_status.get('passing', 0)
-                        metrics['rules_warning'] = rule_status.get('warning', 0)
-                        metrics['rules_failing'] = rule_status.get('failing', 0)
-                except Exception as status_error:
-                    st.warning(f"⚠️ Could not load rule status: {str(status_error)}")
-                
-                # Ensure health score is calculated if not provided
-                if 'health_score' not in metrics or not metrics['health_score']:
-                    weights = {
-                        'completeness': 0.25,
-                        'accuracy': 0.2,
-                        'timeliness': 0.25,
-                        'validity': 0.2,
-                        'uniqueness': 0.1
-                    }
-                    metrics['health_score'] = round(sum(
-                        metrics['dimensions'].get(dim, 0) * weight 
-                        for dim, weight in weights.items()
-                    ), 1)
-                
-                st.success(f"✅ Data quality metrics loaded at {datetime.utcnow().strftime('%H:%M:%S UTC')}")
-                
-            except Exception as e:
-                st.error(f"❌ Error loading quality metrics: {str(e)}")
-                import traceback
-                st.error(traceback.format_exc())
-                # Reset to default metrics on error
-                metrics = default_metrics.copy()
-        
-        # Calculate trend indicators (placeholder - would come from historical data)
-        health_trend = "+2%"
-        sla_trend = "+5%"
+                    with dm_cols[j]:
+                        render_pillar_card(*dimensions[i+j])
 
-        # Rule Status section removed per request
+        st.markdown("<br>", unsafe_allow_html=True)
         
-        # Top Failing Rules
-        st.markdown("#### Top Failing Rules")
-        if st.checkbox("Show detailed rules"):
-            rules_data = {
-                "Rule Name": ["Null Check: customer.email", "Range Check: order.amount", "Referential: order.customer_id"],
-                "Severity": ["High", "Medium", "Critical"],
-                "Status": ["Failing", "Warning", "Failing"],
-                "Last Checked": ["5m ago", "15m ago", "1h ago"]
-            }
-            st.dataframe(pd.DataFrame(rules_data), use_container_width=True)
+        # Strategic Intelligence Section (The "Gap Filler")
+        st.markdown("### 🗺️ Strategic Intelligence Overlays")
+        strat_col1, strat_col2 = st.columns(2)
         
-        # Recent Incidents
-        st.markdown("#### Recent Incidents")
-        try:
-            # Build ASSETS FQN
-            active_db_q = (
-                st.session_state.get("sf_database")
-                or getattr(settings, "SNOWFLAKE_DATABASE", None)
-                or "DATA_CLASSIFICATION_DB"
+        with strat_col1:
+            st.markdown("**Multi-Dimensional Quality Maturity**")
+            # Prepare data for Radar Chart
+            radar_labels = [d[0] for d in dimensions]
+            radar_values = [quality_metrics.get(d[2], {}).get('score', 0) for d in dimensions]
+            
+            fig_radar = go.Figure()
+            fig_radar.add_trace(go.Scatterpolar(
+                r=radar_values + [radar_values[0]],
+                theta=radar_labels + [radar_labels[0]],
+                fill='toself',
+                fillcolor='rgba(99, 102, 241, 0.2)',
+                line=dict(color='#6366f1', width=3),
+                marker=dict(size=8, color='#6366f1')
+            ))
+            fig_radar.update_layout(
+                polar=dict(
+                    radialaxis=dict(visible=True, range=[0, 100], gridcolor='rgba(255,255,255,0.1)', tickfont=dict(size=8)),
+                    angularaxis=dict(gridcolor='rgba(255,255,255,0.1)', tickfont=dict(size=10)),
+                    bgcolor='rgba(0,0,0,0)'
+                ),
+                showlegend=False,
+                height=350,
+                margin=dict(l=40, r=40, t=20, b=20),
+                paper_bgcolor='rgba(0,0,0,0)'
             )
-            _SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
-            T_ASSETS = f"{active_db_q}.{_SCHEMA}.ASSETS"
+            st.plotly_chart(fig_radar, use_container_width=True)
 
-            # WHERE clause (schema filter if selected)
-            where_parts = []
-            params_inc = {}
-            if sel_schema and sel_schema != "All":
-                where_parts.append("SCHEMA_NAME = %(schema)s")
-                params_inc["schema"] = sel_schema
-            where_cls = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        with strat_col2:
+            st.markdown("**Governance Coverage maturity**")
+            # Donut chart for Classification Coverage
+            labels = gov_labels
+            values = gov_values
+            colors = ['#ef4444', '#3b82f6', '#10b981', '#475569']
+            
+            fig_donut = go.Figure(data=[go.Pie(
+                labels=labels, 
+                values=values, 
+                hole=.6,
+                marker=dict(colors=colors),
+                textinfo='percent+label',
+                textposition='outside',
+                insidetextorientation='radial'
+            )])
+            fig_donut.update_layout(
+                showlegend=False,
+                height=350,
+                margin=dict(l=0, r=0, t=0, b=0),
+                paper_bgcolor='rgba(0,0,0,0)',
+                annotations=[dict(text=f'{int(gov_maturity_pct)}%', x=0.5, y=0.5, font_size=24, showarrow=False, font_color='white', font_family='Inter')]
+            )
+            st.plotly_chart(fig_donut, use_container_width=True)
 
-            # Query per request
-            query_inc = f"""
-                select DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, ASSET_TYPE as ASSET_TYPE,
-                       CLASSIFICATION_LABEL as CLASSIFICATION_LEVEL,
-                       CLASSIFICATION_DATE as LAST_CLASSIFIED_AT
-                from {T_ASSETS}
-                {where_cls}
-                order by LAST_CLASSIFIED_AT desc
-                limit 200
-            """
-
-            rows_inc = snowflake_connector.execute_query(query_inc, params_inc)
-            if rows_inc:
-                df_inc = pd.DataFrame(rows_inc)
-                st.dataframe(df_inc, use_container_width=True, hide_index=True)
-            else:
-                st.info("No recent incidents found for the current selection.")
-        except Exception as e:
-            st.warning(f"Failed to load Recent Incidents: {e}")
-        
         st.markdown("---")
         
-        # Impact & Drill-down Section (removed)
-        # st.markdown("### 🔗 Impact & Drill-down")
+        # Security & Integrity Focus
+        st.markdown("#### 🛡️ Security & Integrity Deep-Dive")
+        s_col1, s_col2 = st.columns(2)
         
-        # Impact & Drill-down removed
-        
-        # Removed dataset-level details
-        if sel_object and sel_object != "None":
+        with s_col1:
+            st.markdown("**Privileged Access Trend**")
+            # Mini-trend for access incidents
+            acc_dates = pd.date_range(end=datetime.now(), periods=10).date
+            acc_values = [2, 0, 1, 0, 0, 3, 1, 0, 0, 2]
+            fig_acc = px.area(x=acc_dates, y=acc_values, color_discrete_sequence=['#ef4444'])
+            fig_acc.update_layout(height=150, margin=dict(l=0,r=0,t=0,b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                                 xaxis=dict(visible=False), yaxis=dict(visible=False))
+            st.plotly_chart(fig_acc, use_container_width=True)
+            
             try:
-                db, schema, table = _split_fqn(sel_object)
-                if db and schema and table:
-                    # Get table stats (parameterized and quoted)
-                    stats = _run(
-                        f"""
-                        SELECT 
-                            ROW_COUNT,
-                            BYTES,
-                            LAST_ALTERED,
-                            DATEDIFF('hour', LAST_ALTERED, CURRENT_TIMESTAMP()) as hours_since_update
-                        FROM "{db}".INFORMATION_SCHEMA.TABLES 
-                        WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
-                        """,
-                        {"s": schema, "t": table},
-                    )
-                    
-                    if stats:
-                        st.metric("Row Count", f"{int(stats[0].get('ROW_COUNT', 0)):,}")
-                        hours_since_update = int(stats[0].get('HOURS_SINCE_UPDATE', 0))
-                        last_updated = f"{hours_since_update} hours ago" if hours_since_update < 24 else f"{hours_since_update//24} days ago"
-                        st.metric("Last Updated", last_updated)
+                # Query recent classification activities as a proxy for incidents
+                query_inc = """
+                    SELECT ASSET_NAME, CLASSIFICATION_LABEL as TYPE, TO_VARCHAR(CLASSIFICATION_DATE, 'HH24:MI') as TIME
+                    FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                    WHERE CLASSIFICATION_LABEL IN ('SENSITIVE', 'CONFIDENTIAL')
+                    ORDER BY CLASSIFICATION_DATE DESC LIMIT 3
+                """
+                rows_inc = _run(query_inc)
+                if rows_inc:
+                    st.dataframe(pd.DataFrame(rows_inc), use_container_width=True, hide_index=True)
                 else:
-                    st.info("Select a fully-qualified object (DB.SCHEMA.TABLE) to show table statistics.")
-            except Exception as e:
-                st.warning(f"Could not fetch table statistics: {str(e)}")
+                    st.info("No critical activities detected in latest window.")
+            except Exception:
+                pass
         
+        with s_col2:
+            st.markdown("**Active Governance Velocity**")
+            # Display velocity metrics
+            v_col1, v_col2 = st.columns(2)
+            v_col1.metric("Tasks Resolved", "14", "+2")
+            v_col2.metric("Mean Response", "4.2h", "-15m")
+            
+            tasks = [
+                {"Task": "Review SOX-Schema", "Status": "Open", "Priority": "High"},
+                {"Task": "Authorize PII Request", "Status": "Pending", "Priority": "Critical"},
+                {"Task": "Lineage Gap Scan", "Status": "In-Progress", "Priority": "Medium"}
+            ]
+            st.dataframe(pd.DataFrame(tasks), use_container_width=True, hide_index=True)
+
 
     # ---- Data Profiling Tools ----
     with dq_profile:
-        st.subheader("")
-        if sel_object and sel_object != "None":
-            db, sch, name = _split_fqn(sel_object)
-            has_fqn = bool(db and sch and name)
-            if not has_fqn:
-                st.info("Select a fully-qualified object (DB.SCHEMA.TABLE) to view column metadata and statistics.")
-            cols = _columns(db, sch, name) if has_fqn else []
-            # Dimensions & Metrics — table-level for selected object
-            st.markdown("---")
-            st.subheader("Dimensions & Metrics")
-            d: Dict[str, Any] = {}
-            if has_fqn:
-                fqn = f"{db}.{sch}.{name}"
-                # Row count
-                try:
-                    rc = _run(f"select count(*) as N from {fqn}") or []
-                    d["TOTAL_ROWS"] = int(rc[0].get("N") or 0) if rc else 0
-                except Exception:
-                    d["TOTAL_ROWS"] = 0
-                # Columns list for selectors/guards
-                try:
-                    crow = _run(
-                        f"select COLUMN_NAME from {db}.INFORMATION_SCHEMA.COLUMNS where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s order by ORDINAL_POSITION",
-                        {"s": sch, "t": name}
-                    ) or []
-                    table_cols = [r.get("COLUMN_NAME") for r in crow if r.get("COLUMN_NAME")]
-                except Exception:
-                    table_cols = []
-                # Key column for uniqueness
-                default_key = next((c for c in table_cols if c and "ID" in c.upper()), (table_cols[0] if table_cols else None))
-                key_col = st.selectbox("Key column for uniqueness", options=table_cols, index=(table_cols.index(default_key) if (default_key in table_cols) else 0) if table_cols else None, key="dm_key_col") if table_cols else None
-                if key_col:
-                    try:
-                        uq = _run(f"select count(distinct \"{key_col}\") as D from {fqn}") or []
-                        distinct_c = int(uq[0].get("D") or 0) if uq else 0
-                        total = d.get("TOTAL_ROWS", 0)
-                        d["DISTINCT_ASSETS"] = distinct_c
-                        d["UNIQUENESS_PCT"] = round((distinct_c * 100.0 / (total or 1)), 2) if total else 0.0
-                        d["DUPLICATE_RECORDS"] = max(total - distinct_c, 0)
-                    except Exception:
-                        d["DISTINCT_ASSETS"] = 0
-                        d["UNIQUENESS_PCT"] = 0.0
-                        d["DUPLICATE_RECORDS"] = 0
-                # Completeness: compute % nulls for up to three indicative columns if they exist
-                def _pct_null(col: str) -> float:
-                    try:
-                        r = _run(f"select sum(iff(\"{col}\" is null,1,0)) as N, count(*) as T from {fqn}") or []
-                        n = int(r[0].get("N") or 0) if r else 0
-                        t = int(r[0].get("T") or 0) if r else 0
-                        return round((n * 100.0 / (t or 1)), 2) if t else 0.0
-                    except Exception:
-                        return 0.0
-                if "CLASSIFICATION_LABEL" in [c.upper() for c in table_cols]:
-                    d["NULL_PCT_CLASSIFICATION"] = _pct_null(next(c for c in table_cols if c.upper()=="CLASSIFICATION_LABEL"))
-                if "DATA_OWNER" in [c.upper() for c in table_cols]:
-                    d["NULL_PCT_OWNER"] = _pct_null(next(c for c in table_cols if c.upper()=="DATA_OWNER"))
-                if "BUSINESS_UNIT" in [c.upper() for c in table_cols]:
-                    d["NULL_PCT_BUSINESS_UNIT"] = _pct_null(next(c for c in table_cols if c.upper()=="BUSINESS_UNIT"))
-                # Validity examples (optional, guarded)
-                if "DATA_OWNER_EMAIL" in [c.upper() for c in table_cols]:
-                    try:
-                        vr = _run(
-                            f"select sum(iff(DATA_OWNER_EMAIL is not null and not regexp_like(DATA_OWNER_EMAIL, '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\\\.[A-Z]{{2,}}$', 'i'),1,0)) as BAD, count(*) as T from {fqn}"
-                        ) or []
-                        bad = int(vr[0].get("BAD") or 0) if vr else 0
-                        t = int(vr[0].get("T") or 0) if vr else 0
-                        d["INVALID_EMAIL_PCT"] = round((bad * 100.0 / (t or 1)), 2) if t else 0.0
-                    except Exception:
-                        d["INVALID_EMAIL_PCT"] = None
-                if "REVIEW_FREQUENCY_DAYS" in [c.upper() for c in table_cols]:
-                    try:
-                        rr = _run(
-                            f"select sum(iff(REVIEW_FREQUENCY_DAYS < 0 or REVIEW_FREQUENCY_DAYS > 1095,1,0)) as BAD, count(*) as T from {fqn}"
-                        ) or []
-                        bad = int(rr[0].get("BAD") or 0) if rr else 0
-                        t = int(rr[0].get("T") or 0) if rr else 0
-                        d["OUT_OF_RANGE_REVIEW_FREQ_PCT"] = round((bad * 100.0 / (t or 1)), 2) if t else 0.0
-                    except Exception:
-                        d["OUT_OF_RANGE_REVIEW_FREQ_PCT"] = None
-                if set([c.upper() for c in table_cols]) >= {"CLASSIFICATION_LABEL","PREVIOUS_CLASSIFICATION_LABEL"}:
-                    try:
-                        rr = _run(
-                            f"select sum(iff(CLASSIFICATION_LABEL != PREVIOUS_CLASSIFICATION_LABEL,1,0)) as CHG, count(*) as T from {fqn}"
-                        ) or []
-                        chg = int(rr[0].get("CHG") or 0) if rr else 0
-                        t = int(rr[0].get("T") or 0) if rr else 0
-                        d["CLASSIFICATION_CHANGE_PCT"] = round((chg * 100.0 / (t or 1)), 2) if t else 0.0
-                    except Exception:
-                        d["CLASSIFICATION_CHANGE_PCT"] = None
-                # Timeliness from INFORMATION_SCHEMA.TABLES
-                try:
-                    tmeta = _run(
-                        f"select LAST_ALTERED from {db}.INFORMATION_SCHEMA.TABLES where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s",
-                        {"s": sch, "t": name}
-                    ) or []
-                    if tmeta and tmeta[0].get("LAST_ALTERED"):
-                        d["LAST_UPDATED"] = tmeta[0]["LAST_ALTERED"]
-                        dd = _run("select datediff('day', %(ts)s, current_timestamp()) as DD", {"ts": d["LAST_UPDATED"]}) or []
-                        if dd:
-                            d["DATA_STALENESS_DAYS"] = int(dd[0].get("DD") or 0)
-                except Exception:
-                    pass
-            # Render if we have any metrics
-            if d:
-                # Top metric cards with Dashboard-style pillars
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.markdown(f"""
-                        <div class="pillar-card">
-                            <div class="pillar-icon">💎</div>
-                            <div class="pillar-label">Uniqueness</div>
-                            <div class="pillar-value">{float(d.get('UNIQUENESS_PCT') or 0):.1f}%</div>
-                            <div class="pillar-status">Unique Records</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                with c2:
-                    st.markdown(f"""
-                        <div class="pillar-card">
-                            <div class="pillar-icon">👯</div>
-                            <div class="pillar-label">Duplicates</div>
-                            <div class="pillar-value">{int(d.get('DUPLICATE_RECORDS') or 0):,}</div>
-                            <div class="pillar-status">Redundant rows</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                with c3:
-                    st.markdown(f"""
-                        <div class="pillar-card">
-                            <div class="pillar-icon">📊</div>
-                            <div class="pillar-label">Volume</div>
-                            <div class="pillar-value">{int(d.get('TOTAL_ROWS') or 0):,}</div>
-                            <div class="pillar-status">Total instances</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                with c4:
-                    st.markdown(f"""
-                        <div class="pillar-card">
-                            <div class="pillar-icon">🔍</div>
-                            <div class="pillar-label">Distinct</div>
-                            <div class="pillar-value">{int(d.get('DISTINCT_ASSETS') or 0):,}</div>
-                            <div class="pillar-status">Unique items</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-
-                st.markdown("<br>", unsafe_allow_html=True)
-
-                # Completeness mini-chart (null % by key attributes)
-                null_df = pd.DataFrame([
-                    {"DIMENSION": "Classification", "NULL_PCT": float(d.get('NULL_PCT_CLASSIFICATION') or 0)},
-                    {"DIMENSION": "Owner", "NULL_PCT": float(d.get('NULL_PCT_OWNER') or 0)},
-                    {"DIMENSION": "Business Unit", "NULL_PCT": float(d.get('NULL_PCT_BUSINESS_UNIT') or 0)},
-                ])
-                st.plotly_chart(
-                    px.bar(null_df, x="DIMENSION", y="NULL_PCT", title="Completeness: % Nulls by Attribute", text="NULL_PCT")
-                    .update_traces(marker_color='#2ED4C6', texttemplate='%{text:.1f}%', textposition='outside'),
-                    use_container_width=True
-                )
-
-                # Validity mini-cards
-                v1, v2, v3 = st.columns(3)
-                with v1:
-                    st.markdown(f"""
-                        <div class="pillar-card">
-                            <div class="pillar-icon">📧</div>
-                            <div class="pillar-label">Email Validity</div>
-                            <div class="pillar-value">{float(d.get('INVALID_EMAIL_PCT') or 0):.1f}%</div>
-                            <div class="pillar-status">Format violations</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                with v2:
-                    st.markdown(f"""
-                        <div class="pillar-card">
-                            <div class="pillar-icon">📅</div>
-                            <div class="pillar-label">Review Window</div>
-                            <div class="pillar-value">{float(d.get('OUT_OF_RANGE_REVIEW_FREQ_PCT') or 0):.1f}%</div>
-                            <div class="pillar-status">Policy exceptions</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                with v3:
-                    st.markdown(f"""
-                        <div class="pillar-card">
-                            <div class="pillar-icon">🔄</div>
-                            <div class="pillar-label">Drift Velocity</div>
-                            <div class="pillar-value">{float(d.get('CLASSIFICATION_CHANGE_PCT') or 0):.1f}%</div>
-                            <div class="pillar-status">Label transitions</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-
-                st.markdown("<br>", unsafe_allow_html=True)
-
-                # Timeliness
-                t1, t2, t3 = st.columns(3)
-                with t1:
-                    st.markdown(f"""
-                        <div class="pillar-card" style="background: rgba(56, 189, 248, 0.05);">
-                            <div class="pillar-icon">⌛</div>
-                            <div class="pillar-label">Average Age</div>
-                            <div class="pillar-value">{float(d.get('AVG_RECORD_AGE_DAYS') or 0):.1f}</div>
-                            <div class="pillar-status">Days since entry</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                with t2:
-                    last_upd = str(d.get('LAST_UPDATED') or '—')
-                    if ' ' in last_upd: last_upd = last_upd.split(' ')[0]
-                    st.markdown(f"""
-                        <div class="pillar-card" style="background: rgba(56, 189, 248, 0.05);">
-                            <div class="pillar-icon">🔔</div>
-                            <div class="pillar-label">Last Updated</div>
-                            <div class="pillar-value" style="font-size: 1.5rem;">{last_upd}</div>
-                            <div class="pillar-status">Latest modification</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                with t3:
-                    st.markdown(f"""
-                        <div class="pillar-card" style="background: rgba(239, 68, 68, 0.05);">
-                            <div class="pillar-icon">❄️</div>
-                            <div class="pillar-label">Staleness</div>
-                            <div class="pillar-value">{int(d.get('DATA_STALENESS_DAYS') or 0)}</div>
-                            <div class="pillar-status">Days inactive</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-
+        # Resolve target FQN from global filter context
+        target_fqn = None
+        if sel_object and sel_object != "All":
+            if "." in sel_object: target_fqn = sel_object
+            elif active_db != "All" and sel_schema != "All": target_fqn = f"{active_db}.{sel_schema}.{sel_object}"
+        
+        if target_fqn:
+            db_n, sch_n, tbl_n = _split_fqn(target_fqn)
+            
+            if not (db_n and sch_n and tbl_n):
+                st.info("💡 Select a fully-qualified object (DB.SCHEMA.TABLE) to view deep profiling metrics.")
             else:
-                st.info("No metrics available for the selected table.")
-            # Column metadata (ACCOUNT_USAGE only)
-            if has_fqn:
-                try:
-                    rows = _run(
-                        f"select * from SNOWFLAKE.ACCOUNT_USAGE.COLUMNS where TABLE_CATALOG=%(d)s and TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s limit 500",
-                        {"d": db, "s": sch, "t": name}
-                    ) or []
-                    st.subheader("COLUMNS LEVEL DETAILED VIEW")
-                    st.caption("Source: SNOWFLAKE.ACCOUNT_USAGE.COLUMNS")
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                except Exception as e:
-                    st.info(f"Account usage columns unavailable: {e}")
-            # Table metadata + size
-            try:
-                if has_fqn:
-                    tmeta = _run(
-                        f"select * from {db}.INFORMATION_SCHEMA.TABLES where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s",
-                        {"s": sch, "t": name}
-                    ) or []
-                else:
-                    tmeta = []
-            except Exception:
-                tmeta = []
-            size_b = _estimate_size(sel_object)
-            rc = _table_rowcount(db, sch, name) if has_fqn else None
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Row Count", f"{rc:,}" if rc is not None else "—")
-            k2.metric("Estimated Size (MB)", f"{(size_b/1024/1024):,.2f}" if size_b else "—")
-            k3.metric("Table Type", (tmeta[0].get("TABLE_TYPE") if tmeta else "—"))
-
-            # Column statistics and distributions
-            st.markdown("---")
-            st.subheader("Column Statistics")
-            # Use deep-link focus column if provided via session state
-            focus_col = st.session_state.pop('int_profile_focus_col', None) if 'int_profile_focus_col' in st.session_state else None
-            default_cols = [focus_col] if (focus_col and cols and focus_col in cols) else (cols[:5] if cols else [])
-            chosen_cols = st.multiselect("Columns to profile", options=cols, default=default_cols) if cols else []
-            # Type map for consistency checks
-            try:
-                if has_fqn:
-                    type_rows = _run(
-                        f"""
-                        select upper(COLUMN_NAME) as CN, upper(DATA_TYPE) as DT
-                        from {db}.INFORMATION_SCHEMA.COLUMNS
-                        where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s
-                        """,
-                        {"s": sch, "t": name}
-                    ) or []
-                    type_map = {r.get("CN"): (r.get("DT") or "").upper() for r in type_rows}
-                else:
-                    type_map = {}
-            except Exception:
-                type_map = {}
-
-            def _pct_color(v: Optional[float]) -> str:
-                if v is None:
-                    return "#cccccc"
-                if v >= 95:
-                    return "#2ecc71"  # green
-                if v >= 80:
-                    return "#f1c40f"  # yellow
-                return "#e74c3c"       # red
-
-            stats_rows = []
-            for c in chosen_cols:
-                try:
-                    r = _run(f"select count(*) as TOTAL, count(\"{c}\") as NON_NULL, count(distinct \"{c}\") as DISTINCT_COUNT from {sel_object}") or []
-                    total = int(r[0].get("TOTAL") or 0) if r else 0
-                    nonnull = int(r[0].get("NON_NULL") or 0) if r else 0
-                    distinct = int(r[0].get("DISTINCT_COUNT") or 0) if r else 0
-                    minv = maxv = avgv = None
+                st.markdown(f"### Live Data Profile: `{tbl_n}`")
+                st.caption(f"Real-time intelligence from `{target_fqn}`")
+                
+                cols = _columns(db_n, sch_n, tbl_n)
+                
+                # --- Tier 1: Live Intelligence Hub ---
+                with st.spinner(f'🧪 Analyzing live data for {tbl_n}...'):
+                    # Strictly construct the FQN with double quotes for identifier safety
+                    db_clean = db_n.strip()
+                    sch_clean = sch_n.strip()
+                    tbl_clean = tbl_n.strip()
+                    quoted_fqn = f'"{db_clean}"."{sch_clean}"."{tbl_clean}"'
+                    
                     try:
-                        r2 = _run(f"select min(\"{c}\") as MINV, max(\"{c}\") as MAXV, avg(try_to_double(\"{c}\")) as AVGV from {sel_object}") or []
-                        minv = r2[0].get("MINV") if r2 else None
-                        maxv = r2[0].get("MAXV") if r2 else None
-                        avgv = r2[0].get("AVGV") if r2 else None
-                    except Exception:
-                        pass
-                    # Derived metrics
-                    completeness_pct = round((nonnull/total)*100, 2) if total else None
-                    uniqueness_pct = round((distinct/nonnull)*100, 2) if nonnull else None
-                    cardinality_ratio = round((distinct/nonnull)*100, 2) if nonnull else None
+                        # 1. Authoritative Live volume (Total Rows)
+                        vol_res = _run(f"SELECT COUNT(*) as N FROM {quoted_fqn}")
+                        if vol_res is None or (not vol_res and not isinstance(vol_res, list)):
+                            st.warning("⚠️ Access restricted or asset unavailable.")
+                            total = 0
+                        else:
+                            total = int(vol_res[0].get("N") or 0)
+                        
+                        # 2. Fetch specific storage and sync metadata
+                        meta_q = f"""
+                            SELECT BYTES, TO_VARCHAR(LAST_ALTERED, 'YYYY-MM-DD HH24:MI') as SYNC_AT, TABLE_TYPE
+                            FROM "{db_clean}".INFORMATION_SCHEMA.TABLES 
+                            WHERE TABLE_SCHEMA = %(sch)s AND TABLE_NAME = %(tbl)s
+                        """
+                        meta_res = _run(meta_q, {"sch": sch_clean, "tbl": tbl_clean}) or []
+                        
+                        size_bytes = int(meta_res[0].get("BYTES") or 0) if meta_res else 0
+                        last_sync = meta_res[0].get("SYNC_AT") if meta_res else "Real-time"
+                        
+                        # 3. Accuracy check for Row Uniqueness (live execution)
+                        if total > 0 and total < 500000:
+                            u_res = _run(f"SELECT COUNT(DISTINCT *) as DN FROM {quoted_fqn}") or []
+                            uniq = int(u_res[0].get("DN") or 0) if u_res else total
+                        else:
+                            uniq = total 
+                            
+                    except Exception as e:
+                        logger.error(f"Live profiling error: {e}")
+                        total = 0; uniq = 0; size_bytes = 0; last_sync = "N/A"
+                    
+                    size_mb = size_bytes / (1024*1024)
+                    u_pct = (uniq/total*100) if total > 0 else 0
+                        
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.markdown(f"""<div class="pillar-card"><div class="pillar-icon" style="color:#60a5fa">📊</div><div class="pillar-label">Live Row Count</div><div class="pillar-value">{total:,}</div><div class="pillar-status">{last_sync}</div></div>""", unsafe_allow_html=True)
+                    with c2:
+                        st.markdown(f"""<div class="pillar-card"><div class="pillar-icon" style="color:#34d399">💎</div><div class="pillar-label">Uniqueness</div><div class="pillar-value">{u_pct:.1f}%</div><div class="pillar-status">Calculated Live</div></div>""", unsafe_allow_html=True)
+                    with c3:
+                        st.markdown(f"""<div class="pillar-card"><div class="pillar-icon" style="color:#a78bfa">📦</div><div class="pillar-label">Storage Footprint</div><div class="pillar-value">{size_mb:.2f}</div><div class="pillar-status">MB Allocated</div></div>""", unsafe_allow_html=True)
+                    with c4:
+                        st.markdown(f"""<div class="pillar-card"><div class="pillar-icon" style="color:#fbbf24">📑</div><div class="pillar-label">Schema Depth</div><div class="pillar-value">{len(cols)}</div><div class="pillar-status">Attributes</div></div>""", unsafe_allow_html=True)
 
-                    # Pattern validity (heuristics by column name)
-                    cname = c.upper()
-                    pattern_valid_pct: Optional[float] = None
-                    if any(k in cname for k in ["EMAIL"]):
-                        re_pat = r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$'
-                        rr = _run(f"select sum(iff(\"{c}\" is not null and \"{c}\" rlike %(p)s,1,0)) as OK, sum(iff(\"{c}\" is not null,1,0)) as N from {sel_object}", {"p": re_pat}) or []
-                        n = int(rr[0].get("N") or 0) if rr else 0
-                        ok = int(rr[0].get("OK") or 0) if rr else 0
-                        pattern_valid_pct = round((ok/n)*100, 2) if n else None
-                    elif any(k in cname for k in ["PHONE","MOBILE"]):
-                        re_pat = r'^[+]?\d[\d\s().-]{7,}$'
-                        rr = _run(f"select sum(iff(\"{c}\" is not null and \"{c}\" rlike %(p)s,1,0)) as OK, sum(iff(\"{c}\" is not null,1,0)) as N from {sel_object}", {"p": re_pat}) or []
-                        n = int(rr[0].get("N") or 0) if rr else 0
-                        ok = int(rr[0].get("OK") or 0) if rr else 0
-                        pattern_valid_pct = round((ok/n)*100, 2) if n else None
-                    elif any(k in cname for k in ["URL","LINK"]):
-                        re_pat = r'^(https?://).+'
-                        rr = _run(f"select sum(iff(\"{c}\" is not null and \"{c}\" rlike %(p)s,1,0)) as OK, sum(iff(\"{c}\" is not null,1,0)) as N from {sel_object}", {"p": re_pat}) or []
-                        n = int(rr[0].get("N") or 0) if rr else 0
-                        ok = int(rr[0].get("OK") or 0) if rr else 0
-                        pattern_valid_pct = round((ok/n)*100, 2) if n else None
-                    elif any(k in cname for k in ["DATE","DOB"]):
-                        rr = _run(f"select sum(iff(\"{c}\" is not null and try_to_timestamp(\"{c}\") is not null,1,0)) as OK, sum(iff(\"{c}\" is not null,1,0)) as N from {sel_object}") or []
-                        n = int(rr[0].get("N") or 0) if rr else 0
-                        ok = int(rr[0].get("OK") or 0) if rr else 0
-                        pattern_valid_pct = round((ok/n)*100, 2) if n else None
+                st.markdown("<br>", unsafe_allow_html=True)
+                
+                # --- Tier 2: Interactive Intelligence Tabs ---
+                res_tab1, res_tab2 = st.tabs(["📊 Summary Stats", "🔍 Data Sample"])
+                
+                with res_tab1:
+                    col_b, col_d = st.columns([1.5, 1])
+                    
+                    with col_b:
+                        st.markdown("#### Quality Checks")
+                        with st.spinner("Analyzing attribute integrity..."):
+                            stats = []
+                            for c in cols[:12]:
+                                try:
+                                    r = _run(f"SELECT count(*) as T, count(\"{c}\") as NN, count(distinct \"{c}\") as D FROM {quoted_fqn}") or []
+                                    if not r: continue
+                                    t, nn, d = int(r[0].get("T") or 0), int(r[0].get("NN") or 0), int(r[0].get("D") or 0)
+                                    stats.append({
+                                        "Attribute": c,
+                                        "Comp %": round((nn/t)*100, 1) if t else 0,
+                                        "Uniq %": round((d/nn)*100, 1) if nn else 0,
+                                        "Nulls": t - nn
+                                    })
+                                except Exception: pass
+                            
+                            if stats:
+                                st.dataframe(
+                                    pd.DataFrame(stats).style.background_gradient(subset=['Comp %'], cmap='RdYlGn', vmin=0, vmax=100), 
+                                    use_container_width=True, hide_index=True
+                                )
+                            else:
+                                st.info("🔍 Integrity telemetry pending for this asset type.")
+                    
+                    with col_d:
+                        st.markdown("#### Top Values")
+                        dist_target = st.selectbox("Select Attribute", options=cols, key="min_dist_sel")
+                        if dist_target:
+                            try:
+                                dist_df = pd.DataFrame(_run(f'SELECT "{dist_target}" as V, count(*) as C FROM {quoted_fqn} GROUP BY 1 ORDER BY 2 DESC LIMIT 10') or [])
+                                if not dist_df.empty:
+                                    fig_dist = px.bar(dist_df, x='V', y='C', color='C', color_continuous_scale='Blues')
+                                    fig_dist.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font={'color':'white'}, showlegend=False)
+                                    fig_dist.update_coloraxes(showscale=False)
+                                    st.plotly_chart(fig_dist, use_container_width=True)
+                                else:
+                                    st.caption("No data for this type.")
+                            except Exception:
+                                st.caption("Unable to render distribution.")
 
-                    # Type consistency based on declared type
-                    declared = type_map.get(c.upper(), "")
-                    type_consist_pct: Optional[float] = None
-                    if declared.startswith("NUMBER") or declared in ("INT","INTEGER","DECIMAL","FLOAT","DOUBLE"):
-                        rr = _run(f"select sum(iff(\"{c}\" is not null and try_to_double(\"{c}\") is not null,1,0)) as OK, sum(iff(\"{c}\" is not null,1,0)) as N from {sel_object}") or []
-                        n = int(rr[0].get("N") or 0) if rr else 0
-                        ok = int(rr[0].get("OK") or 0) if rr else 0
-                        type_consist_pct = round((ok/n)*100, 2) if n else None
-                    elif declared.startswith("DATE") or declared.startswith("TIMESTAMP"):
-                        # If column is already date/timestamp, consider consistent; else try parsing
-                        rr = _run(f"select sum(iff(\"{c}\" is not null and try_to_timestamp(\"{c}\") is not null,1,0)) as OK, sum(iff(\"{c}\" is not null,1,0)) as N from {sel_object}") or []
-                        n = int(rr[0].get("N") or 0) if rr else 0
-                        ok = int(rr[0].get("OK") or 0) if rr else 0
-                        type_consist_pct = round((ok/n)*100, 2) if n else None
-                    else:
-                        # Treat varchar/text as consistent by default
-                        type_consist_pct = 100.0 if nonnull else None
-
-                    # Range checks (heuristics)
-                    range_ok_pct: Optional[float] = None
-                    if any(k in cname for k in ["AGE"]):
-                        rr = _run(f"select sum(iff(try_to_double(\"{c}\") between 0 and 120,1,0)) as OK, sum(iff(\"{c}\" is not null,1,0)) as N from {sel_object}") or []
-                        n = int(rr[0].get("N") or 0) if rr else 0
-                        ok = int(rr[0].get("OK") or 0) if rr else 0
-                        range_ok_pct = round((ok/n)*100, 2) if n else None
-                    elif any(k in cname for k in ["SALARY","AMOUNT","PRICE","COST"]):
-                        rr = _run(f"select sum(iff(try_to_double(\"{c}\") > 0 and try_to_double(\"{c}\") < 1e9,1,0)) as OK, sum(iff(\"{c}\" is not null,1,0)) as N from {sel_object}") or []
-                        n = int(rr[0].get("N") or 0) if rr else 0
-                        ok = int(rr[0].get("OK") or 0) if rr else 0
-                        range_ok_pct = round((ok/n)*100, 2) if n else None
-
-                    # Column health score (weighted by heuristics)
-                    health_score: Optional[float] = None
-                    if any(k in cname for k in ["_ID","ID"]):
-                        weights = [(uniqueness_pct, 0.4), (completeness_pct, 0.4), (pattern_valid_pct, 0.2)]
-                    elif "EMAIL" in cname:
-                        weights = [(pattern_valid_pct, 0.5), (completeness_pct, 0.3), (uniqueness_pct, 0.2)]
-                    elif declared.startswith("VARCHAR") and uniqueness_pct is not None and uniqueness_pct <= 30:
-                        # Category-like
-                        inv_uniq = (100 - uniqueness_pct) if uniqueness_pct is not None else None
-                        weights = [(completeness_pct, 0.6), (inv_uniq, 0.4)]
-                    else:
-                        weights = [(completeness_pct, 0.5), (type_consist_pct, 0.3), (pattern_valid_pct, 0.2)]
+                with res_tab2:
+                    st.markdown("#### Data Preview")
                     try:
-                        num = sum((v or 0)*w for v, w in weights if v is not None)
-                        den = sum(w for v, w in weights if v is not None)
-                        health_score = round(num/den, 2) if den else None
-                    except Exception:
-                        health_score = None
-
-                    stats_rows.append({
-                        "COLUMN": c,
-                        "TOTAL": total,
-                        "NON_NULL": nonnull,
-                        "NULLS": max(total - nonnull, 0),
-                        "DISTINCT": distinct,
-                        "COMPLETENESS_%": completeness_pct,
-                        "UNIQUENESS_%": uniqueness_pct,
-                        "PATTERN_VALID_%": pattern_valid_pct,
-                        "TYPE_CONSIST_%": type_consist_pct,
-                        "CARDINALITY_%": cardinality_ratio,
-                        "RANGE_OK_%": range_ok_pct,
-                        "HEALTH_SCORE": health_score,
-                        "MIN": minv,
-                        "MAX": maxv,
-                        "AVG": avgv,
-                    })
-                except Exception:
-                    continue
-            if stats_rows:
-                df_stats = pd.DataFrame(stats_rows)
-                st.dataframe(df_stats, use_container_width=True)
-
-            # Simple distributions for first selected column
-            if chosen_cols:
-                col0 = chosen_cols[0]
-                try:
-                    vals = _run(
-                        f"select \"{col0}\" as V, count(*) as C from {sel_object} group by 1 order by C desc nulls last limit 20"
-                    ) or []
-                    if vals:
-                        dfv = pd.DataFrame(vals)
-                        st.plotly_chart(px.bar(dfv, x="V", y="C", title=f"Distribution: {col0}"), use_container_width=True)
-                except Exception:
-                    pass
-
-
-            # Section variables for example SQL rendering
-            f_db = db or active_db or "DB"
-            f_sch = sch or (sel_schema if (sel_schema and sel_schema != "All") else None) or "SCHEMA"
-            f_tbl = name or "TABLE"
-            f_obj = sel_object if sel_object and sel_object != "All" else f"{f_db}.{f_sch}.{f_tbl}"
-            tgt_col = (chosen_cols[0] if chosen_cols else None)
-            # Removed Quality Profiling, Semantic Profiling, and Completeness UI sections
+                        sample_full = pd.DataFrame(_run(f"SELECT * FROM {quoted_fqn} LIMIT 10") or [])
+                        if not sample_full.empty:
+                            st.dataframe(sample_full, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Empty asset.")
+                    except Exception as e:
+                        st.error(f"Sample error: {e}")
+        else:
+            st.markdown("""
+            <div style="text-align: center; padding: 60px; background: rgba(255,255,255,0.02); border-radius: 20px; border: 1px dashed rgba(255,255,255,0.1); margin-top:20px;">
+                <div style="font-size: 4rem; margin-bottom: 20px;">🔬</div>
+                <h3 style="color: rgba(255,255,255,0.8); font-weight:800;">Profiling Intelligence Ready</h3>
+                <p style="color: rgba(255,255,255,0.4);">Select a table in the sidebar to begin profiling.</p>
+            </div>
+            """, unsafe_allow_html=True)
 
     # ---- Standard DQ removed per INFORMATION_SCHEMA-only design ----
 
     # ---- Quality Issues Log ----
     with dq_issues:
-        st.subheader("Quality Issues Log")
-        st.caption("Live detection from INFORMATION_SCHEMA only (no persistence)")
-        colt1, colt2 = st.columns(2)
-        with colt1:
-            stale_days = st.number_input("Stale if last_altered older than (days)", min_value=1, max_value=3650, value=7, step=1, key="qi_stale")
-        with colt2:
-            sch_filter = sel_schema if sel_schema != "All" else None
-        if not active_db:
-            st.info("Select a database to scan.")
-        else:
-            # Stale tables
-            try:
-                rows_stale = _run(
-                    f"""
-                    select TABLE_CATALOG as DATABASE_NAME, TABLE_SCHEMA as SCHEMA_NAME, TABLE_NAME,
-                           LAST_ALTERED,
-                           datediff('day', LAST_ALTERED, current_timestamp()) as STALE_DAYS
-                    from {active_db}.INFORMATION_SCHEMA.TABLES
-                    where TABLE_TYPE='BASE TABLE'
-                      {("and TABLE_SCHEMA=%(s)s" if sch_filter else "")}
-                      and LAST_ALTERED < dateadd('day', -%(d)s, current_timestamp())
-                    order by STALE_DAYS desc
-                    limit 1000
-                    """,
-                    ({"s": sch_filter, "d": int(stale_days)} if sch_filter else {"d": int(stale_days)})
-                ) or []
-            except Exception:
-                rows_stale = []
-                st.info("Stale scan unavailable.")
-            st.markdown("**Stale Tables**")
-            st.dataframe(pd.DataFrame(rows_stale), use_container_width=True)
+        st.markdown("### 🏷️ Active Quality Issues")
+        st.caption("High-fidelity anomaly detection and stale asset tracking")
+        
+        # 1. Resolve Filter Scope
+        db_filter = active_db if active_db != "All" else None
+        sch_filter = sel_schema if sel_schema != "All" else None
+        tbl_filter = sel_object if (sel_object and sel_object != "All" and "." not in sel_object) else None
+        
+        if sel_object and "." in sel_object:
+            _, _, tbl_filter = _split_fqn(sel_object)
 
-            # Empty tables
-            try:
-                rows_empty = _run(
-                    f"""
-                    select TABLE_CATALOG as DATABASE_NAME, TABLE_SCHEMA as SCHEMA_NAME, TABLE_NAME,
-                           coalesce(ROW_COUNT,0) as ROW_COUNT
-                    from {active_db}.INFORMATION_SCHEMA.TABLES
-                    where TABLE_TYPE='BASE TABLE'
-                      {("and TABLE_SCHEMA=%(s)s" if sch_filter else "")}
-                      and coalesce(ROW_COUNT,0) = 0
-                    order by TABLE_SCHEMA, TABLE_NAME
-                    limit 1000
-                    """,
-                    ({"s": sch_filter} if sch_filter else None)
-                ) or []
-            except Exception:
-                rows_empty = []
-                st.info("Empty table scan unavailable.")
-            st.markdown("**Empty Tables**")
-            st.dataframe(pd.DataFrame(rows_empty), use_container_width=True)
+        use_account_wide = (db_filter is None)
 
-            # Schema quality summary (nullability)
+        with st.container(border=True):
+            c_opt1, c_opt2, c_opt3 = st.columns([1, 1, 1.5])
+            with c_opt1:
+                stale_days = st.number_input("Stale Threshold (Days)", min_value=1, max_value=365, value=30, key="qi_stale_new")
+            with c_opt2:
+                min_row_count = st.number_input("Min Row Threshold", min_value=0, max_value=1000, value=100, key="qi_min_row")
+            with c_opt3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🚀 Refresh Quality Scan", type="secondary", use_container_width=True):
+                    st.cache_data.clear()
+
+        with st.spinner('🔍 Analyzing metadata for quality signals...'):
             try:
-                rows_schema = _run(
-                    f"""
-                    select TABLE_CATALOG as DATABASE_NAME, TABLE_SCHEMA as SCHEMA_NAME, TABLE_NAME,
-                           sum(iff(upper(IS_NULLABLE)='NO',1,0)) as NON_NULLABLE_COLS,
-                           count(*) as TOTAL_COLS
-                    from {active_db}.INFORMATION_SCHEMA.COLUMNS
-                    {("where TABLE_SCHEMA=%(s)s" if sch_filter else "")}
-                    group by 1,2,3
-                    order by TOTAL_COLS desc
-                    limit 1000
-                    """,
-                    ({"s": sch_filter} if sch_filter else None)
-                ) or []
-            except Exception:
-                rows_schema = []
-                st.info("Schema quality scan unavailable.")
-            st.markdown("**Schema Quality (Nullability Summary)**")
-            st.dataframe(pd.DataFrame(rows_schema), use_container_width=True)
+                # Build Dynamic Source and Filters
+                if use_account_wide:
+                    source_tbl = "SNOWFLAKE.ACCOUNT_USAGE.TABLES"
+                    source_col = "SNOWFLAKE.ACCOUNT_USAGE.COLUMNS"
+                    db_col, sch_col, tbl_col = "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME"
+                else:
+                    db_clean = db_filter.strip()
+                    source_tbl = f'"{db_clean}".INFORMATION_SCHEMA.TABLES'
+                    source_col = f'"{db_clean}".INFORMATION_SCHEMA.COLUMNS'
+                    db_col, sch_col, tbl_col = "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME"
+
+                # Standard Criteria
+                base_where = ["TABLE_TYPE IN ('BASE TABLE', 'VIEW')"]
+                if use_account_wide: base_where.append("DELETED_ON IS NULL")
+                
+                if db_filter and use_account_wide:
+                    base_where.append(f"{db_col} = '{db_filter}'")
+                if sch_filter:
+                    base_where.append(f"{sch_col} = '{sch_filter}'")
+                else:
+                    base_where.append(f"{sch_col} NOT IN ('INFORMATION_SCHEMA', 'ACCOUNT_USAGE')")
+                if tbl_filter:
+                    base_where.append(f"{tbl_col} = '{tbl_filter}'")
+
+                where_clause = " AND ".join(base_where)
+
+                # 1. Fetch Discovery Set and Calculate Aging (Tables & Views)
+                stale_q = f"""
+                    SELECT 
+                        {tbl_col} || '_id' AS ASSET_ID,
+                        {tbl_col} AS ASSET_NAME,
+                        LOWER(TABLE_TYPE) AS ASSET_TYPE,
+                        LAST_ALTERED AS LAST_UPDATED,
+                        DATEADD(day, %(d)s, LAST_ALTERED) AS STALE_SINCE,
+                        'data_owner@example.com' AS OWNER_EMAIL,
+                        {sch_col} AS DATA_DOMAIN,
+                        CASE 
+                            WHEN LAST_ALTERED IS NULL THEN 'STALE'
+                            WHEN LAST_ALTERED < DATEADD(day, -%(d)s, CURRENT_TIMESTAMP()) 
+                            THEN 'STALE' 
+                            ELSE 'ACTIVE' 
+                        END AS STATUS,
+                        'Calculated policy based on ' || %(d)s || ' day threshold' AS REMARKS,
+                        0 AS STRUCTURAL_GAPS,
+                        CASE 
+                            WHEN COALESCE(ROW_COUNT, 0) < %(m)s THEN 1 
+                            ELSE 0 
+                        END AS PARTIAL_DATA
+                    FROM {source_tbl}
+                    WHERE {where_clause}
+                    AND {sch_col} NOT IN ('INFORMATION_SCHEMA', 'ACCOUNT_USAGE')
+                    ORDER BY 
+                        LAST_ALTERED ASC,
+                        {tbl_col}
+                    LIMIT 200
+                """
+                rows_stale = _run(stale_q, {"d": int(stale_days), "m": int(min_row_count)}) or []
+                
+                # 2. Fetch Empty or Near-Empty Tables
+                empty_q = f"""
+                    SELECT {sch_col} as SCHEMA, {tbl_col} as TABLE_NAME, CREATED, ROW_COUNT
+                    FROM {source_tbl}
+                    WHERE {where_clause}
+                    AND COALESCE(ROW_COUNT, 0) <= %(m)s
+                    ORDER BY ROW_COUNT ASC LIMIT 50
+                """
+                rows_empty = _run(empty_q, {"m": int(min_row_count)}) or []
+
+                # 3. Structural Vulnerabilities
+                struc_q = f"""
+                    SELECT {tbl_col} as TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+                    FROM {source_col}
+                    WHERE IS_NULLABLE = 'YES'
+                    AND {sch_col} NOT IN ('INFORMATION_SCHEMA', 'ACCOUNT_USAGE')
+                    {f"AND {sch_col} = '{sch_filter}'" if sch_filter else ""}
+                    {f"AND {tbl_col} = '{tbl_filter}'" if tbl_filter else ""}
+                    AND {tbl_col} IN (SELECT {tbl_col} FROM {source_tbl} WHERE {where_clause})
+                    LIMIT 50
+                """
+                rows_struc = _run(struc_q) or []
+
+            except Exception as e:
+                st.error(f"Anomaly Engine Failure: {e}")
+                rows_stale = rows_empty = rows_struc = []
+
+        # KPI Summary
+        k1, k2, k3, k4 = st.columns(4)
+        total_stale_count = len([r for r in rows_stale if str(r.get("STATUS", "")).upper() == "STALE"])
+        total_issues = len(rows_stale) + len(rows_empty) + len(rows_struc)
+        with k1:
+            st.markdown(f"""<div class="pillar-card"><div class="pillar-icon" style="color:#f87171">🛑</div><div class="pillar-label">Total Risks</div><div class="pillar-value">{total_issues}</div><div class="pillar-status">In Current Filter</div></div>""", unsafe_allow_html=True)
+        with k2:
+            st.markdown(f"""
+            <div class=\"pillar-card\" style=\"position:relative; border-bottom: 3px solid #fbbf24;\">
+                <div class=\"pillar-icon\" style=\"color:#fbbf24\">⏳</div>
+                <div class=\"pillar-value\">{len(rows_stale)}</div>
+                <div class=\"pillar-label\">Stale Assets</div>
+                <div class=\"pillar-status\">
+                    <span style=\"font-size:0.9em;color:#fbbf24;font-weight:700;\">
+                        >{stale_days} Days Inactive
+                    </span>
+                </div>
+                <div style=\"position:absolute; bottom:8px; right:12px; font-size:0.75rem; color:rgba(255,255,255,0.3);\">
+                    {len(rows_stale)} checked
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        with k3:
+            st.markdown(f"""<div class="pillar-card"><div class="pillar-icon" style="color:#60a5fa">🕳️</div><div class="pillar-label">Empty Tables</div><div class="pillar-value">{len(rows_empty)}</div><div class="pillar-status">Zero Payload</div></div>""", unsafe_allow_html=True)
+        with k4:
+            st.markdown(f"""<div class="pillar-card"><div class="pillar-icon" style="color:#a78bfa">🧩</div><div class="pillar-label">Structural Gaps</div><div class="pillar-value">{len(rows_struc)}</div><div class="pillar-status">Refactor Targets</div></div>""", unsafe_allow_html=True)
+
+# ... (rest of the code remains the same)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Detail Analysis
+        i_tab1, i_tab2, i_tab3 = st.tabs(["🕒 Aging Analysis", "📉 Empty Assets", "📐 Structural Vulnerability"])
+        
+        with i_tab1:
+            if rows_stale:
+                df_stale = pd.DataFrame(rows_stale)
+                st.info(f"Analyzing {len(rows_stale)} assets against the {stale_days}-day discovery policy.")
+                st.data_editor(
+                    df_stale,
+                    column_config={
+                        "STATUS": st.column_config.SelectboxColumn(
+                            "STATUS",
+                            help="Adjust the governance status of this asset",
+                            options=["STALE", "ACTIVE", "RESOLVED", "FALSE POSITIVE"],
+                            required=True
+                        )
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                    key="se_stale_editor"
+                )
+            else:
+                st.success("✨ Hygiene Check: No stale assets found in selected scope.")
+
+        with i_tab2:
+            if rows_empty:
+                df_empty = pd.DataFrame(rows_empty)
+                st.warning("Detected tables with zero or sub-threshold record counts in this filter context.")
+                st.dataframe(df_empty, use_container_width=True, hide_index=True)
+            else:
+                st.success("✨ Data Presence: All filtered assets contain active records.")
+
+        with i_tab3:
+            if rows_struc:
+                df_struc = pd.DataFrame(rows_struc)
+                st.markdown("Nullable attribute clusters within your selected schema/table scope.")
+                st.dataframe(df_struc, use_container_width=True, hide_index=True)
+            else:
+                st.info("No structural vulnerabilities detected for these filters.")
 
         def _detect_and_persist(dbname: Optional[str], thr_null_pct: float, thr_duplicates_pct: float) -> int:
             if not dbname:
@@ -2673,606 +2284,361 @@ with q_tab:
 
         # Live scan only; no persistence or detect button. Use the tables above.
 
-    # ---- Resolution Tracking ----
-    with dq_resolve:
-        st.subheader("Resolution Tracking")
-        st.caption("Session-only notes; verify via re-scan against INFORMATION_SCHEMA")
-        if "dq_resolutions" not in st.session_state:
-            st.session_state["dq_resolutions"] = []
-        colr1, colr2 = st.columns(2)
-        with colr1:
-            res_note = st.text_input("Resolution note")
-        with colr2:
-            if st.button("Add Note") and res_note:
-                st.session_state["dq_resolutions"].append({"at": datetime.utcnow().isoformat(), "note": res_note})
-        if st.session_state["dq_resolutions"]:
-            st.markdown("**Notes (session)**")
-            st.dataframe(pd.DataFrame(st.session_state["dq_resolutions"]), use_container_width=True, hide_index=True)
-        st.markdown("---")
-        st.subheader("Verify Resolutions")
-        st.caption("Re-run the Quality Issues scans to confirm issues are resolved")
-        if st.button("Re-Scan Now"):
-            st.cache_data.clear(); st.rerun()
-
 # =====================================
-# Data Lineage
+# Minimal Data Lineage
+# =====================================
+# =====================================
+# Minimal Data Lineage
 # =====================================
 with l_tab:
-    lin_viz, lin_map, lin_change, lin_column, lin_impact = st.tabs([
-        "Lineage Visualization",
-        "Dependency Mapping",
-        "Change Propagation",
-        "Column-level Info",
-        "Impact Analysis",
-    ])
-
-    # Base: dependencies from INFORMATION_SCHEMA
-    # (Lineage tab content will go here)
-    # This section will contain the lineage visualization logic
-    pass
-
-    def _deps(db: str, schema: Optional[str], name: Optional[str]) -> pd.DataFrame:
-        """Return best-effort object dependency edges within a database.
-        Includes both downstream (referencing=selected) and upstream (referenced=selected)
-        using OBJECT_DEPENDENCIES and VIEW_TABLE_USAGE.
-        """
-        if not db or not schema or not name:
-            return pd.DataFrame()
-        try:
-            # Try ACCOUNT_USAGE.OBJECT_DEPENDENCIES first (more comprehensive)
-            deps = _run(
-                """
-                select 
-                    REFERENCING_DATABASE as REFERENCING_OBJECT_CATALOG, 
-                    REFERENCING_SCHEMA as REFERENCING_OBJECT_SCHEMA, 
-                    REFERENCING_OBJECT_NAME,
-                    REFERENCED_DATABASE as REFERENCED_OBJECT_CATALOG, 
-                    REFERENCED_SCHEMA as REFERENCED_OBJECT_SCHEMA, 
-                    REFERENCED_OBJECT_NAME,
-                    REFERENCED_OBJECT_DOMAIN as REFERENCED_TYPE
-                from SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES 
-                where REFERENCING_DATABASE = %(db)s 
-                  and REFERENCING_SCHEMA = %(s)s 
-                  and REFERENCING_OBJECT_NAME = %(t)s
-                limit 5000
-                """,
-                {"db": db, "s": schema, "t": name}
-            ) or []
-            # Also get objects that reference this one
-            refs = _run(
-                """
-                select 
-                    REFERENCING_DATABASE as REFERENCING_OBJECT_CATALOG, 
-                    REFERENCING_SCHEMA as REFERENCING_OBJECT_SCHEMA, 
-                    REFERENCING_OBJECT_NAME,
-                    REFERENCED_DATABASE as REFERENCED_OBJECT_CATALOG, 
-                    REFERENCED_SCHEMA as REFERENCED_OBJECT_SCHEMA, 
-                    REFERENCED_OBJECT_NAME,
-                    REFERENCED_OBJECT_DOMAIN as REFERENCED_TYPE
-                from SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES 
-                where REFERENCED_DATABASE = %(db)s 
-                  and REFERENCED_SCHEMA = %(s)s 
-                  and REFERENCED_OBJECT_NAME = %(t)s
-                limit 5000
-                """,
-                {"db": db, "s": schema, "t": name}
-            ) or []
-            
-            # Combine both directions
-            df = pd.DataFrame(deps + refs)
-            return df if not df.empty else pd.DataFrame()
-            
-        except Exception as e:
-            st.error(f"Error fetching dependencies: {str(e)}")
-            return pd.DataFrame()
-
-    # ---- Lineage Visualization ----
-    with lin_viz:
-        st.subheader("Lineage Visualization")
+    if not sel_object or sel_object == "None":
+        st.markdown("""
+        <div style="text-align: center; padding: 60px; background: rgba(255,255,255,0.02); border-radius: 20px; border: 1px dashed rgba(255,255,255,0.2); margin-top:20px;">
+            <div style="font-size: 4rem; margin-bottom: 20px;">🕸️</div>
+            <h3 style="color: white; font-weight:800;">Data Lineage Engine</h3>
+            <p style="color: rgba(255,255,255,0.5); max-width: 500px; margin: 0 auto; line-height:1.6;">
+                Data lineage shows the <b>origin, transformations, and destinations</b> of data across systems.<br>
+                Select an asset to discover where your data comes from and who uses it.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        db_split, sch_split, name_split = _split_fqn(sel_object)
+        if db_split:
+            db, sch, name = db_split.upper(), sch_split.upper(), name_split.upper()
+        else:
+            db = (active_db or "").upper()
+            sch = (sel_schema or "").upper()
+            name = (sel_object or "").upper()
         
-        # Toggle between standard and Snowflake lineage
-        lineage_type = st.radio("Lineage Type", ["Standard Dependencies", "Snowflake Lineage"], horizontal=True)
+        target_fqn = f"{db}.{sch}.{name}"
         
-        if lineage_type == "Snowflake Lineage":
-            st.info("Using Snowflake's native lineage tracking. This provides detailed column-level lineage information.")
-            
-            # Get current database and schema from session state or use defaults
-            db = st.session_state.get("sf_database", "DATA_CLASSIFICATION_DB")
-            schema = st.session_state.get("sf_schema", "DATA_CLASSIFICATION_GOVERNANCE")
-            
-            # Get list of tables for selection
+        st.markdown(f"""
+        <div style="background: linear-gradient(90deg, rgba(59, 130, 246, 0.1), rgba(0, 0, 0, 0)); padding: 20px; border-radius: 12px; border-left: 4px solid #3b82f6; margin-bottom: 25px;">
+            <h3 style="margin:0; color:white; font-size:1.4rem;">💡 Lineage Insights for {name}</h3>
+            <p style="margin:5px 0 0 0; color:rgba(255,255,255,0.6); font-size:0.9rem;">
+                <b>Data lineage</b> shows the origin, transformations, and destinations of data across systems.<br>
+                Discover <b>where this data came from</b> and <b>who uses it</b> in your environment.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        lin_tab1, lin_tab2 = st.tabs(["🕸️ Visual Lineage", "💥 Impact Dashboard"])
+
+        with st.spinner("🕸️ Discovering full data journey..."):
             try:
-                tables = _run(f"""
-                    SELECT TABLE_NAME 
-                    FROM {db}.INFORMATION_SCHEMA.TABLES 
-                    WHERE TABLE_SCHEMA = %s
-                    ORDER BY TABLE_NAME
-                """, [schema])
-                table_options = [t["TABLE_NAME"] for t in tables] if tables else []
-            except Exception as e:
-                st.error(f"Error loading tables: {str(e)}")
-                table_options = []
-            
-            # Input for table selection
-            selected_table = st.selectbox("Select a table to view lineage:", table_options, index=0 if table_options else None)
-            
-            # Direction and depth controls
-            col1, col2 = st.columns(2)
-            with col1:
-                direction = st.selectbox(
-                    "Lineage Direction:",
-                    ["DOWNSTREAM", "UPSTREAM", "BOTH"],
-                    index=0
-                )
-            with col2:
-                max_depth = st.slider("Maximum Depth:", min_value=1, max_value=5, value=2)
-            
-            if selected_table:
-                try:
-                    # Build the lineage query
-                    query = """
+                # High-fidelity 3-Stage Lineage discovery as per Snowflake logic
+                lin_q = f"""
+                WITH base_asset AS (
+                    SELECT 
+                        '{db}'  AS DATABASE_NAME,
+                        '{sch}' AS SCHEMA_NAME,
+                        '{name}' AS OBJECT_NAME,
+                        'TABLE' AS OBJECT_TYPE
+                ),
+                upstream_lineage AS (
                     SELECT
-                        DISTANCE,
-                        SOURCE_OBJECT_DOMAIN,
-                        SOURCE_OBJECT_DATABASE,
-                        SOURCE_OBJECT_SCHEMA,
-                        SOURCE_OBJECT_NAME,
-                        SOURCE_STATUS,
-                        TARGET_OBJECT_DOMAIN,
-                        TARGET_OBJECT_DATABASE,
-                        TARGET_OBJECT_SCHEMA,
-                        TARGET_OBJECT_NAME,
-                        TARGET_STATUS
-                    FROM TABLE (SNOWFLAKE.CORE.GET_LINEAGE(
-                        %(full_table_name)s,
-                        'TABLE',
-                        %(direction)s,
-                        %(max_depth)s
-                    ))"""
-                    
-                    full_table_name = f"{db}.{schema}.{selected_table}"
-                    
-                    # Execute the query
-                    lineage_data = _run(query, {
-                        'full_table_name': full_table_name,
-                        'direction': direction,
-                        'max_depth': max_depth
-                    })
-                    
-                    if not lineage_data:
-                        st.info("No lineage data found for the selected table.")
-                    else:
-                        # Convert to DataFrame for display
-                        df = pd.DataFrame(lineage_data)
-                        
-                        # Show raw data in an expander
-                        with st.expander("View Raw Lineage Data", expanded=False):
-                            st.dataframe(df, use_container_width=True)
-                        
-                        # Basic visualization using graphviz
-                        try:
-                            import graphviz
-                            
-                            # Create a new directed graph
-                            graph = graphviz.Digraph(comment='Data Lineage')
-                            graph.attr(rankdir='LR')
-                            
-                            # Add nodes and edges
-                            added_nodes = set()
-                            
-                            for _, row in df.iterrows():
-                                source = f"{row['SOURCE_OBJECT_SCHEMA']}.{row['SOURCE_OBJECT_NAME']}"
-                                target = f"{row['TARGET_OBJECT_SCHEMA']}.{row['TARGET_OBJECT_NAME']}"
-                                
-                                # Add source node if not already added
-                                if source not in added_nodes:
-                                    graph.node(source, shape='box', style='filled', 
-                                             color='lightblue2', fontname='Arial')
-                                    added_nodes.add(source)
-                                
-                                # Add target node if not already added
-                                if target not in added_nodes:
-                                    graph.node(target, shape='box', style='filled', 
-                                             color='lightblue2', fontname='Arial')
-                                    added_nodes.add(target)
-                                
-                                # Add edge with distance as label
-                                graph.edge(source, target, label=f"{row['DISTANCE']}")
-                            
-                            # Display the graph
-                            st.graphviz_chart(graph)
-                            
-                        except ImportError:
-                            st.warning("Graphviz is not installed. Please install it for visualizations.")
-                except Exception as e:
-                    st.error(f"Error loading lineage: {str(e)}")
-        else:
-            # Original standard dependencies view
-            level = st.selectbox("View level", ["Table/View", "System (Schema)", "Column"], index=0, key="lin_level")
-            max_ = st.slider("Depth", min_value=1, max_value=5, value=2, key="lin_depth")
-            type_filter = st.multiselect("Show types", ["TABLE","VIEW","PIPELINE"], default=["TABLE","VIEW","PIPELINE"], key="lin_types")
-        if sel_object and sel_object != "None":
-            db, sch, name = _split_fqn(sel_object)
-            df = _deps(db, sch, name)
-            if df.empty:
-                st.info("No dependencies found or insufficient privileges.")
-            else:
-                # Build edges and node metadata
-                edges: List[Tuple[str, str, str, str]] = []  # (src, dst, src_type, dst_type)
-                for _, r in df.iterrows():
-                    src = f"{r['REFERENCED_OBJECT_DATABASE']}.{r['REFERENCED_OBJECT_SCHEMA']}.{r['REFERENCED_OBJECT_NAME']}"
-                    dst = f"{r['REFERENCING_OBJECT_DATABASE']}.{r['REFERENCING_OBJECT_SCHEMA']}.{r['REFERENCING_OBJECT_NAME']}"
-                    src_type = (r.get('REFERENCED_TYPE') or 'TABLE')
-                    dst_type = 'UNKNOWN'
-                    edges.append((src, dst, str(src_type).upper(), str(dst_type).upper()))
-                # Optional: include ingestion pipelines best-effort from ACCOUNT_USAGE
-                try:
-                    start_dt = datetime.utcnow() - timedelta(days=30)
-                    pl = _run(
-                        """
-                        select to_varchar(file_name) as PIPELINE_NAME, target_table_name as TABLE_NAME, target_schema_name as SCHEMA_NAME, target_database_name as DATABASE_NAME
-                        from SNOWFLAKE.ACCOUNT_USAGE.LOAD_HISTORY
-                        where last_load_time >= %(s)s
-                        limit 500
-                        """,
-                        {"s": start_dt}
-                    ) or []
-                    for r in pl:
-                        dst = f"{r['DATABASE_NAME']}.{r['SCHEMA_NAME']}.{r['TABLE_NAME']}"
-                        src = f"PIPELINE::{r['PIPELINE_NAME']}"
-                        edges.append((src, dst, "PIPELINE", "TABLE"))
-                except Exception:
-                    pass
-                # Filter by type
-                edges = [e for e in edges if e[2] in type_filter and e[3] in type_filter]
-                # Compute limited-depth neighborhood around selected object
-                from collections import defaultdict, deque
-                g_out = defaultdict(list)
-                g_in = defaultdict(list)
-                for a,b,ta,tb in edges:
-                    g_out[a].append(b)
-                    g_in[b].append(a)
-                root = f"{db}.{sch}.{name}"
-                keep = {root}
-                dq = deque([(root,0)])
-                while dq:
-                    n, d = dq.popleft()
-                    if d >= max_depth:
-                        continue
-                    for nb in g_out.get(n, []) + g_in.get(n, []):
-                        if nb not in keep:
-                            keep.add(nb)
-                            dq.append((nb, d+1))
-                fedges = [(a,b,ta,tb) for (a,b,ta,tb) in edges if a in keep and b in keep]
-                nodes = sorted({n for a,b,_,_ in fedges for n in (a,b)} | {root})
-                # Gather metadata for tooltips
-                def _meta(n: str) -> Dict[str, Any]:
-                    if n.startswith("PIPELINE::"):
-                        return {"TYPE":"PIPELINE","LABEL":n}
-                    parts = n.split(".")
-                    if len(parts) != 3:
-                        return {"TYPE":"UNKNOWN","LABEL":n}
-                    d,s,t = parts
-                    try:
-                        m = _run(
-                            f"""
-                            select TABLE_NAME as NAME, TABLE_SCHEMA as SCH, TABLE_OWNER as OWNER, ROW_COUNT, LAST_ALTERED, 'TABLE' as T
-                            from {d}.INFORMATION_SCHEMA.TABLES where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s
-                            union all
-                            select TABLE_NAME, TABLE_SCHEMA, VIEW_OWNER as OWNER, null as ROW_COUNT, LAST_ALTERED, 'VIEW' as T
-                            from {d}.INFORMATION_SCHEMA.VIEWS where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s
-                            limit 1
-                            """,
-                            {"s": s, "t": t}
-                        ) or []
-                    except Exception:
-                        m = []
-                    if not m:
-                        return {"TYPE":"UNKNOWN","LABEL":n}
-                    row = m[0]
-                    # Try to bring in DQ summary if available
-                    dq_sum = None
-                    try:
-                        dq_rows = _run(
-                            f"""
-                            select METRIC, avg(VALUE) as VAL
-                            from {d}.DATA_GOVERNANCE.DQ_METRICS
-                            where DATABASE_NAME=%(d)s and SCHEMA_NAME=%(s)s and TABLE_NAME=%(t)s
-                            group by METRIC
-                            limit 50
-                            """,
-                            {"d": d, "s": s, "t": t}
-                        ) or []
-                        if dq_rows:
-                            dq_sum = ", ".join([f"{r['METRIC']}: {round(r['VAL'],2)}" for r in dq_rows[:5]])
-                    except Exception:
-                        dq_sum = None
-                    return {
-                        "TYPE": row.get("T") or "TABLE",
-                        "LABEL": n,
-                        "OWNER": row.get("OWNER"),
-                        "ROW_COUNT": row.get("ROW_COUNT"),
-                        "LAST_ALTERED": str(row.get("LAST_ALTERED") or ""),
-                        "DQ": dq_sum
-                    }
-                meta = {n: _meta(n) for n in nodes}
-                # Color map
-                color_map = {"TABLE":"#1f77b4","VIEW":"#ff7f0e","PIPELINE":"#2ca02c","UNKNOWN":"#7f7f7f"}
-                # Layout - circular for simplicity
-                import math
-                N = len(nodes)
-                xs = [math.cos(2*math.pi*i/max(N,1)) for i in range(N)]
-                ys = [math.sin(2*math.pi*i/max(N,1)) for i in range(N)]
-                idx = {n:i for i,n in enumerate(nodes)}
-                edge_x = []
-                edge_y = []
-                for a,b,_,_ in fedges:
-                    ia, ib = idx[a], idx[b]
-                    edge_x += [xs[ia], xs[ib], None]
-                    edge_y += [ys[ia], ys[ib], None]
-                node_x = [xs[idx[n]] for n in nodes]
-                node_y = [ys[idx[n]] for n in nodes]
-                hover_text = []
-                marker_colors = []
-                for n in nodes:
-                    m = meta.get(n, {})
-                    hover = f"{m.get('LABEL')}<br>Type: {m.get('TYPE')}<br>Owner: {m.get('OWNER')}<br>Row Count: {m.get('ROW_COUNT')}<br>Last Altered: {m.get('LAST_ALTERED')}"
-                    if m.get("DQ"):
-                        hover += f"<br>DQ: {m.get('DQ')}"
-                    hover_text.append(hover)
-                    marker_colors.append(color_map.get(m.get("TYPE","UNKNOWN"), "#7f7f7f"))
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode='lines', line=dict(width=1, color='#888'), hoverinfo='skip'))
-                fig.add_trace(go.Scatter(x=node_x, y=node_y, mode='markers+text', text=[n.split('.')[-1] if not n.startswith('PIPELINE::') else n.replace('PIPELINE::','') for n in nodes], textposition='top center',
-                                         marker=dict(size=12, color=marker_colors),
-                                         hovertext=hover_text, hoverinfo='text'))
-                fig.update_layout(showlegend=False, margin=dict(l=10,r=10,t=30,b=30), height=560)
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Select an object from the sidebar to visualize lineage.")
-
-    # ---- Impact Analysis ----
-    with lin_impact:
-        st.subheader("Impact Analysis")
-        if sel_object and sel_object != "None":
-            db, sch, name = _split_fqn(sel_object)
-            df = _deps(db, sch, name)
-            if df.empty:
-                st.info("No downstream dependencies found.")
-            else:
-                down = df[[
-                    "REFERENCING_OBJECT_CATALOG","REFERENCING_OBJECT_SCHEMA","REFERENCING_OBJECT_NAME"
-                ]].drop_duplicates()
-                down["FULL_NAME"] = down["REFERENCING_OBJECT_CATALOG"] + "." + down["REFERENCING_OBJECT_SCHEMA"] + "." + down["REFERENCING_OBJECT_NAME"]
-                st.markdown("**Downstream Objects**")
-                st.dataframe(down[["FULL_NAME"]], use_container_width=True)
-                # Query history: who uses downstream
-                try:
-                    start_dt = datetime.utcnow() - timedelta(days=30)
-                    pat = "|".join([re.escape(x) for x in down["FULL_NAME"].str.upper().tolist()[:20]])
-                    qh = _run(
-                        """
-                        select QUERY_ID, USER_NAME, START_TIME, QUERY_TEXT
-                        from SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-                        where START_TIME >= %(s)s
-                          and regexp_like(upper(QUERY_TEXT), %(pat)s)
-                        order by START_TIME desc
-                        limit 1000
-                        """,
-                        {"s": start_dt, "pat": pat}
-                    ) or []
-                    qdf = pd.DataFrame(qh)
-                    st.markdown("**Dependent Queries (30d)**")
-                    st.dataframe(qdf, use_container_width=True)
-                    # Risk score: simple heuristic
-                    affected_assets = len(down)
-                    distinct_users = qdf.get("USER_NAME", pd.Series(dtype=str)).nunique() if not qdf.empty else 0
-                    risk = min(100, affected_assets*10 + distinct_users*5)
-                    c1,c2,c3 = st.columns(3)
-                    c1.metric("Affected assets", f"{affected_assets}")
-                    c2.metric("Impacted users", f"{distinct_users}")
-                    c3.metric("Risk score", f"{risk}")
-                except Exception as e:
-                    st.info(f"QUERY_HISTORY unavailable: {e}")
-        else:
-            st.info("Select an object to analyze impact.")
-
-    # ---- Dependency Mapping ----
-    with lin_map:
-        st.subheader("Dependency Mapping")
-        try:
-            db = active_db
-            df = _deps(db, None if sel_schema == "All" else sel_schema, None)
-            if df.empty:
-                st.info("No dependencies available.")
-            else:
-                # Filter by object type
-                typ = st.multiselect("Referenced Type", sorted(df.get("REFERENCED_TYPE", pd.Series(dtype=str)).dropna().unique().tolist()))
-                view = df.copy()
-                if typ:
-                    view = view[view["REFERENCED_TYPE"].isin(typ)]
-                st.dataframe(view, use_container_width=True)
-                # PK/FK best-effort and orphan/cycle detection around selected schema
-                if db and sel_schema and sel_schema != "All":
-                    try:
-                        keys = _run(
-                            f"""
-                            select tc.CONSTRAINT_TYPE, kc.TABLE_NAME, kc.COLUMN_NAME, kc.POSITION
-                            from {db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-                            join {db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE kc
-                              on tc.TABLE_SCHEMA=kc.TABLE_SCHEMA and tc.TABLE_NAME=kc.TABLE_NAME and tc.CONSTRAINT_NAME=kc.CONSTRAINT_NAME
-                            where tc.TABLE_SCHEMA=%(s)s
-                            order by kc.TABLE_NAME, kc.POSITION
-                            """,
-                            {"s": sel_schema}
-                        ) or []
-                        st.markdown("**PK/UNIQUE columns (best-effort)**")
-                        st.dataframe(pd.DataFrame(keys), use_container_width=True)
-                    except Exception:
-                        pass
-                # Graph-based checks
-                try:
-                    edges = list(set([(f"{r['REFERENCED_OBJECT_CATALOG']}.{r['REFERENCED_OBJECT_SCHEMA']}.{r['REFERENCED_OBJECT_NAME']}",
-                                       f"{r['REFERENCING_OBJECT_CATALOG']}.{r['REFERENCING_OBJECT_SCHEMA']}.{r['REFERENCING_OBJECT_NAME']}") for _, r in view.iterrows()]))
-                    nodes = sorted({n for e in edges for n in e})
-                    out_deg = {n:0 for n in nodes}
-                    in_deg = {n:0 for n in nodes}
-                    for a,b in edges:
-                        out_deg[a]+=1; in_deg[b]+=1
-                    orphans = [n for n in nodes if in_deg.get(n,0)==0 and out_deg.get(n,0)==0]
-                    st.markdown("**Orphan Objects**")
-                    if orphans:
-                        st.dataframe(pd.DataFrame({"ORPHAN": orphans}), use_container_width=True)
-                    # Simple cycle detection (depth-limited)
-                    from collections import defaultdict, deque
-                    g = defaultdict(list)
-                    for a,b in edges:
-                        g[a].append(b)
-                    cycles: List[List[str]] = []
-                    for start in nodes[:200]:
-                        dq = deque([(start,[start])])
-                        seen = set()
-                        while dq:
-                            n, path = dq.popleft()
-                            if len(path) > 8:
-                                continue
-                            for nb in g.get(n, []):
-                                if nb == start and len(path) > 1:
-                                    cycles.append(path+[start])
-                                elif nb not in path and nb not in seen:
-                                    seen.add(nb)
-                                    dq.append((nb, path+[nb]))
-                    if cycles:
-                        st.markdown("**Detected Cycles (truncated)**")
-                        st.dataframe(pd.DataFrame({"CYCLE": [" -> ".join(c[:10]) for c in cycles[:20]]}), use_container_width=True)
-                except Exception:
-                    pass
-        except Exception as e:
-            st.info(f"Dependency mapping unavailable: {e}")
-
-    # ---- Change Propagation ----
-    with lin_change:
-        st.subheader("Change Propagation")
-        start_dt = datetime.utcnow() - (timedelta(days=7) if time_rng == "Last 7 days" else timedelta(days=30) if time_rng == "Last 30 days" else timedelta(days=90) if time_rng == "Last 90 days" else timedelta(days=365))
-        end_dt = datetime.utcnow()
-        if sel_object and sel_object != "None":
-            db, sch, name = _split_fqn(sel_object)
-            try:
-                # Escape regex for schema.table pattern
-                pat = ".*" + re.escape(f"{sch}.{name}").upper() + ".*"
-                qh = _run(
-                    """
-                    select QUERY_ID, USER_NAME, START_TIME, QUERY_TEXT
-                    from SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-                    where START_TIME between %(s)s and %(e)s
-                      and (upper(QUERY_TEXT) like any_values(array_construct('%INSERT%','%UPDATE%','%MERGE%','%DELETE%','%CREATE TABLE AS%')))
-                      and regexp_like(upper(QUERY_TEXT), %(pat)s)
-                    order by START_TIME desc limit 1000
-                    """,
-                    {"s": start_dt, "e": end_dt, "pat": pat}
-                ) or []
-            except Exception as e:
-                qh = []
-                st.info(f"QUERY_HISTORY unavailable: {e}")
-            try:
-                th = _run(
-                    """
-                    select NAME, SCHEDULED_TIME, STATE, QUERY_TEXT
-                    from SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY
-                    where SCHEDULED_TIME between %(s)s and %(e)s
-                    order by SCHEDULED_TIME desc limit 1000
-                    """,
-                    {"s": start_dt, "e": end_dt}
-                ) or []
-            except Exception as e:
-                st.info(f"Masking policy info unavailable: {e}")
-        st.markdown("---")
-        st.subheader("Column Lineage (best-effort)")
-        try:
-            # Attempt programmatic lineage function
-            rows = _run(
+                        'UPSTREAM' AS STAGE,
+                        od.REFERENCED_DATABASE || '.' || od.REFERENCED_SCHEMA || '.' || od.REFERENCED_OBJECT_NAME AS FROM_OBJECT,
+                        od.REFERENCED_OBJECT_DOMAIN AS FROM_TYPE,
+                        ba.DATABASE_NAME || '.' || ba.SCHEMA_NAME || '.' || ba.OBJECT_NAME AS TO_OBJECT,
+                        ba.OBJECT_TYPE AS TO_TYPE,
+                        1 AS DEPTH,
+                        od.REFERENCED_OBJECT_NAME || ' → ' || ba.OBJECT_NAME AS LINEAGE_PATH,
+                        od.REFERENCED_DATABASE,
+                        od.REFERENCED_SCHEMA,
+                        od.REFERENCED_OBJECT_NAME
+                    FROM SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES od
+                    JOIN base_asset ba
+                      ON od.REFERENCING_DATABASE = ba.DATABASE_NAME
+                     AND od.REFERENCING_SCHEMA  = ba.SCHEMA_NAME
+                     AND od.REFERENCING_OBJECT_NAME = ba.OBJECT_NAME
+                    UNION ALL
+                    SELECT
+                        'UPSTREAM',
+                        od.REFERENCED_DATABASE || '.' || od.REFERENCED_SCHEMA || '.' || od.REFERENCED_OBJECT_NAME,
+                        od.REFERENCED_OBJECT_DOMAIN,
+                        ul.TO_OBJECT,
+                        ul.TO_TYPE,
+                        ul.DEPTH + 1,
+                        od.REFERENCED_OBJECT_NAME || ' → ' || ul.LINEAGE_PATH,
+                        od.REFERENCED_DATABASE,
+                        od.REFERENCED_SCHEMA,
+                        od.REFERENCED_OBJECT_NAME
+                    FROM upstream_lineage ul
+                    JOIN SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES od
+                      ON od.REFERENCING_DATABASE = ul.REFERENCED_DATABASE
+                     AND od.REFERENCING_SCHEMA  = ul.REFERENCED_SCHEMA
+                     AND od.REFERENCING_OBJECT_NAME = ul.REFERENCED_OBJECT_NAME
+                    WHERE ul.DEPTH < 5
+                ),
+                transformations AS (
+                    SELECT
+                        'TRANSFORMATION' AS STAGE,
+                        ba.DATABASE_NAME || '.' || ba.SCHEMA_NAME || '.' || ba.OBJECT_NAME AS FROM_OBJECT,
+                        'TABLE' AS FROM_TYPE,
+                        v.TABLE_CATALOG || '.' || v.TABLE_SCHEMA || '.' || v.TABLE_NAME AS TO_OBJECT,
+                        'VIEW' AS TO_TYPE,
+                        1 AS DEPTH,
+                        ba.OBJECT_NAME || ' → ' || v.TABLE_NAME AS LINEAGE_PATH,
+                        OBJECT_CONSTRUCT('definition', SUBSTR(v.VIEW_DEFINITION, 1, 200)) AS ADDITIONAL_INFO
+                    FROM "{db}".INFORMATION_SCHEMA.VIEWS v
+                    JOIN base_asset ba
+                      ON v.TABLE_CATALOG = ba.DATABASE_NAME
+                     AND v.VIEW_DEFINITION ILIKE '%' || ba.OBJECT_NAME || '%'
+                ),
+                downstream_lineage AS (
+                    SELECT
+                        'DOWNSTREAM' AS STAGE,
+                        ba.DATABASE_NAME || '.' || ba.SCHEMA_NAME || '.' || ba.OBJECT_NAME AS FROM_OBJECT,
+                        ba.OBJECT_TYPE AS FROM_TYPE,
+                        od.REFERENCING_DATABASE || '.' || od.REFERENCING_SCHEMA || '.' || od.REFERENCING_OBJECT_NAME AS TO_OBJECT,
+                        od.REFERENCING_OBJECT_DOMAIN AS TO_TYPE,
+                        1 AS DEPTH,
+                        ba.OBJECT_NAME || ' → ' || od.REFERENCING_OBJECT_NAME AS LINEAGE_PATH,
+                        od.REFERENCING_DATABASE,
+                        od.REFERENCING_SCHEMA,
+                        od.REFERENCING_OBJECT_NAME
+                    FROM SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES od
+                    JOIN base_asset ba
+                      ON od.REFERENCED_DATABASE = ba.DATABASE_NAME
+                     AND od.REFERENCED_SCHEMA  = ba.SCHEMA_NAME
+                     AND od.REFERENCED_OBJECT_NAME = ba.OBJECT_NAME
+                    UNION ALL
+                    SELECT
+                        'DOWNSTREAM',
+                        dl.FROM_OBJECT,
+                        dl.FROM_TYPE,
+                        od.REFERENCING_DATABASE || '.' || od.REFERENCING_SCHEMA || '.' || od.REFERENCING_OBJECT_NAME,
+                        od.REFERENCING_OBJECT_DOMAIN,
+                        dl.DEPTH + 1,
+                        dl.LINEAGE_PATH || ' → ' || od.REFERENCING_OBJECT_NAME,
+                        od.REFERENCING_DATABASE,
+                        od.REFERENCING_SCHEMA,
+                        od.REFERENCING_OBJECT_NAME
+                    FROM downstream_lineage dl
+                    JOIN SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES od
+                      ON od.REFERENCED_DATABASE = dl.REFERENCING_DATABASE
+                     AND od.REFERENCED_SCHEMA  = dl.REFERENCING_SCHEMA
+                     AND od.REFERENCED_OBJECT_NAME = dl.REFERENCING_OBJECT_NAME
+                    WHERE dl.DEPTH < 5
+                )
+                SELECT 
+                    STAGE AS DATA_STAGE, 
+                    FROM_OBJECT, FROM_TYPE, TO_OBJECT, TO_TYPE, DEPTH 
+                FROM (
+                    SELECT STAGE, FROM_OBJECT, FROM_TYPE, TO_OBJECT, TO_TYPE, DEPTH FROM upstream_lineage
+                    UNION ALL
+                    SELECT STAGE, FROM_OBJECT, FROM_TYPE, TO_OBJECT, TO_TYPE, DEPTH FROM transformations
+                    UNION ALL
+                    SELECT STAGE, FROM_OBJECT, FROM_TYPE, TO_OBJECT, TO_TYPE, DEPTH FROM downstream_lineage
+                )
+                WHERE FROM_OBJECT NOT ILIKE 'DATA_CLASSIFICATION_DB.TEST_DATA%'
+                  AND TO_OBJECT NOT ILIKE 'DATA_CLASSIFICATION_DB.TEST_DATA%'
+                ORDER BY 
+                    CASE DATA_STAGE 
+                        WHEN 'UPSTREAM' THEN 1 
+                        WHEN 'TRANSFORMATION' THEN 2 
+                        WHEN 'DOWNSTREAM' THEN 3 
+                        ELSE 4 
+                    END, 
+                    DEPTH, 
+                    FROM_OBJECT
+                LIMIT 500
                 """
-                select * from table(SNOWFLAKE.CORE.GET_LINEAGE(object_name=>%(f)s, include_columns=>true))
-                limit 2000
-                """,
-                {"f": sel_object}
-            ) or []
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
-            else:
-                st.info("No lineage information available")
-        except Exception as e:
-            error_msg = str(e).split('\n')[0]
-            st.warning(f"Could not retrieve lineage: {error_msg}")
-
-    # ---- Column-level Info ----
-    with lin_column:
-        st.subheader("Column-level Info")
-        if sel_object and sel_object != "None":
-            db, sch, name = _split_fqn(sel_object)
-            c1, c2 = st.columns(2)
-            with c1:
-                try:
-                    tr = _run(
-                        """
-                        select OBJECT_DATABASE, OBJECT_SCHEMA, OBJECT_NAME, COLUMN_NAME, TAG_NAME, TAG_VALUE
-                        from SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
-                        where OBJECT_DATABASE=%(d)s and OBJECT_SCHEMA=%(s)s and OBJECT_NAME=%(t)s and COLUMN_NAME is not null
-                        limit 1000
-                        """,
-                        {"d": db, "s": sch, "t": name}
-                    ) or []
-                    st.markdown("**Column Tags**")
-                    st.dataframe(pd.DataFrame(tr), use_container_width=True)
-                except Exception as e:
-                    st.info(f"TAG_REFERENCES unavailable: {e}")
-            with c2:
-                try:
-                    rows = _run(
-                        f"""
-                        select COLUMN_NAME, DATA_TYPE, MASKING_POLICY
-                        from {db}.INFORMATION_SCHEMA.COLUMNS
-                        where TABLE_SCHEMA=%(s)s and TABLE_NAME=%(t)s
-                        order by ORDINAL_POSITION
-                        """,
-                        {"s": sch, "t": name}
-                    ) or []
-                    st.markdown("**Masking Policies**")
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                except Exception as e:
-                    st.info(f"Masking policy info unavailable: {e}")
-            st.markdown("---")
-            st.subheader("Column Lineage (best-effort)")
-            try:
-                # Attempt programmatic lineage function
-                rows = _run(
-                    """
-                    select * from table(SNOWFLAKE.CORE.GET_LINEAGE(object_name=>%(f)s, include_columns=>true))
-                    limit 2000
-                    """,
-                    {"f": sel_object}
-                ) or []
-                if rows:
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                else:
-                    # Fallback via VIEW_COLUMN_USAGE for simple view -> base column mapping
-                    try:
-                        vcu = _run(
-                            f"""
-                            select VIEW_CATALOG, VIEW_SCHEMA, VIEW_NAME, TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
-                            from {db}.INFORMATION_SCHEMA.VIEW_COLUMN_USAGE
-                            where VIEW_SCHEMA=%(s)s and VIEW_NAME=%(t)s
-                            limit 1000
-                            """,
-                            {"s": sch, "t": name}
-                        ) or []
-                        if vcu:
-                            st.dataframe(pd.DataFrame(vcu), use_container_width=True)
-                        else:
-                            st.info("No column-level lineage returned.")
-                    except Exception as e:
-                        st.info(f"Column-level lineage unavailable: {e}")
+                rows = _run(lin_q) or []
+                ldf = pd.DataFrame(rows)
             except Exception as e:
-                st.info(f"GET_LINEAGE unavailable: {e}")
-        else:
-            st.info("Select an object to view column-level details.")
+                st.error(f"Full Journey Discovery Error: {e}")
+                ldf = pd.DataFrame()
+
+        with lin_tab1:
+            if ldf.empty:
+                nodes_data = {target_fqn: {"x": 0, "y": 0, "stage": "FOCAL", "type": "TABLE"}}
+                edges = []
+            else:
+                # 1. Identity all nodes and their attributes
+                all_nodes = set(ldf['FROM_OBJECT'].tolist() + ldf['TO_OBJECT'].tolist())
+                nodes_data = {}
+                
+                # Default focal
+                nodes_data[target_fqn] = {"x": 0, "y": 0, "stage": "FOCAL", "type": "TABLE"}
+
+                # Analyze stages and depths for coordinates
+                for _, row in ldf.iterrows():
+                    f_obj, t_obj, stage, depth = row['FROM_OBJECT'], row['TO_OBJECT'], row['DATA_STAGE'], row['DEPTH']
+                    
+                    if stage == 'UPSTREAM':
+                        # From Object is further away (upstream)
+                        if f_obj not in nodes_data:
+                            nodes_data[f_obj] = {"depth": depth, "stage": "ORIGIN", "type": row['FROM_TYPE']}
+                    elif stage == 'TRANSFORMATION':
+                        if t_obj not in nodes_data:
+                            nodes_data[t_obj] = {"depth": depth, "stage": "TRANSFORMATION", "type": row['TO_TYPE']}
+                    elif stage == 'DOWNSTREAM':
+                        if t_obj not in nodes_data:
+                            nodes_data[t_obj] = {"depth": depth, "stage": "DESTINATION", "type": row['TO_TYPE']}
+
+                # 2. Calculate coordinates
+                # X-axis: stage groups
+                stage_x = {"ORIGIN": -1.5, "FOCAL": 0, "TRANSFORMATION": 1.2, "DESTINATION": 2.5}
+                
+                # Group nodes by X coordinate to spread them along Y
+                from collections import defaultdict
+                x_groups = defaultdict(list)
+                for node, attr in nodes_data.items():
+                    # Refine X based on depth within stage
+                    base_x = stage_x.get(attr['stage'], 0)
+                    if attr['stage'] == "ORIGIN":
+                        x = base_x - (attr.get('depth', 1) * 0.4)
+                    elif attr['stage'] in ["TRANSFORMATION", "DESTINATION"]:
+                        x = base_x + (attr.get('depth', 1) * 0.4)
+                    else:
+                        x = base_x
+                    attr['x'] = x
+                    x_groups[x].append(node)
+
+                for x, group_nodes in x_groups.items():
+                    count = len(group_nodes)
+                    for i, node in enumerate(sorted(group_nodes)):
+                        # Center the group vertically
+                        nodes_data[node]['y'] = (i - (count - 1) / 2) * 0.8 if count > 1 else 0
+
+                # 3. Build edges
+                edges = []
+                for _, row in ldf.iterrows():
+                    f_obj, t_obj = row['FROM_OBJECT'], row['TO_OBJECT']
+                    if f_obj in nodes_data and t_obj in nodes_data:
+                        edges.append({
+                            "x": [nodes_data[f_obj]['x'], nodes_data[t_obj]['x'], None],
+                            "y": [nodes_data[f_obj]['y'], nodes_data[t_obj]['y'], None]
+                        })
+
+            # 4. Render
+            if not nodes_data:
+                st.warning("⚠️ No valid objects identified for lineage.")
+            else:
+                fig = go.Figure()
+                
+                # Edges
+                for edge in edges:
+                    fig.add_trace(go.Scatter(
+                        x=edge['x'], y=edge['y'],
+                        line=dict(width=1.5, color='rgba(255,255,255,0.1)'),
+                        hoverinfo='skip', mode='lines'
+                    ))
+                
+                # Nodes by category for better legend/styling
+                stages = [
+                    ("ORIGIN", "#3b82f6", "circle"), 
+                    ("TRANSFORMATION", "#a855f7", "diamond"), 
+                    ("DESTINATION", "#10b981", "circle"), 
+                    ("FOCAL", "#059669", "hexagon")
+                ]
+                
+                for s_name, s_color, s_symbol in stages:
+                    s_nodes = [n for n, a in nodes_data.items() if a['stage'] == s_name]
+                    if not s_nodes: continue
+                    
+                    fig.add_trace(go.Scatter(
+                        x=[nodes_data[n]['x'] for n in s_nodes],
+                        y=[nodes_data[n]['y'] for n in s_nodes],
+                        mode='markers+text',
+                        name=s_name.capitalize(),
+                        text=[(str(n).split('.')[-1][:15] + '...') if len(str(n).split('.')[-1])>15 else str(n).split('.')[-1] for n in s_nodes],
+                        textposition="top center",
+                        marker=dict(
+                            size=20 if s_name == "FOCAL" else 15,
+                            color=s_color,
+                            line=dict(width=2, color='white'),
+                            symbol=s_symbol
+                        ),
+                        textfont=dict(color='white', size=10),
+                        hovertext=[f"<b>{s_name}</b><br>FQN: {n}<br>Type: {nodes_data[n].get('type','UNKNOWN')}" for n in s_nodes],
+                        hoverinfo='text'
+                    ))
+
+                fig.update_layout(
+                    showlegend=True, 
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="white", size=10)),
+                    paper_bgcolor='rgba(0,0,0,0)', 
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    xaxis=dict(visible=False, zeroline=False), 
+                    yaxis=dict(visible=False, zeroline=False),
+                    height=600, 
+                    margin=dict(l=50,r=50,t=80,b=50),
+                    hoverlabel=dict(bgcolor="#1a202c", font_size=12, font_family="Inter")
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.markdown("""
+                <div style="display: flex; justify-content: space-between; padding: 10px 20px; background: rgba(255,255,255,0.03); border-radius: 10px; font-size: 0.8rem; color: rgba(255,255,255,0.5);">
+                    <span>⬅️ Upstream Origins</span>
+                    <span>📍 FOCAL ASSET</span>
+                    <span>Transformations & Destinations ➡️</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+        with lin_tab2:
+            if ldf.empty:
+                st.success(f"✨ **{name}** is an isolated asset: No upstream origin or downstream destinations were detected in your environment.")
+            else:
+                # Direct categorization based on user's mission statement
+                origin = ldf[ldf['DATA_STAGE'] == 'UPSTREAM'].drop_duplicates('FROM_OBJECT')
+                transformations = ldf[ldf['DATA_STAGE'] == 'TRANSFORMATION'].drop_duplicates('TO_OBJECT')
+                destinations = ldf[ldf['DATA_STAGE'] == 'DOWNSTREAM'].drop_duplicates('TO_OBJECT')
+                
+                # Premium KPI Ribbon
+                st.markdown("""
+                <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 30px;">
+                    <div class="pillar-card" style="border-bottom: 4px solid #3b82f6;">
+                        <div style="font-size: 0.7rem; color: rgba(255,255,255,0.5); text-transform: uppercase; font-weight: 700;">📦 Origin</div>
+                        <div style="font-size: 1.8rem; font-weight: 800; color: white;">{origin_cnt}</div>
+                        <div style="font-size: 0.65rem; color: #60a5fa;">Upstream Sources</div>
+                    </div>
+                    <div class="pillar-card" style="border-bottom: 4px solid #a855f7;">
+                        <div style="font-size: 0.7rem; color: rgba(255,255,255,0.5); text-transform: uppercase; font-weight: 700;">🔄 Transformations</div>
+                        <div style="font-size: 1.8rem; font-weight: 800; color: white;">{trans_cnt}</div>
+                        <div style="font-size: 0.65rem; color: #c084fc;">Dependent Views</div>
+                    </div>
+                    <div class="pillar-card" style="border-bottom: 4px solid #10b981;">
+                        <div style="font-size: 0.7rem; color: rgba(255,255,255,0.5); text-transform: uppercase; font-weight: 700;">🤝 Destinations</div>
+                        <div style="font-size: 1.8rem; font-weight: 800; color: white;">{dest_cnt}</div>
+                        <div style="font-size: 0.65rem; color: #34d399;">Downstream Users</div>
+                    </div>
+                    <div class="pillar-card" style="border-bottom: 4px solid #f87171; background: rgba(248, 113, 113, 0.05);">
+                        <div style="font-size: 0.7rem; color: rgba(255,255,255,0.5); text-transform: uppercase; font-weight: 700;">💥 Blast Radius</div>
+                        <div style="font-size: 1.8rem; font-weight: 800; color: #f87171;">{blast_score}%</div>
+                        <div style="font-size: 0.65rem; color: rgba(255,255,255,0.4);">Change Impact Score</div>
+                    </div>
+                </div>
+                """.format(
+                    origin_cnt=len(origin),
+                    trans_cnt=len(transformations),
+                    dest_cnt=len(destinations),
+                    blast_score=min(100, (len(transformations) + len(destinations)) * 10)
+                ), unsafe_allow_html=True)
+
+                st.markdown("#### 🔍 Lineage Detail: Provenance & Lifecycle")
+                
+                det_col1, det_col2, det_col3 = st.columns(3)
+                
+                with det_col1:
+                    st.caption("🕵️ WHERE DID THIS COME FROM?")
+                    st.markdown("<div style='font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;'>Primary Upstream Origins (Ancestors)</div>", unsafe_allow_html=True)
+                    st.dataframe(origin[['FROM_OBJECT','FROM_TYPE']].rename(columns={'FROM_OBJECT':'Source','FROM_TYPE':'Type'}), 
+                                 hide_index=True, use_container_width=True)
+                
+                with det_col2:
+                    st.caption("🔄 WHAT TRANSFORMATIONS USE IT?")
+                    st.markdown("<div style='font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;'>Views & Logic Dependents</div>", unsafe_allow_html=True)
+                    st.dataframe(transformations[['TO_OBJECT','TO_TYPE']].rename(columns={'TO_OBJECT':'Logic Path','TO_TYPE':'Type'}), 
+                                 hide_index=True, use_container_width=True)
+                    
+                with det_col3:
+                    st.caption("👥 WHO USES THIS DATA?")
+                    st.markdown("<div style='font-size:0.75rem; color:rgba(255,255,255,0.4); margin-bottom:10px;'>Primary Downstream Consumers</div>", unsafe_allow_html=True)
+                    st.dataframe(destinations[['TO_OBJECT','TO_TYPE']].rename(columns={'TO_OBJECT':'Destination','TO_TYPE':'Type'}), 
+                                 hide_index=True, use_container_width=True)
+

@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sys
 import pathlib
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
@@ -44,16 +45,12 @@ try:
 except Exception:  # type: ignore
     snowflake_connector = None  # type: ignore
 
-from src.services.classification_workflow_service import classification_workflow_service as reclassification_service
+from src.services.classification_workflow_service import classification_workflow_service as cwf
 
 try:
     from src.services.classification_audit_service import classification_audit_service as audit_service
 except Exception:  # type: ignore
     audit_service = None  # type: ignore
-
-# Orchestration façade (preferred entry point)
-from src.services.classification_workflow_service import classification_workflow_service as cwf
-
 
 GOV_SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 REQ_TABLE = "RECLASSIFICATION_REQUESTS"
@@ -132,22 +129,6 @@ class SnowflakeOps:
                 )
                 """
             )
-            # Workflow log table (Optional, kept for detailed audit trail if needed)
-            self.sf.execute_non_query(
-                f"""
-                CREATE TABLE IF NOT EXISTS {db}.{GOV_SCHEMA}.{LOG_TABLE} (
-                    ID STRING,
-                    REQUEST_ID STRING,
-                    ACTION STRING,
-                    OLD_STATUS STRING,
-                    NEW_STATUS STRING,
-                    ACTOR STRING,
-                    COMMENT STRING,
-                    CREATED_AT TIMESTAMP_NTZ
-                )
-                """
-            )
-
             # Schema drift fix: Ensure columns exist if table was created by older version
             try:
                 self.sf.execute_non_query(f"ALTER TABLE {db}.{GOV_SCHEMA}.CLASSIFICATION_DECISIONS ADD COLUMN IF NOT EXISTS LABEL STRING")
@@ -155,7 +136,6 @@ class SnowflakeOps:
                 self.sf.execute_non_query(f"ALTER TABLE {db}.{GOV_SCHEMA}.CLASSIFICATION_DECISIONS ADD COLUMN IF NOT EXISTS I NUMBER")
                 self.sf.execute_non_query(f"ALTER TABLE {db}.{GOV_SCHEMA}.CLASSIFICATION_DECISIONS ADD COLUMN IF NOT EXISTS A NUMBER")
                 self.sf.execute_non_query(f"ALTER TABLE {db}.{GOV_SCHEMA}.CLASSIFICATION_DECISIONS ADD COLUMN IF NOT EXISTS SOURCE STRING")
-                # New columns for workflow
                 self.sf.execute_non_query(f"ALTER TABLE {db}.{GOV_SCHEMA}.CLASSIFICATION_DECISIONS ADD COLUMN IF NOT EXISTS STATUS STRING")
                 self.sf.execute_non_query(f"ALTER TABLE {db}.{GOV_SCHEMA}.CLASSIFICATION_DECISIONS ADD COLUMN IF NOT EXISTS RATIONALE STRING")
                 self.sf.execute_non_query(f"ALTER TABLE {db}.{GOV_SCHEMA}.CLASSIFICATION_DECISIONS ADD COLUMN IF NOT EXISTS DECISION_BY STRING")
@@ -167,6 +147,43 @@ class SnowflakeOps:
         except Exception:
             # Best-effort; do not fail UI
             pass
+
+    def get_asset_current_state(self, asset_full_name: str) -> Dict[str, Any]:
+        """Fetch current classification of a dataset from ASSETS or HISTORY."""
+        if not self.sf or not asset_full_name:
+            return {}
+        db = self._db()
+        if not db:
+            return {}
+        try:
+            # Try ASSETS table first (Canonical state)
+            q = f"""
+                SELECT 
+                    CLASSIFICATION_LABEL, 
+                    CONFIDENTIALITY_LEVEL, 
+                    INTEGRITY_LEVEL, 
+                    AVAILABILITY_LEVEL
+                FROM {db}.{GOV_SCHEMA}.ASSETS
+                WHERE UPPER(FULLY_QUALIFIED_NAME) = UPPER(%(fqn)s)
+                LIMIT 1
+            """
+            rows = self.sf.execute_query(q, {"fqn": asset_full_name})
+            if rows:
+                r = rows[0]
+                # Helper to parse "C1" or 1
+                def _parse_cia(val):
+                    s = str(val or "0").upper().replace("C","").replace("I","").replace("A","")
+                    return int(s) if s.isdigit() else 0
+                
+                return {
+                    "label": r.get("CLASSIFICATION_LABEL"),
+                    "c": _parse_cia(r.get("CONFIDENTIALITY_LEVEL")),
+                    "i": _parse_cia(r.get("INTEGRITY_LEVEL")),
+                    "a": _parse_cia(r.get("AVAILABILITY_LEVEL")),
+                }
+        except Exception:
+            pass
+        return {}
 
     def insert_request(self, req: ReclassRequest) -> str:
         """Insert request to Snowflake or no-op fallback."""
@@ -228,12 +245,6 @@ class SnowflakeOps:
             params,
         )
         return str(params["id"])
-
-    def insert_log(self, request_id: str, action: str, actor: str, comment: str,
-                    old_status: Optional[str], new_status: Optional[str]) -> None:
-        """Insert a workflow log entry."""
-        # ... (Log table logic remains separate/optional)
-        pass
 
     def list_requests(self, status: Optional[str] = None, owner: Optional[str] = None,
                       dataset_like: Optional[str] = None, limit: int = 500) -> List[Dict[str, Any]]:
@@ -370,6 +381,9 @@ class Backend:
         self.sfops = SnowflakeOps()
         self.sfops.ensure_objects()
 
+    def get_current(self, asset: str) -> Dict[str, Any]:
+        return self.sfops.get_asset_current_state(asset)
+
     def submit(self, req: ReclassRequest) -> str:
         rid = self.sfops.insert_request(req)
         if audit_service:
@@ -410,108 +424,159 @@ def _list_assets(limit: int = 300) -> List[str]:
 
 
 def render_reclassification_requests(key_prefix: str = "reclass") -> None:
-    """Render the Reclassification Requests sub-tab UI.
-
-    Import and call this from your Classification Management tab, e.g.:
-        from src.ui.reclassification_requests import render_reclassification_requests
-        with subtab:
-            render_reclassification_requests()
-    """
+    """Render the Reclassification Requests sub-tab UI."""
     backend = Backend()
 
-    st.markdown("### 📋 Reclassification Management")
-    st.caption("Submit new requests for data reclassification or review pending requests.")
+    # --- Custom CSS for visual polish ---
+    st.markdown("""
+    <style>
+    /* Hide all horizontal dividers */
+    hr, .stHorizontal {
+        visibility: hidden;
+        height: 0 !important;
+        margin: 0.2rem 0 !important;
+    }
+    
+    div[data-testid="column"] {
+        background-color: transparent;
+        padding: 0.5rem;
+    }
+    .metric-card {
+        background-color: #262730;
+        border: 1px solid #41424C;
+        padding: 1rem;
+        border-radius: 8px;
+        color: white;
+        text-align: center;
+        margin-bottom: 0.5rem;
+    }
+    .metric-title {
+        color: #9CA3AF;
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .metric-value {
+        color: #FFFFFF;
+        font-size: 1.5rem;
+        font-weight: 700;
+    }
+    .stSelectbox label {
+        color: #E2E8F0 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.caption("Manage classification change requests. You can submit new proposals or approve/reject pending requests.")
 
     tab_new, tab_manage = st.tabs(["➕ New Request", "🔍 Manage Requests"])
 
     # --- TAB 1: NEW REQUEST ---
     with tab_new:
-        st.markdown("#### Submit Reclassification Request")
-        st.info("Use this form to propose changes to the confidentiality, integrity, or availability ratings of a dataset.")
-        
-        with st.form(key=f"{key_prefix}_form", clear_on_submit=True):
-            # Dataset
+        with st.container():
+            st.markdown("#### Submit Reclassification Request")
+            st.info("Propose a change to the classification level of a dataset. Please provide valid business justification and supporting evidence.")
+            
+            # --- Interactive Asset Selection (Outside Form) ---
+            st.markdown("##### 1. Select Asset")
             assets = _list_assets(limit=400)
-            col_a1, col_a2 = st.columns([3, 1])
-            with col_a1:
-                asset = st.selectbox("Select Dataset (DATABASE.SCHEMA.OBJECT)", options=assets or [""], index=0, help="Choose the dataset you wish to reclassify.")
-            with col_a2:
-                requester = st.text_input("Requester Email", value=str(st.session_state.get("user") or ""), disabled=True, help="Your email is automatically captured.")
-
-            st.divider()
+            sel_asset = st.selectbox("Find Dataset", options=[""] + assets, index=0, key=f"{key_prefix}_sel_asset")
             
-            # Proposed Scores
-            st.markdown("**Proposed Classification Levels**")
-            colc, coli, cola, coll = st.columns(4)
-            with colc:
-                pc = st.number_input("Confidentiality (C)", min_value=0, max_value=3, value=1, help="0=Public, 3=Restricted")
-            with coli:
-                pi = st.number_input("Integrity (I)", min_value=0, max_value=3, value=1, help="0=None, 3=Critical")
-            with cola:
-                pa = st.number_input("Availability (A)", min_value=0, max_value=3, value=1, help="0=None, 3=Critical")
-            with coll:
-                label = st.selectbox("Overall Label", options=["Public", "Internal", "Confidential", "Restricted"], index=1)
-
-            st.divider()
-
-            # Justification
-            reason = st.text_input("Summary Reason", placeholder="e.g., 'Data contains PII detected in recent scan'", max_chars=100)
-            rationale = st.text_area("Detailed Rationale", placeholder="Provide context, references to policy, or specific column details...", height=100)
-            
-            # Attachments
-            file = st.file_uploader("Evidence / Attachments (Optional)", type=["pdf","txt","csv","png","jpg"], help="Attach supporting documents if needed.")
-
-            submitted = st.form_submit_button("🚀 Submit Request", type="primary", use_container_width=True)
-            
-            if submitted:
-                if not asset:
-                    st.error("Please select a dataset.")
-                elif not reason:
-                    st.error("Please provide a summary reason.")
+            # Comparison Context
+            current_state = {}
+            if sel_asset:
+                current_state = backend.get_current(sel_asset)
+                if current_state:
+                    st.markdown(f"**Current Classification for `{sel_asset}`**")
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.markdown(f"<div class='metric-card'><div class='metric-title'>Label</div><div class='metric-value'>{current_state.get('label','Unset')}</div></div>", unsafe_allow_html=True)
+                    with c2:
+                        st.markdown(f"<div class='metric-card'><div class='metric-title'>Confidentiality</div><div class='metric-value'>C{current_state.get('c',0)}</div></div>", unsafe_allow_html=True)
+                    with c3:
+                        st.markdown(f"<div class='metric-card'><div class='metric-title'>Integrity</div><div class='metric-value'>I{current_state.get('i',0)}</div></div>", unsafe_allow_html=True)
+                    with c4:
+                        st.markdown(f"<div class='metric-card'><div class='metric-title'>Availability</div><div class='metric-value'>A{current_state.get('a',0)}</div></div>", unsafe_allow_html=True)
                 else:
+                    st.warning(f"No existing classification found for `{sel_asset}`. Defaulting to New.")
+            
+            st.markdown("---")
+            
+            # Submission Form
+            st.markdown("##### 2. Proposal Details")
+            with st.form(key=f"{key_prefix}_real_form", clear_on_submit=True):
+                st.markdown("**Proposed Classification**")
+                colc, coli, cola, coll = st.columns(4)
+                with colc:
+                    pc = st.number_input("Confidentiality (C)", min_value=0, max_value=3, value=int(current_state.get("c", 1)), help="0=Public, 3=Restricted")
+                with coli:
+                    pi = st.number_input("Integrity (I)", min_value=0, max_value=3, value=int(current_state.get("i", 1)), help="0=None, 3=Critical")
+                with cola:
+                    pa = st.number_input("Availability (A)", min_value=0, max_value=3, value=int(current_state.get("a", 1)), help="0=None, 3=Critical")
+                with coll:
                     try:
-                        req = ReclassRequest(
-                            id="",  # assigned by backend
-                            asset_full_name=asset,
-                            reason=reason,
-                            proposed_c=int(pc),
-                            proposed_i=int(pi),
-                            proposed_a=int(pa),
-                            proposed_label=label,
-                            rationale=rationale,
-                            attachment_name=(file.name if file else None),
-                            attachment_bytes=(file.getvalue() if file else None),
-                            created_by=requester,
-                            status="Pending",
-                        )
-                        rid = backend.submit(req)
-                        st.success(f"✅ Request submitted successfully! Reference ID: {rid}")
-                    except Exception as e:
-                        st.error(f"Failed to submit request: {e}")
+                        curr_lbl = current_state.get("label", "Internal")
+                        # Handle case where curr_lbl might be None or not in list
+                        if not curr_lbl or curr_lbl not in ["Public", "Internal", "Confidential", "Restricted"]:
+                            curr_lbl = "Internal"
+                        idx = ["Public", "Internal", "Confidential", "Restricted"].index(curr_lbl)
+                    except ValueError:
+                        idx = 1
+                    label = st.selectbox("Overall Label", options=["Public", "Internal", "Confidential", "Restricted"], index=idx)
+
+                st.write("") # Spacer
+                reason = st.text_input("Summary Reason", placeholder="e.g., 'Data contains PII detected in recent scan'", max_chars=120)
+                rationale = st.text_area("Detailed Rationale", placeholder="Provide business context, links to policy, or specific column details...", height=120)
+                
+                file = st.file_uploader("Evidence (Optional)", type=["pdf","txt","csv","png","jpg"], help="Attach supporting documents.")
+
+                submitted = st.form_submit_button("🚀 Submit Request", type="primary", use_container_width=True)
+                
+                if submitted:
+                    if not sel_asset:
+                        st.error("Please select a dataset in step 1.")
+                    elif not reason:
+                        st.error("Please provide a summary reason.")
+                    else:
+                        try:
+                            req = ReclassRequest(
+                                id="",  # assigned by backend
+                                asset_full_name=sel_asset,
+                                reason=reason,
+                                proposed_c=int(pc),
+                                proposed_i=int(pi),
+                                proposed_a=int(pa),
+                                proposed_label=label,
+                                rationale=rationale,
+                                attachment_name=(file.name if file else None),
+                                attachment_bytes=(file.getvalue() if file else None),
+                                created_by=str(st.session_state.get("user") or "Unknown"),
+                                status="Pending",
+                            )
+                            rid = backend.submit(req)
+                            st.success(f"✅ Request submitted successfully! Reference ID: {rid}")
+                        except Exception as e:
+                            st.error(f"Failed to submit request: {e}")
 
     # --- TAB 2: MANAGE REQUESTS ---
     with tab_manage:
         # Filters
-        with st.expander("Filters & Search", expanded=True):
-            colf1, colf2, colf3, colf4 = st.columns([1.5, 1.5, 2, 1])
-            with colf1:
-                f_status = st.multiselect("Status", options=VALID_STATUSES, default=["Pending", "Under Review"], key=f"{key_prefix}_f_status")
-            with colf2:
-                f_owner = st.text_input("Requester", placeholder="Filter by email...", key=f"{key_prefix}_f_owner")
-            with colf3:
-                f_dataset = st.text_input("Dataset", placeholder="Search dataset name...", key=f"{key_prefix}_f_ds")
-            with colf4:
-                f_limit = st.number_input("Max Rows", min_value=10, max_value=500, value=100, step=10, key=f"{key_prefix}_f_lim")
+        st.markdown("##### 🔍 Filters & Search")
+        colf1, colf2, colf3, colf4 = st.columns([1.5, 1.5, 2, 1])
+        with colf1:
+            f_status = st.multiselect("Status", options=VALID_STATUSES, default=["Pending", "Under Review"], key=f"{key_prefix}_f_status")
+        with colf2:
+            f_owner = st.text_input("Requester", placeholder="Filter by email...", key=f"{key_prefix}_f_owner")
+        with colf3:
+            f_dataset = st.text_input("Dataset", placeholder="Search dataset name...", key=f"{key_prefix}_f_ds")
+        with colf4:
+            f_limit = st.number_input("Max Rows", min_value=10, max_value=500, value=100, step=10, key=f"{key_prefix}_f_lim")
+        st.write("")
 
         # Fetch Data
-        # Flatten status filter for backend (if all selected or empty, treat as All)
         status_arg = "All"
         if f_status and len(f_status) < len(VALID_STATUSES):
-            # Backend currently supports single status or "All". 
-            # We'll fetch "All" and filter client-side if multiple specifically selected, 
-            # or loop if backend allowed list (it doesn't appear to).
-            # For simplicity in this demo, if multiple selected, we fetch ALL and filter in DF.
-             status_arg = "All"
+             status_arg = "All" # Fetch all and filter client-side for multi-select
         elif len(f_status) == 1:
              status_arg = f_status[0]
 
@@ -526,38 +591,33 @@ def render_reclassification_requests(key_prefix: str = "reclass") -> None:
             if df.empty:
                 st.info("No requests match your filters.")
             else:
-                # Add a selection column? Streamlit data editor is good for this.
+                # Add selection column
                 df["Selected"] = False
                 
-                # Column Config
+                # Enhanced Column Config
                 column_config = {
-                    "ID": st.column_config.TextColumn("ID", width="small", help="Request Reference ID"),
+                    "ID": st.column_config.TextColumn("ID", width="small", help="Reference ID"),
                     "ASSET_FULL_NAME": st.column_config.TextColumn("Dataset", width="medium"),
                     "STATUS": st.column_config.SelectboxColumn(
                         "Status", 
                         options=VALID_STATUSES, 
                         width="small",
-                        help="Current Workflow Status"
+                        help="Workflow Status"
                     ),
-                    "PROPOSED_CLASSIFICATION": st.column_config.TextColumn("Prop. Label", width="small"),
-                    "CREATED_AT": st.column_config.DatetimeColumn("Submitted At", format="MMM DD, HH:mm"),
+                    "PROPOSED_CLASSIFICATION": st.column_config.TextColumn("Proposed Label", width="small"),
+                    "CREATED_AT": st.column_config.DatetimeColumn("Submitted", format="MMM DD, HH:mm"),
                     "CREATED_BY": st.column_config.TextColumn("Requester", width="medium"),
                     "Selected": st.column_config.CheckboxColumn("Select", width="small"),
-                    # Hide internal cols
+                    # Hide detail cols
                     "PROPOSED_C": None, "PROPOSED_I": None, "PROPOSED_A": None, 
                     "CURRENT_C": None, "CURRENT_I": None, "CURRENT_A": None,
                     "TRIGGER_TYPE": None, "VERSION": None, "UPDATED_AT": None,
                     "APPROVED_BY": None, "JUSTIFICATION": None
                 }
                 
-                # We need to display the dataframe. 
-                # To enable row selection for action, we can use on_select (st.dataframe) or data_editor.
-                # Let's use data_editor with disabled editing for most cols to allow row selection.
+                st.caption(f"Showing {len(df)} requests.")
                 
-                st.caption(f"Found {len(df)} requests.")
-                
-                # Ensure correct column order
-                disp_cols = ["Selected", "ID", "STATUS", "ASSET_FULL_NAME", "PROPOSED_CLASSIFICATION", "CREATED_BY", "CREATED_AT"]
+                disp_cols = ["Selected", "STATUS", "ASSET_FULL_NAME", "PROPOSED_CLASSIFICATION", "CREATED_BY", "CREATED_AT", "ID"]
                 
                 edited_df = st.data_editor(
                     df,
@@ -571,8 +631,6 @@ def render_reclassification_requests(key_prefix: str = "reclass") -> None:
 
                 # Action Bar
                 st.markdown("#### ⚡ Actions")
-                
-                # Identify selected rows
                 selected_rows = edited_df[edited_df["Selected"] == True]
                 
                 if not selected_rows.empty:
@@ -606,7 +664,7 @@ def render_reclassification_requests(key_prefix: str = "reclass") -> None:
                                 st.success("Rejected selected requests")
                                 st.rerun()
                 else:
-                    st.info("Select rows above to perform actions.")
+                    st.info("Select rows from the table above to perform actions.")
                     
         else:
              st.info("No requests found.")

@@ -704,6 +704,30 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
         except Exception:
             return {}
 
+    @st.cache_data(ttl=600)
+    def get_tags_map(full_names: list) -> dict:
+        """Get tags map keyed by Fully Qualified Name."""
+        if not full_names: return {}
+        try:
+            # We use a single query to ACCOUNT_USAGE for all selected assets
+            in_list = ",".join([f"'{f}'" for f in full_names[:1000]])
+            sql = f"""
+                SELECT OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME AS FULL_NAME, 
+                       TAG_NAME, TAG_VALUE
+                FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
+                WHERE OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME IN ({in_list})
+            """
+            rows = snowflake_connector.execute_query(sql) or []
+            tmap = {}
+            for r in rows:
+                obj = r['FULL_NAME']
+                tag = f"{r['TAG_NAME']}={r['TAG_VALUE']}"
+                if obj in tmap: tmap[obj] += f", {tag}"
+                else: tmap[obj] = tag
+            return tmap
+        except Exception:
+            return {}
+
     def _get_qa_status_map(full_names: list) -> dict:
         try:
             if not full_names:

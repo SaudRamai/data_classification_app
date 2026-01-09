@@ -973,7 +973,7 @@ with tab_inv_browser:
 
     # Helper: summarize by a grouping key
     # Helper: Ensure the view exists
-    @st.cache_data(ttl=3600)
+    @st.cache_data(ttl=600)
     def _ensure_inventory_view_exists(db_name: str):
         try:
             # Create the view using {db_name} dynamically

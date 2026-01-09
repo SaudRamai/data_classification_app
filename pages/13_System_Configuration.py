@@ -24,7 +24,7 @@ import streamlit as st
 
 # Page configuration - MUST be the first Streamlit command
 st.set_page_config(
-    page_title="Administration - Data Governance App",
+    page_title="System Configuration - Data Governance App",
     page_icon="🛠️",
     layout="wide"
 )

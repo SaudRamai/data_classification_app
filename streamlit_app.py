@@ -822,7 +822,7 @@ else:
         if can_admin:
             st.markdown('<div class="feature-card"><div class="card-icon">⚙️</div><div class="card-title">Administration</div><div class="card-desc">System configuration, role assignments, and governance module management.</div></div>', unsafe_allow_html=True)
             if st.button("Configure System", key="h_admin", use_container_width=True):
-                st.switch_page("pages/13_Admin_Config.py")
+                st.switch_page("pages/13_System_Configuration.py")
         else: st.info("Administration restricted to Admin roles.")
 
     st.markdown("<br><br>", unsafe_allow_html=True)

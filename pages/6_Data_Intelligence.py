@@ -173,7 +173,9 @@ if not is_sis and not (sf_user and sf_account) and not is_bypassed:
 DEFAULT_TTL = 1800  # 30 minutes for most caches
 
 def _has_sf_creds() -> bool:
-    """Return True if minimal Snowflake credentials are present (account + user)."""
+    """Return True if minimal Snowflake credentials are present or running in SiS."""
+    if is_sis:
+        return True
     try:
         _u = st.session_state.get("sf_user") or getattr(settings, "SNOWFLAKE_USER", None)
         _a = st.session_state.get("sf_account") or getattr(settings, "SNOWFLAKE_ACCOUNT", None)
@@ -182,23 +184,15 @@ def _has_sf_creds() -> bool:
         return False
 
 def _run(query: str, params: Optional[Dict] = None) -> List[Dict]:
-    """Execute a SQL query and return results as a list of dictionaries.
-    
-    Args:
-        query: SQL query to execute
-        params: Optional dictionary of parameters for parameterized queries
-        
-    Returns:
-        List of dictionaries where each dictionary represents a row with column names as keys
-    """
+    """Execute a SQL query and return results as a list of dictionaries."""
     try:
         # Short-circuit invalid queries that reference an unknown DB placeholder
-        # e.g. "from None.INFORMATION_SCHEMA..." or "from NONE.INFORMATION_SCHEMA..."
         q_upper = (query or '').upper()
         if ('NONE.INFORMATION_SCHEMA' in q_upper) or (' NONE.' in q_upper) or (' FROM NONE.' in q_upper):
             if not is_bypassed:
                 st.info("Select a database to view details.")
             return []
+            
         # Defensive: do not attempt a connection if credentials are missing
         if not _has_sf_creds():
             if not is_bypassed:
@@ -206,34 +200,22 @@ def _run(query: str, params: Optional[Dict] = None) -> List[Dict]:
             else:
                 st.toast("⚠️ Snowflake session missing - showing UI only", icon="⚠️")
             return []
-        # Get the active Snowflake connection context manager
-        with snowflake_connector.get_connection() as conn:
-            if not conn:
-                if not is_bypassed:
-                    st.error("❌ No active Snowflake connection. Please check your connection settings.")
-                else:
-                    st.toast("❌ Connection failed (bypassed)", icon="❌")
-                return []
-                
-            # Execute the query
-            with conn.cursor() as cur:
-                if params:
-                    cur.execute(query, params)
-                else:
-                    cur.execute(query)
-                    
-                # Fetch results if this is a SELECT query
-                if cur.description:
-                    columns = [col[0] for col in cur.description]
-                    return [dict(zip(columns, row)) for row in cur.fetchall()]
-                return []
+
+        # Use the connector's execute_query which handles both SiS and standard connection caching
+        try:
+            return snowflake_connector.execute_query(query, params) or []
+        except Exception as conn_err:
+             if not is_bypassed:
+                 # Only show error if not in bypass mode
+                 st.error(f"❌ Connection error: {str(conn_err)}")
+             else:
+                 logger.warning(f"Connection error (bypassed): {str(conn_err)}")
+             return []
                 
     except Exception as e:
         if not is_bypassed:
             st.error(f"❌ Error executing query: {str(e)}")
-            st.error(f"Query: {query[:500]}")  # Show first 500 chars of the query
-            if hasattr(e, 'snowflake_messages'):
-                st.error(f"Snowflake messages: {e.snowflake_messages}")
+            st.error(f"Query: {query[:500]}")
         else:
             logger.warning(f"Query failed (suppressed in bypass): {str(e)}")
         return []

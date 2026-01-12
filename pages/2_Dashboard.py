@@ -953,7 +953,7 @@ def render_realtime_dashboard():
 
         if st.button("⏰ Review Overdue Tasks", use_container_width=True):
              # Navigate to Data Assets for detailed review
-             st.switch_page("pages/2_Data_Assets.py")
+             st.switch_page("pages/1_Data_Assets.py")
              
         if st.button("📖 View Policy Guidelines", use_container_width=True):
              st.switch_page("pages/6_Policy_Guidance.py")

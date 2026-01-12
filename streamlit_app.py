@@ -328,7 +328,7 @@ try:
             # Redirect to Dashboard page
             try:
                 if hasattr(st, "switch_page"):
-                    st.switch_page("pages/1_Dashboard.py")
+                    st.switch_page("pages/2_Dashboard.py")
                 else:
                     raise AttributeError("switch_page not available")
             except Exception:
@@ -392,7 +392,7 @@ def _login_section():
                 # Redirect to Dashboard page
                 try:
                     if hasattr(st, "switch_page"):
-                        st.switch_page("pages/1_Dashboard.py")
+                        st.switch_page("pages/2_Dashboard.py")
                     else:
                         raise AttributeError("switch_page not available")
                 except Exception:
@@ -425,7 +425,7 @@ def _login_section():
                             )
                             try:
                                 if hasattr(st, "switch_page"):
-                                    st.switch_page("pages/1_Dashboard.py")
+                                    st.switch_page("pages/2_Dashboard.py")
                                 else:
                                     raise AttributeError("switch_page not available")
                             except Exception:
@@ -453,7 +453,7 @@ def _login_section():
                                 )
                                 try:
                                     if hasattr(st, "switch_page"):
-                                        st.switch_page("pages/1_Dashboard.py")
+                                        st.switch_page("pages/2_Dashboard.py")
                                     else:
                                         raise AttributeError("switch_page not available")
                                 except Exception:
@@ -766,12 +766,12 @@ else:
     with c1:
         st.markdown('<div class="feature-card"><div class="card-icon">📦</div><div class="card-title">Data Assets</div><div class="card-desc">Browse inventory and metadata</div></div>', unsafe_allow_html=True)
         if st.button("Browse Assets", key="h_assets", use_container_width=True):
-            st.switch_page("pages/2_Data_Assets.py")
+            st.switch_page("pages/1_Data_Assets.py")
 
     with c2:
         st.markdown('<div class="feature-card"><div class="card-icon">📊</div><div class="card-title">Dashboard</div><div class="card-desc">Overview and metrics</div></div>', unsafe_allow_html=True)
         if st.button("View Dashboard", key="h_dash", use_container_width=True):
-            st.switch_page("pages/1_Dashboard.py")
+            st.switch_page("pages/2_Dashboard.py")
 
     with c3:
         st.markdown('<div class="feature-card"><div class="card-icon">🏷️</div><div class="card-title">Classification</div><div class="card-desc">Label and tag data</div></div>', unsafe_allow_html=True)

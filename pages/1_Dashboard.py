@@ -956,7 +956,7 @@ def render_realtime_dashboard():
              st.switch_page("pages/2_Data_Assets.py")
              
         if st.button("📖 View Policy Guidelines", use_container_width=True):
-             st.switch_page("pages/12_Policy_Guidance.py")
+             st.switch_page("pages/6_Policy_Guidance.py")
     
     with col2:
         st.subheader("🔔 Recent Activity")

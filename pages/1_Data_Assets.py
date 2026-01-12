@@ -955,6 +955,65 @@ with tab_inv_browser:
                 <div class="pillar-status" style="color: {viol_color}; background: {viol_bg};">{viol_status}</div>
             </div>
             """, unsafe_allow_html=True)
+        
+        # --- NEW: Compliance Counts (Source: ASSETS only) ---
+        @st.cache_data(ttl=600)
+        def _get_compliance_counts_from_governance(db_name):
+            if not db_name: return {'pii':0, 'sox':0, 'soc':0}
+            try:
+                # Simplified query based on USER request
+                query = f"""
+                    SELECT
+                        COUNT_IF(PII_RELEVANT = TRUE)  AS PII_ASSET_COUNT,
+                        COUNT_IF(SOX_RELEVANT = TRUE)  AS SOX_ASSET_COUNT,
+                        COUNT_IF(SOC2_RELEVANT = TRUE) AS SOC2_ASSET_COUNT
+                    FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                """
+                rows = snowflake_connector.execute_query(query)
+                if rows:
+                    return {
+                        'pii': int(rows[0].get('PII_ASSET_COUNT') or 0),
+                        'sox': int(rows[0].get('SOX_ASSET_COUNT') or 0),
+                        'soc': int(rows[0].get('SOC2_ASSET_COUNT') or 0)
+                    }
+            except Exception:
+                pass
+            return {'pii':0, 'sox':0, 'soc':0}
+
+        c_counts = _get_compliance_counts_from_governance(active_db)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.subheader("Compliance Impact")
+        
+        c1, c2, c3 = st.columns(3)
+        with c1:
+             st.markdown(f"""
+            <div class="pillar-card">
+                <div class="pillar-icon">👤</div>
+                <div class="pillar-label">PII Assets</div>
+                <div class="pillar-value">{c_counts['pii']:,}</div>
+                <div class="pillar-status" style="color: #38bdf8; background: rgba(56, 189, 248, 0.1);">Privacy Restricted</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with c2:
+             st.markdown(f"""
+            <div class="pillar-card">
+                <div class="pillar-icon">💰</div>
+                <div class="pillar-label">SOX Assets</div>
+                <div class="pillar-value">{c_counts['sox']:,}</div>
+                <div class="pillar-status" style="color: #38bdf8; background: rgba(56, 189, 248, 0.1);">Financial Control</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with c3:
+             st.markdown(f"""
+            <div class="pillar-card">
+                <div class="pillar-icon">🔒</div>
+                <div class="pillar-label">SOC In-Scope</div>
+                <div class="pillar-value">{c_counts['soc']:,}</div>
+                <div class="pillar-status" style="color: #38bdf8; background: rgba(56, 189, 248, 0.1);">Security Audit</div>
+            </div>
+            """, unsafe_allow_html=True)
+        # -----------------------------------------------
     except Exception as e:
         if not is_bypassed:
             st.warning(f"Could not fetch quality dimensions: {e}")
@@ -1324,9 +1383,8 @@ with tab_inv_browser:
                 logger.error(f"Failed to create inventory view (bypassed): {e}")
             return False
 
-    # Modified summarizer to use the view
     @st.cache_data(ttl=120)
-    def _fetch_inventory_view(level: str) -> pd.DataFrame:
+    def _fetch_inventory_view(level: str, filters: dict = None) -> pd.DataFrame:
         try:
             db_name = (
                 st.session_state.get("sf_database")
@@ -1338,21 +1396,96 @@ with tab_inv_browser:
             # Ensure view exists
             _ensure_inventory_view_exists(db_name)
             
-            # Simply select * as the view now matches the desired structure perfectly
+            # Build WHERE clause based on filters
+            conditions = [f"LEVEL = '{level}'"]
+            
+            if filters:
+                # Database filter applies to all levels (column "Database")
+                if filters.get("database") and filters["database"] != "All":
+                    conditions.append(f"\"Database\" = '{filters['database']}'")
+                
+                # Schema filter applies to SCHEMA and ASSET levels (column "Schema")
+                if level in ('SCHEMA', 'ASSET'):
+                     if filters.get("schema") and filters["schema"] != "All":
+                         conditions.append(f"\"Schema\" = '{filters['schema']}'")
+                
+                # Asset/Table filter applies to ASSET level only (column "Asset_Name")
+                if level == 'ASSET':
+                     if filters.get("table") and filters["table"] != "All":
+                         conditions.append(f"\"Asset_Name\" = '{filters['table']}'")
+
+            where_sql = " AND ".join(conditions)
+
+            # Base query from the view
             query = f"""
             SELECT *
             FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS
-            WHERE LEVEL = '{level}'
+            WHERE {where_sql}
             ORDER BY 1, 2
             """
             rows = snowflake_connector.execute_query(query)
-            df = pd.DataFrame(rows)
+            df_metrics = pd.DataFrame(rows)
             
-            if not df.empty:
-                # Rename columns to match UI expectations if necessary, though view aliases are already good
-                pass
-                
-            return df
+            # If fetching Databases, enrich with "SHOW DATABASES" to include empty/unscanned ones
+            if level == 'DATABASE':
+                try:
+                    all_rows = snowflake_connector.execute_query("SHOW DATABASES") or []
+                    # Extract database names safely (keys might be lower or upper case)
+                    all_dbs = []
+                    for r in all_rows:
+                        # Try common key variations
+                        nm = r.get('name') or r.get('NAME')
+                        if nm:
+                            all_dbs.append(nm)
+                    
+                    # Apply specific DB filter to the "SHOW DATABASES" list too
+                    if filters and filters.get("database") and filters["database"] != "All":
+                        all_dbs = [d for d in all_dbs if d == filters["database"]]
+
+                    if all_dbs:
+                        # Create a base DataFrame of all available databases
+                        df_all = pd.DataFrame({'Database': all_dbs})
+                        
+                        # Merge with the metrics we found
+                        if not df_metrics.empty:
+                            # Normalize column names just in case
+                            if 'Database' in df_metrics.columns:
+                                df_combined = pd.merge(df_all, df_metrics, on='Database', how='left')
+                            else:
+                                df_combined = df_metrics # Fallback if schema mismatch
+                        else:
+                            df_combined = df_all
+                            
+                        # Fill default values for databases that have no assets in the governance table yet
+                        fill_map = {
+                            "Total_Assets": 0,
+                            "Classified": 0,
+                            "Has_Classification_Date": 0,
+                            "Classification_Coverage": '0% ❌',
+                            "Accuracy_Percent": '0%', 
+                            "Timeliness_Percent": '0%',
+                            "Compliance_Status": '❌ Poor', 
+                            "Owner_Coverage": '0%',
+                            "SLA_Breach_Assets": 0,
+                            "New_Pending_Assets": 0,
+                            "Sensitive_Columns": '0 PII, 0 SOX, 0 SOC2',
+                            "Avg_Days_To_Classify": 0.0
+                        }
+                        for col, val in fill_map.items():
+                            if col not in df_combined.columns:
+                                df_combined[col] = val
+                            else:
+                                df_combined[col] = df_combined[col].fillna(val)
+                        
+                        # Sort: Active (tracked) databases first, then others
+                        df_combined = df_combined.sort_values(by=['Total_Assets', 'Database'], ascending=[False, True])
+                        return df_combined
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to blend SHOW DATABASES: {e}")
+                    # Fallback to just returning what the view has
+            
+            return df_metrics
         except Exception as e:
             if not is_bypassed:
                 st.error(f"Failed to fetch inventory view: {e}")
@@ -1363,7 +1496,7 @@ with tab_inv_browser:
     # Database View
     with b_db:
         st.caption("Aggregated metrics per Database. Actions apply at database scope.")
-        db_df = _fetch_inventory_view("DATABASE")
+        db_df = _fetch_inventory_view("DATABASE", st.session_state.get("global_filters", {}))
         if db_df.empty:
             if not is_bypassed:
                 st.info("No data available.")
@@ -1372,14 +1505,27 @@ with tab_inv_browser:
         else:
             # Drop technical columns for cleaner display
             show_cols = ["Database", "Total_Assets", "Classified", "Classification_Coverage", "Accuracy_Percent", "Timeliness_Percent", "Compliance_Status", "Owner_Coverage", "SLA_Breach_Assets", "Avg_Days_To_Classify", "Sensitive_Columns"]
-            st.dataframe(db_df[show_cols], use_container_width=True, hide_index=True)
+            
+            # Native Streamlit Dataframe
+            st.dataframe(
+                db_df[show_cols],
+                use_container_width=True,
+                hide_index=True
+            )
             
             # Simplified Actions
             c1, c2 = st.columns(2)
             with c1:
-                sel_db = st.selectbox("Select Database", options=db_df["Database"].tolist())
+                # Default to first database if available
+                default_ix = 0
+                if not db_df.empty:
+                     db_list = db_df["Database"].tolist()
+                     sel_db = st.selectbox("Select Database", options=db_list, index=0)
+                else:
+                     st.selectbox("Select Database", options=[])
+                     
             with c2:
-                if st.button("Export Summary"):
+                if st.button("Export Summary", key="btn_exp_db"):
                     try:
                         csv = db_df.to_csv(index=False).encode('utf-8')
                         st.download_button("Download CSV", data=csv, file_name="database_summary.csv", mime="text/csv")
@@ -1388,7 +1534,7 @@ with tab_inv_browser:
     # Schema View
     with b_schema:
         st.caption("Aggregated metrics per Schema. Actions apply at schema scope.")
-        sch_df = _fetch_inventory_view("SCHEMA")
+        sch_df = _fetch_inventory_view("SCHEMA", st.session_state.get("global_filters", {}))
         if sch_df.empty:
             if not is_bypassed:
                 st.info("No data available.")
@@ -1396,12 +1542,17 @@ with tab_inv_browser:
                 logger.info("No data available (bypassed).")
         else:
             show_cols = ["Database", "Schema", "Total_Assets", "Classified", "Classification_Coverage", "Accuracy_Percent", "Timeliness_Percent", "Compliance_Status", "Owner_Coverage", "SLA_Breach_Assets", "Avg_Days_To_Classify", "Sensitive_Columns"]
-            st.dataframe(sch_df[show_cols], use_container_width=True, hide_index=True)
+            
+            st.dataframe(
+                sch_df[show_cols], 
+                use_container_width=True, 
+                hide_index=True
+            )
 
     # Table/View List
     with b_tbl:
         st.caption("Detailed asset list with column-level metrics.")
-        tbl_df = _fetch_inventory_view("ASSET")
+        tbl_df = _fetch_inventory_view("ASSET", st.session_state.get("global_filters", {}))
         if tbl_df.empty:
             if not is_bypassed:
                 st.info("No data available.")
@@ -1409,7 +1560,19 @@ with tab_inv_browser:
                 logger.info("No data available (bypassed).")
         else:
             show_cols = ["Schema", "Asset_Name", "Asset_Type", "Classification_Coverage", "Accuracy_Percent", "Timeliness_Percent", "Compliance_Status", "Owner_Coverage", "SLA_Breach_Assets", "Column_Stats", "Masking_Status", "Sensitive_Columns"]
-            st.dataframe(tbl_df[show_cols], use_container_width=True, hide_index=True)
+            
+            st.dataframe(
+                tbl_df[show_cols], 
+                use_container_width=True, 
+                hide_index=True
+            )
+            
+            # Export for assets
+            if st.button("Export Asset List", key="btn_exp_asset"):
+                try:
+                    csv = tbl_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("Download CSV", data=csv, file_name="asset_inventory.csv", mime="text/csv")
+                except: pass
 
     # Column-Level Details Fetcher
     @st.cache_data(ttl=120)

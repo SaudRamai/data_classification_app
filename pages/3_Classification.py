@@ -93,8 +93,121 @@ except Exception:
 
 # STUB: Missing function definition causing NameError
 # This forces the logic to fall back to the direct Snowflake views/tables which are implemented below.
-def my_fetch_tasks(*args, **kwargs):
-    return []
+def my_fetch_tasks(current_user: str = None, db: str = None, schema: str = "DATA_CLASSIFICATION_GOVERNANCE") -> List[Dict[str, Any]]:
+    """
+    Fetch tasks assigned to the logged-in user from the ASSETS table.
+    
+    Returns tasks for:
+    - Assets waiting for initial classification (owned by user)
+    - Assets waiting for peer review (user is peer reviewer)
+    - Assets waiting for management approval (user is management reviewer)
+    - Assets past SLA (> 5 days unclassified)
+    - Assets with expiring exceptions
+    
+    Args:
+        current_user: Username to filter tasks for. If None, uses CURRENT_USER()
+        db: Database name. If None, uses session state or settings
+        schema: Schema name, defaults to DATA_CLASSIFICATION_GOVERNANCE
+    
+    Returns:
+        List of task dictionaries with asset details
+    """
+    try:
+        # Resolve database
+        if not db:
+            db = st.session_state.get("sf_database") or getattr(settings, "SNOWFLAKE_DATABASE", "DATA_CLASSIFICATION_DB")
+        
+        # Resolve current user
+        if not current_user:
+            try:
+                user_result = snowflake_connector.execute_query("SELECT CURRENT_USER() as U")
+                if user_result and len(user_result) > 0:
+                    current_user = user_result[0].get('U')
+            except Exception:
+                current_user = "UNKNOWN_USER"
+        
+        # Query for user tasks from ASSETS table
+        query = f"""
+        SELECT
+            ASSET_ID,
+            ASSET_NAME,
+            FULLY_QUALIFIED_NAME,
+            ASSET_TYPE,
+            CLASSIFICATION_LABEL,
+            REVIEW_STATUS,
+            NEXT_REVIEW_DATE,
+            DATA_OWNER,
+            PEER_REVIEWER,
+            MANAGEMENT_REVIEWER,
+            PEER_REVIEW_COMPLETED,
+            MANAGEMENT_REVIEW_COMPLETED,
+            HAS_EXCEPTION,
+            EXCEPTION_EXPIRY_DATE,
+            DATA_CREATION_DATE,
+            CREATED_TIMESTAMP,
+            DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CURRENT_DATE()) as DAYS_SINCE_CREATION,
+            CASE
+                WHEN DATA_OWNER = '{current_user}' AND (CLASSIFICATION_LABEL IS NULL OR UPPER(TRIM(CLASSIFICATION_LABEL)) IN ('', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'))
+                THEN 'Needs Classification'
+                WHEN PEER_REVIEWER = '{current_user}' AND PEER_REVIEW_COMPLETED = FALSE
+                THEN 'Needs Peer Review'
+                WHEN MANAGEMENT_REVIEWER = '{current_user}' AND MANAGEMENT_REVIEW_COMPLETED = FALSE
+                THEN 'Needs Management Approval'
+                WHEN DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CURRENT_DATE()) > 5 
+                     AND (CLASSIFICATION_LABEL IS NULL OR UPPER(TRIM(CLASSIFICATION_LABEL)) IN ('', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'))
+                THEN 'Past SLA'
+                WHEN HAS_EXCEPTION = TRUE AND EXCEPTION_EXPIRY_DATE <= DATEADD(day, 7, CURRENT_DATE())
+                THEN 'Exception Expiring Soon'
+                ELSE 'Other'
+            END as TASK_TYPE
+        FROM {db}.{schema}.ASSETS
+        WHERE
+            (
+                -- Assets owned by user needing classification
+                (DATA_OWNER = '{current_user}' 
+                 AND (CLASSIFICATION_LABEL IS NULL OR UPPER(TRIM(CLASSIFICATION_LABEL)) IN ('', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW')))
+            )
+            OR (
+                -- Assets needing peer review
+                PEER_REVIEWER = '{current_user}' 
+                AND PEER_REVIEW_COMPLETED = FALSE
+            )
+            OR (
+                -- Assets needing management approval
+                MANAGEMENT_REVIEWER = '{current_user}' 
+                AND MANAGEMENT_REVIEW_COMPLETED = FALSE
+            )
+            OR (
+                -- Assets past SLA (owned by user)
+                DATA_OWNER = '{current_user}'
+                AND DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CURRENT_DATE()) > 5
+                AND (CLASSIFICATION_LABEL IS NULL OR UPPER(TRIM(CLASSIFICATION_LABEL)) IN ('', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'))
+            )
+            OR (
+                -- Exceptions expiring within 7 days
+                HAS_EXCEPTION = TRUE 
+                AND EXCEPTION_EXPIRY_DATE <= DATEADD(day, 7, CURRENT_DATE())
+                AND (DATA_OWNER = '{current_user}' OR PEER_REVIEWER = '{current_user}' OR MANAGEMENT_REVIEWER = '{current_user}')
+            )
+        ORDER BY 
+            CASE TASK_TYPE
+                WHEN 'Past SLA' THEN 1
+                WHEN 'Exception Expiring Soon' THEN 2
+                WHEN 'Needs Management Approval' THEN 3
+                WHEN 'Needs Peer Review' THEN 4
+                WHEN 'Needs Classification' THEN 5
+                ELSE 6
+            END,
+            DAYS_SINCE_CREATION DESC
+        """
+        
+        results = snowflake_connector.execute_query(query)
+        return results or []
+        
+    except Exception as e:
+        logger.error(f"Error fetching user tasks: {e}")
+        return []
+
 
 # Initialize session state for filters
 ALLOWED_CLASSIFICATIONS = TAG_DEFINITIONS.get("DATA_CLASSIFICATION") or ["Public", "Internal", "Restricted", "Confidential"]

@@ -805,8 +805,8 @@ def render_realtime_dashboard():
         from src.services.asset_utils import get_compliance_coverage_metrics
         comp_data = get_compliance_coverage_metrics(active_db, _SCHEMA, snowflake_connector)
         
-        # Premium Metric Row for Section 6
-        c1, c2, c3, c4 = st.columns(4)
+        # Premium Metric Row for Section 6 - Now with 6 columns
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         
         with c1:
             st.markdown(f"""
@@ -819,16 +819,42 @@ def render_realtime_dashboard():
             """, unsafe_allow_html=True)
 
         with c2:
+            # PII Assets Count
+            pii_count = comp_data.get('pii_assets', 0)
             st.markdown(f"""
-                <div class="pillar-card" style="border-top: 4px solid #F6AD55;">
-                    <div class="pillar-icon">📋</div>
-                    <div class="pillar-label">Regulated Data</div>
-                    <div class="pillar-value">{comp_data['regulated_total']}</div>
-                    <div class="pillar-status">SOX & SOC2 Scope</div>
+                <div class="pillar-card" style="border-top: 4px solid #9F7AEA;">
+                    <div class="pillar-icon">�</div>
+                    <div class="pillar-label">PII Assets</div>
+                    <div class="pillar-value">{pii_count}</div>
+                    <div class="pillar-status">Privacy Restricted</div>
                 </div>
             """, unsafe_allow_html=True)
 
         with c3:
+            # SOX Assets Count
+            sox_count = comp_data.get('sox_assets', 0)
+            st.markdown(f"""
+                <div class="pillar-card" style="border-top: 4px solid #38bdf8;">
+                    <div class="pillar-icon">💰</div>
+                    <div class="pillar-label">SOX Assets</div>
+                    <div class="pillar-value">{sox_count}</div>
+                    <div class="pillar-status">Financial Control</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        with c4:
+            # SOC2 Assets Count
+            soc_count = comp_data.get('soc2_assets', 0)
+            st.markdown(f"""
+                <div class="pillar-card" style="border-top: 4px solid #F6AD55;">
+                    <div class="pillar-icon">🔒</div>
+                    <div class="pillar-label">SOC2 Assets</div>
+                    <div class="pillar-value">{soc_count}</div>
+                    <div class="pillar-status">Security Audit</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        with c5:
             st.markdown(f"""
                 <div class="pillar-card" style="border-top: 4px solid #F1C40F;">
                     <div class="pillar-icon">🛡️</div>
@@ -838,7 +864,7 @@ def render_realtime_dashboard():
                 </div>
             """, unsafe_allow_html=True)
 
-        with c4:
+        with c6:
             st.markdown(f"""
                 <div class="pillar-card" style="border-top: 4px solid #28A745;">
                     <div class="pillar-icon">✅</div>

@@ -191,11 +191,17 @@ class ClassificationWorkflowService:
         return did
 
     # --- Reviews ---
-    def list_reviews(self, current_user: str, review_filter: str = "All", approval_status: str = "All pending", lookback_days: int = 30, page: int = 1, page_size: int = 50, database: Optional[str] = None) -> Dict[str, Any]:
+    def list_reviews(self, current_user: str, review_filter: str = "All", approval_status: str = "All pending", asset_name_filter: Optional[str] = None, lookback_days: int = 30, page: int = 1, page_size: int = 50, database: Optional[str] = None) -> Dict[str, Any]:
         db = database or self._resolve_db()
         rf, ap = review_filter.lower(), approval_status.lower()
         lb, p, ps = max(1, int(lookback_days)), max(1, int(page)), max(1, min(500, int(page_size)))
         start, end = (p - 1) * ps + 1, p * ps
+
+        # Build asset name filter condition
+        asset_filter_sql = ""
+        if asset_name_filter and asset_name_filter.strip():
+            # Support partial matching with LIKE
+            asset_filter_sql = "AND UPPER(b.ASSET_NAME) LIKE UPPER(%(asset_filter)s)"
 
         sql = f"""
         WITH base AS (
@@ -213,6 +219,7 @@ class ClassificationWorkflowService:
           {"AND b.CHANGE_TIMESTAMP >= dateadd('day', -%(lb)s, current_timestamp())" if rf == "recent changes" else ""}
           {"AND b.APPROVAL_REQUIRED = true AND b.APPROVED_BY IS NULL" if ap in ("all pending", "pending my approval") else ""}
           {"AND upper(COALESCE(b.CREATED_BY,'')) <> upper(%(me)s)" if ap == "pending my approval" else ""}
+          {asset_filter_sql}
         ),
         numbered AS (
           SELECT f.*, row_number() over (order by f.CHANGE_TIMESTAMP desc, f.ID desc) as RN, count(*) over() as TOTAL
@@ -221,7 +228,12 @@ class ClassificationWorkflowService:
         SELECT * FROM numbered WHERE RN BETWEEN %(start)s AND %(end)s
         """
         try:
-            rows = self.connector.execute_query(sql, {"lb": lb, "start": start, "end": end, "me": current_user or ""}) or []
+            params = {"lb": lb, "start": start, "end": end, "me": current_user or ""}
+            if asset_name_filter and asset_name_filter.strip():
+                # Add wildcards for partial matching
+                params["asset_filter"] = f"%{asset_name_filter.strip()}%"
+            
+            rows = self.connector.execute_query(sql, params) or []
             total = int(rows[0].get("TOTAL", 0)) if rows else 0
             items = [{
                 "id": r.get("ID"), "asset_id": r.get("ASSET_ID"), "database": r.get("DATABASE_NAME"),
@@ -240,15 +252,45 @@ class ClassificationWorkflowService:
         try:
             # When approving a historical review, we log a *new* decision
             self.record_decision(asset_full_name, who, "REVIEW", "Approved", label, c, i, a, comments or "Approved via Pending Reviews", {"review_id": review_id})
+            
+            # ✅ APPLY TAGS AFTER APPROVAL (Rule: No approval → No tag, Approved → Apply tag)
+            from src.services.tagging_service import tagging_service
+            from src.services.classification_pipeline_service import discovery_service
+            
+            try:
+                # Build tags from approved classification
+                tags = {
+                    "DATA_CLASSIFICATION": label,
+                    "CONFIDENTIALITY_LEVEL": f"C{int(c or 0)}",
+                    "INTEGRITY_LEVEL": f"I{int(i or 0)}",
+                    "AVAILABILITY_LEVEL": f"A{int(a or 0)}",
+                    "COMPLIANCE_FRAMEWORKS": ""  # Can be extended based on label/categories
+                }
+                
+                # Apply tags to the Snowflake object (TABLE/VIEW)
+                tagging_service.apply_tags_to_object(asset_full_name, "TABLE", tags)
+                logger.info(f"Applied tags to {asset_full_name} after approval: {tags}")
+                
+                # Mark as classified in discovery service
+                discovery_service.mark_classified(asset_full_name, label, int(c or 0), int(i or 0), int(a or 0))
+                
+            except Exception as tag_err:
+                logger.warning(f"Failed to apply tags to {asset_full_name}: {tag_err}")
+                # Don't fail the approval if tagging fails
+            
+            # Update approval status in history
             db = self._resolve_db()
             self.connector.execute_non_query(f"""
                 UPDATE {db}.{SCHEMA}.CLASSIFICATION_HISTORY
                 SET APPROVED_BY = %(who)s, APPROVAL_TIMESTAMP = CURRENT_TIMESTAMP, APPROVAL_STATUS = 'APPROVED'
                 WHERE HISTORY_ID = %(rid)s
             """, {"who": who, "rid": review_id})
+            
             audit_service.log(who, "REVIEW_APPROVE", "CLASSIFICATION", asset_full_name, {"review_id": review_id, "label": label})
             return True
-        except Exception: return False
+        except Exception as e:
+            logger.error(f"Error approving review {review_id}: {e}")
+            return False
 
     def reject_review(self, review_id: str, asset_full_name: str, approver: Optional[str] = None, justification: str = "") -> bool:
         who = approver or (st.session_state.get("user") if st else "user")
@@ -304,7 +346,38 @@ class ClassificationWorkflowService:
         asset = r["ASSET_FULL_NAME"]
         label, c, i, a = r["LABEL"], r["C"], r["I"], r["A"]
         
-        # 2. Apply Tags
+        # 2. Archive Old Classification to History (if exists)
+        try:
+            from src.services.tagging_service import tagging_service
+            
+            # Get current tags before updating
+            current_tags = tagging_service.get_object_tags(asset, "TABLE")
+            old_classification = None
+            for tag_ref in current_tags:
+                if tag_ref.get("TAG_NAME") == "DATA_CLASSIFICATION":
+                    old_classification = tag_ref.get("TAG_VALUE")
+                    break
+            
+            if old_classification and old_classification != label:
+                # Archive to history
+                history_table = f"{db}.{SCHEMA}.CLASSIFICATION_HISTORY"
+                self.connector.execute_non_query(f"""
+                    INSERT INTO {history_table} 
+                    (HISTORY_ID, ASSET_FULL_NAME, OLD_LABEL, NEW_LABEL, CHANGED_BY, CHANGE_REASON, CHANGE_TIMESTAMP)
+                    SELECT 
+                        %(hid)s, %(asset)s, %(old)s, %(new)s, %(by)s, 'Reclassification Approved', CURRENT_TIMESTAMP
+                """, {
+                    "hid": str(uuid.uuid4()),
+                    "asset": asset,
+                    "old": old_classification,
+                    "new": label,
+                    "by": approver
+                })
+                logger.info(f"Archived old classification for {asset}: {old_classification} → {label}")
+        except Exception as archive_err:
+            logger.warning(f"Failed to archive old classification: {archive_err}")
+        
+        # 3. Apply/Update Tags (tags are updated, not duplicated)
         from src.services.tagging_service import tagging_service
         from src.services.classification_pipeline_service import discovery_service
         
@@ -315,12 +388,19 @@ class ClassificationWorkflowService:
             "AVAILABILITY_LEVEL": f"A{int(a or 0)}",
             "COMPLIANCE_FRAMEWORKS": ""
         }
-        tagging_service.apply_tags_to_object(asset, "TABLE", tags)
         
-        # 3. Mark Discovery Service
+        # apply_tags_to_object will UPDATE existing tags, not create duplicates
+        tagging_service.apply_tags_to_object(asset, "TABLE", tags)
+        logger.info(f"Updated tags for {asset} after reclassification: {tags}")
+        
+        # 4. Mark Discovery Service
         discovery_service.mark_classified(asset, label, int(c or 0), int(i or 0), int(a or 0))
         
-        # 4. Update the Decision Record (Status=Approved, Appproved_By=Approver)
+        # 5. Re-evaluate Policies (placeholder for future policy engine integration)
+        # TODO: Trigger policy re-evaluation based on new classification
+        # Example: If changed from NON_SENSITIVE to PII, apply masking policies
+        
+        # 6. Update the Decision Record (Status=Approved, Approved_By=Approver)
         self.connector.execute_non_query(f"""
             UPDATE {table} 
             SET STATUS = 'Approved', 
@@ -330,7 +410,7 @@ class ClassificationWorkflowService:
             WHERE ID = %(id)s
         """, {"ap": approver, "id": request_id})
         
-        audit_service.log(approver, "RECLASS_REQUEST_APPROVE", "ASSET", asset, {"request_id": request_id})
+        audit_service.log(approver, "RECLASS_REQUEST_APPROVE", "ASSET", asset, {"request_id": request_id, "new_label": label})
 
     def reject_reclassification(self, request_id: str, approver: str, justification: Optional[str] = None) -> None:
         db = self._resolve_db()

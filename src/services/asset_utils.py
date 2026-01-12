@@ -273,7 +273,7 @@ def get_compliance_coverage_metrics(db: str, schema: str, connector=None) -> Dic
     """Return compliance coverage KPIs derived from the ASSETS table."""
     try:
         fqn = f"{db}.{schema}.{T_ASSETS}"
-        # Detailed coverage metrics
+        # Detailed coverage metrics including individual asset counts
         pii_query = f"""
             SELECT
                 COALESCE(ROUND(100.0 * COUNT(CASE 
@@ -283,7 +283,10 @@ def get_compliance_coverage_metrics(db: str, schema: str, connector=None) -> Dic
                     THEN 1 END) 
                     / NULLIF(COUNT(CASE WHEN PII_RELEVANT = TRUE THEN 1 END), 0), 1), 0.0) as PII_PCT,
                 COUNT(CASE WHEN SOX_RELEVANT = TRUE OR SOC2_RELEVANT = TRUE THEN 1 END) as REG_TOTAL,
-                COUNT(CASE WHEN HAS_EXCEPTION = TRUE THEN 1 END) as EX_COUNT
+                COUNT(CASE WHEN HAS_EXCEPTION = TRUE THEN 1 END) as EX_COUNT,
+                COUNT_IF(PII_RELEVANT = TRUE) as PII_ASSETS,
+                COUNT_IF(SOX_RELEVANT = TRUE) as SOX_ASSETS,
+                COUNT_IF(SOC2_RELEVANT = TRUE) as SOC2_ASSETS
             FROM {fqn}
         """
         rows = snowflake_connector.execute_query(pii_query) or [{}]
@@ -293,6 +296,9 @@ def get_compliance_coverage_metrics(db: str, schema: str, connector=None) -> Dic
             'pii_coverage_pct': float(r.get('PII_PCT') if r.get('PII_PCT') is not None else 0.0),
             'regulated_total': int(r.get('REG_TOTAL', 0)),
             'exception_count': int(r.get('EX_COUNT', 0)),
+            'pii_assets': int(r.get('PII_ASSETS', 0)),
+            'sox_assets': int(r.get('SOX_ASSETS', 0)),
+            'soc2_assets': int(r.get('SOC2_ASSETS', 0)),
             'trends': {
                 'classification': [
                     {'MONTH': 'Oct', 'CLASSIFIED_COUNT': 40, 'NON_COMPLIANT_COUNT': 15, 'RISK_WEIGHT': 2.5},
@@ -302,7 +308,7 @@ def get_compliance_coverage_metrics(db: str, schema: str, connector=None) -> Dic
             }
         }
     except Exception:
-        return {'pii_coverage_pct': 0, 'regulated_total': 0, 'exception_count': 0, 'trends': {'classification': []}}
+        return {'pii_coverage_pct': 0, 'regulated_total': 0, 'exception_count': 0, 'pii_assets': 0, 'sox_assets': 0, 'soc2_assets': 0, 'trends': {'classification': []}}
 
 def seed_sample_assets(database: Optional[str] = None, schema: str = "DATA_CLASSIFICATION_GOVERNANCE", connector=None) -> Dict[str, Any]:
     """Maintain logic to initialize the authoritative tables."""

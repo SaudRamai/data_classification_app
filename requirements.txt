@@ -13,3 +13,4 @@ altair
 python-dateutil
 pytz
 pypdf
+streamlit-aggrid

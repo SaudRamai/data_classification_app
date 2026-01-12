@@ -759,71 +759,29 @@ else:
     can_classify = _has_any(("classify", "classification", "steward")) or can_data
     can_intelligence = True # Open to all authenticated
 
-    # --- SECTION 1: CORE GOVERNANCE ---
-    st.markdown('<div class="section-header">🛠️ Core Operations</div>', unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
+    # --- MINIMAL PAGE CARDS ---
+    st.markdown('<div class="section-header">📊 Quick Access</div>', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
     
     with c1:
-        st.markdown('<div class="feature-card"><div class="card-icon">⚡</div><div class="card-title">Governance Dashboard</div><div class="card-desc">Executive overview of data health, classification coverage, and critical risks.</div></div>', unsafe_allow_html=True)
-        if st.button("Open Dashboard", key="h_dash", use_container_width=True):
-            st.switch_page("pages/1_Dashboard.py")
+        st.markdown('<div class="feature-card"><div class="card-icon">📦</div><div class="card-title">Data Assets</div><div class="card-desc">Browse inventory and metadata</div></div>', unsafe_allow_html=True)
+        if st.button("Browse Assets", key="h_assets", use_container_width=True):
+            st.switch_page("pages/1_Data_Assets.py")
 
     with c2:
-        if can_data:
-            st.markdown('<div class="feature-card"><div class="card-icon">📦</div><div class="card-title">Data Assets</div><div class="card-desc">Comprehensive inventory of databases, schemas, and tables with deep metadata.</div></div>', unsafe_allow_html=True)
-            if st.button("Browse Assets", key="h_assets", use_container_width=True):
-                st.switch_page("pages/2_Data_Assets.py")
-        else: st.info("Asset inventory restricted to Data roles.")
+        st.markdown('<div class="feature-card"><div class="card-icon">📊</div><div class="card-title">Dashboard</div><div class="card-desc">Overview and metrics</div></div>', unsafe_allow_html=True)
+        if st.button("View Dashboard", key="h_dash", use_container_width=True):
+            st.switch_page("pages/2_Dashboard.py")
 
     with c3:
-        if can_classify:
-            st.markdown('<div class="feature-card"><div class="card-icon">🏷️</div><div class="card-title">Classification</div><div class="card-desc">Execute guided or AI-driven workflows to tag sensitive data fields.</div></div>', unsafe_allow_html=True)
-            if st.button("Label Data", key="h_class", use_container_width=True):
-                st.switch_page("pages/3_Classification.py")
-        else: st.info("Labeling restricted to Stewards.")
-
-    # --- SECTION 2: INTELLIGENCE & DISCOVERY ---
-    st.markdown('<div class="section-header">🧠 Intelligence & Discovery</div>', unsafe_allow_html=True)
-    i1, i2, i3 = st.columns(3)
-
-    with i1:
-        st.markdown('<div class="feature-card"><div class="card-icon">🕸️</div><div class="card-title">Data Intelligence</div><div class="card-desc">Advanced lineage visualization and anomaly detection for complex data flows.</div></div>', unsafe_allow_html=True)
-        if st.button("Explore Lineage", key="h_intel", use_container_width=True):
-            st.switch_page("pages/6_Data_Intelligence.py")
-
-    with i2:
-        st.markdown('<div class="feature-card"><div class="card-icon">🔍</div><div class="card-title">Deep Discovery</div><div class="card-desc">Search across all governing metadata to locate specific assets or data patterns.</div></div>', unsafe_allow_html=True)
-        if st.button("Search Assets", key="h_search", use_container_width=True):
-            # Redirect to the unified Classification module (Discovery tab lives there)
+        st.markdown('<div class="feature-card"><div class="card-icon">🏷️</div><div class="card-title">Classification</div><div class="card-desc">Label and tag data</div></div>', unsafe_allow_html=True)
+        if st.button("Classify Data", key="h_class", use_container_width=True):
             st.switch_page("pages/3_Classification.py")
 
-    with i3:
-        st.markdown('<div class="feature-card"><div class="card-icon">📈</div><div class="card-title">Usage Analytics</div><div class="card-desc">Monitor access trends and user interactions with sensitive governable data.</div></div>', unsafe_allow_html=True)
-        if st.button("View Analytics", key="h_stats", use_container_width=True, disabled=True):
-            pass # Roadmap item
+    with c4:
+        st.markdown('<div class="feature-card"><div class="card-icon">⚖️</div><div class="card-title">Compliance</div><div class="card-desc">Track regulatory status</div></div>', unsafe_allow_html=True)
+        if st.button("Check Compliance", key="h_comp", use_container_width=True):
+            st.switch_page("pages/4_Compliance.py")
 
-    # --- SECTION 3: POLICY & ADMINISTRATION ---
-    st.markdown('<div class="section-header">📋 Policy & Framework</div>', unsafe_allow_html=True)
-    p1, p2, p3 = st.columns(3)
-
-    with p1:
-        if can_compliance:
-            st.markdown('<div class="feature-card"><div class="card-icon">⚖️</div><div class="card-title">Compliance</div><div class="card-desc">Track SOX, PII, and SOC2 adherence across your Snowflake environment.</div></div>', unsafe_allow_html=True)
-            if st.button("Check Compliance", key="h_comp", use_container_width=True):
-                st.switch_page("pages/4_Compliance.py")
-        else: st.info("Compliance view restricted to Audit roles.")
-
-    with p2:
-        st.markdown('<div class="feature-card"><div class="card-icon">📘</div><div class="card-title">Policy Hub</div><div class="card-desc">Authoritative handling rules, documentation, and governing responsibilities.</div></div>', unsafe_allow_html=True)
-        if st.button("Read Policies", key="h_policy", use_container_width=True):
-            st.switch_page("pages/12_Policy_Guidance.py")
-
-    with p3:
-        if can_admin:
-            st.markdown('<div class="feature-card"><div class="card-icon">⚙️</div><div class="card-title">Administration</div><div class="card-desc">System configuration, role assignments, and governance module management.</div></div>', unsafe_allow_html=True)
-            if st.button("Configure System", key="h_admin", use_container_width=True):
-                st.switch_page("pages/13_System_Configuration.py")
-        else: st.info("Administration restricted to Admin roles.")
-
-    st.markdown("<br><br>", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
     st.caption("Data Governance App v2.4 • Connected to Snowflake Performance Engine")

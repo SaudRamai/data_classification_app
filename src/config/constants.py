@@ -20,10 +20,9 @@ CIA_RATINGS = [
 
 # Compliance frameworks
 COMPLIANCE_FRAMEWORKS = [
-    "SOC2",
+    "PII",
     "SOX",
-    "GDPR",
-    "CCPA"
+    "SOC"
 ]
 
 # Data quality dimensions

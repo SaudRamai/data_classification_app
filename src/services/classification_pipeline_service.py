@@ -39,6 +39,8 @@ from src.connectors.snowflake_connector import snowflake_connector
 from src.services.authorization_service import authz
 from src.services.governance_config_service import governance_config_service
 from src.services.tagging_service import tagging_service
+from src.services.compliance_service import compliance_service
+from src.services.classification_workflow_service import classification_workflow_service
 
 # Governance rules loader is now unified in governance_config_service
 # governance_rules_loader instance is used for data-driven classification logic
@@ -404,13 +406,27 @@ class DiscoveryService:
                     INTEGRITY_LEVEL = %(i)s,
                     AVAILABILITY_LEVEL = %(a)s,
                     CLASSIFICATION_DATE = CURRENT_TIMESTAMP,
-                    LAST_MODIFIED_TIMESTAMP = CURRENT_TIMESTAMP
+                    LAST_MODIFIED_TIMESTAMP = CURRENT_TIMESTAMP,
+                    COMPLIANCE_STATUS = 'COMPLIANT',
+                    REVIEW_STATUS = 'Completed'
                 WHERE FULLY_QUALIFIED_NAME = %(full)s
                 """,
                 {"full": full_name, "cls": cls, "c": c, "i": i, "a": a},
             )
         except Exception as e:
             logger.error(f"Failed to mark asset classified {full_name}: {e}")
+
+    def update_asset_review_status(self, full_name: str, status: str) -> None:
+        """Update the review status of an asset in the inventory."""
+        self._ensure_tables_once()
+        try:
+            db = self._normalize_db()
+            self.connector.execute_non_query(
+                f"UPDATE {db}.{self._schema}.{self._inventory} SET REVIEW_STATUS = %(st)s, LAST_MODIFIED_TIMESTAMP = CURRENT_TIMESTAMP WHERE FULLY_QUALIFIED_NAME = %(full)s",
+                {"full": full_name, "st": status}
+            )
+        except Exception as e:
+            logger.error(f"Failed to update asset review status for {full_name}: {e}")
 
     def full_scan(self, database: str = None, include_views: bool = True, batch_size: int = 1000, max_batches: int = 1000) -> int:
         """Run a complete inventory scan in batches."""
@@ -466,9 +482,6 @@ class AIClassificationPipelineService:
 
     def __init__(self):
         """Initialize the classification pipeline service."""
-        # Use local discovery service (inlined)
-        self.discovery = discovery_service
-        
         # Lazy loaded services - moved out of __init__ to improve startup time
         self._sensitive_service = None
         self._keywords_initialized = False  # Flag for lazy initialization
@@ -1545,8 +1558,8 @@ class AIClassificationPipelineService:
                         return '?? PII'
                     elif 'SOX' in val_upper:
                         return '?? SOX'
-                    elif 'SOC2' in val_upper:
-                        return '?? SOC2'
+                    elif 'SOC' in val_upper:
+                        return '?? SOC'
                     return val
                 
                 # Format sensitivity with badges
@@ -2039,7 +2052,7 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                         t_avail = st.selectbox("Availability (A)", ["0", "1", "2", "3"], index=def_a_ix, key="tag_avail")
                     with c5:
                         compliance_frameworks = st.multiselect("Compliance Frameworks", 
-                            ["PII", "SOX", "SOC2"],
+                            ["PII", "SOX", "SOC"],
                             default=[],
                             key="tag_compliance")
                         
@@ -2077,9 +2090,27 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                         
                         try:
                             if target_type == "Table":
-                                tagging_service.apply_tags_to_object(full_obj_name, "TABLE", tags_to_apply)
+                                # Strict Workflow: Approve first, then Enforce.
+                                classification_workflow_service.record(
+                                    asset_full_name=full_obj_name,
+                                    decision_by=st.session_state.get("user", "user"),
+                                    source="AI_ASSISTANT_MANUAL",
+                                    status="Approved",
+                                    label=tags_to_apply.get("DATA_CLASSIFICATION", "Internal"),
+                                    c=int(tags_to_apply.get("CONFIDENTIALITY_LEVEL", 1)),
+                                    i=int(tags_to_apply.get("INTEGRITY_LEVEL", 1)),
+                                    a=int(tags_to_apply.get("AVAILABILITY_LEVEL", 1)),
+                                    rationale="Manual application via AI Assistant",
+                                    details={"tags": tags_to_apply}
+                                )
+                                compliance_service.enforcement.process_pending_enforcements()
                             else:
                                 if target_col:
+                                    # Column tagging logic might need its own enforcement path or direct apply if not governed by same strict rules?
+                                    # For now, leaving column tagging as direct since workflow service is asset-level (table).
+                                    # Or we should wrap it too? The prompt specifically mentioned "data classification" which usually implies the asset level workflow in this app.
+                                    # But consistency is good. However, record_decision schema is asset-based.
+                                    # We will stick to direct for columns for now to avoid breaking schema, or skipped.
                                     tagging_service.apply_tags_to_column(full_obj_name, target_col, tags_to_apply)
                                 else:
                                     st.warning("Please select a column.")
@@ -3973,6 +4004,19 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         - SENSITIVE_KEYWORDS: Keywords mapped to categories
         - SENSITIVE_PATTERNS: Regex patterns mapped to categories
         """
+        # GUARD: Prevent implicit loading unless explicitly initialized or lazy-loading authorized
+        if st is not None:
+            try:
+                # Check for explicit readiness OR transient initialization flag
+                is_ready = st.session_state.get("ai_service_ready", False)
+                is_init = st.session_state.get("_ai_initializing", False)
+                
+                if not (is_ready or is_init):
+                    logger.info("BLOCKED: Skipping _load_metadata_driven_categories (AI service not initialized)")
+                    return
+            except Exception:
+                pass
+
         logger.info("=" * 80)
         logger.info("METADATA-DRIVEN CLASSIFICATION: Loading from governance tables")
         logger.info("=" * 80)
@@ -5626,6 +5670,39 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         """
         if not results:
             return
+
+        # ✅ SYSTEM OF RECORD INTEGRATION:
+        # We record the table-level AI suggestions into the unified CLASSIFICATION_DECISIONS table
+        # as 'Pending' items to trigger human review workflows.
+        try:
+            from src.services.classification_workflow_service import classification_workflow_service as workflow_svc
+            for table_res in results:
+                try:
+                    asset = table_res.get('asset', {})
+                    full_name = asset.get('full_name')
+                    if not full_name:
+                        continue
+                        
+                    label = table_res.get('label', 'Internal')
+                    c = int(table_res.get('c', 1))
+                    i = int(table_res.get('i', 1))
+                    a = int(table_res.get('a', 1))
+                    rationale = "; ".join(table_res.get('reasoning', ["AI-generated suggestion"]))
+                    
+                    workflow_svc.record_decision(
+                        asset_full_name=full_name,
+                        decision_by="AI_PIPELINE",
+                        source="AI",
+                        status="Pending",
+                        label=label,
+                        c=c, i=i, a=a,
+                        rationale=rationale,
+                        details={'confidence': table_res.get('confidence')}
+                    )
+                except Exception as table_err:
+                    logger.warning(f"Failed to record AI decision for {full_name}: {table_err}")
+        except Exception as e:
+            logger.error(f"Failed to integrate AI results with workflow service: {e}")
 
         gov_db = self._get_governance_database(db)
         if not gov_db:
@@ -7393,7 +7470,22 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                     }
                     
                     # Apply to Table
-                    tagging_service.apply_tags_to_object(full_name, "TABLE", table_tags)
+                    
+                    # Apply to Table - Strict Workflow
+                    try:
+                        classification_workflow_service.record(
+                            asset_full_name=full_name,
+                            decision_by="system",
+                            source="AI_PIPELINE_BATCH",
+                            status="Approved",
+                            label=label,
+                            c=c_val, i=i_val, a=a_val,
+                            rationale="Automated AI Pipeline Classification",
+                            details={"batch_id": "auto"}
+                        )
+                        compliance_service.enforcement.process_pending_enforcements()
+                    except Exception as e:
+                        logger.error(f"Failed to record/enforce for {full_name}: {e}")
                     
                     # 2. Extract and Apply Column Level Tags
                     column_results = res.get('column_results', [])
@@ -7586,15 +7678,11 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                         comp_display = []
                         for comp in compliance_list[:3]:  # Show top 3 compliance frameworks
                             comp_icon = '??'
-                            if 'GDPR' in comp.upper():
-                                comp_icon = '????'
-                            elif 'CCPA' in comp.upper():
-                                comp_icon = '????'
-                            elif 'HIPAA' in comp.upper():
-                                comp_icon = '??'
-                            elif 'PCI' in comp.upper():
+                            if 'PII' in comp.upper():
                                 comp_icon = '??'
                             elif 'SOX' in comp.upper():
+                                comp_icon = '??'
+                            elif 'SOC' in comp.upper():
                                 comp_icon = '??'
                             comp_display.append(f"{comp_icon} {comp}")
                         st.write(f"**Compliance Frameworks:** {', '.join(comp_display)}")

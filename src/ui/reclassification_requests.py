@@ -52,6 +52,8 @@ try:
 except Exception:  # type: ignore
     audit_service = None  # type: ignore
 
+from src.components.classification_management import render_unified_task_action_panel
+
 GOV_SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 REQ_TABLE = "RECLASSIFICATION_REQUESTS"
 LOG_TABLE = "RECLASSIFICATION_WORKFLOW_LOG"
@@ -629,40 +631,37 @@ def render_reclassification_requests(key_prefix: str = "reclass") -> None:
                     key=f"{key_prefix}_editor"
                 )
 
-                # Action Bar
-                st.markdown("#### ⚡ Actions")
+                # --- Unified Action Interface ---
+                st.divider()
                 selected_rows = edited_df[edited_df["Selected"] == True]
                 
                 if not selected_rows.empty:
-                    st.write(f"selected {len(selected_rows)} request(s)")
+                    # Selection logic: If multiple selected, we show a selectbox to pick which one to action specifically
+                    # as the unified panel is designed for single-asset context.
+                    s_ids = selected_rows["ID"].tolist()
+                    s_map = dict(zip(selected_rows["ID"], selected_rows["ASSET_FULL_NAME"]))
                     
-                    col_act1, col_act2, col_act3 = st.columns(3)
-                    actor_email = str(st.session_state.get("user") or "unknown_user")
+                    if len(s_ids) > 1:
+                        st.info(f"Multiple assets selected ({len(s_ids)}). Choose one below to action.")
+                        sel_action_id = st.selectbox("Action Asset", options=s_ids, format_func=lambda x: s_map.get(x, x), key=f"{key_prefix}_action_select")
+                    else:
+                        sel_action_id = s_ids[0]
                     
-                    with col_act1:
-                         if st.button("👀 Mark Under Review", use_container_width=True):
-                             for _, row in selected_rows.iterrows():
-                                 backend.set_status(str(row["ID"]), "Under Review", actor_email, "Bulk update")
-                             st.success("Updated status to Under Review")
-                             st.rerun()
-                    
-                    with col_act2:
-                         if st.button("✅ Approve Selected", type="primary", use_container_width=True):
-                             for _, row in selected_rows.iterrows():
-                                 backend.set_status(str(row["ID"]), "Approved", actor_email, "Bulk Approved")
-                             st.success("Approved selected requests")
-                             st.rerun()
-
-                    with col_act3:
-                         rej_reason = st.text_input("Rejection Reason", placeholder="Reason...", label_visibility="collapsed")
-                         if st.button("❌ Reject Selected", type="secondary", use_container_width=True):
-                             if not rej_reason:
-                                 st.error("Enter a rejection reason first.")
-                             else:
-                                for _, row in selected_rows.iterrows():
-                                    backend.set_status(str(row["ID"]), "Rejected", actor_email, rej_reason)
-                                st.success("Rejected selected requests")
-                                st.rerun()
+                    if sel_action_id:
+                        s_row = selected_rows[selected_rows["ID"] == sel_action_id].iloc[0]
+                        
+                        render_unified_task_action_panel(
+                            asset_name=s_row["ASSET_FULL_NAME"],
+                            c_init=s_row.get("PROPOSED_C", 1),
+                            i_init=s_row.get("PROPOSED_I", 1),
+                            a_init=s_row.get("PROPOSED_A", 1),
+                            status=s_row["STATUS"],
+                            user=str(st.session_state.get("user") or "unknown_user"),
+                            task_id=str(s_row["ID"]),
+                            priority=None,
+                            completion=None,
+                            key_prefix="ui_req"
+                        )
                 else:
                     st.info("Select rows from the table above to perform actions.")
                     

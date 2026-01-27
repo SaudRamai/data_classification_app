@@ -175,40 +175,8 @@ with st.sidebar:
     st.session_state["global_filters"] = g_filters
 
 # --- Policy enforcement helpers (Decision Matrix & Audit persistence) ---
-def _ensure_decisions_table():
-    """Ensure the audit table for classification decisions exists."""
-    try:
-        db = st.session_state.get('sf_database') or settings.SNOWFLAKE_DATABASE
-        if not db:
-            return  # Skip if no database configured
-        snowflake_connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {db}.DATA_GOVERNANCE")
-        snowflake_connector.execute_non_query(
-            f"""
-            CREATE TABLE IF NOT EXISTS {db}.DATA_GOVERNANCE.CLASSIFICATION_DECISIONS (
-                ID STRING DEFAULT UUID_STRING(),
-                ASSET_FULL_NAME STRING,
-                CLASSIFICATION STRING,
-                C NUMBER(1),
-                I NUMBER(1),
-                A NUMBER(1),
-                OWNER STRING,
-                RATIONALE STRING,
-                CHECKLIST_JSON STRING,
-                DECIDED_BY STRING,
-                DECIDED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-                PREV_CLASSIFICATION STRING,
-                PREV_C NUMBER(1),
-                PREV_I NUMBER(1),
-                PREV_A NUMBER(1)
-            )
-            """
-        )
-    except Exception:
-        # Best-effort; do not block UI if ensure fails
-        pass
-
 def _persist_decision(asset: str, new_cls: str, c: int, i: int, a: int, owner: str, rationale: str, checklist: dict, decided_by: str, prev: Optional[dict] = None):
-    """Persist a classification decision for auditability."""
+    """Persist a classification decision via the centralized workflow service."""
     try:
         # Require rationale per policy before persisting
         if not rationale or not str(rationale).strip():
@@ -217,35 +185,25 @@ def _persist_decision(asset: str, new_cls: str, c: int, i: int, a: int, owner: s
             except Exception:
                 pass
             return
-        _ensure_decisions_table()
-        params = {
-            "asset": asset,
-            "cls": new_cls,
-            "c": int(c),
-            "i": int(i),
-            "a": int(a),
-            "owner": owner or None,
-            "rationale": rationale or None,
-            "checklist": str(checklist or {}),
-            "by": decided_by or "unknown",
-            "p_cls": (prev or {}).get("classification"),
-            "p_c": (prev or {}).get("C"),
-            "p_i": (prev or {}).get("I"),
-            "p_a": (prev or {}).get("A"),
-        }
-        db = st.session_state.get('sf_database') or settings.SNOWFLAKE_DATABASE
-        if not db:
-            return  # Skip if no database configured
-        snowflake_connector.execute_non_query(
-            f"""
-            INSERT INTO {db}.DATA_GOVERNANCE.CLASSIFICATION_DECISIONS
-            (ASSET_FULL_NAME, CLASSIFICATION, C, I, A, OWNER, RATIONALE, CHECKLIST_JSON, DECIDED_BY, PREV_CLASSIFICATION, PREV_C, PREV_I, PREV_A)
-            VALUES (%(asset)s, %(cls)s, %(c)s, %(i)s, %(a)s, %(owner)s, %(rationale)s, %(checklist)s, %(by)s, %(p_cls)s, %(p_c)s, %(p_i)s, %(p_a)s)
-            """,
-            params,
+            
+        # Use the centralized service
+        cwf.record_decision(
+            asset_full_name=asset,
+            decision_by=decided_by or "unknown",
+            source="DATA_ASSETS_MANUAL",
+            status="Approved", # Direct application from Data Assets is typically authoritative
+            label=new_cls,
+            c=c, i=i, a=a,
+            rationale=rationale or "",
+            details={
+                "checklist": checklist,
+                "previous_state": prev,
+                "owner": owner
+            }
         )
-    except Exception:
-        # Do not block the UI if persistence fails; audit_service captures UI-level actions
+    except Exception as e:
+        logger.error(f"Failed to persist decision via CWF: {e}")
+        # Do not block the UI if persistence fails, but log it
         pass
 
 def _validate_decision_matrix(label: str, c: int, i: int, a: int, has_pii: bool, regs: List[str]) -> Tuple[bool, str]:

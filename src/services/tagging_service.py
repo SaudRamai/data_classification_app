@@ -28,7 +28,7 @@ def _load_allowed_values(connector, value_type: str) -> List[str]:
         "INTEGRITY_LEVEL": ["I0", "I1", "I2", "I3"],
         "AVAILABILITY_LEVEL": ["A0", "A1", "A2", "A3"],
         "SPECIAL_CATEGORY": ["PII", "PHI", "PCI", "SOX", "Financial", "Auth", "Confidential", "Other"],
-        "COMPLIANCE_FRAMEWORKS": ["PII", "SOX", "SOC2", "GDPR", "CCPA", "HIPAA", "PCI DSS", "Internal/Other"],
+        "COMPLIANCE_FRAMEWORKS": ["PII", "SOX", "SOC"],
         "REVIEW_STATUS": ["Pending Reclassification", "Due Soon", "Overdue", "Reviewed"]
     }
     

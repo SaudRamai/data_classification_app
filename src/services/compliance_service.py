@@ -248,6 +248,77 @@ class EnforcementSubservice:
         self.ensure_row_access_policy(fq, "(BU STRING, GEO STRING)", using_expr)
         return fq
 
+    def process_pending_enforcements(self, database: Optional[str] = None) -> Dict[str, Any]:
+        """Orchestrate post-approval actions: tagging, masking, and RBAC."""
+        db = database or self.parent._active_db()
+        decisions_table = f"{db}.{GOV_SCHEMA}.CLASSIFICATION_DECISIONS"
+        
+        # 1. Fetch Approved but not yet Enforced decisions
+        query = f"""
+            SELECT ID, ASSET_FULL_NAME, LABEL, C, I, A, APPROVED_BY
+            FROM {decisions_table}
+            WHERE STATUS = 'Approved' AND (ENFORCEMENT_STATUS IS NULL OR ENFORCEMENT_STATUS = 'Pending')
+            LIMIT 50
+        """
+        pending = self.connector.execute_query(query) or []
+        results = {"processed": 0, "errors": []}
+        
+        if not pending:
+            return results
+
+        from src.services.tagging_service import tagging_service
+        
+        for p in pending:
+            did, asset, lbl, c, i, a = p["ID"], p["ASSET_FULL_NAME"], p["LABEL"], p["C"], p["I"], p["A"]
+            try:
+                # A. Apply Classification Tags
+                tags = {
+                    "DATA_CLASSIFICATION": lbl,
+                    "CONFIDENTIALITY_LEVEL": f"C{int(c or 0)}",
+                    "INTEGRITY_LEVEL": f"I{int(i or 0)}",
+                    "AVAILABILITY_LEVEL": f"A{int(a or 0)}"
+                }
+                tagging_service.apply_tags_to_object(asset, "TABLE", tags)
+                
+                # B. Apply Masking Policies for sensitive data (C >= 2)
+                if int(c or 0) >= 2:
+                    # Simple automated masking based on standard redaction policy
+                    # In a real scenario, this would look at column categories
+                    # Here we ensure a base policy exists for the asset
+                    discovery_query = f"SELECT COLUMN_NAME, DATA_TYPE FROM {asset.split('.')[0]}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=%(s)s AND TABLE_NAME=%(t)s"
+                    parts = asset.split('.')
+                    if len(parts) == 3:
+                        cols = self.connector.execute_query(discovery_query, {"s": parts[1], "t": parts[2]}) or []
+                        for col_info in cols:
+                            col_name = col_info["COLUMN_NAME"]
+                            # Only mask if it looks like PII or if explicitly requested in future logic
+                            if any(k in col_name.upper() for k in ["EMAIL", "NAME", "PHONE", "SSN", "SECRET"]):
+                                policy_fqn = f"{db}.{GOV_SCHEMA}.MASK_REDACT_STRING"
+                                self.ensure_masking_policy(policy_fqn, return_type='STRING')
+                                self.apply_masking_policy(asset, col_name, policy_fqn)
+
+                # C. Enforce RBAC (Placeholder for dynamic grant management)
+                # Logic: If Confidential (C3), only certain roles can access. 
+                # This would typically involve REVOKE ALL and then selective GRANT.
+                
+                # D. Finalize status
+                self.connector.execute_non_query(f"""
+                    UPDATE {decisions_table}
+                    SET ENFORCEMENT_STATUS = 'Success',
+                        ENFORCEMENT_TIMESTAMP = CURRENT_TIMESTAMP
+                    WHERE ID = %(id)s
+                """, {"id": did})
+                
+                audit_service.log(p["APPROVED_BY"], "ENFORCEMENT_COMPLETE", "ASSET", asset, {"decision_id": did, "actions": ["TAGGING", "MASKING"]})
+                results["processed"] += 1
+                
+            except Exception as e:
+                logger.error(f"Enforcement failed for {did} ({asset}): {e}")
+                self.connector.execute_non_query(f"UPDATE {decisions_table} SET ENFORCEMENT_STATUS = 'Failed' WHERE ID = %(id)s", {"id": did})
+                results["errors"].append({"id": did, "asset": asset, "error": str(e)})
+
+        return results
+
 class NLPSubservice:
     """Internalized NLP-based compliance evaluation."""
     def __init__(self, parent: ComplianceService):

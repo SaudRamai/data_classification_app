@@ -1062,7 +1062,7 @@ with tab_inv_browser:
     # Helper: summarize by a grouping key
     # Helper: Ensure the view exists
     @st.cache_data(ttl=600)
-    def _ensure_inventory_view_exists(db_name: str):
+    def _ensure_inventory_view_enrichment(db_name: str):
         try:
             # Create the view using {db_name} dynamically
             ddl = f"""
@@ -1419,8 +1419,8 @@ with tab_inv_browser:
             if not db_name or str(db_name).upper() in ("NONE", "NULL", "(NONE)"):
                 return pd.DataFrame()
             
-            # Ensure view exists
-            _ensure_inventory_view_exists(db_name)
+            # Ensure view exists (v2 with enrichment)
+            _ensure_inventory_view_enrichment(db_name)
             
             # Build WHERE clause based on filters
             conditions = [f"LEVEL = '{level}'"]
@@ -1495,7 +1495,10 @@ with tab_inv_browser:
                             "SLA_Breach_Assets": 0,
                             "New_Pending_Assets": 0,
                             "Sensitive_Columns": '0 PII, 0 SOX, 0 SOC2',
-                            "Avg_Days_To_Classify": 0.0
+                            "Avg_Days_To_Classify": 0.0,
+                            "Business_Unit": None,
+                            "Business_Domain": None,
+                            "Lifecycle": None
                         }
                         for col, val in fill_map.items():
                             if col not in df_combined.columns:
@@ -1595,9 +1598,10 @@ with tab_inv_browser:
                 logger.info("No data available (bypassed).")
         else:
             show_cols = ["Schema", "Asset_Name", "Asset_Type", "Business_Unit", "Business_Domain", "Lifecycle", "Classification_Coverage", "Accuracy_Percent", "Timeliness_Percent", "Compliance_Status", "Owner_Coverage", "SLA_Breach_Assets", "Column_Stats", "Masking_Status", "Sensitive_Columns"]
+            final_show_cols = [c for c in show_cols if c in tbl_df.columns]
             
             st.dataframe(
-                tbl_df[show_cols], 
+                tbl_df[final_show_cols], 
                 use_container_width=True, 
                 hide_index=True
             )

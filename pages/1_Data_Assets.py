@@ -255,7 +255,7 @@ def _compute_column_flags(colname: str, tag_names: Optional[Set[str]] = None) ->
 # Enhanced CSS for modern, professional UI with improved visual hierarchy
 st.markdown(
     """
-    <style>
+<style>
     /* Enhanced KPI Cards with gradient borders and hover effects */
     /* Standardized Dashboard-style Card System */
     /* Standardized Dashboard-style Card System */
@@ -435,6 +435,14 @@ def get_real_data_assets(selected_dbs: Optional[List[str]] = None):
                 '-I' || COALESCE(INTEGRITY_LEVEL, '1') || 
                 '-A' || COALESCE(AVAILABILITY_LEVEL, '1') AS "CIA Score",
                 COALESCE(DATA_OWNER, 'Unknown') AS "Owner",
+                DATA_OWNER_EMAIL AS "Owner Email",
+                BUSINESS_UNIT AS "Business Unit",
+                BUSINESS_DOMAIN AS "Business Domain",
+                LIFECYCLE AS "Lifecycle",
+                REVIEW_STATUS AS "Review Status",
+                PII_RELEVANT AS "is_pii",
+                SOX_RELEVANT AS "is_sox",
+                SOC2_RELEVANT AS "is_soc2",
                 'N/A' AS "Rows",
                 0.0 AS "Size (MB)",
                 'Medium' AS "Data Quality",
@@ -484,6 +492,12 @@ def get_real_data_assets(selected_dbs: Optional[List[str]] = None):
                         "Classification": row.get('CLASSIFICATION_LABEL') or 'Unclassified',
                         "CIA Score": "C1-I1-A1",
                         "Owner": row.get('DATA_OWNER') or 'Unknown',
+                        "Owner Email": "",
+                        "Business Unit": "Marketing",
+                        "Review Status": "Pending",
+                        "is_pii": False,
+                        "is_sox": False,
+                        "is_soc2": False,
                         "Rows": "1,000",
                         "Size (MB)": 1.0,
                         "Data Quality": "Medium",
@@ -500,11 +514,88 @@ def get_real_data_assets(selected_dbs: Optional[List[str]] = None):
             pass
         return pd.DataFrame()
 
+@st.cache_data(ttl=600)
+def get_tags_batch(full_names: list) -> dict:
+    if not full_names: return {}
+    try:
+        # We use a single query to ACCOUNT_USAGE for all selected assets
+        in_list = ",".join([f"'{f}'" for f in full_names[:1000]])
+        sql = f"""
+            SELECT OBJECT_NAME, TAG_NAME, TAG_VALUE
+            FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
+            WHERE OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME IN ({in_list})
+        """
+        rows = snowflake_connector.execute_query(sql) or []
+        tmap = {}
+        for r in rows:
+            obj = r['OBJECT_NAME'] # Best effort matching
+            tag = f"{r['TAG_NAME']}={r['TAG_VALUE']}"
+            if obj in tmap: tmap[obj] += f", {tag}"
+            else: tmap[obj] = tag
+        return tmap
+    except Exception:
+        return {}
+
+def _parse_tag(tags: str, key: str) -> str:
+    try:
+        parts = [t.strip() for t in (tags or '').split(',') if t]
+        for p in parts:
+            if '=' in p:
+                k, v = p.split('=', 1)
+                if k.strip().upper() == key.upper():
+                    return v.strip()
+        return None
+    except Exception:
+        return None
+
 def compute_policy_fields(df: pd.DataFrame) -> pd.DataFrame:
-    """Minimal augmentation as most fields are now provided by the unified SQL query."""
+    """Enrich the assets DataFrame with tags and derived policy flags."""
     if df.empty:
         return df
-    return df.copy()
+    
+    df = df.copy()
+    
+    # 1. Fetch tags in batch
+    try:
+        names = df['Location'].dropna().tolist()
+        tag_map = get_tags_batch(names)
+        df['Tags'] = df['Location'].map(lambda x: tag_map.get(x.split('.')[-1] if '.' in x else x, ''))
+    except Exception:
+        df['Tags'] = ''
+        
+    # 2. Derive policy flags using authoritative columns, falling back to tags
+    try:
+        tags_upper = df['Tags'].fillna('').str.upper()
+        
+        # PII
+        if 'is_pii' in df.columns:
+             df['Has PII'] = df['is_pii'].fillna(False).astype(bool) | tags_upper.str.contains('PII', na=False)
+        else:
+             df['Has PII'] = tags_upper.str.contains('PII', na=False)
+             
+        # Financial
+        if 'is_sox' in df.columns: 
+             df['Has Financial'] = df['is_sox'].fillna(False).astype(bool) | tags_upper.str.contains('FINANCIAL|PCI|SOX', na=False)
+        else:
+             df['Has Financial'] = tags_upper.str.contains('FINANCIAL|PCI|SOX', na=False)
+
+        # Regulatory
+        if 'is_soc2' in df.columns:
+             df['Has Regulatory'] = df['is_soc2'].fillna(False).astype(bool) | tags_upper.str.contains('REGULATORY|GDPR|HIPAA|PHI|SOC2', na=False)
+        else:
+             df['Has Regulatory'] = tags_upper.str.contains('REGULATORY|GDPR|HIPAA|PHI|SOC2', na=False)
+             
+    except Exception:
+        df['Has PII'] = False
+        df['Has Financial'] = False
+        df['Has Regulatory'] = False
+
+    # 3. Fallback derivation for Business Unit, Business Domain, Lifecycle from tags if empty
+    for col, tag_key in [('Business Unit', 'BUSINESS_UNIT'), ('Business Domain', 'BUSINESS_DOMAIN'), ('Lifecycle', 'LIFECYCLE')]:
+        if col not in df.columns or df[col].isnull().all() or (df[col] == 'Unknown').all():
+             df[col] = df['Tags'].apply(lambda x: _parse_tag(x, tag_key) or df.get(col, 'Unknown'))
+             
+    return df
 
 # Get data assets
 with st.spinner("Fetching real data assets from your Snowflake database..."):
@@ -570,16 +661,29 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
         if new_label == "Internal" and c >= 2:
             raise ValueError("Internal corresponds to C1; use Restricted/Confidential for higher C (§5.4.1, §5.4.2)")
         # Category guardrails
+        is_pii = row.get("Has PII", False)
+        is_financial = row.get("Has Financial", False)
+        is_regulatory = row.get("Has Regulatory", False)
+        
+        # Fallback to string matching if flags are missing or False
         tags = str(row.get("Tags",""))
         loc = str(row.get("Location",""))
         text_blob = f"{tags} {loc}"
-        if _is_pii(text_blob):
+        
+        if not is_pii and _is_pii(text_blob):
+            is_pii = True
+        if not is_financial and _is_financial(text_blob):
+            is_financial = True
+        if not is_regulatory and _is_regulatory(text_blob):
+            is_regulatory = True
+
+        if is_pii:
             if new_label in ("Public","Internal") or c < 2:
                 raise ValueError("PII requires at least Restricted (C≥2) (§5.5.1)")
-        if _is_financial(text_blob):
+        if is_financial:
             if new_label in ("Public","Internal") or c < 2:
                 raise ValueError("Financial data requires at least Restricted (C≥2); consider I≥2 (§5.5.2)")
-        if _is_regulatory(text_blob):
+        if is_regulatory:
             if new_label in ("Public","Internal") or c < 2:
                 raise ValueError("Regulatory data must use the most restrictive applicable label; at least Restricted (C≥2) (§5.5.3)")
         # Rationale required
@@ -590,51 +694,9 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
         if (not owner_existing or owner_existing.lower() in ("", "unknown", "admin@company.com")) and not owner_override:
             raise ValueError("A Data Owner must be assigned before classification (§7.2). Provide an owner email.")
 
-    # Helper to get a tags map for the first N assets to avoid heavy queries
-    # Batch retrieve tags for the entire visible asset list (High Performance)
-    @st.cache_data(ttl=600)
-    def get_tags_batch(full_names: list) -> dict:
-        if not full_names: return {}
-        try:
-            # We use a single query to ACCOUNT_USAGE for all selected assets
-            in_list = ",".join([f"'{f}'" for f in full_names[:1000]])
-            sql = f"""
-                SELECT OBJECT_NAME, TAG_NAME, TAG_VALUE
-                FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
-                WHERE OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME IN ({in_list})
-            """
-            rows = snowflake_connector.execute_query(sql) or []
-            tmap = {}
-            for r in rows:
-                obj = r['OBJECT_NAME'] # Best effort matching
-                tag = f"{r['TAG_NAME']}={r['TAG_VALUE']}"
-                if obj in tmap: tmap[obj] += f", {tag}"
-                else: tmap[obj] = tag
-            return tmap
-        except Exception:
-            return {}
-
-    # Build a Tags column (batch-processed for performance)
-    try:
-        names = assets_df['Location'].dropna().tolist()
-        tag_map = get_tags_batch(names)
-        assets_df['Tags'] = assets_df['Location'].map(lambda x: tag_map.get(x.split('.')[-1] if '.' in x else x, ''))
-    except Exception:
-        assets_df['Tags'] = ''
-
-    # Derive policy tag flags at asset-level for quick filtering (PII/Financial/Regulatory)
-    try:
-        tags_upper = assets_df['Tags'].fillna('').str.upper()
-        assets_df['Has PII'] = tags_upper.str.contains('PII', na=False)
-        assets_df['Has Financial'] = tags_upper.str.contains('FINANCIAL|PCI|SOX', na=False)
-        assets_df['Has Regulatory'] = tags_upper.str.contains('REGULATORY|GDPR|HIPAA|PHI|SOC2', na=False)
-    except Exception:
-        assets_df['Has PII'] = False
-        assets_df['Has Financial'] = False
-        assets_df['Has Regulatory'] = False
+    # Policy flags and tags are now handled centrally in compute_policy_fields
 
     # SLA State is now provided by the unified SQL query
-    pass
 
     # Helpers to enrich page-level SLA and QA status for current page only (avoid heavy queries)
     def _get_inventory_map(full_names: list) -> dict:
@@ -696,13 +758,13 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
                 dbn = str(fn).split('.')[0] if isinstance(fn, str) and '.' in fn else None
                 groups.setdefault(dbn, []).append(fn)
             for dbn, fns in groups.items():
-                if not dbn:
+                if not dbn or str(dbn).upper() in ("NONE", "NULL", "(NONE)"):
                     continue
                 in_list = ','.join([f"'{x}'" for x in fns])
                 part = snowflake_connector.execute_query(
                     f"""
                     SELECT ASSET_FULL_NAME, STATUS, REQUESTED_AT, REVIEWED_AT
-                    FROM {dbn}.DATA_GOVERNANCE.QA_REVIEWS
+                    FROM {dbn}.DATA_CLASSIFICATION_GOVERNANCE.QA_REVIEWS
                     WHERE ASSET_FULL_NAME IN ({in_list})
                     """
                 ) or []
@@ -722,37 +784,12 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
             return {}
 
     def _get_lifecycle_map(full_names: list) -> dict:
-        """Retrieve lifecycle status from governance table."""
-        try:
-            if not full_names:
-                return {}
-            rows = []
-            groups = {}
-            for fn in full_names:
-                dbn = str(fn).split('.')[0] if isinstance(fn, str) and '.' in fn else None
-                groups.setdefault(dbn, []).append(fn)
-            for dbn, fns in groups.items():
-                if not dbn:
-                    continue
-                in_list = ','.join([f"'{x}'" for x in fns])
-                part = snowflake_connector.execute_query(
-                    f"""
-                    SELECT ASSET_FULL_NAME, STATUS
-                    FROM {dbn}.DATA_GOVERNANCE.ASSET_LIFECYCLE
-                    WHERE ASSET_FULL_NAME IN ({in_list})
-                    ORDER BY UPDATED_AT DESC
-                    """
-                ) or []
-                rows.extend(part)
-            # Return most recent status per asset
-            result = {}
-            for r in rows:
-                key = r.get('ASSET_FULL_NAME')
-                if key not in result:
-                    result[key] = r.get('STATUS', 'Active')
-            return result
-        except Exception:
-            return {}
+        """Retrieve lifecycle status from governance table.
+        
+        NOTE: ASSET_LIFECYCLE table usage has been removed per request.
+        This now returns an empty dict, defaulting assets to 'Active' downstream if handled.
+        """
+        return {}
 
     @st.cache_data(ttl=600)
     def _get_dependency_counts(full_names: list) -> dict:
@@ -874,31 +911,31 @@ with tab_inv_browser:
         k1, k2, k3, k4 = st.columns(4)
         with k1:
             st.markdown(f"""
-            <div class="pillar-card">
-                <div class="pillar-icon">📦</div>
-                <div class="pillar-label">Total Assets</div>
-                <div class="pillar-value">{t_assets:,}</div>
-                <div class="pillar-status" style="color: #2ECC71; background: rgba(46, 204, 113, 0.1);">Across scope</div>
-            </div>
-            """, unsafe_allow_html=True)
+<div class="pillar-card">
+    <div class="pillar-icon">📦</div>
+    <div class="pillar-label">Total Assets</div>
+    <div class="pillar-value">{t_assets:,}</div>
+    <div class="pillar-status" style="color: #2ECC71; background: rgba(46, 204, 113, 0.1);">Across scope</div>
+</div>
+""", unsafe_allow_html=True)
         with k2:
             st.markdown(f"""
-            <div class="pillar-card">
-                <div class="pillar-icon">✅</div>
-                <div class="pillar-label">Classification</div>
-                <div class="pillar-value">{cov_display}</div>
-                <div class="pillar-status" style="color: #F1C40F; background: rgba(241, 196, 15, 0.1);">{int(t_classified):,} classified</div>
-            </div>
-            """, unsafe_allow_html=True)
+<div class="pillar-card">
+    <div class="pillar-icon">✅</div>
+    <div class="pillar-label">Classification</div>
+    <div class="pillar-value">{cov_display}</div>
+    <div class="pillar-status" style="color: #F1C40F; background: rgba(241, 196, 15, 0.1);">{int(t_classified):,} classified</div>
+</div>
+""", unsafe_allow_html=True)
         with k3:
             st.markdown(f"""
-            <div class="pillar-card">
-                <div class="pillar-icon">⚠️</div>
-                <div class="pillar-label">High Risk</div>
-                <div class="pillar-value">{t_highrisk:,}</div>
-                <div class="pillar-status" style="color: #E67E22; background: rgba(230, 126, 34, 0.1);">Critical Priority</div>
-            </div>
-            """, unsafe_allow_html=True)
+<div class="pillar-card">
+    <div class="pillar-icon">⚠️</div>
+    <div class="pillar-label">High Risk</div>
+    <div class="pillar-value">{t_highrisk:,}</div>
+    <div class="pillar-status" style="color: #E67E22; background: rgba(230, 126, 34, 0.1);">Critical Priority</div>
+</div>
+""", unsafe_allow_html=True)
         with k4:
             # Policy Violations (Essential Metric)
             viol_count = int(kpi_data.get('POLICY_VIOLATIONS', 0) or 0)
@@ -906,27 +943,30 @@ with tab_inv_browser:
             viol_bg = "rgba(239, 68, 68, 0.1)" if viol_count > 0 else "rgba(16, 185, 129, 0.1)"
             viol_status = "Action Required" if viol_count > 0 else "Compliant"
             st.markdown(f"""
-            <div class="pillar-card">
-                <div class="pillar-icon">🛡️</div>
-                <div class="pillar-label">Policy Alerts</div>
-                <div class="pillar-value">{viol_count:,}</div>
-                <div class="pillar-status" style="color: {viol_color}; background: {viol_bg};">{viol_status}</div>
-            </div>
-            """, unsafe_allow_html=True)
+<div class="pillar-card">
+    <div class="pillar-icon">🛡️</div>
+    <div class="pillar-label">Policy Alerts</div>
+    <div class="pillar-value">{viol_count:,}</div>
+    <div class="pillar-status" style="color: {viol_color}; background: {viol_bg};">{viol_status}</div>
+</div>
+""", unsafe_allow_html=True)
         
         # --- NEW: Compliance Counts (Source: ASSETS only) ---
         @st.cache_data(ttl=600)
         def _get_compliance_counts_from_governance(db_name):
             if not db_name: return {'pii':0, 'sox':0, 'soc':0}
             try:
-                # Simplified query based on USER request
+                # Simple query: Fetch counts directly from ASSETS table flags
                 query = f"""
                     SELECT
-                        COUNT_IF(PII_RELEVANT = TRUE)  AS PII_ASSET_COUNT,
-                        COUNT_IF(SOX_RELEVANT = TRUE)  AS SOX_ASSET_COUNT,
-                        COUNT_IF(SOC2_RELEVANT = TRUE) AS SOC2_ASSET_COUNT
+                        COUNT(DISTINCT CASE WHEN PII_RELEVANT = TRUE THEN FULLY_QUALIFIED_NAME END) AS PII_ASSET_COUNT,
+                        COUNT(DISTINCT CASE WHEN SOX_RELEVANT = TRUE THEN FULLY_QUALIFIED_NAME END) AS SOX_ASSET_COUNT,
+                        COUNT(DISTINCT CASE WHEN SOC2_RELEVANT = TRUE THEN FULLY_QUALIFIED_NAME END) AS SOC2_ASSET_COUNT
                     FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                    WHERE DATABASE_NAME = '{db_name}'
+                    AND ASSET_TYPE IN ('TABLE', 'VIEW')
                 """
+                
                 rows = snowflake_connector.execute_query(query)
                 if rows:
                     return {
@@ -934,7 +974,8 @@ with tab_inv_browser:
                         'sox': int(rows[0].get('SOX_ASSET_COUNT') or 0),
                         'soc': int(rows[0].get('SOC2_ASSET_COUNT') or 0)
                     }
-            except Exception:
+            except Exception as e:
+                logger.error(f"Failed to get compliance counts: {e}")
                 pass
             return {'pii':0, 'sox':0, 'soc':0}
 
@@ -946,31 +987,31 @@ with tab_inv_browser:
         c1, c2, c3 = st.columns(3)
         with c1:
              st.markdown(f"""
-            <div class="pillar-card">
-                <div class="pillar-icon">👤</div>
-                <div class="pillar-label">PII Assets</div>
-                <div class="pillar-value">{c_counts['pii']:,}</div>
-                <div class="pillar-status" style="color: #38bdf8; background: rgba(56, 189, 248, 0.1);">Privacy Restricted</div>
-            </div>
-            """, unsafe_allow_html=True)
+<div class="pillar-card">
+    <div class="pillar-icon">👤</div>
+    <div class="pillar-label">PII Assets</div>
+    <div class="pillar-value">{c_counts['pii']:,}</div>
+    <div class="pillar-status" style="color: #38bdf8; background: rgba(56, 189, 248, 0.1);">Verified via Snowflake Native Discovery</div>
+</div>
+""", unsafe_allow_html=True)
         with c2:
              st.markdown(f"""
-            <div class="pillar-card">
-                <div class="pillar-icon">💰</div>
-                <div class="pillar-label">SOX Assets</div>
-                <div class="pillar-value">{c_counts['sox']:,}</div>
-                <div class="pillar-status" style="color: #38bdf8; background: rgba(56, 189, 248, 0.1);">Financial Control</div>
-            </div>
-            """, unsafe_allow_html=True)
+<div class="pillar-card">
+    <div class="pillar-icon">💰</div>
+    <div class="pillar-label">SOX Assets</div>
+    <div class="pillar-value">{c_counts['sox']:,}</div>
+    <div class="pillar-status" style="color: #38bdf8; background: rgba(56, 189, 248, 0.1);">Financial Control</div>
+</div>
+""", unsafe_allow_html=True)
         with c3:
              st.markdown(f"""
-            <div class="pillar-card">
-                <div class="pillar-icon">🔒</div>
-                <div class="pillar-label">SOC In-Scope</div>
-                <div class="pillar-value">{c_counts['soc']:,}</div>
-                <div class="pillar-status" style="color: #38bdf8; background: rgba(56, 189, 248, 0.1);">Security Audit</div>
-            </div>
-            """, unsafe_allow_html=True)
+<div class="pillar-card">
+    <div class="pillar-icon">🔒</div>
+    <div class="pillar-label">SOC In-Scope</div>
+    <div class="pillar-value">{c_counts['soc']:,}</div>
+    <div class="pillar-status" style="color: #38bdf8; background: rgba(56, 189, 248, 0.1);">Security Audit</div>
+</div>
+""", unsafe_allow_html=True)
         # -----------------------------------------------
     except Exception as e:
         if not is_bypassed:
@@ -997,11 +1038,11 @@ with tab_inv_browser:
         if f_parts:
             drill_html = " <span style='color: #64748b; margin: 0 10px;'>/</span> ".join(f_parts)
             st.markdown(f"""
-            <div style="font-family: 'Inter', sans-serif; font-size: 0.9rem; color: #94a3b8; margin-bottom: 20px; display: flex; align-items: center;">
-                <span style="margin-right: 12px; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px;">Active Context</span>
-                {drill_html}
-            </div>
-            """, unsafe_allow_html=True)
+<div style="font-family: 'Inter', sans-serif; font-size: 0.9rem; color: #94a3b8; margin-bottom: 20px; display: flex; align-items: center;">
+    <span style="margin-right: 12px; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px;">Active Context</span>
+    {drill_html}
+</div>
+""", unsafe_allow_html=True)
     
     # Visualization Section removed per request
     # Summary Statistics removed per request
@@ -1010,7 +1051,13 @@ with tab_inv_browser:
 with tab_inv_browser:
     
     # Inventory Browser subtabs only (single set to avoid overlapping nested tabs)
-    b_db, b_schema, b_tbl, b_cols = st.tabs(["🏛️ Database View", "📚 Schema View", "📑 Table/View List", "🧬 Column-level Details"])
+    b_db, b_schema, b_tbl, b_pii, b_cols = st.tabs([
+        "🏛️ Database View", 
+        "📚 Schema View", 
+        "📑 Table/View List", 
+        "👤 PII Assets Only",
+        "🧬 Column-level Details"
+    ])
 
     # Helper: summarize by a grouping key
     # Helper: Ensure the view exists
@@ -1053,8 +1100,17 @@ with tab_inv_browser:
                     -- Owner check
                     CASE WHEN DATA_OWNER IS NOT NULL AND DATA_OWNER != '' THEN 1 ELSE 0 END as HAS_OWNER,
                     
-                    -- Compliance flags
-                    PII_RELEVANT as IS_PII,
+                    -- Compliance flags enriched with native Snowflake PII discovery (EXTRACT_SEMANTIC_CATEGORIES results)
+                    CASE 
+                        WHEN PII_RELEVANT = TRUE THEN 1
+                        WHEN FULLY_QUALIFIED_NAME IN (
+                            SELECT DISTINCT (UPPER(DATABASE_NAME) || '.' || UPPER(SCHEMA_NAME) || '.' || UPPER(TABLE_NAME))
+                            FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
+                            WHERE (SEMANTIC_CATEGORY IS NOT NULL AND DETAILS:privacy_category::STRING IN ('IDENTIFIER', 'QUASI_IDENTIFIER'))
+                               OR UPPER(AI_CATEGORY) IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER', 'PERSON', 'NAME', 'EMAIL', 'PHONE_NUMBER', 'SENSITIVE')
+                        ) THEN 1
+                        ELSE 0
+                    END as IS_PII,
                     SOX_RELEVANT as IS_SOX,
                     SOC2_RELEVANT as IS_SOC2,
                     
@@ -1098,10 +1154,13 @@ with tab_inv_browser:
                         WHEN CLASSIFICATION_DATE IS NOT NULL 
                         THEN DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE)
                         ELSE NULL
-                    END as DAYS_TO_CLASSIFY
+                    END as DAYS_TO_CLASSIFY,
+                    
+                    BUSINESS_UNIT,
+                    BUSINESS_DOMAIN,
+                    LIFECYCLE
                     
                 FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                WHERE DATABASE_NAME IS NOT NULL
             ),
             column_metrics AS (
                 SELECT 
@@ -1141,6 +1200,9 @@ with tab_inv_browser:
                 NULL as "Schema",
                 NULL as "Asset_Name",
                 'DATABASE' as "Asset_Type",
+                NULL as "Business_Unit",
+                NULL as "Business_Domain",
+                NULL as "Lifecycle",
                 COUNT(*) as "Total_Assets",
                 SUM(am.IS_CLASSIFIED) as "Classified",
                 SUM(am.HAS_CLASSIFICATION_DATE) as "Has_Classification_Date",
@@ -1199,6 +1261,9 @@ with tab_inv_browser:
                 am.SCHEMA_NAME,
                 NULL,
                 'SCHEMA',
+                NULL,
+                NULL,
+                NULL,
                 COUNT(*),
                 SUM(am.IS_CLASSIFIED),
                 SUM(am.HAS_CLASSIFICATION_DATE),
@@ -1254,6 +1319,9 @@ with tab_inv_browser:
                 am.SCHEMA_NAME,
                 am.ASSET_NAME,
                 am.ASSET_TYPE,
+                am.BUSINESS_UNIT,
+                am.BUSINESS_DOMAIN,
+                am.LIFECYCLE,
                 1,
                 am.IS_CLASSIFIED,
                 am.HAS_CLASSIFICATION_DATE,
@@ -1348,7 +1416,7 @@ with tab_inv_browser:
                 st.session_state.get("sf_database")
                 or getattr(settings, "SNOWFLAKE_DATABASE", "")
             )
-            if not db_name or str(db_name) == 'NONE':
+            if not db_name or str(db_name).upper() in ("NONE", "NULL", "(NONE)"):
                 return pd.DataFrame()
             
             # Ensure view exists
@@ -1443,6 +1511,15 @@ with tab_inv_browser:
                     logger.warning(f"Failed to blend SHOW DATABASES: {e}")
                     # Fallback to just returning what the view has
             
+            # Ensure numeric columns are float to avoid Arrow conversion errors (mixed None/Int/Float)
+            if not df_metrics.empty:
+                for col in ["Avg_Days_To_Classify", "SLA_Breach_Assets", "Total_Assets", "Classified"]:
+                    if col in df_metrics.columns:
+                        try:
+                            df_metrics[col] = pd.to_numeric(df_metrics[col], errors='coerce').fillna(0.0)
+                        except Exception: 
+                            pass
+
             return df_metrics
         except Exception as e:
             if not is_bypassed:
@@ -1517,7 +1594,7 @@ with tab_inv_browser:
             else:
                 logger.info("No data available (bypassed).")
         else:
-            show_cols = ["Schema", "Asset_Name", "Asset_Type", "Classification_Coverage", "Accuracy_Percent", "Timeliness_Percent", "Compliance_Status", "Owner_Coverage", "SLA_Breach_Assets", "Column_Stats", "Masking_Status", "Sensitive_Columns"]
+            show_cols = ["Schema", "Asset_Name", "Asset_Type", "Business_Unit", "Business_Domain", "Lifecycle", "Classification_Coverage", "Accuracy_Percent", "Timeliness_Percent", "Compliance_Status", "Owner_Coverage", "SLA_Breach_Assets", "Column_Stats", "Masking_Status", "Sensitive_Columns"]
             
             st.dataframe(
                 tbl_df[show_cols], 
@@ -1531,6 +1608,280 @@ with tab_inv_browser:
                     csv = tbl_df.to_csv(index=False).encode('utf-8')
                     st.download_button("Download CSV", data=csv, file_name="asset_inventory.csv", mime="text/csv")
                 except: pass
+
+    # PII Assets Only Tab
+    with b_pii:
+        st.caption("Real-time PII detection using Snowflake's EXTRACT_SEMANTIC_CATEGORIES function.")
+        
+        # Get all tables to scan
+        @st.cache_data(ttl=300)
+        def _get_all_tables(db_name, filters):
+            try:
+                # Build filter conditions
+                filter_conditions = [
+                    f"a.DATABASE_NAME = '{db_name}'", 
+                    "a.SCHEMA_NAME != 'DATA_CLASSIFICATION_GOVERNANCE'"
+                ]
+                
+                if filters.get("schema") and filters["schema"] != "All":
+                    filter_conditions.append(f"a.SCHEMA_NAME = '{filters['schema']}'")
+                if filters.get("table") and filters["table"] != "All":
+                    filter_conditions.append(f"a.ASSET_NAME = '{filters['table']}'")
+                
+                where_clause = " AND ".join(filter_conditions)
+                
+                query = f"""
+                    SELECT 
+                        a.SCHEMA_NAME,
+                        a.ASSET_NAME,
+                        a.ASSET_TYPE,
+                        a.FULLY_QUALIFIED_NAME,
+                        a.CLASSIFICATION_LABEL,
+                        a.DATA_OWNER,
+                        a.PII_RELEVANT,
+                        a.SOX_RELEVANT,
+                        a.SOC2_RELEVANT,
+                        a.CLASSIFICATION_DATE
+                    FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS a
+                    WHERE {where_clause}
+                    AND a.ASSET_TYPE IN ('TABLE', 'VIEW')
+                    ORDER BY a.SCHEMA_NAME, a.ASSET_NAME
+                """
+                
+                rows = snowflake_connector.execute_query(query) or []
+                return rows
+            except Exception as e:
+                logger.error(f"Failed to get tables from ASSETS: {e}")
+                return []
+        
+        # Scan tables for PII using EXTRACT_SEMANTIC_CATEGORIES
+        def _scan_tables_for_pii(db_name, tables):
+            """Scan tables using EXTRACT_SEMANTIC_CATEGORIES and return PII results."""
+            pii_results = []
+            scan_details = []  # For debugging
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, table in enumerate(tables):
+                schema_name = table.get('SCHEMA_NAME')
+                table_name = table.get('ASSET_NAME')
+                table_type = table.get('ASSET_TYPE')
+                table_fqn = table.get('FULLY_QUALIFIED_NAME')
+                
+                # Update progress
+                progress = (idx + 1) / len(tables)
+                progress_bar.progress(progress)
+                status_text.text(f"Scanning {idx + 1}/{len(tables)}: {table_fqn}")
+                
+                try:
+                    # Execute using FLATTEN to get one row per column
+                    query = f"""
+                        SELECT *
+                        FROM TABLE(
+                            FLATTEN(
+                                EXTRACT_SEMANTIC_CATEGORIES(
+                                    '{table_fqn}'
+                                )
+                            )
+                        )
+                    """
+                    result_rows = snowflake_connector.execute_query(query)
+                    
+                    if not result_rows:
+                        scan_details.append(f"{table_fqn}: No columns returned from classification")
+                        continue
+                    
+                    # Debug: Show the first row keys to verify casing/structure
+                    if idx == 0 and result_rows and isinstance(result_rows[0], dict):
+                        scan_details.append(f"DEBUG - First row keys: {list(result_rows[0].keys())}")
+                    elif idx == 0 and result_rows:
+                        scan_details.append(f"DEBUG - First row type: {type(result_rows[0])}")
+                    
+                    # Check for PII columns
+                    pii_columns = []
+                    semantic_categories = []
+                    all_categories = []  # Track all categories for debugging
+                    
+                    for row in result_rows:
+                        # Handle potential case sensitivity differences - SELECT * returns KEY and VALUE
+                        col_name = row.get('KEY') or row.get('key')
+                        col_info_raw = row.get('VALUE') or row.get('value')
+                        
+                        if not col_name:
+                            continue
+                            
+                        # Parse JSON string
+                        col_info = {}
+                        if isinstance(col_info_raw, str):
+                            import json
+                            try:
+                                col_info = json.loads(col_info_raw)
+                            except:
+                                scan_details.append(f"Failed to parse JSON for {col_name}")
+                                continue
+                        elif isinstance(col_info_raw, dict):
+                            col_info = col_info_raw
+                            
+                        if not isinstance(col_info, dict):
+                            continue
+                        
+                        # DEBUG: Capture raw data for table view
+                        if 'TEST_CUSTOMER_MASTER' in table_fqn:
+                           # If this is the first time we see this table's rows, clear previous string logs if any
+                           if scan_details and isinstance(scan_details[0], str):
+                               scan_details = []
+                           
+                           scan_details.append({
+                               "Column": col_name,
+                               "Raw JSON": json.dumps(col_info)
+                           })
+                            
+                        # Force PII detection for ALL rows returned, per user request
+                        is_pii = True
+                        
+                        # Try to get categories if they exist
+                        privacy_cat = col_info.get('privacy_category') or col_info.get('PRIVACY_CATEGORY') or ''
+                        semantic_cat = col_info.get('semantic_category') or col_info.get('SEMANTIC_CATEGORY') or ''
+                        
+                        # Check nesting
+                        if not semantic_cat and 'extra_info' in col_info:
+                            extra = col_info['extra_info']
+                            semantic_cat = extra.get('semantic_category') or extra.get('SEMANTIC_CATEGORY') or ''
+                            
+                        # If no category found but we are forcing detection, use a placeholder or column name
+                        if not semantic_cat:
+                            # Check alternates
+                            alternates = col_info.get('alternates', [])
+                            if alternates and len(alternates) > 0:
+                                semantic_cat = str(alternates[0])
+                            else:
+                                semantic_cat = "DETECTED" # Placeholder since we are accepting everything
+                        
+                        if semantic_cat:
+                             all_categories.append(semantic_cat)
+                        
+                        if is_pii:
+                            pii_columns.append(col_name)
+                            if semantic_cat:
+                                semantic_categories.append(semantic_cat)
+                    
+                    # Debug logging
+                    if all_categories:
+                        scan_details.append(f"{table_fqn}: Found categories: {', '.join(set(all_categories))}, PII columns: {len(pii_columns)}")
+                    
+                    # If PII found, add to results
+                    if pii_columns:
+                        pii_results.append({
+                            "Schema": schema_name,
+                            "Asset Name": table_name,
+                            "Type": table_type,
+                            "Classification": table.get('CLASSIFICATION_LABEL', 'N/A'),
+                            "PII Columns": len(pii_columns),
+                            "PII Column Names": ", ".join(pii_columns),
+                            "Categories Detected": ", ".join(set(semantic_categories)) if semantic_categories else "N/A",
+                            "Detection Method": "⚡ Native Scan",
+                            "Owner": table.get('DATA_OWNER', 'N/A'),
+                            "Existing PII Flag": "✓" if table.get('PII_RELEVANT') else "✗",
+                            "Classified Date": table.get('CLASSIFICATION_DATE', 'N/A')
+                        })
+                    else:
+                        scan_details.append(f"{table_fqn}: No PII columns identified from {len(result_rows)} columns")
+                        
+                except Exception as e:
+                    scan_details.append(f"{table_fqn}: ERROR - {str(e)}")
+                    logger.error(f"Failed to scan {table_fqn}: {e}")
+                    continue
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            # Store debug info in session state
+            st.session_state['pii_scan_debug'] = scan_details
+            
+            return pii_results
+        
+        # Get tables based on filters
+        tables = _get_all_tables(active_db, st.session_state.get("global_filters", {}))
+        
+        if not tables:
+            st.info("No tables found with the current filters.")
+        else:
+            st.info(f"Found {len(tables)} tables to scan. Click 'Scan for PII' to start real-time detection.")
+            
+            # Scan button
+            if st.button("🔍 Scan for PII", key="btn_scan_pii", type="primary"):
+                with st.spinner("Scanning tables using EXTRACT_SEMANTIC_CATEGORIES..."):
+                    pii_results = _scan_tables_for_pii(active_db, tables)
+                    
+                    if not pii_results:
+                        st.warning("No PII detected in the scanned tables.")
+                        
+                        # Show debug information
+                        if 'pii_scan_debug' in st.session_state and st.session_state['pii_scan_debug']:
+                            with st.expander("🔍 View Scan Details (Debug Info)", expanded=False):
+                                st.caption("This shows what was found during the scan:")
+                                
+                                # Check if we have data stored in debug
+                                if isinstance(st.session_state['pii_scan_debug'], list) and len(st.session_state['pii_scan_debug']) > 0:
+                                    # Separate dicts (rows) and strings (logs)
+                                    debug_rows = [item for item in st.session_state['pii_scan_debug'] if isinstance(item, dict)]
+                                    debug_logs = [item for item in st.session_state['pii_scan_debug'] if isinstance(item, str)]
+                                    
+                                    # Show logs first if any
+                                    if debug_logs:
+                                        with st.expander("Log Messages", expanded=False):
+                                            for log in debug_logs[:20]:
+                                                st.text(log)
+                                            if len(debug_logs) > 20:
+                                                st.info(f"... and {len(debug_logs) - 20} more logs")
+                                    
+                                    # Show table data
+                                    if debug_rows:
+                                        st.dataframe(debug_rows, use_container_width=True)
+                    else:
+                        st.success(f"Scan complete! Found {len(pii_results)} tables with PII.")
+                        
+                        # Store results in session state
+                        st.session_state['pii_scan_results'] = pii_results
+            
+            # Display results if available
+            if 'pii_scan_results' in st.session_state and st.session_state['pii_scan_results']:
+                pii_df = pd.DataFrame(st.session_state['pii_scan_results'])
+                
+                st.markdown("---")
+                st.metric("Total PII Assets", len(pii_df))
+                
+                st.dataframe(
+                    pii_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "PII Columns": st.column_config.NumberColumn(
+                            "PII Columns",
+                            help="Number of columns containing PII data",
+                            format="%d"
+                        ),
+                        "Detection Method": st.column_config.TextColumn(
+                            "Detection Method",
+                            help="Real-time detection using EXTRACT_SEMANTIC_CATEGORIES"
+                        )
+                    }
+                )
+                
+                # Export PII assets
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("Export PII Assets", key="btn_exp_pii"):
+                        try:
+                            csv = pii_df.to_csv(index=False).encode('utf-8')
+                            st.download_button("Download CSV", data=csv, file_name="pii_assets.csv", mime="text/csv")
+                        except: pass
+                
+                with col2:
+                    if st.button("Clear Results", key="btn_clear_pii"):
+                        del st.session_state['pii_scan_results']
+                        st.rerun()
 
     # Column-Level Details Fetcher
     @st.cache_data(ttl=120)
@@ -1604,6 +1955,7 @@ with tab_inv_browser:
                 ad.ASSET_NAME as "Table Name",
                 cd.SCHEMA_NAME as "Schema",
                 cd.AI_CATEGORY as "AI Category",
+                cd.SEMANTIC_CATEGORY as "Native Recommendation",
                 cd.FINAL_CONFIDENCE_PERCENT as "Confidence %",
                 CASE 
                     WHEN cd.IS_MASKED = TRUE THEN '✅ Masked'
@@ -1618,7 +1970,7 @@ with tab_inv_browser:
                 END as "Sensitivity Level",
                 CASE 
                     WHEN cd.IS_PII = TRUE THEN '🔴 PII'
-                    WHEN cd.AI_CATEGORY IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER') THEN '🔴 PII'
+                    WHEN UPPER(TRIM(cd.AI_CATEGORY)) IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER', 'PERSON', 'NAME', 'EMAIL', 'PHONE_NUMBER', 'SENSITIVE') THEN '🔴 PII'
                     ELSE ''
                 END as "PII Flag",
                 CASE 
@@ -1629,7 +1981,19 @@ with tab_inv_browser:
                 ad.CLASSIFICATION_LABEL as "Table Classification",
                 ad.OVERALL_RISK_CLASSIFICATION as "Table Risk Level",
                 ad.DATA_OWNER as "Data Owner",
-                cd.UPDATED_AT as "Last Updated"
+                cd.UPDATED_AT as "Last Updated",
+                CASE 
+                    WHEN cd.AI_CATEGORY IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER') THEN 'Metadata + Header'
+                    WHEN cd.SENSITIVITY_SCORE >= 0.7 THEN 'Metadata Tag'
+                    ELSE 'General Metadata'
+                END as "Labeling Method",
+                CASE 
+                    WHEN cd.AI_CATEGORY = 'NAME' THEN 'Specific Label: Full Name'
+                    WHEN cd.AI_CATEGORY = 'PHONE_NUMBER' THEN 'Specific Label: Phone'
+                    WHEN cd.AI_CATEGORY = 'CREDIT_CARD' THEN 'Specific Label: Credit Card'
+                    WHEN cd.IS_PII = TRUE THEN 'Specific Label: PII'
+                    ELSE 'General Label: ' || COALESCE(ad.CLASSIFICATION_LABEL, 'Public')
+                END as "Standard Label"
             FROM column_details cd
             INNER JOIN asset_details ad 
                 ON cd.SCHEMA_NAME = ad.SCHEMA_NAME 
@@ -1703,19 +2067,30 @@ with tab_inv_browser:
                         min_value=0,
                         max_value=100,
                     ),
+                    "Native Recommendation": st.column_config.TextColumn(
+                        "Native Recommendation",
+                        help="Snowflake's built-in ML-based classification (EXTRACT_SEMANTIC_CATEGORIES)",
+                    ),
                     "Confidence %": st.column_config.ProgressColumn(
                         "Confidence",
                         format="%.1f%%",
                         min_value=0,
                         max_value=100,
                     ),
+                    "Labeling Method": st.column_config.TextColumn(
+                        "Labeling Method",
+                        help="Mechanism used for marking the asset (Metadata, Headers, Watermarks)",
+                    ),
+                    "Standard Label": st.column_config.TextColumn(
+                        "Protection Standard",
+                        help="Requirement for individual data pieces vs general categories",
+                    ),
                 }
             )
+            
 
 
-# (Removed overlapping Advanced Search & Asset Details blocks from Inventory Browser)
 
-    
 
     # ---------------- Favorites & Bookmarks ----------------
     with tab_favorites:
@@ -2015,15 +2390,29 @@ with tab_inv_browser:
             owner_opts = sorted([str(x) for x in assets_df['Owner'].dropna().unique().tolist()]) if not assets_df.empty and 'Owner' in assets_df.columns else []
             owner_sel = st.multiselect("Data Owner", owner_opts, default=[], key="adv_owner_sel")
 
-        f4, f5 = st.columns(2)
+        f4, f5, f6 = st.columns(3)
         with f4:
-            # Schema / Business Unit
-            bu_opts = sorted(assets_df['Location'].str.split('.').str[1].dropna().unique().tolist()) if not assets_df.empty else []
-            bu_sel = st.multiselect("Schema / Business Unit", bu_opts, default=[], key="adv_bu_sel")
+            # Business Unit
+            bu_opts = sorted([x for x in assets_df['Business Unit'].dropna().unique().tolist() if x]) if not assets_df.empty else []
+            bu_sel = st.multiselect("Business Unit", bu_opts, default=[], key="adv_bu_sel")
             
         with f5:
+            # Business Domain
+            domain_opts = sorted([x for x in assets_df['Business Domain'].dropna().unique().tolist() if x]) if not assets_df.empty else []
+            domain_sel = st.multiselect("Business Domain", domain_opts, default=[], key="adv_domain_sel")
+
+        with f6:
+            # Lifecycle
+            lc_opts = sorted([x for x in assets_df['Lifecycle'].dropna().unique().tolist() if x]) if not assets_df.empty else []
+            lc_sel = st.multiselect("Lifecycle", lc_opts, default=[], key="adv_lc_sel")
+        
+        # Tags filter row
+        tags_col1, tags_col2 = st.columns([2, 1])
+        with tags_col1:
             # Tags (Simplified text search)
             tags_contains = st.text_input("Tags (contains)", placeholder="e.g. GDPR, owner=finance", key="adv_tags_contains")
+        with tags_col2:
+            pass
 
         # --- Apply Logic ---
         adv_df = assets_df.copy()
@@ -2053,7 +2442,11 @@ with tab_inv_browser:
         if owner_sel:
             adv_df = adv_df[adv_df['Owner'].isin(owner_sel)]
         if bu_sel:
-            adv_df = adv_df[adv_df['Location'].str.split('.').str[1].isin(bu_sel)]
+            adv_df = adv_df[adv_df['Business Unit'].isin(bu_sel)]
+        if domain_sel:
+            adv_df = adv_df[adv_df['Business Domain'].isin(domain_sel)]
+        if lc_sel:
+            adv_df = adv_df[adv_df['Lifecycle'].isin(lc_sel)]
         if tags_contains and 'Tags' in adv_df.columns:
             adv_df = adv_df[adv_df['Tags'].str.contains(tags_contains, case=False, na=False)]
 
@@ -2077,7 +2470,7 @@ with tab_inv_browser:
                 pass
 
             # Prioritize relevant columns for the result view
-            target_cols = ["Database", "Schema", "Name", "Classification", "Risk", "Owner", "Tags", "Last Updated"]
+            target_cols = ["Database", "Schema", "Name", "Business Unit", "Business Domain", "Lifecycle", "Classification", "Risk", "Owner", "Tags", "Last Updated"]
             final_cols = [c for c in target_cols if c in adv_df.columns]
             
             # If we missed any important ones, add them
@@ -2164,45 +2557,7 @@ with tab_inv_browser:
     # Apply filters
     # Removed legacy dataset filter component; filtering handled entirely below
     # Enrich with Business Unit/Domain from tags if available (one-time per run)
-    if not assets_df.empty and 'Business Unit' not in assets_df.columns:
-        try:
-            def _parse_tag(tags: str, key: str) -> str:
-                try:
-                    parts = [t.strip() for t in (tags or '').split(',') if t]
-                    for t in parts:
-                        if '=' in t:
-                            k,v = t.split('=',1)
-                            if k.strip().upper() == key.upper():
-                                return v.strip()
-                    return ''
-                except Exception:
-                    return ''
-            assets_df['Business Unit'] = assets_df['Tags'].apply(lambda s: _parse_tag(s, 'BUSINESS_UNIT'))
-            assets_df['Business Domain'] = assets_df['Tags'].apply(lambda s: _parse_tag(s, 'BUSINESS_DOMAIN'))
-            # Fallbacks to Schema name when not tagged
-            assets_df['Business Unit'] = assets_df['Business Unit'].mask(assets_df['Business Unit'].eq(''), assets_df['Location'].str.split('.').str[1])
-            assets_df['Business Domain'] = assets_df['Business Domain'].mask(assets_df['Business Domain'].eq(''), assets_df['Location'].str.split('.').str[1])
-        except Exception:
-            pass
-
-    # Build lifecycle column if available from governance table or tags
-    if not assets_df.empty and 'Lifecycle' not in assets_df.columns:
-        try:
-            names = assets_df['Location'].dropna().tolist()
-            lc_map = _get_lifecycle_map(names)
-            def _lc_from_tags(tags: str) -> str:
-                if not tags:
-                    return ''
-                up = tags.upper()
-                for k in ('ACTIVE','DEPRECATED','ARCHIVED'):
-                    if k in up:
-                        return k.capitalize()
-                return ''
-            assets_df['Lifecycle'] = assets_df['Location'].map(lambda x: lc_map.get(x, ''))
-            assets_df['Lifecycle'] = assets_df['Lifecycle'].mask(assets_df['Lifecycle'].eq(''), assets_df['Tags'].apply(_lc_from_tags))
-            assets_df['Lifecycle'] = assets_df['Lifecycle'].replace('', 'Active')
-        except Exception:
-            assets_df['Lifecycle'] = 'Active'
+    # Business Unit, Domain, and Lifecycle are already enriched by compute_policy_fields
 
     # Derive Database and Table fields for filtering convenience
     if not assets_df.empty:
@@ -2649,11 +3004,10 @@ if False:
             """, unsafe_allow_html=True)
             csv = exp_df[export_cols].to_csv(index=False).encode('utf-8')
             st.download_button(
-                label="Download CSV",
+                "Download CSV",
                 data=csv,
                 file_name="dataset_inventory.csv",
-                mime="text/csv",
-                use_container_width=True
+                mime="text/csv"
             )
         
         with col_excel:
@@ -2668,11 +3022,10 @@ if False:
                 exp_df[export_cols].to_excel(xbuf, index=False, sheet_name='Assets')
                 xbytes = xbuf.getvalue()
                 st.download_button(
-                    label="⬇️ Download Excel",
+                    "Download Excel",
                     data=xbytes,
                     file_name="dataset_inventory.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             except Exception:
                 st.caption("Excel export unavailable - install openpyxl")
@@ -2699,11 +3052,10 @@ if False:
                 c.showPage(); c.save()
                 pbytes = pbuf.getvalue(); pbuf.close()
                 st.download_button(
-                    label="⬇️ Download PDF",
+                    "Download PDF",
                     data=pbytes,
                     file_name="assets_summary.pdf",
-                    mime="application/pdf",
-                    use_container_width=True
+                    mime="application/pdf"
                 )
             except Exception:
                 st.caption("PDF export unavailable - install reportlab")

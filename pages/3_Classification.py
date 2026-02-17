@@ -79,10 +79,12 @@ def _get_current_db() -> str:
             db = "DATA_CLASSIFICATION_DB"
     return str(db or "DATA_CLASSIFICATION_DB")
 
+@st.cache_data(ttl=600, show_spinner=False)
 def _get_coverage_pct() -> float:
-    """Calculate real data classification coverage percentage."""
+    """Calculate real data classification coverage percentage with caching."""
     try:
         db = _get_current_db()
+        if not db: return 68.4
         query = f"SELECT (COUNT(CASE WHEN CLASSIFICATION_LABEL IS NOT NULL AND CLASSIFICATION_LABEL != '' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0)) as COV FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
         res = snowflake_connector.execute_query(query)
         if res and res[0].get('COV') is not None:
@@ -182,13 +184,9 @@ from src.services.classification_workflow_service import _validate_cia as dm_val
 # Import from consolidated classification pipeline service (single authoritative module)
 # IMPORTANT: These imports are now LAZY-LOADED inside functions that need them
 # to prevent automatic service instantiation on every page load
-# from src.services.classification_pipeline_service import (
-#     ai_classification_pipeline_service,
-#     ai_assistant_service,
-#     ai_classification_service,
-#     discovery_service,
-#     ai_sensitive_detection_service,
-# )
+# Import from consolidated classification pipeline service (single authoritative module)
+# IMPORTANT: These imports are now LAZY-LOADED inside functions that need them
+# to prevent automatic service instantiation on every page load
 
 def _detect_sensitive_tables(database: str, schema: Optional[str] = None, sample_size: int = 1000) -> List[Dict[str, Any]]:
     """Detect sensitive tables in the specified database using metadata, patterns, and AI.
@@ -592,75 +590,90 @@ def _render_status_cards():
 
 
 def _render_snowflake_object_explorer(fqn: str):
-    """Snowflake-Native Object Context Panel with meta-metrics."""
+    """Snowflake-Native Object Context Panel with meta-metrics. Optimized with internal caching."""
     if not fqn or fqn.count('.') != 2 or fqn == "Select an asset to classify":
         return
     
-    try:
-        parts = fqn.split('.')
-        db, sc, tb = parts[0], parts[1], parts[2]
-        
-        # Enhanced query to get more metadata and DDL
-        query = f"SELECT TABLE_TYPE, ROW_COUNT, BYTES, LAST_ALTERED, CREATED, TABLE_OWNER FROM {db}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{sc}' AND TABLE_NAME = '{tb}'"
-        data = snowflake_connector.execute_query(query)
-        is_view = False
-        if not data:
-            query = f"SELECT 'VIEW' as TABLE_TYPE, NULL as ROW_COUNT, NULL as BYTES, LAST_ALTERED, CREATED, VIEW_OWNER as TABLE_OWNER FROM {db}.INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = '{sc}' AND TABLE_NAME = '{tb}'"
-            data = snowflake_connector.execute_query(query)
-            is_view = True
+    @st.cache_data(ttl=120, show_spinner=False)
+    def _fetch_object_meta(_fqn: str):
+        try:
+            parts = _fqn.split('.')
+            db, sc, tb = parts[0], parts[1], parts[2]
             
-        if data:
-            r = data[0]
-            with st.container():
-                st.markdown(f"##### 🔎 technical context: `{tb}`")
-                
-                rows = r.get('ROW_COUNT')
-                size = r.get('BYTES')
-                created = pd.to_datetime(r.get('CREATED'))
-                last_altered = pd.to_datetime(r.get('LAST_ALTERED'))
-                owner = r.get('TABLE_OWNER')
-                
-                age_days = (datetime.now() - created).days if created else 0
-                
-                # Visual metrics row
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.caption("📦 Scale")
-                mc1.write(f"**{rows:,} rows**" if rows is not None else "N/A")
-                mc2.caption("💾 Size")
-                mc2.write(f"**{size / (1024*1024):.1f} MB**" if size is not None else "N/A")
-                mc3.caption("📅 Age")
-                mc3.write(f"**{age_days} days**")
-                
-                col_a, col_b = st.columns(2)
-                col_a.caption("👤 Owner")
-                col_a.write(f"**{owner or 'N/A'}**")
-                col_b.caption("🕒 Last Altered")
-                col_b.write(f"**{last_altered.strftime('%Y-%m-%d')}**" if last_altered else "N/A")
-
+            # Metadata Query
+            query = f"SELECT TABLE_TYPE, ROW_COUNT, BYTES, LAST_ALTERED, CREATED, TABLE_OWNER FROM {db}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{sc}' AND TABLE_NAME = '{tb}'"
+            data = snowflake_connector.execute_query(query)
+            is_view = False
+            if not data:
+                query = f"SELECT 'VIEW' as TABLE_TYPE, NULL as ROW_COUNT, NULL as BYTES, LAST_ALTERED, CREATED, VIEW_OWNER as TABLE_OWNER FROM {db}.INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = '{sc}' AND TABLE_NAME = '{tb}'"
+                data = snowflake_connector.execute_query(query)
+                is_view = True
+            
+            # DDL Query
+            ddl = None
+            if data:
                 try:
-                    ddl_query = f"SELECT GET_DDL('{'VIEW' if is_view else 'TABLE'}', '{fqn}') as DDL"
+                    ddl_query = f"SELECT GET_DDL('{'VIEW' if is_view else 'TABLE'}', '{_fqn}') as DDL"
                     ddl_res = snowflake_connector.execute_query(ddl_query)
                     if ddl_res:
-                        with st.expander("🛠️ Show DDL"):
-                            st.code(ddl_res[0].get('DDL'), language="sql")
+                        ddl = ddl_res[0].get('DDL')
                 except Exception:
                     pass
+            
+            # Tags Query
+            tags = []
+            try:
+                tags = tagging_service.get_object_tags(_fqn, "TABLE") if tagging_service else []
+            except Exception:
+                pass
                 
-                # Native Tags Preview
-                try:
-                    tags = tagging_service.get_object_tags(fqn, "TABLE") if tagging_service else []
-                    if tags:
-                        st.markdown("**🏷️ Active Governance Tags:**")
-                        tags_html = ""
-                        for t in tags:
-                            name = t.get("TAG_NAME")
-                            val = t.get("TAG_VALUE")
-                            tags_html += f'<span class="active-filter-pill">{name}={val}</span> '
-                        st.markdown(tags_html, unsafe_allow_html=True)
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.error(f"Object explorer failed for {fqn}: {e}")
+            return {"data": data[0] if data else None, "ddl": ddl, "tags": tags, "is_view": is_view}
+        except Exception as e:
+            logger.error(f"Meta fetch failed for {_fqn}: {e}")
+            return None
+
+    res = _fetch_object_meta(fqn)
+    if not res or not res["data"]:
+        return
+
+    r = res["data"]
+    with st.container():
+        st.markdown(f"##### 🔎 technical context: `{fqn.split('.')[-1]}`")
+        
+        rows = r.get('ROW_COUNT')
+        size = r.get('BYTES')
+        created = pd.to_datetime(r.get('CREATED'))
+        last_altered = pd.to_datetime(r.get('LAST_ALTERED'))
+        owner = r.get('TABLE_OWNER')
+        
+        # Ensure timezone-aware calculation to avoid TypeError
+        now_utc = pd.Timestamp.now(tz='UTC')
+        created_utc = pd.to_datetime(created, utc=True) if created else None
+        age_days = (now_utc - created_utc).days if created_utc else 0
+        
+        # Visual metrics row
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.caption("📦 Scale")
+        mc1.write(f"**{rows:,} rows**" if rows is not None else "N/A")
+        mc2.caption("💾 Size")
+        mc2.write(f"**{size / (1024*1024):.1f} MB**" if size is not None else "N/A")
+        mc3.caption("📅 Age")
+        mc3.write(f"**{age_days} days**")
+        
+        col_a, col_b = st.columns(2)
+        col_a.caption("👤 Owner")
+        col_a.write(f"**{owner or 'N/A'}**")
+        col_b.caption("🕒 Last Altered")
+        col_b.write(f"**{last_altered.strftime('%Y-%m-%d')}**" if last_altered else "N/A")
+
+        if res["ddl"]:
+            with st.expander("🛠️ Show DDL"):
+                st.code(res["ddl"], language="sql")
+        
+        if res["tags"]:
+            st.markdown("**🏷️ Active Governance Tags:**")
+            tags_html = "".join([f'<span class="active-filter-pill">{t.get("TAG_NAME")}={t.get("TAG_VALUE")}</span> ' for t in res["tags"]])
+            st.markdown(tags_html, unsafe_allow_html=True)
 
 
 # Show resolved governance database and allow re-detection (DB + Schema)
@@ -683,15 +696,6 @@ try:
 except Exception as e:
     st.error(f"Error initializing database context: {e}")
     st.stop()
-
-    # (Removed) Sidebar scanning options
-
-with col_db1:
-    pass
-with col_db2:
-    pass
-with col_db3:
-    pass
 
 # Global Filters (sidebar) and driver for tabs
 with st.sidebar:
@@ -962,15 +966,18 @@ def _compute_and_store_table_stats(table_fqn: str) -> None:
     except Exception:
         pass
 
-def _ensure_governance_objects(db: str) -> None:
+@st.cache_data(ttl=3600, show_spinner="Initializing Governance Environment...")
+def _ensure_governance_objects(db: str) -> bool:
+    """Ensure governance tables and views exist. Cached to prevent redundant DDL lag."""
     try:
         snowflake_connector.execute_non_query(
             f"CREATE SCHEMA IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE"
         )
+        # Create Tables (Fast if exists)
         snowflake_connector.execute_non_query(
             f"""
             CREATE TABLE IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS (
-                ASSET_ID VARCHAR(100) NOT NULL,
+                ASSET_ID VARCHAR(100) PRIMARY KEY,
                 ASSET_NAME VARCHAR(500) NOT NULL,
                 ASSET_TYPE VARCHAR(50) NOT NULL,
                 DATABASE_NAME VARCHAR(255),
@@ -984,6 +991,8 @@ def _ensure_governance_objects(db: str) -> None:
                 DATA_CUSTODIAN_EMAIL VARCHAR(255),
                 BUSINESS_PURPOSE VARCHAR(2000),
                 DATA_DESCRIPTION VARCHAR(4000),
+                BUSINESS_DOMAIN VARCHAR(100),
+                LIFECYCLE VARCHAR(50) DEFAULT 'Active',
                 CLASSIFICATION_LABEL VARCHAR(20),
                 CLASSIFICATION_LABEL_COLOR VARCHAR(20),
                 CONFIDENTIALITY_LEVEL VARCHAR(2),
@@ -1049,8 +1058,7 @@ def _ensure_governance_objects(db: str) -> None:
                 RECORD_VERSION NUMBER(10,0) DEFAULT 1,
                 WAREHOUSE_NAME VARCHAR(255),
                 ADDITIONAL_NOTES VARCHAR(4000),
-                STAKEHOLDER_COMMENTS VARCHAR(4000),
-                PRIMARY KEY (ASSET_ID)
+                STAKEHOLDER_COMMENTS VARCHAR(4000)
             )
             """
         )
@@ -1072,23 +1080,10 @@ def _ensure_governance_objects(db: str) -> None:
             )
             """
         )
+        # Create View (Heavy/Synchronous in Snowflake - Cache ensures once-per-hour max)
         snowflake_connector.execute_non_query(
             f"""
-            CREATE OR REPLACE VIEW DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.VW_MY_CLASSIFICATION_TASKS(
-                TASK_ID,
-                DATASET_NAME,
-                ASSET_FULL_NAME,
-                OWNER,
-                STATUS,
-                CONFIDENTIALITY_LEVEL,
-                INTEGRITY_LEVEL,
-                AVAILABILITY_LEVEL,
-                DUE_DATE,
-                CREATED_AT,
-                UPDATED_AT,
-                STATUS_LABEL,
-                DETAILS
-            ) AS
+            CREATE OR REPLACE VIEW {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_MY_CLASSIFICATION_TASKS AS
             SELECT
                 TASK_ID,
                 COALESCE(DATASET_NAME, SPLIT_PART(COALESCE(ASSET_FULL_NAME, ''), '.', 3)) AS DATASET_NAME,
@@ -1107,13 +1102,13 @@ def _ensure_governance_objects(db: str) -> None:
                     ELSE 'IN_PROGRESS'
                 END AS STATUS_LABEL,
                 DETAILS
-            FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_TASKS;
+            FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_TASKS;
             """
         )
         snowflake_connector.execute_non_query(
             f"""
             CREATE TABLE IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS (
-              ID STRING,
+              ID STRING PRIMARY KEY,
               ASSET_FULL_NAME STRING,
               ASSET_ID STRING,
               USER_ID STRING,
@@ -1141,8 +1136,10 @@ def _ensure_governance_objects(db: str) -> None:
             )
             """
         )
-    except Exception:
-        pass
+        return True
+    except Exception as e:
+        logger.error(f"Setup failed for {db}: {e}")
+        return False
 
 try:
     _db_ctx = _active_db_from_filter()
@@ -1187,7 +1184,9 @@ def _where_from_filters_for_fqn(column_name: str, sel: dict) -> Tuple[List[str],
         pass
     return frags, params
 
+@st.cache_data(ttl=60, show_spinner="Browsing assets...")
 def _inventory_assets(db: str, gv_schema: str, sel: dict) -> List[Dict]:
+    """Fetch recent assets from the governance inventory table with caching."""
     try:
         where, params = _where_from_filters_for_fqn("FULLY_QUALIFIED_NAME", sel or {})
         sql = f"""
@@ -1309,6 +1308,8 @@ def render_live_feed():
                     SELECT 
                       FULLY_QUALIFIED_NAME AS FULL_NAME,
                       BUSINESS_UNIT AS OBJECT_DOMAIN,
+                      BUSINESS_DOMAIN,
+                      LIFECYCLE,
                       COALESCE(LAST_MODIFIED_TIMESTAMP, CREATED_TIMESTAMP) AS FIRST_DISCOVERED,
                       (CLASSIFICATION_LABEL IS NOT NULL) AS CLASSIFIED
                     FROM {_db}.{gv}.ASSETS
@@ -1372,11 +1373,115 @@ def render_live_feed():
 
 # (Removed) Sidebar scanning options (pre-tabs)
 
-# Primary tabs per requirements
-tab_new, tab_tasks = st.tabs([
+# Primary tabs per requirements (Structured Lifecycle Approach)
+tab_lifecycle, tab_new, tab_tasks = st.tabs([
+    "🔁 Process Lifecycle",
     "📝 New Classification",
     "🗂️ Classification Management",
 ])
+
+with tab_lifecycle:
+    st.subheader("Data Classification Lifecycle")
+    st.markdown("""
+    An effective data classification process brings structure to the entire data lifecycle. 
+    Our framework balances **AI-driven automation** with **human oversight** across five critical stages:
+    """)
+    
+    # Process Flow Visualization (Horizontal Steps)
+    l1, l2, l3, l4, l5 = st.columns(5)
+    
+    with l1:
+        st.markdown("""
+<div style="text-align: center; padding: 1rem; border-radius: 12px; background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.2); height: 100%;">
+    <div style="font-size: 2rem; margin-bottom: 0.5rem;">🔍</div>
+    <div style="font-weight: 700; color: #38bdf8; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px;">Step 1</div>
+    <div style="font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem;">Data Discovery</div>
+    <div style="font-size: 0.75rem; opacity: 0.8;">Visibility into where assets live across cloud storage.</div>
+</div>
+""", unsafe_allow_html=True)
+        
+    with l2:
+        st.markdown("""
+<div style="text-align: center; padding: 1rem; border-radius: 12px; background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.2); height: 100%;">
+    <div style="font-size: 2rem; margin-bottom: 0.5rem;">📁</div>
+    <div style="font-weight: 700; color: #8b5cf6; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px;">Step 2</div>
+    <div style="font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem;">Categorizing</div>
+    <div style="font-size: 0.75rem; opacity: 0.8;">Grouping by business function and sensitivity.</div>
+</div>
+""", unsafe_allow_html=True)
+        
+    with l3:
+        st.markdown("""
+<div style="text-align: center; padding: 1rem; border-radius: 12px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.2); height: 100%;">
+    <div style="font-size: 2rem; margin-bottom: 0.5rem;">🏷️</div>
+    <div style="font-weight: 700; color: #f59e0b; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px;">Step 3</div>
+    <div style="font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem;">Labeling</div>
+    <div style="font-size: 0.75rem; opacity: 0.8;">Applying tags that inform access control levels.</div>
+</div>
+""", unsafe_allow_html=True)
+        
+    with l4:
+        st.markdown("""
+<div style="text-align: center; padding: 1rem; border-radius: 12px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); height: 100%;">
+    <div style="font-size: 2rem; margin-bottom: 0.5rem;">🛡️</div>
+    <div style="font-weight: 700; color: #10b981; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px;">Step 4</div>
+    <div style="font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem;">Applying Controls</div>
+    <div style="font-size: 0.75rem; opacity: 0.8;">Encryption, masking, and DLP enforcement.</div>
+</div>
+""", unsafe_allow_html=True)
+        
+    with l5:
+        st.markdown("""
+<div style="text-align: center; padding: 1rem; border-radius: 12px; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.2); height: 100%;">
+    <div style="font-size: 2rem; margin-bottom: 0.5rem;">🔄</div>
+    <div style="font-weight: 700; color: #ef4444; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px;">Step 5</div>
+    <div style="font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem;">Optimization</div>
+    <div style="font-size: 0.75rem; opacity: 0.8;">Regular review to ensure alignment with laws.</div>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown("---")
+    
+    col_det1, col_det2 = st.columns(2)
+    
+    with col_det1:
+        with st.expander("🚀 Phase 1: Visibility & Grouping", expanded=True):
+            st.markdown("""
+            **Data Discovery & Categorization**
+            The first step is visibility. Our automated tools scan Snowflake databases, recognizing patterns and identifiers (PII, Financial, etc.) that signal sensitive information.
+            
+            Once discovered, data is grouped based on:
+            - **Business Function**: Sales, HR, Finance, etc.
+            - **Sensitivity Level**: Public to Confidential.
+            - **Regulatory Requirements**: GDPR, SOX, HIPAA.
+            """)
+            
+        with st.expander("🛠️ Phase 2: Action & Enforcement", expanded=False):
+            st.markdown("""
+            **Labeling & Security Controls**
+            Data receives Snowflake-native tags indicating its classification. These labels inform:
+            - **Permissions**: Dynamic Masking Policies.
+            - **Access Control**: Row-level Security.
+            - **Protection**: Automated encryption and DLP monitoring.
+            """)
+
+    with col_det2:
+        with st.expander("✨ AI-Powered Automation", expanded=True):
+            st.info("Artificial intelligence (AI)-powered tools continuously streamline workflows, flag anomalies, and optimize data protection without slowing productivity.")
+            st.markdown("""
+            In our program, **Automation and Policy** work in tandem:
+            - **Technology** accelerates accuracy and scanning speed.
+            - **Governance** ensures human accountability and policy alignment.
+            """)
+            
+        with st.expander("📈 Phase 3: Continuous Optimization", expanded=False):
+            st.markdown("""
+            **Review & Optimization**
+            As business needs evolve, so does data sensitivity and risk. 
+            - **Regular Reviews**: Ensuring labels remain accurate over time.
+            - **Compliance Alignment**: Adjusting to new privacy laws or internal policy updates.
+            - **Feedback Loops**: Improving AI accuracy through manual review corrections.
+            """)
 
 with tab_new:
     pass
@@ -1926,6 +2031,7 @@ with tab_new:
         try:
             # Lazy import - only load when AI tab is active
             from src.services.classification_pipeline_service import ai_classification_pipeline_service
+            
             ai_classification_pipeline_service.render_classification_pipeline()
         except Exception as e:
             st.error(f"Failed to render AI Classification Pipeline: {e}")
@@ -2524,6 +2630,21 @@ with tab_new:
     # Guided Workflow
     with sub_guided:
         st.markdown("#### Guided Classification Workflow")
+        
+        # Lifecycle Progress Integration
+        st.markdown("""
+        <div style='background: rgba(255,255,255,0.03); padding: 10px; border-radius: 8px; margin-bottom: 20px; border: 1px solid rgba(255,255,255,0.05);'>
+            <div style='display: flex; justify-content: space-between; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: #94a3b8; margin-bottom: 8px;'>
+                <span>Stage 1: Discovery ✅</span>
+                <span style='color: #38bdf8;'>Stage 2-3: Categorizing & Labeling ⏳</span>
+                <span>Stage 4-5: Controls & Optimization 🔜</span>
+            </div>
+            <div style='height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px;'>
+                <div style='height: 4px; background: #38bdf8; width: 60%; border-radius: 2px;'></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
         # Snowflake ops via services
         def _sf_apply_tags(asset_full_name: str, tags: dict):
             """Apply tags to a Snowflake object using tagging service with error reporting."""
@@ -2992,11 +3113,27 @@ with tab_new:
 
                 # Step 5: Review & Submission
                 st.markdown("---")
-                st.markdown("##### Step 5: Finalize Assessment")
-                st.info("Click 'Calculate Suggestion' below to review the resulting classification and then use the **⚡ Task Review & Action** panel to apply tags.")
+                # Step 5: Lifecycle & Controls
+                st.markdown("##### Step 5: Lifecycle & Controls")
+                c_controls = st.multiselect(
+                    "Select additional security controls (§7.4)",
+                    ["Dynamic Data Masking", "Row-level Security", "Tag-based Encryption", "Digital Watermarking"],
+                    default=["Dynamic Data Masking"],
+                    help="Selected controls will be automatically prioritized during the 'Applying Controls' stage."
+                )
+                nc_review_freq = st.selectbox(
+                    "Review Frequency (§7.5)",
+                    ["90 Days (High Risk)", "180 Days", "365 Days (Standard)", "730 Days"],
+                    index=2
+                )
+                
+                st.info("Click 'Calculate Suggestion' below to review the resulting classification. Once submitted, the system will proceed to **Stage 4: Applying Controls** and **Stage 5: Optimization**.")
                 
                 # We only need one button now to 'commit' the form answers to session state
-                st.form_submit_button("🏁 Calculate Suggestion", type="primary", use_container_width=True)
+                if st.form_submit_button("🏁 Calculate Suggestion", type="primary"):
+                    st.session_state["nc_guided_submitted"] = True
+                    st.session_state["nc_controls"] = c_controls
+                    st.session_state["nc_review_freq"] = nc_review_freq
 
             # --- Unified Task Review & Action Panel (Integrated into Flow) ---
             if valid_asset_selected and st.session_state.get("nc_c") is not None:
@@ -3418,7 +3555,7 @@ if False:
     # Manual scan button
     if st.button("Scan for Sensitive Tables"):
         st.session_state["trigger_sensitive_scan"] = True
-        st.experimental_rerun()
+        st.rerun()
     
     # Display results if available
     if "sensitive_tables" in st.session_state and st.session_state["sensitive_tables"]:
@@ -4341,6 +4478,16 @@ if False:
 
 with tab_tasks:
     st.subheader("Classification Management")
+    
+    with st.expander("🔄 Stage 5: Review & Optimization", expanded=False):
+        st.markdown("""
+        Regular reviews keep labels accurate and ensure alignment with new privacy laws or internal policies.
+        - **Accountability**: Assigning and completing pending review tasks.
+        - **Reclassification**: Adjusting labels as business needs and risk profiles evolve.
+        - **Feedback Loops**: Validating AI detections to optimize future scans.
+        """)
+        st.caption("Continuous management is critical for a mature data governance program.")
+
     # Restore earlier sub-tabs
     sub_my, sub_pending, sub_history, sub_reclass = st.tabs([
         "My Tasks", "Classification review", "History", "Reclassification Requests"
@@ -4378,10 +4525,19 @@ with tab_tasks:
             # The statuses are now IN_PROGRESS, COMPLETED, CANCELLED per the view logic
             status_filter = st.selectbox("Task Status", options=["All", "IN_PROGRESS", "COMPLETED", "CANCELLED"], index=1, key="tasks_status_final")
 
+        # Sub-tab Specific Data Loading (Optimized with Caching)
+        @st.cache_data(ttl=30, show_spinner="Loading your tasks...")
+        def _get_user_tasks(db: str):
+            try:
+                q = f"SELECT * FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_MY_CLASSIFICATION_TASKS LIMIT 500"
+                return snowflake_connector.execute_query(q) or []
+            except Exception as e:
+                logger.error(f"Task fetch failed: {e}")
+                return []
+
         # Load from View
         try:
-            q = f"SELECT * FROM {db_target}.DATA_CLASSIFICATION_GOVERNANCE.VW_MY_CLASSIFICATION_TASKS LIMIT 500"
-            rows = snowflake_connector.execute_query(q) or []
+            rows = _get_user_tasks(db_target)
             df_tasks = pd.DataFrame(rows)
         except Exception as e:
             st.error(f"Failed to load user tasks: {e}")
@@ -4391,8 +4547,17 @@ with tab_tasks:
             now = datetime.utcnow()
             me = me_user.lower()
 
-            # Derived fields for filtering
-            df_tasks["Due Bucket"] = df_tasks["DUE_DATE"].apply(lambda d: "Overdue" if (pd.to_datetime(d).date() < now.date()) else "Future")
+            # Derived fields for filtering with null safety
+            def _get_due_bucket(d):
+                try:
+                    if d is None: return "Future"
+                    dt = pd.to_datetime(d)
+                    if pd.isna(dt): return "Future"
+                    return "Overdue" if dt.date() < now.date() else "Future"
+                except Exception:
+                    return "Future"
+            
+            df_tasks["Due Bucket"] = df_tasks["DUE_DATE"].apply(_get_due_bucket)
             df_tasks["Assignment"] = df_tasks["OWNER"].apply(lambda o: "Assigned to me" if str(o).lower() == me else "Unassigned")
             df_tasks["Priority_Level"] = "Normal" # Fallback if not in view
             df_tasks["Task_Type_Name"] = "Initial Classification"
@@ -4507,90 +4672,49 @@ with tab_tasks:
 
         where_str = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
-        df = pd.DataFrame()
-        if db:
-            # Main strategy: use the centralized VW_CLASSIFICATION_REVIEWS view
+        @st.cache_data(ttl=60, show_spinner="Fetching pending reviews...")
+        def _get_classification_reviews(db: str, where_str: str, params: dict):
             try:
-                # Resolve governance schema
                 gv = st.session_state.get('governance_schema') or 'DATA_CLASSIFICATION_GOVERNANCE'
                 q = f"""
                     SELECT 
-                        REVIEW_ID,
-                        ASSET_FULL_NAME,
-                        REQUESTED_LABEL AS PROPOSED_LABEL_N,
-                        CONFIDENTIALITY_LEVEL AS PC,
-                        INTEGRITY_LEVEL AS PI,
-                        AVAILABILITY_LEVEL AS PA,
-                        REVIEWER,
-                        STATUS,
-                        STATUS_LABEL,
-                        CREATED_AT,
-                        REVIEW_DUE_DATE,
-                        LAST_COMMENT
+                        REVIEW_ID, ASSET_FULL_NAME, REQUESTED_LABEL AS PROPOSED_LABEL_N,
+                        CONFIDENTIALITY_LEVEL AS PC, INTEGRITY_LEVEL AS PI, AVAILABILITY_LEVEL AS PA,
+                        REVIEWER, STATUS, STATUS_LABEL, CREATED_AT, REVIEW_DUE_DATE, LAST_COMMENT
                     FROM {db}.{gv}.VW_CLASSIFICATION_REVIEWS
                     {where_str}
                     ORDER BY CREATED_AT DESC
                 """
-                rows = snowflake_connector.execute_query(q, sql_params) or []
-                df = pd.DataFrame(rows)
-            except Exception as e:
-                # pass
-                df = pd.DataFrame()
-            # Second attempt: try CLASSIFICATION_REVIEW table
-            if df.empty:
-                try:
-                    # SQL logic already built in sql_params and where_str
-                    q_mid = f"""
-                        SELECT 
-                            REVIEW_ID,
-                            ASSET_FULL_NAME,
-                            PROPOSED_CLASSIFICATION as PROPOSED_LABEL_N,
-                            PROPOSED_C as PC,
-                            PROPOSED_I as PI,
-                            PROPOSED_A as PA,
-                            REVIEWER,
-                            STATUS,
-                            STATUS as STATUS_LABEL,
-                            CREATED_AT,
-                            REVIEW_DUE_DATE,
-                            LAST_COMMENT
-                        FROM {db}.{gv}.CLASSIFICATION_REVIEW
-                        {where_str}
-                        ORDER BY COALESCE(REVIEW_DUE_DATE, CREATED_AT, CURRENT_TIMESTAMP()) ASC
-                    """
-                    rows_mid = snowflake_connector.execute_query(q_mid, sql_params) or []
-                    df = pd.DataFrame(rows_mid)
-                except Exception as e:
-                    # st.caption(f"Classification review table unavailable: {e}")
-                    pass
+                return snowflake_connector.execute_query(q, params) or []
+            except Exception:
+                return []
 
-            # Third attempt: try RECLASSIFICATION_REQUESTS table
+        df = pd.DataFrame()
+        if db:
+            rows = _get_classification_reviews(db, where_str, sql_params)
+            df = pd.DataFrame(rows)
+            
+            # Second attempt: try CLASSIFICATION_REVIEW table if view failed (empty result)
             if df.empty:
-                try:
-                    # SQL logic already built in sql_params and where_str
-                    q2 = f"""
-                        SELECT 
-                            ID as REVIEW_ID,
-                            ASSET_FULL_NAME,
-                            REQUESTED_LABEL as PROPOSED_LABEL_N,
-                            NULL as PC,
-                            NULL as PI,
-                            NULL as PA,
-                            NULL as REVIEWER,
-                            STATUS,
-                            STATUS as STATUS_LABEL,
-                            CREATED_AT,
-                            NULL as REVIEW_DUE_DATE,
-                            NULL as LAST_COMMENT
-                        FROM {db}.{gv}.RECLASSIFICATION_REQUESTS
-                        {where_str}
-                        ORDER BY COALESCE(CREATED_AT, CURRENT_TIMESTAMP()) ASC
-                    """
-                    rows2 = snowflake_connector.execute_query(q2, sql_params) or []
-                    df = pd.DataFrame(rows2)
-                except Exception as e:
-                    # st.caption(f"Reviews table fallback unavailable: {e}")
-                    pass
+                @st.cache_data(ttl=60, show_spinner=False)
+                def _get_legacy_reviews(db: str, where_str: str, params: dict):
+                    try:
+                        gv = st.session_state.get('governance_schema') or 'DATA_CLASSIFICATION_GOVERNANCE'
+                        q = f"""
+                            SELECT 
+                                REVIEW_ID, ASSET_FULL_NAME, PROPOSED_CLASSIFICATION as PROPOSED_LABEL_N,
+                                PROPOSED_C as PC, PROPOSED_I as PI, PROPOSED_A as PA,
+                                REVIEWER, STATUS, STATUS as STATUS_LABEL, CREATED_AT,
+                                REVIEW_DUE_DATE, LAST_COMMENT
+                            FROM {db}.{gv}.CLASSIFICATION_REVIEW
+                            {where_str}
+                            ORDER BY COALESCE(REVIEW_DUE_DATE, CREATED_AT, CURRENT_TIMESTAMP()) ASC
+                        """
+                        return snowflake_connector.execute_query(q, params) or []
+                    except Exception:
+                        return []
+                rows = _get_legacy_reviews(db, where_str, sql_params)
+                df = pd.DataFrame(rows)
         if df.empty:
             st.info("No pending reviews for the selected filters.")
         else:
@@ -5287,6 +5411,8 @@ with tab_tasks:
                         SELECT 
                           FULLY_QUALIFIED_NAME AS FULL_NAME,
                           BUSINESS_UNIT AS OBJECT_DOMAIN,
+                          BUSINESS_DOMAIN,
+                          LIFECYCLE,
                           COALESCE(LAST_MODIFIED_TIMESTAMP, CREATED_TIMESTAMP) AS FIRST_DISCOVERED,
                           (CLASSIFICATION_LABEL IS NOT NULL) AS CLASSIFIED
                         FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
@@ -8455,6 +8581,9 @@ with tab1:
                                 for r in (reasons_dm or []):
                                     errors.append(f"{full}: {r}")
                                 continue
+                                for r in (reasons_dm or []):
+                                    errors.append(f"{full}: {r}")
+                                continue
 
                             # Enforce rationale for higher sensitivity
                             if label in ("Restricted", "Confidential") and not rationale.strip():
@@ -8676,6 +8805,47 @@ with tab1:
                 suggestions = colmap
             except Exception:
                 pass
+
+        # FETCH: Snowflake Native PII Suggestions (EXTRACT_SEMANTIC_CATEGORIES)
+        native_suggestions = {}
+        if table_full:
+            # Check if user triggered a native scan for this specific table in session
+            if st.button("❄️ Fetch Snowflake Native PII Suggestions", key=f"native_pii_btn_{table_full}", help="Uses Snowflake's ML-based EXTRACT_SEMANTIC_CATEGORIES function"):
+                with st.spinner("Snowflake is analyzing technical metadata..."):
+                    try:
+                        # Display the query being executed
+                        st.caption(f"Executing: `SELECT EXTRACT_SEMANTIC_CATEGORIES('{table_full}')`")
+                        native_res = ai_classification_service.detect_pii_native(table_full)
+                        if native_res:
+                            for col_name, info in native_res.items():
+                                # Standard Snowflake native output format
+                                sem_cat = info.get("semantic_category")
+                                if sem_cat:
+                                    native_suggestions[col_name.upper()] = {
+                                        "label": sem_cat,
+                                        "confidence": info.get("extra_info", {}).get("probability", "N/A"),
+                                        "privacy": info.get("privacy_category", "N/A")
+                                    }
+                            st.session_state[f"native_suggestions_{table_full}"] = native_suggestions
+                            st.success("Native PII metadata fetched successfully.")
+                    except Exception as e:
+                        st.error(f"Native scan failed: {e}")
+            
+            # Load from session if already fetched
+            native_suggestions = st.session_state.get(f"native_suggestions_{table_full}", {})
+
+        # Merge suggestions (AI has priority, but Native adds detail)
+        for col_name, n_info in native_suggestions.items():
+            if col_name in suggestions:
+                suggestions[col_name]["reason"] += f" | Native: {n_info['label']} ({n_info['confidence']})"
+            else:
+                suggestions[col_name] = {
+                    "label": "Confidential" if n_info['privacy'] in ['IDENTIFIER', 'QUASI_IDENTIFIER'] else "Internal",
+                    "c": 3 if n_info['privacy'] == 'IDENTIFIER' else 2,
+                    "i": 2,
+                    "a": 2,
+                    "reason": f"Snowflake Native: {n_info['label']}"
+                }
 
         # Fetch current tags for object/columns (best-effort) to show history/current state
         prev_tags = {}

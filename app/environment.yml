@@ -1,0 +1,16 @@
+name: data_classification_app
+channels:
+  - snowflake
+dependencies:
+  - python=3.11
+  - streamlit
+  - snowflake-snowpark-python
+  - snowflake-connector-python
+  - pandas
+  - numpy
+  - pydantic
+  - requests
+  - plotly
+  - altair
+  - python-dateutil
+  - pytz

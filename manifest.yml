@@ -3,10 +3,120 @@ artifacts:
   setup_script: setup.sql
   default_streamlit:
     name: DATA_GOVERNANCE_APP
-    directory: .
+    directory: app
     main_file: streamlit_app.py
 
 # Define application roles
 application_roles:
   app_public:
-    description: Public role for the application
+    description: Public role for the application (standard users)
+  app_admin:
+    description: Administrative role with elevated governance permissions
+
+# Required packages for AI/ML operations (Snowflake-compatible)
+packages:
+  - streamlit == 1.35.0
+  - pandas == 2.1.0
+  - numpy == 1.25.0
+  - plotly == 5.17.0
+  - snowflake-connector-python == 3.6.0
+  - scikit-learn == 1.3.0
+  - pydantic == 2.5.0
+  - requests == 2.31.0
+  - python-dateutil == 2.8.2
+  - pytz == 2023.3
+  - altair == 5.2.0
+  - sentence-transformers == 2.2.2
+  - transformers == 4.35.2
+  - torch == 2.1.0
+  - cryptography == 41.0.0
+  - openpyxl == 3.1.2
+  - xlsxwriter == 3.1.9
+
+# Application permissions
+privileges:
+  # Required for metadata discovery and governance operations
+  account:
+    - CREATE DATABASE
+    - CREATE SCHEMA
+    - CREATE TABLE
+    - CREATE VIEW
+    - CREATE STREAMLIT
+    - CREATE WAREHOUSE
+    - CREATE STAGE
+    - CREATE FUNCTION
+    - CREATE MASKING POLICY
+    - CREATE ROW ACCESS POLICY
+    - CREATE TAG
+    - APPLY MASKING POLICY
+    - APPLY ROW ACCESS POLICY
+    - APPLY TAG
+    
+  # Required for reading user data and metadata
+  database:
+    - SELECT
+    - USAGE
+    - CREATE SCHEMA
+    - CREATE TABLE
+    - CREATE VIEW
+    - CREATE TAG
+    - APPLY TAG
+    
+  schema:
+    - SELECT
+    - USAGE
+    - CREATE TABLE
+    - CREATE VIEW
+    - CREATE TAG
+    - APPLY TAG
+    - MODIFY
+    
+  table:
+    - SELECT
+    - INSERT
+    - UPDATE
+    - DELETE
+    - CREATE TAG
+    - APPLY TAG
+    
+  view:
+    - SELECT
+    
+  warehouse:
+    - USAGE
+    - OPERATE
+    
+  stage:
+    - READ
+    - WRITE
+    - USAGE
+
+# Marketplace listing information
+marketplace:
+  category: "Data Governance & Security"
+  short_description: "AI-powered data classification and governance platform for Snowflake"
+  long_description: "
+    Comprehensive data governance solution that automates data classification, 
+    PII detection, and compliance monitoring using advanced AI/ML techniques.
+    Features bulk classification, intelligent discovery, and real-time compliance tracking.
+  "
+  tags:
+    - "AI/ML"
+    - "Data Classification"
+    - "Compliance"
+    - "PII Detection"
+    - "Data Governance"
+    - "Security"
+    - "Automation"
+    - "Privacy"
+  region_availability:
+    - "AWS US East 1 (N. Virginia)"
+    - "AWS US West 2 (Oregon)"
+    - "AWS Europe West 1 (Ireland)"
+    - "Azure East US 2"
+    - "Azure West Europe"
+    - "GCP US Central1"
+  pricing_model: "Per-user subscription"
+  support_level: "Enterprise"
+  documentation_url: "https://docs.yourcompany.com/data-governance-app"
+  contact_email: "support@yourcompany.com"

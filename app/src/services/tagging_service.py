@@ -551,42 +551,6 @@ class TaggingService:
             column_refs = []
         return object_refs + column_refs
 
-    def get_bulk_object_tags(self, full_names: List[str]) -> List[Dict]:
-        """Return tags for multiple objects and their columns in a single batch query."""
-        if not full_names:
-            return []
-        
-        # Group objects by database to handle potential account-wide scale efficiently
-        db_groups = {}
-        for fn in full_names:
-            try:
-                db = fn.split(".")[0]
-                db_groups.setdefault(db, []).append(fn)
-            except Exception:
-                continue
-                
-        results = []
-        for db, fns in db_groups.items():
-            # Process in chunks of 50 to avoid excessively long SQL strings or parameter limits
-            for i in range(0, len(fns), 50):
-                chunk = fns[i:i+50]
-                try:
-                    # Construct matching predicates for database, schema, and object name
-                    # Filter by DB first to narrow down ACCOUNT_USAGE scan if possible
-                    in_list = ", ".join([f"'{x}'" for x in chunk])
-                    rows = self.connector.execute_query(
-                        f"""
-                        SELECT OBJECT_DATABASE, OBJECT_SCHEMA, OBJECT_NAME, COLUMN_NAME, TAG_NAME, TAG_VALUE
-                        FROM "SNOWFLAKE"."ACCOUNT_USAGE"."TAG_REFERENCES"
-                        WHERE OBJECT_DATABASE = %(db)s
-                          AND (OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME) IN ({in_list})
-                        """,
-                        {"db": db}
-                    ) or []
-                    results.extend(rows)
-                except Exception as e:
-                    logger.warning(f"Bulk tag retrieval failed for DB {db}, chunk starting {i}: {e}")
-        return results
 
     def bulk_apply_classification(
         self,
@@ -647,160 +611,9 @@ class TaggingService:
             f"MODIFY COLUMN {self._q(column_name)} SET TAG {assignments}"
         )
 
-    def suggest_compliance_frameworks(
-        self,
-        asset_name: str = "",
-        detected_categories: Optional[List[str]] = None,
-        special_categories: Optional[List[str]] = None,
-    ) -> List[str]:
-        """Suggest relevant Compliance Framework tags based on:
-        - Detected AI column/table categories (e.g. 'PII', 'FINANCIAL', 'SOX', 'SOC')
-        - Explicitly chosen Special Categories (PII, PHI, PCI, SOX, Financial)
-        - Asset name heuristics (table/column name signals)
 
-        Returns a deduplicated, sorted list of suggested framework values that are
-        present in the allowed COMPLIANCE_FRAMEWORKS list.
-        """
-        allowed_fw = _load_allowed_values(self.connector, "COMPLIANCE_FRAMEWORKS")
-        if not allowed_fw:
-            allowed_fw = ["PII", "SOX", "SOC"]
 
-        suggestions: set = set()
 
-        # --- 1. Asset name heuristic patterns → frameworks ---
-        asset_up = str(asset_name or "").upper()
-        _name_rules: List[Tuple[List[str], str]] = [
-            (["PII", "SSN", "NATIONAL_ID", "PASSPORT", "EMAIL", "PHONE",
-               "ADDRESS", "DOB", "AADHAAR", "PAN", "PERSON", "EMPLOYEE",
-               "CUSTOMER", "BIOMETRIC", "FINGERPRINT", "DRIVER_LICENSE",
-               "VOTER_ID", "MILITARY_ID"], "PII"),
-            (["PHI", "HIPAA", "MEDICAL", "HEALTH", "PATIENT", "CLINICAL",
-               "DIAGNOSIS", "PRESCRIPTION"], "PII"),  # PHI → maps to PII fw
-            (["PCI", "CREDIT_CARD", "CARD_NUMBER", "CVV", "PAYMENT"], "PII"),  # PCI → PII
-            (["SOX", "FINANCIAL_REPORT", "GAAP", "IFRS", "AUDIT",
-               "GL", "LEDGER", "REVENUE", "EXPENSE", "PAYROLL",
-               "INCOME", "BALANCE_SHEET", "EARNINGS"], "SOX"),
-            (["SOC", "SOC2", "SOC1", "COMPLIANCE_CONTROL",
-               "SECURITY_AUDIT", "SYSTEM_CONTROL"], "SOC"),
-        ]
-        for keywords, framework in _name_rules:
-            if framework in allowed_fw and any(kw in asset_up for kw in keywords):
-                suggestions.add(framework)
-
-        # --- 2. AI-detected column categories → frameworks ---
-        cat_fw_map = {
-            "PII": "PII", "PERSONAL": "PII", "PII_STRICT": "PII",
-            "PHI": "PII", "HIPAA": "PII",
-            "PCI": "PII",
-            "SOX": "SOX", "FINANCIAL": "SOX", "ACCOUNTING": "SOX",
-            "SOC": "SOC", "SOC2": "SOC", "REGULATORY": "SOC",
-        }
-        for cat in (detected_categories or []):
-            cat_up = str(cat).upper()
-            for key, fw in cat_fw_map.items():
-                if key in cat_up and fw in allowed_fw:
-                    suggestions.add(fw)
-                    break
-
-        # --- 3. Explicitly chosen special categories → frameworks ---
-        special_fw_map = {
-            "PII": "PII",
-            "PHI": "PII",        # PHI data must meet PII framework
-            "PCI": "PII",        # PCI cardholder data → PII compliance
-            "SOX": "SOX",
-            "Financial": "SOX",
-            "Auth": "SOC",       # Authorization/authentication data → SOC
-        }
-        for sc in (special_categories or []):
-            mapped = special_fw_map.get(sc) or special_fw_map.get(str(sc).upper())
-            if mapped and mapped in allowed_fw:
-                suggestions.add(mapped)
-
-        # Return sorted, deduplicated values that are in allowed list
-        return sorted(suggestions & set(allowed_fw))
-
-    def suggest_tags_from_criteria(self, classification: str, c: int, i: int, a: int, framework: Optional[str] = None, special_category: Optional[str] = None) -> Dict[str, str]:
-        classification = (classification or "Internal").title()
-        c = max(0, min(3, int(c)))
-        i = max(0, min(3, int(i)))
-        a = max(0, min(3, int(a)))
-        tags = {
-            "DATA_CLASSIFICATION": classification,
-            "CONFIDENTIALITY_LEVEL": str(c),
-            "INTEGRITY_LEVEL": str(i),
-            "AVAILABILITY_LEVEL": str(a),
-        }
-        if framework and str(framework).upper() not in ("NONE", "NULL", ""):
-            tags["COMPLIANCE_FRAMEWORKS"] = str(framework)
-        if special_category and str(special_category).upper() not in ("NONE", "NULL", ""):
-            tags["SPECIAL_CATEGORY"] = str(special_category)
-        return tags
-
-    def explain_tag(self, tag_name: str, value: Optional[str] = None) -> Dict:
-        tag = str(tag_name or "").upper()
-        allowed = TAG_DEFINITIONS.get(tag, [])
-        info = {
-            "tag": tag,
-            "allowed_values": allowed,
-            "value": value,
-        }
-        desc = {
-            "DATA_CLASSIFICATION": "Overall data sensitivity label",
-            "CONFIDENTIALITY_LEVEL": "C level: 0 Public, 1 Internal, 2 Restricted, 3 Confidential",
-            "INTEGRITY_LEVEL": "I level: 0 Low, 1 Standard, 2 High, 3 Critical",
-            "AVAILABILITY_LEVEL": "A level: 0 Low, 1 Standard, 2 High, 3 Critical",
-            "SPECIAL_CATEGORY": "Sensitive category such as PII/PHI/PCI/SOX",
-            "COMPLIANCE_CATEGORY": "Applicable regulations (e.g., GDPR, HIPAA, PCI DSS)",
-            "LAST_CLASSIFIED_DATE": "YYYY-MM-DD date when last classified",
-            "LAST_REVIEW_DATE": "YYYY-MM-DD date when last reviewed",
-            "REVIEW_STATUS": "Review workflow status",
-            "MASKING_OVERRIDE": "Whether to override masking enforcement",
-            "MASKING_EXEMPT": "Whether object/column is exempt from masking",
-        }
-        info["description"] = desc.get(tag, "")
-        if value is not None and isinstance(allowed, list) and allowed and value not in allowed and allowed != "__DATE__":
-            info["validation"] = f"Invalid value '{value}'. Allowed: {allowed}"
-        return info
-
-    def diagnose(self, full_name: Optional[str], object_type: Optional[str], tags: Optional[Dict[str, str]], error_message: str) -> List[str]:
-        msg = str(error_message or "")
-        suggestions: List[str] = []
-        try:
-            if tags:
-                try:
-                    self.validate_tags(tags)
-                except Exception as e:
-                    suggestions.append(str(e))
-            if full_name and object_type and tags:
-                try:
-                    if object_type.upper() in ("TABLE", "VIEW"):
-                        db, schema, obj = self._split_fqn(full_name)
-                        _ = self.connector.execute_query(
-                            f"SELECT 1 FROM {self._q(db)}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{obj}' LIMIT 1"
-                        )
-                except Exception:
-                    pass
-            m = msg.lower()
-            if "not authorized" in m or "insufficient privileges" in m or "not enough privileges" in m:
-                suggestions.append("Grant OWNERSHIP or ALTER on the object and USAGE on database/schema; use a role with privileges")
-            if "does not exist" in m or "object does not exist" in m:
-                suggestions.append("Verify DB.SCHEMA.OBJECT and case/quoting; ensure object exists in current account")
-            if "tag" in m and "does not exist" in m:
-                if tags:
-                    current_db = self.tag_db
-                    current_schema = self.tag_schema
-                    for k in tags.keys():
-                        if not self._tag_exists(current_db, current_schema, k):
-                            suggestions.append(f"Tag {current_db}.{current_schema}.{k} is missing; initialize tagging or create tag")
-            if "invalid identifier" in m:
-                suggestions.append("Quote identifiers with double quotes if mixed-case or special chars")
-            if "cannot modify" in m and "column" in m:
-                suggestions.append("Ensure column exists and you used ALTER TABLE ... MODIFY COLUMN syntax")
-            if not suggestions:
-                suggestions.append("Check current role, warehouse, and context; confirm tag allowed values and object existence")
-        except Exception:
-            pass
-        return suggestions
 
 
     # --- Label Registry Management (Merged from LabelService) ---
@@ -881,14 +694,6 @@ class TaggingService:
             {"n": label_name, "d": description, "col": color, "c": default_c, "i": default_i, "a": default_a, "p": policy},
         )
 
-    def delete_label(self, label_name: str) -> None:
-        db = self.tag_db
-        schema = "DATA_CLASSIFICATION_GOVERNANCE"
-        table = "LABEL_REGISTRY"
-        self.connector.execute_non_query(
-            f"DELETE FROM {db}.{schema}.{table} WHERE LABEL_NAME = %(n)s",
-            {"n": label_name},
-        )
 
 
 tagging_service = TaggingService()

@@ -574,38 +574,13 @@ class GovernanceRulesLoader:
             logger.error(f"Failed to load category metadata: {e}")
             return {}
 
-    def refresh_all_rules(self) -> None:
-        """Refresh all governance rules from database (clear cache and reload)."""
-        logger.info("Refreshing all governance rules from views")
-        self._cache.clear()
-        
-        # Reload all rules
-        self.load_classification_rules(force_refresh=True)
-        self.load_context_aware_rules(force_refresh=True)
-        self.load_tiebreaker_keywords(force_refresh=True)
-        self.load_address_context_indicators(force_refresh=True)
-        self.load_exclusion_patterns(force_refresh=True)
-        self.load_policy_group_keywords(force_refresh=True)
-        self.load_category_scoring_weights(force_refresh=True)
-        self.load_category_metadata(force_refresh=True)
-        
-        logger.info("All governance rules refreshed successfully")
 
     def clear_cache(self) -> None:
         """Clear the internal cache."""
         self._cache.clear()
         logger.debug("Cache cleared")
 
-    def enable_cache(self) -> None:
-        """Enable caching of governance rules."""
-        self._cache_enabled = True
-        logger.debug("Cache enabled")
 
-    def disable_cache(self) -> None:
-        """Disable caching of governance rules."""
-        self._cache_enabled = False
-        self._cache.clear()
-        logger.debug("Cache disabled and cleared")
 
 
 

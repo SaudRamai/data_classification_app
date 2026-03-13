@@ -87,22 +87,6 @@ def insert_audit_log(
         logger.error(f"Failed to insert audit log: {e}")
         raise
 
-def query_audit_logs(db: str, limit: int = 100, resource_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Query recent audit logs."""
-    try:
-        where_clause = ""
-        params = {"limit": limit}
-        if resource_id:
-            where_clause = "WHERE RESOURCE_ID = %(rid)s"
-            params["rid"] = resource_id
-            
-        return snowflake_connector.execute_query(
-            f"SELECT * FROM {db}.{SCHEMA}.{LOG_TABLE} {where_clause} ORDER BY TIMESTAMP DESC LIMIT %(limit)s",
-            params
-        ) or []
-    except Exception as e:
-        logger.error(f"Failed to query audit logs: {e}")
-        return []
 
 def get_daily_digest(db: str, day: str) -> Optional[Dict[str, Any]]:
     """Fetch daily digest record for a specific date."""
@@ -116,35 +100,6 @@ def get_daily_digest(db: str, day: str) -> Optional[Dict[str, Any]]:
         logger.error(f"Failed to get daily digest: {e}")
         return None
 
-def upsert_daily_digest(
-    db: str,
-    day: str,
-    record_count: int,
-    sha256_hex: str,
-    prev_sha256_hex: Optional[str],
-    chain_sha256_hex: str
-) -> None:
-    """Upsert daily digest record."""
-    try:
-        snowflake_connector.execute_non_query(
-            f"""
-            MERGE INTO {db}.{SCHEMA}.{DIGEST_TABLE} t
-            USING (
-              SELECT TO_DATE(%(d)s) AS DATE_KEY, %(c)s AS RECORD_COUNT, %(s)s AS SHA256_HEX,
-                     %(ps)s AS PREV_SHA256_HEX, %(cs)s AS CHAIN_SHA256_HEX
-            ) s 
-            ON t.DATE_KEY = s.DATE_KEY
-            WHEN MATCHED THEN UPDATE SET RECORD_COUNT = s.RECORD_COUNT, SHA256_HEX = s.SHA256_HEX,
-                                        PREV_SHA256_HEX = s.PREV_SHA256_HEX, CHAIN_SHA256_HEX = s.CHAIN_SHA256_HEX,
-                                        CREATED_AT = CURRENT_TIMESTAMP
-            WHEN NOT MATCHED THEN INSERT (DATE_KEY, RECORD_COUNT, SHA256_HEX, PREV_SHA256_HEX, CHAIN_SHA256_HEX)
-                                  VALUES (s.DATE_KEY, s.RECORD_COUNT, s.SHA256_HEX, s.PREV_SHA256_HEX, s.CHAIN_SHA256_HEX)
-            """,
-            {"d": day, "c": record_count, "s": sha256_hex, "ps": prev_sha256_hex, "cs": chain_sha256_hex}
-        )
-    except Exception as e:
-        logger.error(f"Failed to upsert daily digest: {e}")
-        raise
 
 def fetch_audit_rows(
     database: Optional[str] = None,
@@ -211,21 +166,3 @@ def fetch_audit_rows(
         logger.error(f"Failed to fetch audit rows: {e}")
         return []
 
-def get_audit_summary(database: Optional[str] = None, schema: str = "DATA_CLASSIFICATION_GOVERNANCE", days_back: int = 30) -> Dict[str, Any]:
-    rows = fetch_audit_rows(database=database, schema=schema, start_date=(datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d"), limit=10000)
-    if not rows: return {"total_changes": 0, "high_risk_changes": 0, "classification_distribution": {}, "top_owners": []}
-    class_dist = {}
-    owner_counts = {}
-    high_risk = 0
-    for r in rows:
-        lvl = r.get("classification_level", "Unknown")
-        class_dist[lvl] = class_dist.get(lvl, 0) + 1
-        own = r.get("owner", "Unknown")
-        owner_counts[own] = owner_counts.get(own, 0) + 1
-        if r.get("overall_risk") == "High": high_risk += 1
-    return {
-        "total_changes": len(rows),
-        "high_risk_changes": high_risk,
-        "classification_distribution": class_dist,
-        "top_owners": sorted(owner_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-    }

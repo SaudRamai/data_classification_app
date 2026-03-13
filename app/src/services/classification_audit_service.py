@@ -86,25 +86,6 @@ class ClassificationAuditService:
         except Exception as e:
             logger.error(f"Failed to log workflow event: {e}")
 
-    def get_audit_logs(self, asset_full_name: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
-        """Query audit logs, optionally filtered by asset."""
-        try:
-            self._ensure_tables()
-            db = self._get_db()
-            # resource_id matches asset_full_name in our schema
-            logs = _audit_repo.query_audit_logs(db, limit, resource_id=asset_full_name)
-            # Standardize column names for UI consistency (pandas likes consistent casing)
-            return [{
-                "TIMESTAMP": r.get("TIMESTAMP"),
-                "USER_ID": r.get("USER_ID"),
-                "ACTION": r.get("ACTION"),
-                "RESOURCE_TYPE": r.get("RESOURCE_TYPE"),
-                "RESOURCE_ID": r.get("RESOURCE_ID"),
-                "DETAILS": r.get("DETAILS")
-            } for r in logs]
-        except Exception as e:
-            logger.error(f"Failed to query audit logs: {e}")
-            return []
 
     def fetch_audit(
         self,
@@ -135,59 +116,6 @@ class ClassificationAuditService:
             logger.error(f"Failed to fetch classification history: {e}")
             return []
 
-    def compute_daily_digest(self, day: Optional[str] = None) -> Dict[str, Any]:
-        """Compute and persist a daily audit digest for tamper evidence."""
-        db = self._get_db()
-        if not day:
-            day = datetime.utcnow().strftime("%Y-%m-%d")
-        
-        try:
-            self._ensure_tables()
-            # Fetch logs for the day
-            logs = snowflake_connector.execute_query(
-                f"""
-                SELECT TO_CHAR(TIMESTAMP, 'YYYY-MM-DD HH24:MI:SS.FF3') AS TS,
-                       COALESCE(USER_ID,'' ) AS U,
-                       COALESCE(ACTION,'' ) AS A,
-                       COALESCE(RESOURCE_TYPE,'' ) AS RT,
-                       COALESCE(RESOURCE_ID,'' ) AS RID,
-                       COALESCE(TO_JSON(DETAILS),'') AS D
-                FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.AUDIT_LOG
-                WHERE TO_DATE(TIMESTAMP) = TO_DATE(%(d)s)
-                ORDER BY TS, U, A, RT, RID
-                """,
-                {"d": day},
-            ) or []
-            
-            h = hashlib.sha256()
-            for r in logs:
-                line = "|".join([str(r.get(k, "")) for k in ["TS","U","A","RT","RID","D"]])
-                h.update(line.encode("utf-8"))
-            digest = h.hexdigest()
-            
-            # Chain with previous day
-            prev_dt = datetime.strptime(day, "%Y-%m-%d") - timedelta(days=1)
-            prev_day = prev_dt.strftime("%Y-%m-%d")
-            prev = _audit_repo.get_daily_digest(db, prev_day) or {}
-            prev_sha = prev.get("SHA256_HEX") or prev.get("SHA256")
-            
-            chain_h = hashlib.sha256()
-            chain_h.update((prev_sha or "").encode("utf-8"))
-            chain_h.update(digest.encode("utf-8"))
-            chain_digest = chain_h.hexdigest()
-            
-            _audit_repo.upsert_daily_digest(db, day, len(logs), digest, prev_sha, chain_digest)
-            
-            return {
-                "date_key": day,
-                "count": len(logs),
-                "sha256": digest,
-                "prev_sha256": prev_sha,
-                "chain_sha256": chain_digest
-            }
-        except Exception as e:
-            logger.error(f"Failed to compute daily digest: {e}")
-            raise
 
     def get_daily_digest(self, day: str) -> Optional[Dict[str, Any]]:
         """Fetch a daily digest for a specific day."""
@@ -198,26 +126,6 @@ class ClassificationAuditService:
             logger.error(f"Failed to get daily digest: {e}")
             return None
 
-    def render_snowflake_task_sql(self, task_name: str = "DAILY_AUDIT_DIGEST_TASK", schedule: str = "USING CRON 0 0 * * * UTC") -> str:
-        """Return SQL for a daily audit digest task."""
-        db = self._get_db()
-        return f"""
-CREATE OR REPLACE TASK {task_name}
-{schedule}
-AS
-BEGIN
-  CREATE TEMP TABLE IF NOT EXISTS TMP_AUDIT_CHECK AS
-  SELECT HASH_AGG(OBJECT_CONSTRUCT('ts',TO_CHAR(TIMESTAMP,'YYYY-MM-DD HH24:MI:SS.FF3'),'u',USER_ID,'a',ACTION,'rt',RESOURCE_TYPE,'rid',RESOURCE_ID,'d',DETAILS)) AS H, COUNT(*) AS C
-  FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.AUDIT_LOG
-  WHERE TO_DATE(TIMESTAMP) = CURRENT_DATE;
-  
-  MERGE INTO {db}.DATA_CLASSIFICATION_GOVERNANCE.DAILY_AUDIT_DIGESTS t
-  USING (SELECT CURRENT_DATE AS DATE_KEY, C AS RECORD_COUNT, TO_VARCHAR(H) AS SHA256_HEX FROM TMP_AUDIT_CHECK) s
-  ON t.DATE_KEY = s.DATE_KEY
-  WHEN MATCHED THEN UPDATE SET t.RECORD_COUNT = s.RECORD_COUNT, t.SHA256_HEX = s.SHA256_HEX, t.CREATED_AT = CURRENT_TIMESTAMP
-  WHEN NOT MATCHED THEN INSERT (DATE_KEY, RECORD_COUNT, SHA256_HEX) VALUES (s.DATE_KEY, s.RECORD_COUNT, s.SHA256_HEX);
-END;
-"""
 
 # Create singleton instance
 classification_audit_service = ClassificationAuditService()

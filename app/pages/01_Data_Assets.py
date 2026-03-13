@@ -175,36 +175,6 @@ with st.sidebar:
     st.session_state["global_filters"] = g_filters
 
 # --- Policy enforcement helpers (Decision Matrix & Audit persistence) ---
-def _persist_decision(asset: str, new_cls: str, c: int, i: int, a: int, owner: str, rationale: str, checklist: dict, decided_by: str, prev: Optional[dict] = None):
-    """Persist a classification decision via the centralized workflow service."""
-    try:
-        # Require rationale per policy before persisting
-        if not rationale or not str(rationale).strip():
-            try:
-                st.error("Rationale is required (Policy 6.1.2). Decision not saved.")
-            except Exception:
-                pass
-            return
-            
-        # Use the centralized service
-        cwf.record_decision(
-            asset_full_name=asset,
-            decision_by=decided_by or "unknown",
-            source="DATA_ASSETS_MANUAL",
-            status="Approved", # Direct application from Data Assets is typically authoritative
-            label=new_cls,
-            c=c, i=i, a=a,
-            rationale=rationale or "",
-            details={
-                "checklist": checklist,
-                "previous_state": prev,
-                "owner": owner
-            }
-        )
-    except Exception as e:
-        logger.error(f"Failed to persist decision via CWF: {e}")
-        # Do not block the UI if persistence fails, but log it
-        pass
 
 def _validate_decision_matrix(label: str, c: int, i: int, a: int, has_pii: bool, regs: List[str]) -> Tuple[bool, str]:
     """Hard validation per policy sections 5.2, 5.5, 6.2.2.
@@ -237,20 +207,6 @@ def _validate_decision_matrix(label: str, c: int, i: int, a: int, has_pii: bool,
         return False, f"Validation error: {e}"
 
 # Helper (testable): compute column flags for PII/Financial/Regulatory based on name and tag names
-def _compute_column_flags(colname: str, tag_names: Optional[Set[str]] = None) -> List[str]:
-    try:
-        tag_names = tag_names or set()
-        upn = (colname or '').upper()
-        flags: List[str] = []
-        if any(k in upn for k in ["SSN","EMAIL","PHONE","ADDRESS","DOB","PERSON","CUSTOMER","EMPLOYEE"]) or any("PII" in t for t in tag_names):
-            flags.append("PII")
-        if any(k in upn for k in ["GL","LEDGER","INVOICE","PAYROLL","AR","AP","REVENUE","EXPENSE"]) or any(("FINANCE" in t) or ("FINANCIAL" in t) for t in tag_names):
-            flags.append("Financial")
-        if any(k in upn for k in ["GDPR","HIPAA","PCI","SOX"]) or any(any(x in t for x in ["GDPR","HIPAA","PCI","SOX"]) for t in tag_names):
-            flags.append("Regulatory")
-        return flags
-    except Exception:
-        return []
 
 # Enhanced CSS for modern, professional UI with improved visual hierarchy
 st.markdown(
@@ -630,70 +586,9 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
         pass
 
     # Helper: policy guardrails and validation
-    def _is_pii(text: str) -> bool:
-        if not text:
-            return False
-        t = str(text).upper()
-        return any(k in t for k in ["PII","SSN","SOCIAL","EMAIL","PHONE","DOB","ADDRESS","PERSON","CUSTOMER","EMPLOYEE"])
 
-    def _is_financial(text: str) -> bool:
-        if not text:
-            return False
-        t = str(text).upper()
-        return any(k in t for k in ["FINANCE","FINANCIAL","GL","LEDGER","INVOICE","PAYROLL","SOX","REVENUE","EXPENSE","AR","AP"])
 
-    def _is_regulatory(text: str) -> bool:
-        if not text:
-            return False
-        t = str(text).upper()
-        return any(k in t for k in ["GDPR","HIPAA","PCI","REGULATORY"])
 
-    def _policy_validate_for_asset(row: pd.Series, new_label: str, c: int, i: int, a: int, rationale: str, owner_override: str = ""):
-        """Raise ValueError if validation fails. Implements §5.4.2, §5.5, §6.2, §7.2."""
-        # Allowed sets
-        allowed_labels = {"Public","Internal","Restricted","Confidential"}
-        if new_label not in allowed_labels:
-            raise ValueError("Invalid classification label. Allowed: Public, Internal, Restricted, Confidential (§5.4.2)")
-        if not (0 <= c <= 3 and 0 <= i <= 3 and 0 <= a <= 3):
-            raise ValueError("C/I/A must be integers in 0..3 (§5.4.2)")
-        # Label/level consistency
-        if new_label == "Public" and c >= 2:
-            raise ValueError("Public corresponds to C0 only; C≥2 conflicts (§5.4.1, §5.4.2)")
-        if new_label == "Internal" and c >= 2:
-            raise ValueError("Internal corresponds to C1; use Restricted/Confidential for higher C (§5.4.1, §5.4.2)")
-        # Category guardrails
-        is_pii = row.get("Has PII", False)
-        is_financial = row.get("Has Financial", False)
-        is_regulatory = row.get("Has Regulatory", False)
-        
-        # Fallback to string matching if flags are missing or False
-        tags = str(row.get("Tags",""))
-        loc = str(row.get("Location",""))
-        text_blob = f"{tags} {loc}"
-        
-        if not is_pii and _is_pii(text_blob):
-            is_pii = True
-        if not is_financial and _is_financial(text_blob):
-            is_financial = True
-        if not is_regulatory and _is_regulatory(text_blob):
-            is_regulatory = True
-
-        if is_pii:
-            if new_label in ("Public","Internal") or c < 2:
-                raise ValueError("PII requires at least Restricted (C≥2) (§5.5.1)")
-        if is_financial:
-            if new_label in ("Public","Internal") or c < 2:
-                raise ValueError("Financial data requires at least Restricted (C≥2); consider I≥2 (§5.5.2)")
-        if is_regulatory:
-            if new_label in ("Public","Internal") or c < 2:
-                raise ValueError("Regulatory data must use the most restrictive applicable label; at least Restricted (C≥2) (§5.5.3)")
-        # Rationale required
-        if not rationale or not rationale.strip():
-            raise ValueError("Rationale is required for classification decisions (§6.2)")
-        # Owner required
-        owner_existing = str(row.get("Owner","")) if row is not None else ""
-        if (not owner_existing or owner_existing.lower() in ("", "unknown", "admin@company.com")) and not owner_override:
-            raise ValueError("A Data Owner must be assigned before classification (§7.2). Provide an owner email.")
 
     # Policy flags and tags are now handled centrally in compute_policy_fields
 
@@ -749,87 +644,8 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
         except Exception:
             return {}
 
-    def _get_qa_status_map(full_names: list) -> dict:
-        try:
-            if not full_names:
-                return {}
-            rows = []
-            groups = {}
-            for fn in full_names:
-                dbn = str(fn).split('.')[0] if isinstance(fn, str) and '.' in fn else None
-                groups.setdefault(dbn, []).append(fn)
-            for dbn, fns in groups.items():
-                if not dbn or str(dbn).upper() in ("NONE", "NULL", "(NONE)"):
-                    continue
-                in_list = ','.join([f"'{x}'" for x in fns])
-                part = snowflake_connector.execute_query(
-                    f"""
-                    SELECT ASSET_FULL_NAME, STATUS, REQUESTED_AT, REVIEWED_AT
-                    FROM {dbn}.DATA_CLASSIFICATION_GOVERNANCE.QA_REVIEWS
-                    WHERE ASSET_FULL_NAME IN ({in_list})
-                    """
-                ) or []
-                rows.extend(part)
-            # Reduce to latest per asset in Python to avoid complex SQL
-            latest = {}
-            for r in rows:
-                ts = r.get('REVIEWED_AT') or r.get('REQUESTED_AT')
-                key = r.get('ASSET_FULL_NAME')
-                if key not in latest or (ts and latest[key]['_ts'] and pd.to_datetime(ts) > latest[key]['_ts']):
-                    latest[key] = {
-                        'STATUS': r.get('STATUS') or 'Not Reviewed',
-                        '_ts': pd.to_datetime(ts) if ts else pd.Timestamp.min,
-                    }
-            return {k: v['STATUS'] for k, v in latest.items()}
-        except Exception:
-            return {}
 
-    def _get_lifecycle_map(full_names: list) -> dict:
-        """Retrieve lifecycle status from governance table.
-        
-        NOTE: ASSET_LIFECYCLE table usage has been removed per request.
-        This now returns an empty dict, defaulting assets to 'Active' downstream if handled.
-        """
-        return {}
 
-    @st.cache_data(ttl=600)
-    def _get_dependency_counts(full_names: list) -> dict:
-        """Get dependency counts (upstream + downstream) for assets in batch."""
-        try:
-            if not full_names:
-                return {}
-            # Batch query for all dependencies at once
-            result = {fn: 0 for fn in full_names}
-            # Limit to avoid overly massive UNIONS or IN clauses, but batching is key
-            batch = full_names[:500] 
-            # Simplified approach: query once for all and sum in Python
-            try:
-                # Upstream dependencies
-                up_sql = """
-                    SELECT REFERENCED_DATABASE || '.' || REFERENCED_SCHEMA || '.' || REFERENCED_OBJECT_NAME as FQN, COUNT(*) as CNT
-                    FROM SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES
-                    WHERE REFERENCED_DATABASE || '.' || REFERENCED_SCHEMA || '.' || REFERENCED_OBJECT_NAME IN ({})
-                    GROUP BY 1
-                """.format(','.join([f"'{f}'" for f in batch]))
-                up_rows = snowflake_connector.execute_query(up_sql) or []
-                for r in up_rows:
-                    if r['FQN'] in result: result[r['FQN']] += int(r['CNT'])
-                
-                # Downstream dependencies
-                down_sql = """
-                    SELECT OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME as FQN, COUNT(*) as CNT
-                    FROM SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES
-                    WHERE OBJECT_DATABASE || '.' || OBJECT_SCHEMA || '.' || OBJECT_NAME IN ({})
-                    GROUP BY 1
-                """.format(','.join([f"'{f}'" for f in batch]))
-                down_rows = snowflake_connector.execute_query(down_sql) or []
-                for r in down_rows:
-                    if r['FQN'] in result: result[r['FQN']] += int(r['CNT'])
-            except Exception:
-                pass
-            return result
-        except Exception:
-            return {}
 
 with tab_inv_browser:
     # KPI Cards Section

@@ -334,10 +334,6 @@ class AuthorizationService:
             return True
         return self.is_owner(ident) or self.is_custodian(ident) or self.is_specialist(ident) or self.is_admin(ident) or self.is_consumer(ident)
 
-    def can_see_admin_actions(self, ident: Identity) -> bool:
-        if self._is_bypass():
-            return True
-        return self.is_custodian(ident) or self.is_admin(ident)
 
     def can_classify(self, ident: Identity) -> bool:
         if self._is_bypass():
@@ -367,19 +363,10 @@ class AuthorizationService:
                 return []
         return []
 
-    def refresh_privilege_cache(self) -> None:
-        if st is not None:
-            st.session_state.pop("_ps_role_grants", None)
 
     def _norm(self, name: Optional[str]) -> Optional[str]:
         return str(name).strip().upper() if name is not None else None
 
-    def has_account_priv(self, priv: str) -> bool:
-        p = self._norm(priv)
-        for r in self._cached_role_grants():
-            if self._norm(r.get("privilege")) == p and self._norm(r.get("granted_on")) == "ACCOUNT":
-                return True
-        return False
 
     def list_object_privs(self, fq_object: str, object_type: str = "TABLE") -> Set[str]:
         try:
@@ -394,13 +381,7 @@ class AuthorizationService:
             return privs
         except Exception: return set()
 
-    def has_priv_on_object(self, priv: str, fq_object: str, object_type: str = "TABLE") -> bool:
-        return self._norm(priv) in self.list_object_privs(fq_object, object_type)
 
-    def can_read_table(self, fq_table: str) -> bool:
-        try:
-            return self.has_priv_on_object("SELECT", fq_table, "TABLE") or self.has_priv_on_object("OWNERSHIP", fq_table, "TABLE")
-        except Exception: return True
 
     def can_alter_object(self, fq_object: str, object_type: str = "TABLE") -> bool:
         try:
@@ -411,18 +392,8 @@ class AuthorizationService:
     def can_apply_tags_for_object(self, fq_object: str, object_type: str = "TABLE") -> bool:
         return self.can_alter_object(fq_object, object_type)
 
-    def has_schema_write(self, schema_fq: str) -> bool:
-        try:
-            privs = self.list_object_privs(schema_fq, "SCHEMA")
-            return any(p in privs for p in {"OWNERSHIP", "USAGE", "CREATE"})
-        except Exception: return False
 
-    def can_manage_labels(self, governance_schema_fq: Optional[str] = None) -> bool:
-        if governance_schema_fq: return self.has_schema_write(governance_schema_fq)
-        return self.has_account_priv("MANAGE GRANTS") or self.has_account_priv("MONITOR")
 
-    def can_manage_roles_account_level(self) -> bool:
-        return any(self.has_account_priv(p) for p in ["CREATE ROLE", "MANAGE GRANTS", "USERADMIN", "SECURITYADMIN"])
 
 
 authz = AuthorizationService()

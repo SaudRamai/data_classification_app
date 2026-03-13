@@ -504,137 +504,6 @@ class ClassificationWorkflowService:
         except Exception as e:
             return {"reviews": [], "page": p, "page_size": ps, "total": 0, "error": str(e)}
 
-    def approve_review(self, review_id: str, asset_full_name: str, label: str, c: int, i: int, a: int, approver: Optional[str] = None, comments: str = "") -> Tuple[bool, str, Dict[str, Any]]:
-        # Robustly resolve 'who' as a string
-        val = approver or (st.session_state.get("user") if st else "user")
-        who = str(val) if val else "system"
-        try:
-            db = self._resolve_db()
-            self._ensure_history_table(db)
-            
-            # 1. Fetch current asset state for history preservation
-            prev_label = "Unclassified"
-            prev_c, prev_i, prev_a = 0, 0, 0
-            asset_id = None
-            try:
-                asset_rows = self.connector.execute_query(f"""
-                    SELECT ASSET_ID, CLASSIFICATION_LABEL, 
-                           CONFIDENTIALITY_LEVEL, INTEGRITY_LEVEL, AVAILABILITY_LEVEL
-                    FROM {db}.{SCHEMA}.ASSETS 
-                    WHERE FULLY_QUALIFIED_NAME = %(full)s
-                """, {"full": asset_full_name})
-                if asset_rows:
-                    r = asset_rows[0]
-                    asset_id = r.get("ASSET_ID")
-                    prev_label = r.get("CLASSIFICATION_LABEL") or "Unclassified"
-                    # Handle C1/I1/A1 format
-                    def _parse_cia(v):
-                        if not v: return 0
-                        v = str(v).upper()
-                        if len(v) >= 2 and v[0] in 'CIA':
-                            try: return int(v[1:])
-                            except: return 0
-                        try: return int(float(v))
-                        except: return 0
-                    
-                    prev_c = _parse_cia(r.get("CONFIDENTIALITY_LEVEL"))
-                    prev_i = _parse_cia(r.get("INTEGRITY_LEVEL"))
-                    prev_a = _parse_cia(r.get("AVAILABILITY_LEVEL"))
-            except Exception as e:
-                logger.warning(f"Could not fetch previous asset state for history: {e}")
-
-            # 2. Insert into CLASSIFICATION_DECISIONS (Final State)
-            self.record_decision(
-                asset_full_name=asset_full_name, 
-                decision_by=who, 
-                source="REVIEW_APPROVAL", 
-                status="Approved", 
-                label=label, 
-                c=c, i=i, a=a, 
-                rationale=comments or "Approved via Quality Review", 
-                details={"review_id": review_id, "approved_by": who}
-            )
-            
-            # 3. Update ASSETS Table
-            try:
-                self.connector.execute_non_query(f"""
-                    UPDATE {db}.{SCHEMA}.ASSETS
-                    SET CLASSIFICATION_LABEL = %(lbl)s,
-                        CONFIDENTIALITY_LEVEL = %(c)s,
-                        INTEGRITY_LEVEL = %(i)s,
-                        AVAILABILITY_LEVEL = %(a)s,
-                        CLASSIFIED_BY = %(who)s,
-                        CLASSIFICATION_DATE = CURRENT_TIMESTAMP,
-                        LAST_MODIFIED_TIMESTAMP = CURRENT_TIMESTAMP,
-                        LAST_MODIFIED_BY = %(who)s,
-                        REVIEW_STATUS = 'Completed'
-                    WHERE FULLY_QUALIFIED_NAME = %(full)s
-                """, {
-                    "lbl": label,
-                    "c": f"C{c}", "i": f"I{i}", "a": f"A{a}",
-                    "who": who,
-                    "full": asset_full_name
-                })
-            except Exception as e:
-                logger.error(f"Failed to update ASSETS table: {e}")
-
-            # 4. Record in CLASSIFICATION_HISTORY
-            try:
-                hid = str(uuid.uuid4())[:8].upper()
-                self.connector.execute_non_query(f"""
-                    INSERT INTO {db}.{SCHEMA}.CLASSIFICATION_HISTORY (
-                        HISTORY_ID, ASSET_ID, ASSET_FULL_NAME, 
-                        PREVIOUS_CLASSIFICATION, NEW_CLASSIFICATION,
-                        PREVIOUS_CONFIDENTIALITY, NEW_CONFIDENTIALITY,
-                        PREVIOUS_INTEGRITY, NEW_INTEGRITY,
-                        PREVIOUS_AVAILABILITY, NEW_AVAILABILITY,
-                        CHANGED_BY, CHANGE_REASON, CHANGE_TIMESTAMP,
-                        APPROVED_BY, APPROVAL_TIMESTAMP, BUSINESS_JUSTIFICATION
-                    ) VALUES (
-                        %(hid)s, %(aid)s, %(full)s,
-                        %(pl)s, %(nl)s,
-                        %(pc)s, %(nc)s,
-                        %(pi)s, %(ni)s,
-                        %(pa)s, %(na)s,
-                        %(who)s, 'Quality Review Approval', CURRENT_TIMESTAMP,
-                        %(who)s, CURRENT_TIMESTAMP, %(com)s
-                    )
-                """, {
-                    "hid": hid, "aid": asset_id, "full": asset_full_name,
-                    "pl": prev_label, "nl": label,
-                    "pc": prev_c, "nc": c,
-                    "pi": prev_i, "ni": i,
-                    "pa": prev_a, "na": a,
-                    "who": who, "com": comments or "Approved via workflow"
-                })
-            except Exception as e:
-                logger.warning(f"Failed to record in CLASSIFICATION_HISTORY: {e}")
-
-            # 5. Finalize Review Status
-            self.connector.execute_non_query(f"""
-                UPDATE {db}.{SCHEMA}.CLASSIFICATION_REVIEW
-                SET REVIEWER = %(who)s, 
-                    UPDATED_AT = CURRENT_TIMESTAMP, 
-                    STATUS = 'Approved'
-                WHERE REVIEW_ID = %(rid)s
-            """, {"who": who, "rid": review_id})
-
-            # 6. Trigger Enforcement (Masking, Tagging)
-            enf_result = {}
-            try:
-                from src.services.compliance_service import compliance_service
-                enf_result = compliance_service.enforcement.process_pending_enforcements(db)
-            except Exception as enf_err:
-                logger.warning(f"Immediate enforcement failed (will retry via task): {enf_err}")
-                enf_result = {"error": str(enf_err)}
-            
-            # 7. Log to AUDIT_LOG
-            audit_service.log(who, "REVIEW_APPROVE", "CLASSIFICATION", asset_full_name, {"review_id": review_id, "label": label})
-            
-            return True, "Approval processed successfully", enf_result
-        except Exception as e:
-            logger.error(f"Error approving review {review_id}: {e}")
-            return False, str(e), {}
 
     def list_requests(self, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         """List reclassification requests."""
@@ -710,55 +579,8 @@ class ClassificationWorkflowService:
         })
         return rid
 
-    def approve(self, request_id: str, approver: str) -> Dict[str, Any]:
-        """Approve a reclassification request."""
-        db = self._resolve_db()
-        table = f"{db}.{SCHEMA}.RECLASSIFICATION_REQUESTS"
-        
-        req_rows = self.connector.execute_query(f"SELECT * FROM {table} WHERE ID = %(id)s", {"id": request_id})
-        if not req_rows:
-            return {"processed": 0, "errors": ["Request not found"]}
-        
-        req = req_rows[0]
-        asset = req.get("ASSET_FULL_NAME")
-        
-        try:
-            # 1. Update request status
-            self.connector.execute_non_query(f"UPDATE {table} SET STATUS = 'Approved', UPDATED_AT = CURRENT_TIMESTAMP WHERE ID = %(id)s", {"id": request_id})
-            
-            # 2. Update assets
-            self.connector.execute_non_query(f"""
-                UPDATE {db}.{SCHEMA}.ASSETS 
-                SET CLASSIFICATION_LABEL = %(lbl)s,
-                    CONFIDENTIALITY_LEVEL = %(c)s,
-                    INTEGRITY_LEVEL = %(i)s,
-                    AVAILABILITY_LEVEL = %(a)s,
-                    LAST_MODIFIED_TIMESTAMP = CURRENT_TIMESTAMP,
-                    LAST_MODIFIED_BY = %(who)s
-                WHERE FULLY_QUALIFIED_NAME = %(full)s
-            """, {
-                "lbl": req.get("PROPOSED_CLASSIFICATION"),
-                "c": f"C{req.get('PROPOSED_C')}", "i": f"I{req.get('PROPOSED_I')}", "a": f"A{req.get('PROPOSED_A')}",
-                "who": approver, "full": asset
-            })
-            
-            # 3. Trigger enforcement
-            compliance_service.enforcement.process_pending_enforcements(db)
-            
-            return {"processed": 1, "errors": []}
-        except Exception as e:
-            return {"processed": 0, "errors": [str(e)]}
 
-    def reject(self, request_id: str, approver: str, justification: str) -> None:
-        """Reject a reclassification request."""
-        db = self._resolve_db()
-        table = f"{db}.{SCHEMA}.RECLASSIFICATION_REQUESTS"
-        self.connector.execute_non_query(f"UPDATE {table} SET STATUS = 'Rejected', JUSTIFICATION = %(j)s, UPDATED_AT = CURRENT_TIMESTAMP WHERE ID = %(id)s", 
-                                       {"id": request_id, "j": justification})
 
-    def detect_triggers(self) -> int:
-        """Placeholder for trigger detection."""
-        return 0
 
     # --- Reclassification (Now using CLASSIFICATION_DECISIONS as System of Record) ---
     def submit_reclassification(self, asset_full_name: str, proposed: Tuple[str, int, int, int], justification: str, created_by: str, trigger_type: str = "MANUAL", current: Optional[Tuple[str, int, int, int]] = None) -> str:
@@ -1172,43 +994,9 @@ class ClassificationWorkflowService:
             return False
 
     # --- Exceptions ---
-    def submit_exception(self, asset_full_name: str, regulatory: str, justification: str, risk_level: str, requested_by: str, days_valid: int = 90, details: Optional[Dict[str, Any]] = None) -> str:
-        db = self._resolve_db()
-        self._ensure_schema(db)
-        table = f"{db}.{SCHEMA}.EXCEPTIONS"
-        self.connector.execute_non_query(f"""
-            CREATE TABLE IF NOT EXISTS {table} (
-                ID STRING, ASSET_FULL_NAME STRING, REGULATORY STRING, JUSTIFICATION STRING, RISK_LEVEL STRING, STATUS STRING, REQUESTED_BY STRING, REQUESTED_AT TIMESTAMP_NTZ, APPROVED_BY STRING, APPROVED_AT TIMESTAMP_NTZ, EXPIRES_AT TIMESTAMP_NTZ, DETAILS VARIANT, EVIDENCE_URL STRING
-            )
-        """)
-        eid = str(uuid.uuid4())
-        expires = (datetime.utcnow() + timedelta(days=days_valid)).strftime("%Y-%m-%d %H:%M:%S")
-        self.connector.execute_non_query(f"""
-            INSERT INTO {table} (ID, ASSET_FULL_NAME, REGULATORY, JUSTIFICATION, RISK_LEVEL, STATUS, REQUESTED_BY, REQUESTED_AT, EXPIRES_AT, DETAILS)
-            SELECT %(id)s, %(full)s, %(reg)s, %(just)s, %(risk)s, 'Pending', %(req)s, CURRENT_TIMESTAMP, %(exp)s, TO_VARIANT(PARSE_JSON(%(det)s))
-        """, {"id": eid, "full": asset_full_name, "reg": regulatory, "just": justification, "risk": risk_level, "req": requested_by, "exp": expires, "det": json.dumps(details) if details else None})
-        audit_service.log(requested_by, "EXCEPTION_SUBMIT", "ASSET", asset_full_name, {"exception_id": eid})
-        return eid
 
-    def list_exceptions(self, status: Optional[str] = None, limit: int = 200, asset_full_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        db = self._resolve_db()
-        where, params = ["1=1"], {"lim": limit}
-        if status and status != "All": where.append("STATUS = %(status)s"); params["status"] = status
-        if asset_full_name: where.append("UPPER(ASSET_FULL_NAME) = UPPER(%(full)s)"); params["full"] = asset_full_name
-        return self.connector.execute_query(f"SELECT * FROM {db}.{SCHEMA}.EXCEPTIONS WHERE {' AND '.join(where)} ORDER BY REQUESTED_AT DESC LIMIT %(lim)s", params)
 
-    def approve_exception(self, exception_id: str, approver: str) -> None:
-        db = self._resolve_db()
-        self.connector.execute_non_query(f"UPDATE {db}.{SCHEMA}.EXCEPTIONS SET STATUS = 'Approved', APPROVED_BY = %(ap)s, APPROVED_AT = CURRENT_TIMESTAMP WHERE ID = %(id)s", {"id": exception_id, "ap": approver})
-        audit_service.log(approver, "EXCEPTION_APPROVE", "EXCEPTION", exception_id, None)
 
-    def reject_exception(self, exception_id: str, approver: str, justification: Optional[str] = None) -> None:
-        db = self._resolve_db()
-        self.connector.execute_non_query(f"""
-            UPDATE {db}.{SCHEMA}.EXCEPTIONS SET STATUS = 'Rejected', APPROVED_BY = %(ap)s, APPROVED_AT = CURRENT_TIMESTAMP, DETAILS = OBJECT_CONSTRUCT('rejection_reason', %(just)s)
-            WHERE ID = %(id)s
-        """, {"id": exception_id, "ap": approver, "just": justification or ""})
-        audit_service.log(approver, "EXCEPTION_REJECT", "EXCEPTION", exception_id, {"reason": justification})
 
     # --- History (Query) ---
     def query_history(self, start_date: Optional[str] = None, end_date: Optional[str] = None, users: Optional[List[str]] = None, levels: Optional[List[str]] = None, c_levels: Optional[List[int]] = None, page: int = 1, page_size: int = 100, database: Optional[str] = None) -> Dict[str, Any]:
@@ -1254,9 +1042,6 @@ class ClassificationWorkflowService:
         } for r in rows]
         return {"history": items, "total": total, "page": p, "page_size": ps}
 
-    def fetch_audit_history(self, **kwargs) -> List[Dict[str, Any]]:
-        """Delegate to authoritative audit service for repository-backed history read."""
-        return audit_service.fetch_audit(**kwargs)
 
     # --- Backward Compatibility Aliases ---
     def record(self, *args, **kwargs):
@@ -1267,9 +1052,6 @@ class ClassificationWorkflowService:
         """Alias for submit_reclassification."""
         return self.submit_reclassification(*args, **kwargs)
 
-    def update_or_submit_classification(self, *args, **kwargs):
-        """Alias for update_or_submit_task."""
-        return self.update_or_submit_task(*args, **kwargs)
 
     def query(self, *args, **kwargs):
         """Alias for query_history."""

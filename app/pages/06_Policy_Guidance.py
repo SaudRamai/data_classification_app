@@ -343,26 +343,6 @@ if 'cleanup_done' not in st.session_state:
 # DYNAMIC DATA FETCHING
 # -----------------------------------------------------------------------------
 
-def get_governance_roles():
-    """Fetch Snowflake roles synchronized with application responsibility metadata."""
-    try:
-        sf_roles_raw = snowflake_connector.execute_query("SHOW ROLES") or []
-        sf_role_names = [r['name'].upper() for r in sf_roles_raw]
-        
-        meta_rows = snowflake_connector.execute_query(
-            f"SELECT ROLE_NAME, DESCRIPTION FROM {db_name}.DATA_GOVERNANCE.ROLES"
-        ) or []
-        meta_dict = {r['ROLE_NAME'].upper(): r['DESCRIPTION'] for r in meta_rows}
-        
-        sync_roles = []
-        for name in sorted(sf_role_names):
-            sync_roles.append({
-                "ROLE": name,
-                "RESPONSIBILITY": meta_dict.get(name, "General functional role; specific governance responsibility not defined.")
-            })
-        return sync_roles
-    except Exception:
-        return []
 
 def get_role_counts():
     """Fetch counts per major governance category for the dashboard."""

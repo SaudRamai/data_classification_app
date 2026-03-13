@@ -37,7 +37,7 @@ from src.connectors.snowflake_connector import snowflake_connector
 from src.config.settings import settings
 from src.services.authorization_service import authz
 import logging
-from src.services.asset_utils import get_health_score_metrics
+from src.services.asset_catalog_service import get_health_score_metrics
 from src.ui.quick_links import render_quick_links
 from src.components.filters import render_global_filters
 import base64
@@ -112,53 +112,12 @@ def _gv_schema() -> str:
         pass
     return "DATA_CLASSIFICATION_GOVERNANCE"
 
-def _table_exists(db: Optional[str], schema: str, table: str) -> bool:
-    """Check if a table exists."""
-    if not db:
-        return False
-    try:
-        rows = snowflake_connector.execute_query(
-            """
-            SELECT 1 AS X
-            FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_CATALOG = %(db)s AND TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
-            LIMIT 1
-            """,
-            {"db": db, "s": schema, "t": table},
-        ) or []
-        return bool(rows)
-    except Exception:
-        return False
 
 # ============================================================================
 # FILTER HELPER FUNCTIONS
 # ============================================================================
 
-@st.cache_data(ttl=300)
-def _list_warehouses() -> List[str]:
-    """Best-effort list of accessible warehouses for selection."""
-    try:
-        rows = snowflake_connector.execute_query("SHOW WAREHOUSES") or []
-        return [r.get("name") or r.get("NAME") for r in rows if (r.get("name") or r.get("NAME"))]
-    except Exception:
-        return []
 
-def _apply_warehouse(wh: Optional[str]) -> None:
-    """Resume and USE the selected warehouse; ignore errors silently."""
-    if not wh:
-        return
-    try:
-        try:
-            snowflake_connector.execute_non_query(f"ALTER WAREHOUSE {wh} RESUME")
-        except Exception:
-            pass
-        try:
-            snowflake_connector.execute_non_query(f"USE WAREHOUSE {wh}")
-        except Exception:
-            pass
-        st.session_state['sf_warehouse'] = wh
-    except Exception:
-        pass
 
 @st.cache_data(ttl=300)
 def _list_databases() -> List[str]:
@@ -169,79 +128,9 @@ def _list_databases() -> List[str]:
     except Exception:
         return []
 
-def _apply_database(db: Optional[str]) -> None:
-    """USE the selected database and persist it; ignore errors silently."""
-    try:
-        if db and db != "All":
-            try:
-                snowflake_connector.execute_non_query(f"USE DATABASE {db}")
-            except Exception:
-                pass
-            st.session_state['sf_database'] = db
-        else:
-            # Clear explicit selection; downstream will resolve or prompt
-            st.session_state.pop('sf_database', None)
-    except Exception:
-        pass
 
-@st.cache_data(ttl=300)
-def _list_schemas(db: Optional[str]) -> List[str]:
-    """List schemas in the given database."""
-    if not db or db == "All":
-        return []
-    try:
-        rows = snowflake_connector.execute_query(
-            f"""
-            SELECT SCHEMA_NAME
-            FROM INFORMATION_SCHEMA.SCHEMATA
-            ORDER BY SCHEMA_NAME
-            """
-        ) or []
-        return [r.get('SCHEMA_NAME') for r in rows if r.get('SCHEMA_NAME')]
-    except Exception:
-        return []
 
-@st.cache_data(ttl=300)
-def _list_objects(db: Optional[str], schema: Optional[str]) -> List[str]:
-    """List tables and views in the given database/schema."""
-    if not db or db == "All" or not schema or schema == "All":
-        return []
-    try:
-        rows = snowflake_connector.execute_query(
-            f"""
-            SELECT TABLE_NAME AS NAME, 'TABLE' AS TYPE
-            FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA = %(s)s
-            UNION ALL
-            SELECT TABLE_NAME AS NAME, 'VIEW' AS TYPE
-            FROM INFORMATION_SCHEMA.VIEWS
-            WHERE TABLE_SCHEMA = %(s)s
-            ORDER BY NAME
-            """,
-            {"s": schema},
-        ) or []
-        return [r.get('NAME') for r in rows if r.get('NAME')]
-    except Exception:
-        return []
 
-@st.cache_data(ttl=300)
-def _list_columns(db: Optional[str], schema: Optional[str], obj: Optional[str]) -> List[str]:
-    """List columns in the given table/view."""
-    if not db or db == "All" or not schema or schema == "All" or not obj or obj == "All":
-        return []
-    try:
-        rows = snowflake_connector.execute_query(
-            f"""
-            SELECT COLUMN_NAME
-            FROM {db}.INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = %(s)s AND TABLE_NAME = %(t)s
-            ORDER BY ORDINAL_POSITION
-            """,
-            {"s": schema, "t": obj},
-        ) or []
-        return [r.get('COLUMN_NAME') for r in rows if r.get('COLUMN_NAME')]
-    except Exception:
-        return []
 
 def _get_available_frameworks(db: str) -> List[str]:
     """Auto-detect regulatory frameworks and categories based on available flags in the ASSETS table."""
@@ -498,264 +387,8 @@ def get_classification_requirements_metrics(db: str, filters: dict = None) -> Di
     }
 
 # REMOVED CACHE to force fresh data - enable cache after debugging
-def get_mandatory_compliance_elements(db: str, filters: dict = None) -> List[Dict]:
-    """Fetch mandatory compliance elements metrics from ASSETS table."""
-    schema = _gv_schema()
-    
-    # Construct query to fetch all metrics from ASSETS table
-    query = f"""
-    -- CTE to calculate all compliance metrics from ASSETS table
-    WITH asset_metrics AS (
-        SELECT 
-            -- Total assets
-            COUNT(*) as total_assets,
-            
-            -- 5-Day SLA Compliance
-            COUNT(CASE WHEN 
-                   (DATEDIFF(day, 
-                     COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), 
-                     CLASSIFICATION_DATE
-                   ) - 
-                   (FLOOR(DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE) / 7) * 2) -
-                   CASE 
-                       WHEN DAYOFWEEKISO(COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP)) = 7 THEN 1 
-                       WHEN DAYOFWEEKISO(COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP)) = 6 
-                            AND DAYOFWEEKISO(CLASSIFICATION_DATE) = 7 THEN 2
-                       WHEN DAYOFWEEKISO(CLASSIFICATION_DATE) = 7 THEN 1
-                       ELSE 0
-                   END) <= 5
-                   AND CLASSIFICATION_DATE IS NOT NULL
-             THEN 1 END) as sla_compliant,
-            COUNT(CASE WHEN CLASSIFICATION_DATE IS NOT NULL THEN 1 END) as classified_total,
-            
-            -- Annual Reviews (assets reviewed in last 365 days)
-            COUNT(CASE WHEN LAST_REVIEW_DATE >= DATEADD(year, -1, CURRENT_DATE()) THEN 1 END) as annual_reviewed,
-            
-            -- Documentation Complete (assets with non-null, non-empty data_description)
-            COUNT(CASE WHEN DATA_DESCRIPTION IS NOT NULL AND TRIM(DATA_DESCRIPTION) != '' THEN 1 END) as doc_complete,
-            
-            -- Tags Applied (assets with classification label)
-            COUNT(CASE WHEN CLASSIFICATION_LABEL IS NOT NULL AND CLASSIFICATION_LABEL != 'Unclassified' THEN 1 END) as tagged_assets
-            
-        FROM {db}.{schema}.ASSETS
-        WHERE 1=1
-    )
-    SELECT 
-        'Mandatory Compliance Requirements' as CATEGORY,
-        'Enforcement tracking for Policy AVD-DWH-DCLS-001 Section 4.1 & 5.2' as METRIC,
-        '' as VALUE,
-        '' as STATUS,
-        '' as DETAILS
-
-    UNION ALL
-
-    SELECT 
-        'Assets Classified Within 5 Business Days',
-        'Policy SLA compliance for classification timeline',
-        (
-            SELECT 
-                TO_VARCHAR(sla_compliant) || ' / ' || 
-                TO_VARCHAR(classified_total) || ' (' || 
-                TO_VARCHAR(ROUND(100.0 * sla_compliant / NULLIF(classified_total, 0), 0)) || '%)' 
-            FROM asset_metrics
-        ),
-        (
-            SELECT CASE WHEN (100.0 * sla_compliant / NULLIF(classified_total, 0)) >= 90 THEN '🟢' 
-                        WHEN (100.0 * sla_compliant / NULLIF(classified_total, 0)) >= 70 THEN '🟡' 
-                        ELSE '🔴' END
-            FROM asset_metrics
-        ),
-        (SELECT TO_VARCHAR(classified_total - sla_compliant) || ' assets exceeding 5-day window' FROM asset_metrics)
-
-    UNION ALL
-
-    SELECT 
-        'Annual Reviews Completed',
-        'Periodic review compliance per policy requirements',
-        (
-            SELECT 
-                TO_VARCHAR(annual_reviewed) || ' / ' || 
-                TO_VARCHAR(total_assets) || ' (' || 
-                TO_VARCHAR(ROUND(100.0 * annual_reviewed / NULLIF(total_assets, 0), 0)) || '%)' 
-            FROM asset_metrics
-        ),
-        (
-            SELECT CASE WHEN (100.0 * annual_reviewed / NULLIF(total_assets, 0)) >= 90 THEN '🟢' 
-                        WHEN (100.0 * annual_reviewed / NULLIF(total_assets, 0)) >= 70 THEN '🟡' 
-                        ELSE '🔴' END
-            FROM asset_metrics
-        ),
-        (SELECT TO_VARCHAR(total_assets - annual_reviewed) || ' assets pending annual review' FROM asset_metrics)
-
-    UNION ALL
-
-    SELECT 
-        'Classification Documentation Complete',
-        'Completeness of classification rationale and impact assessments',
-        (
-            SELECT 
-                TO_VARCHAR(doc_complete) || ' / ' || 
-                TO_VARCHAR(total_assets) || ' (' || 
-                TO_VARCHAR(ROUND(100.0 * doc_complete / NULLIF(total_assets, 0), 0)) || '%)' 
-            FROM asset_metrics
-        ),
-        (
-            SELECT CASE WHEN (100.0 * doc_complete / NULLIF(total_assets, 0)) >= 90 THEN '🟢' 
-                        WHEN (100.0 * doc_complete / NULLIF(total_assets, 0)) >= 70 THEN '🟡' 
-                        ELSE '🔴' END
-            FROM asset_metrics
-        ),
-        (SELECT TO_VARCHAR(total_assets - doc_complete) || ' assets missing documentation' FROM asset_metrics)
-
-    UNION ALL
-
-    SELECT 
-        'Snowflake Tags Applied Correctly',
-        'System tagging compliance for data classification',
-        (
-            SELECT 
-                TO_VARCHAR(tagged_assets) || ' / ' || 
-                TO_VARCHAR(total_assets) || ' (' || 
-                TO_VARCHAR(ROUND(100.0 * tagged_assets / NULLIF(total_assets, 0), 0)) || '%)' 
-            FROM asset_metrics
-        ),
-        (
-            SELECT CASE WHEN (100.0 * tagged_assets / NULLIF(total_assets, 0)) >= 90 THEN '🟢' 
-                        WHEN (100.0 * tagged_assets / NULLIF(total_assets, 0)) >= 70 THEN '🟡' 
-                        ELSE '🔴' END
-            FROM asset_metrics
-        ),
-        (SELECT TO_VARCHAR(total_assets - tagged_assets) || ' assets missing classification tags' FROM asset_metrics)
-        
-    ORDER BY 
-        CASE 
-            WHEN CATEGORY = 'Mandatory Compliance Requirements' THEN 1
-            WHEN CATEGORY = 'Assets Classified Within 5 Business Days' THEN 2
-            WHEN CATEGORY = 'Annual Reviews Completed' THEN 3
-            WHEN CATEGORY = 'Classification Documentation Complete' THEN 4
-            WHEN CATEGORY = 'Snowflake Tags Applied Correctly' THEN 5
-            ELSE 6
-        END
-    """
-    
-    try:
-        # Execute query and return results
-        results = snowflake_connector.execute_query(query)
-        # Normalize keys to uppercase for consistency
-        return [{k.upper(): v for k, v in row.items()} for row in (results or [])]
-    except Exception as e:
-        logger.error(f"Error executing mandatory compliance query: {e}")
-        # Return empty list on error
-        return []
 
 # REMOVED CACHE to force fresh data - enable cache after debugging
-def get_risk_classification_data(db: str, filters: dict = None) -> pd.DataFrame:
-    """Fetch risk classification distribution directly from the ASSETS table."""
-    schema = _gv_schema()
-    
-    try:
-        # Resolve a safe database context (some pages may pass "All" when the sidebar filter is not set)
-        if not db or str(db).strip().upper() in ("ALL", "NONE", "NULL", "(NONE)", "UNKNOWN", ""):
-            db = st.session_state.get("sf_database") or ""
-        if not db or str(db).strip().upper() in ("ALL", "NONE", "NULL", "(NONE)", "UNKNOWN", ""):
-            return pd.DataFrame([
-                {'Risk Level': 'CRITICAL', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum >= 10', 'Status': '🔥 Critical'},
-                {'Risk Level': 'HIGH', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum 7-9', 'Status': '🚨 High'},
-                {'Risk Level': 'MEDIUM', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum 4-6', 'Status': '⚠️ Elevated'},
-                {'Risk Level': 'LOW', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum < 4', 'Status': '✅ Secure'}
-            ])
-
-        where_clause, params = _build_filters(filters, db)
-        
-        query = f"""
-        WITH target_assets AS (
-            -- Use the provided database and schema context but don't force a match on DATABASE_NAME column
-            -- unless explicitly requested by UI filters to be more permissive.
-            SELECT * FROM {db}.{schema}.ASSETS
-            WHERE {where_clause}
-        ),
-        risk_calculation AS (
-            SELECT
-                ASSET_ID,
-                (
-                    COALESCE(TRY_TO_NUMBER(SUBSTRING(COALESCE(TO_VARCHAR(CONFIDENTIALITY_LEVEL), 'C1'), 2)), 1) +
-                    COALESCE(TRY_TO_NUMBER(SUBSTRING(COALESCE(TO_VARCHAR(INTEGRITY_LEVEL), 'I1'), 2)), 1) +
-                    COALESCE(TRY_TO_NUMBER(SUBSTRING(COALESCE(TO_VARCHAR(AVAILABILITY_LEVEL), 'A1'), 2)), 1)
-                ) as total_score
-            FROM target_assets
-        ),
-        scored_levels AS (
-            SELECT 
-                ASSET_ID,
-                CASE 
-                    WHEN total_score >= 10 THEN 'CRITICAL'
-                    WHEN total_score >= 7 THEN 'HIGH'
-                    WHEN total_score >= 4 THEN 'MEDIUM'
-                    ELSE 'LOW'
-                END as risk_level
-            FROM risk_calculation
-        ),
-        factory AS (
-            SELECT 'CRITICAL' as l UNION ALL SELECT 'HIGH' UNION ALL SELECT 'MEDIUM' UNION ALL SELECT 'LOW'
-        ),
-        aggregation AS (
-            SELECT 
-                f.l as "Risk Level",
-                COUNT(s.ASSET_ID) as "Count"
-            FROM factory f
-            LEFT JOIN scored_levels s ON f.l = s.risk_level
-            GROUP BY f.l
-        ),
-        totals AS (
-            SELECT SUM("Count") as total_sum FROM aggregation
-        )
-        SELECT 
-            a."Risk Level",
-            a."Count",
-            CONCAT(ROUND((a."Count" / NULLIF(t.total_sum, 0)) * 100, 1), '%') as "Percentage",
-            CASE a."Risk Level"
-                WHEN 'CRITICAL' THEN 'Sum >= 10'
-                WHEN 'HIGH' THEN 'Sum 7-9'
-                WHEN 'MEDIUM' THEN 'Sum 4-6'
-                ELSE 'Sum < 4'
-            END as "Criteria",
-            CASE a."Risk Level"
-                WHEN 'CRITICAL' THEN '🔥 Critical'
-                WHEN 'HIGH' THEN '🚨 High'
-                WHEN 'MEDIUM' THEN '⚠️ Elevated'
-                ELSE '✅ Secure'
-            END as "Status"
-        FROM aggregation a
-        CROSS JOIN totals t
-        ORDER BY 
-            CASE a."Risk Level"
-                WHEN 'LOW' THEN 1
-                WHEN 'MEDIUM' THEN 2
-                WHEN 'HIGH' THEN 3
-                WHEN 'CRITICAL' THEN 4
-            END
-        """
-        
-        rows = snowflake_connector.execute_query(query, params) or []
-        df = pd.DataFrame(rows)
-        # Keep UI stable even if something returns no rows.
-        if df.empty:
-            return pd.DataFrame([
-                {'Risk Level': 'CRITICAL', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum >= 10', 'Status': '🔥 Critical'},
-                {'Risk Level': 'HIGH', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum 7-9', 'Status': '🚨 High'},
-                {'Risk Level': 'MEDIUM', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum 4-6', 'Status': '⚠️ Elevated'},
-                {'Risk Level': 'LOW', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum < 4', 'Status': '✅ Secure'}
-            ])
-        return df
-        
-    except Exception as e:
-        logger.warning(f"Error fetching risk classification data from ASSETS: {e}")
-        return pd.DataFrame([
-            {'Risk Level': 'CRITICAL', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum >= 10', 'Status': '🔥 Critical'},
-            {'Risk Level': 'HIGH', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum 7-9', 'Status': '🚨 High'},
-            {'Risk Level': 'MEDIUM', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum 4-6', 'Status': '⚠️ Elevated'},
-            {'Risk Level': 'LOW', 'Count': 0, 'Percentage': '0%', 'Criteria': 'Sum < 4', 'Status': '✅ Secure'}
-        ])
 
 
 def get_risk_exposure_assets(db: str, filters: dict = None) -> pd.DataFrame:
@@ -994,105 +627,6 @@ def get_mandatory_controls_metrics(db: str) -> Dict:
         logger.error(f"Error in get_mandatory_controls_metrics: {e}")
     return {}
 
-def get_compliance_impact_assessment(db: str) -> List[Dict]:
-    """
-    Perform a multi-dimensional compliance impact assessment for PII, SOX, and SOC 2.
-    Evaluates classification, tagging, masking, RBAC, and audit readiness.
-    """
-    schema = _gv_schema()
-    try:
-        query = f"""
-        WITH framework_assets AS (
-            SELECT 
-                ASSET_ID,
-                ASSET_NAME,
-                FULLY_QUALIFIED_NAME,
-                CLASSIFICATION_LABEL,
-                CONFIDENTIALITY_LEVEL,
-                PII_RELEVANT,
-                SOX_RELEVANT,
-                SOC2_RELEVANT,
-                SENSITIVE_DATA_USAGE_COUNT,
-                DATA_OWNER,
-                LAST_REVIEW_DATE,
-                NEXT_REVIEW_DATE,
-                -- Verify classification & tagging
-                CASE WHEN CLASSIFICATION_LABEL IS NOT NULL AND CLASSIFICATION_LABEL != 'Unclassified' THEN 1 ELSE 0 END as is_tagged,
-                -- Confirm masking (Simulated by checking if C level is elevated or specific tag exists)
-                -- In a real app, this would join with SNOWFLAKE.ACCOUNT_USAGE.POLICY_REFERENCES
-                CASE WHEN CONFIDENTIALITY_LEVEL IN ('C2', 'C3') THEN 1 ELSE 0 END as is_masked,
-                -- Validate RBAC (Based on whether usage count seems aligned with owner)
-                CASE WHEN SENSITIVE_DATA_USAGE_COUNT < 100 THEN 1 ELSE 0 END as is_rbac_aligned,
-                -- Audit readiness
-                CASE WHEN LAST_REVIEW_DATE >= DATEADD(month, -6, CURRENT_DATE()) THEN 1 ELSE 0 END as is_audit_ready
-            FROM {db}.{schema}.ASSETS
-            WHERE PII_RELEVANT = TRUE OR SOX_RELEVANT = TRUE OR SOC2_RELEVANT = TRUE
-        ),
-        impact_calc AS (
-            SELECT
-                'PII' as framework,
-                COUNT(*) as total,
-                SUM(CASE WHEN PII_RELEVANT = TRUE THEN 1 ELSE 0 END) as relevant_count,
-                SUM(CASE WHEN PII_RELEVANT = TRUE AND is_tagged = 1 THEN 1 ELSE 0 END) as tagged,
-                SUM(CASE WHEN PII_RELEVANT = TRUE AND is_masked = 1 THEN 1 ELSE 0 END) as masked,
-                SUM(CASE WHEN PII_RELEVANT = TRUE AND is_rbac_aligned = 1 THEN 1 ELSE 0 END) as rbac,
-                SUM(CASE WHEN PII_RELEVANT = TRUE AND is_audit_ready = 1 THEN 1 ELSE 0 END) as audit
-            FROM framework_assets
-            
-            UNION ALL
-            
-            SELECT
-                'SOX' as framework,
-                COUNT(*) as total,
-                SUM(CASE WHEN SOX_RELEVANT = TRUE THEN 1 ELSE 0 END) as relevant_count,
-                SUM(CASE WHEN SOX_RELEVANT = TRUE AND is_tagged = 1 THEN 1 ELSE 0 END) as tagged,
-                SUM(CASE WHEN SOX_RELEVANT = TRUE AND is_masked = 1 THEN 1 ELSE 0 END) as masked,
-                SUM(CASE WHEN SOX_RELEVANT = TRUE AND is_rbac_aligned = 1 THEN 1 ELSE 0 END) as rbac,
-                SUM(CASE WHEN SOX_RELEVANT = TRUE AND is_audit_ready = 1 THEN 1 ELSE 0 END) as audit
-            FROM framework_assets
-            
-            UNION ALL
-            
-            SELECT
-                'SOC 2' as framework,
-                COUNT(*) as total,
-                SUM(CASE WHEN SOC2_RELEVANT = TRUE THEN 1 ELSE 0 END) as relevant_count,
-                SUM(CASE WHEN SOC2_RELEVANT = TRUE AND is_tagged = 1 THEN 1 ELSE 0 END) as tagged,
-                SUM(CASE WHEN SOC2_RELEVANT = TRUE AND is_masked = 1 THEN 1 ELSE 0 END) as masked,
-                SUM(CASE WHEN SOC2_RELEVANT = TRUE AND is_rbac_aligned = 1 THEN 1 ELSE 0 END) as rbac,
-                SUM(CASE WHEN SOC2_RELEVANT = TRUE AND is_audit_ready = 1 THEN 1 ELSE 0 END) as audit
-            FROM framework_assets
-        )
-        SELECT 
-            framework,
-            relevant_count,
-            tagged,
-            masked,
-            rbac,
-            audit,
-            -- Logic for Impact Level
-            CASE 
-                WHEN relevant_count = 0 THEN 'Low'
-                WHEN (tagged + masked + rbac + audit) / (relevant_count * 4.0) >= 0.9 THEN 'Low'
-                WHEN (tagged + masked + rbac + audit) / (relevant_count * 4.0) >= 0.7 THEN 'Moderate'
-                WHEN (tagged + masked + rbac + audit) / (relevant_count * 4.0) >= 0.5 THEN 'High'
-                ELSE 'Critical'
-            END as impact_level,
-            -- Logic for Rationale
-            CASE 
-                WHEN framework = 'PII' THEN 'Rationale aligned to PII protection: Assessment of individual privacy leakage risk through classification coverage and masking enforcement.'
-                WHEN framework = 'SOX' THEN 'Rationale aligned to SOX internal controls: Evaluation of financial reporting integrity via RBAC alignment and audit trail validity.'
-                WHEN framework = 'SOC 2' THEN 'Rationale aligned to SOC 2 Trust Service Criteria: Verification of security, availability, and confidentiality controls across cloud infrastructure.'
-                ELSE 'Framework-specific rationale.'
-            END as rationale
-        FROM impact_calc
-        WHERE relevant_count > 0
-        """
-        rows = snowflake_connector.execute_query(query)
-        return rows if rows else []
-    except Exception as e:
-        logger.error(f"Error in get_compliance_impact_assessment: {e}")
-        return []
 
 # REMOVED CACHE to force fresh data - enable cache after debugging
 def get_annual_reviews_data(db: str, filters: dict = None) -> pd.DataFrame:
@@ -1134,46 +668,6 @@ def get_annual_reviews_data(db: str, filters: dict = None) -> pd.DataFrame:
         return pd.DataFrame()
 
 # REMOVED CACHE to force fresh data - enable cache after debugging
-def get_qa_reviews_metrics(db: str) -> Dict:
-    """Fetch QA reviews metrics"""
-    schema = _gv_schema()
-    
-    metrics = {
-        'peer_reviews': {'completed': 0, 'pending': 0, 'issues': 0},
-        'management_reviews': {'completed': 0, 'pending': 0, 'issues': 0},
-        'technical_reviews': {'completed': 0, 'pending': 0, 'issues': 0},
-        'consistency_reviews': {'completed': 0, 'pending': 0, 'issues': 0}
-    }
-    
-    try:
-        if _table_exists(db, schema, 'QA_REVIEWS'):
-            query = f"""
-            SELECT 
-                REVIEW_TYPE,
-                STATUS,
-                COUNT(*) AS count,
-                SUM(CASE WHEN ISSUES_FOUND > 0 THEN ISSUES_FOUND ELSE 0 END) AS total_issues
-            FROM {db}.{schema}.QA_REVIEWS
-            GROUP BY REVIEW_TYPE, STATUS
-            """
-            result = snowflake_connector.execute_query(query)
-            if result:
-                for row in result:
-                    review_type = row.get('REVIEW_TYPE', '').lower().replace(' ', '_') + '_reviews'
-                    status = row.get('STATUS', '').lower()
-                    count = int(row.get('count', 0))
-                    
-                    if review_type in metrics:
-                        if status == 'completed':
-                            metrics[review_type]['completed'] = count
-                            metrics[review_type]['issues'] = int(row.get('total_issues', 0))
-                        elif status == 'pending':
-                            metrics[review_type]['pending'] = count
-    
-    except Exception as e:
-        logger.warning(f"Error fetching QA reviews: {e}")
-    
-    return metrics
 
 def get_policy_violations(db: str, filters: dict = None) -> pd.DataFrame:
     """Fetch policy violations data directly from the ASSETS table with filter support."""
@@ -1335,7 +829,7 @@ def get_compliance_trends_metrics(db: str, filters: dict = None) -> pd.DataFrame
             FROM governance_metrics
         ),
 
-        -- 3. Audit Activity Metrics - From AUDIT_LOG base table
+        -- 3. Audit Activity Metrics - From CLASSIFICATION_AUDIT base table
         audit_metrics AS (
             SELECT
                 DATE_TRUNC('MONTH', TIMESTAMP) AS month,
@@ -1343,7 +837,7 @@ def get_compliance_trends_metrics(db: str, filters: dict = None) -> pd.DataFrame
                 COUNT(DISTINCT RESOURCE_ID) AS unique_resources,
                 COUNT(CASE WHEN ACTION ILIKE '%classification%' THEN 1 END) AS classification_events,
                 COUNT(CASE WHEN ACTION ILIKE '%review%' THEN 1 END) AS review_events
-            FROM {db}.{schema}.AUDIT_LOG
+            FROM {db}.{schema}.CLASSIFICATION_AUDIT
             WHERE TIMESTAMP >= DATEADD('month', -6, CURRENT_DATE())
             GROUP BY DATE_TRUNC('MONTH', TIMESTAMP)
         ),
@@ -1777,11 +1271,10 @@ if not db:
 # MAIN TABS
 # ============================================================================
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3 = st.tabs([
     "📊 Compliance Overview",
-    "📅 Reviews & Audits",
-    "⚠️ Policy Violations",
-    "📈 Analytics & Drift"
+    "⚠️ Reviews & Violations",
+    "📈 Reports & Trends"
 ])
 
 with tab1:
@@ -1823,13 +1316,6 @@ with tab1:
                         """
                         # Re-run diag with permissive params
                         row_diag = (snowflake_connector.execute_query(q_diag, params) or [{}])[0]
-                        with st.expander("🔍 Metrics Diagnostics (Data Breakdown)"):
-                            st.caption(f"Context: {diag_db}.{diag_schema}")
-                            d_col1, d_col2 = st.columns(2)
-                            d_col1.metric("Total Registry Assets", row_diag.get("TOTAL_TABLES", 0))
-                            d_col1.metric("Classified Assets", row_diag.get("CLASSIFIED_TABLES", 0))
-                            d_col2.metric("Sensitive Assets", row_diag.get("SENSITIVE_TABLES", 0))
-                            d_col2.metric("Telemetry Hits", row_diag.get("SENSITIVE_ACCESS_TABLES", 0))
             except Exception:
                 pass
 
@@ -1880,13 +1366,11 @@ with tab1:
         st.stop()
     
     # Sub-tabs for Compliance Overview
-    subtab1, subtab2, subtab3 = st.tabs([
+    subtab1, subtab2 = st.tabs([
         "🛡️ Mandatory Controls",
-        "📊 Risk Distribution",
-        "⚖️ Special Categories"
+        "📊 Risk Distribution"
     ])
 
-    
     # ========================================================================
     # SUBTAB 1: MANDATORY COMPLIANCE
     # ========================================================================
@@ -2042,7 +1526,7 @@ Role-based access control explicitly linked to classification metadata.
 </div>""", unsafe_allow_html=True)
             
             st.markdown("<div style='height: 1.5rem;'></div>", unsafe_allow_html=True)
-            st.button("📋 Generate Enterprise Compliance Audit", width='stretch', type="primary")
+            st.button("📋 Generate Enterprise Compliance Audit", width='stretch', type="primary", key="btn_gen_audit_1")
 
         st.markdown(f"""
 <div style="background: rgba(15, 23, 42, 0.6); padding: 1.5rem; border-radius: 16px; margin-top: 2rem; border: 1px solid rgba(255, 255, 255, 0.05); text-align: center;">
@@ -2053,11 +1537,6 @@ Role-based access control explicitly linked to classification metadata.
 </div>
 """, unsafe_allow_html=True)
 
-
-
-
-    
-    
     # ========================================================================
     # SUBTAB 2: RISK DISTRIBUTION
     # ========================================================================
@@ -2198,7 +1677,7 @@ Analysis of data assets by security posture and C.I.A impact levels.
                     margin=dict(t=0, b=50, l=0, r=0),
                     height=400
                 )
-                st.plotly_chart(fig, width='stretch', config={'displayModeBar': False})
+                st.plotly_chart(fig, width='stretch', config={'displayModeBar': False}, key='plotly_risk_chart_1')
                 st.markdown('</div>', unsafe_allow_html=True)
 
             with cards_col:
@@ -2314,258 +1793,20 @@ Analysis of data assets by security posture and C.I.A impact levels.
             st.info("No risk telemetry available for this scope.")
 
     
-    
-    # ========================================================================
-    # SUBTAB 3: SPECIAL CATEGORIES
-    # ========================================================================
-    
-    with subtab3:
-        # Header with download options
-        header_col, download_col = st.columns([3, 1])
-        
-        with header_col:
-            st.markdown("""
-<div style="margin: 1.5rem 0 1rem 0;">
-<h3 style="margin-bottom: 0.25rem; font-size: 1.25rem;">⚖️ Regulatory Frameworks</h3>
-<p style="color: #64748b; font-size: 0.875rem; font-weight: 500;">Special category compliance enforcement (PII, SOC2, SOX)</p>
-</div>
-""", unsafe_allow_html=True)
-        
-        # Fetch special categories data
-        special = get_special_categories_compliance(db, filters=filters)
-        
-        # Prepare data for download
-        download_data = []
-        for framework_name, framework_data in special.items():
-            if framework_data:
-                download_data.append({
-                    'Framework': framework_name,
-                    'Compliance Rate': framework_data.get('rate_str', 'N/A'),
-                    'Status': framework_data.get('status', 'Unknown'),
-                    'Compliant Assets': framework_data.get('compliant', 0),
-                    'Non-Compliant Assets': framework_data.get('non_compliant', 0),
-                    'Recommended Action': framework_data.get('action', 'None')
-                })
-        
-        compliance_df = pd.DataFrame(download_data)
-        
-        with download_col:
-            if not compliance_df.empty:
-                # CSV Download (always available)
-                csv = compliance_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=csv,
-                    file_name=f"special_categories_compliance_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    width='stretch'
-                )
-                
-                # Excel Download (optional - requires openpyxl)
-                try:
-                    from io import BytesIO
-                    excel_buffer = BytesIO()
-                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                        compliance_df.to_excel(writer, index=False, sheet_name='Compliance')
-                    excel_data = excel_buffer.getvalue()
-                    
-                    st.download_button(
-                        label="📥 Download Excel",
-                        data=excel_data,
-                        file_name=f"special_categories_compliance_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        width='stretch'
-                    )
-                except ImportError:
-                    # openpyxl not installed, skip Excel download
-                    st.caption("💡 Install openpyxl for Excel export")
-                except Exception as e:
-                    # Other errors, log but don't break the page
-                    logger.warning(f"Excel export failed: {e}")
-        
-        st.markdown("---")
-        
-        
-        sc1, sc2, sc3 = st.columns(3)
-        
-        def render_special_card(col, title, min_req, data_dict, key):
-            if not data_dict:
-                data_dict = {'status': '⚠️ Unknown', 'rate_str': '0%', 'action': 'No data', 'compliant': 0, 'non_compliant': 0}
-            
-            rate_str = data_dict.get('rate_str', '0%')
-            rate_val = float(rate_str.replace('%','')) if '%' in rate_str else 0
-            rate_color = "#10b981" if rate_val >= 90 else "#f59e0b" if rate_val >= 70 else "#ef4444"
-            status = data_dict.get('status', 'Unknown')
-            action = data_dict.get('action', 'None')
-            compliant = data_dict.get('compliant', 0)
-            non_compliant = data_dict.get('non_compliant', 0)
-            
-            with col:
-                st.markdown(f"""
-<div style="background: rgba(30, 41, 59, 0.4); padding: 1.5rem; border-radius: 24px; border: 1px solid rgba(255,255,255,0.05); border-top: 5px solid {rate_color}; backdrop-filter: blur(12px); box-shadow: 0 10px 30px rgba(0,0,0,0.2);">
-<div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 1.25rem;">
-<div>
-<h4 style="margin:0; font-size: 1.25rem; font-weight: 800; color: #f8fafc; letter-spacing: -0.02em;">{title}</h4>
-<div style="color: #94a3b8; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px;">Min Target: {min_req}</div>
-</div>
-<div style="color: {rate_color}; font-size: 1.75rem; font-weight: 900; letter-spacing: -0.05em;">{rate_str}</div>
-</div>
-<div style="margin-bottom: 1.5rem;">
-<span style="font-size: 0.75rem; font-weight: 800; color: {rate_color}; background: {rate_color}15; padding: 4px 12px; border-radius: 8px; border: 1px solid {rate_color}30;">{status}</span>
-</div>
-<div style="display: flex; gap: 2.5rem; margin-bottom: 1.5rem; background: rgba(255,255,255,0.02); padding: 1rem; border-radius: 16px;">
-<div>
-<div style="color: #64748b; font-size: 0.65rem; font-weight: 800; text-transform: uppercase; margin-bottom: 4px;">Compliant</div>
-<div style="font-size: 1.25rem; font-weight: 800; color: #f8fafc;">{compliant}</div>
-</div>
-<div style="background: rgba(255,255,255,0.05); width: 1px; height: 2.5rem;"></div>
-<div>
-<div style="color: #64748b; font-size: 0.65rem; font-weight: 800; text-transform: uppercase; margin-bottom: 4px;">Violations</div>
-<div style="font-size: 1.25rem; font-weight: 800; color: {'#ef4444' if non_compliant > 0 else '#f8fafc'};">{non_compliant}</div>
-</div>
-</div>
-<div style="background: rgba(0,0,0,0.1); padding: 1rem; border-radius: 12px;">
-<div style="color: #64748b; font-size: 0.65rem; font-weight: 800; text-transform: uppercase; margin-bottom: 6px;">Recommended Action</div>
-<div style="font-size: 0.8rem; color: #cbd5e1; font-weight: 500; line-height: 1.4;">{action}</div>
-</div>
-</div>
-""", unsafe_allow_html=True)
-                
-                if st.button(f"🛡️ Start {title} Audit", key=f"aud_{key}", width='stretch', type="primary"):
-                    if non_compliant > 0:
-                        st.markdown(f"""
-<div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.2); padding: 1rem; border-radius: 12px; margin-top: 1rem;">
-<div style="color: #ef4444; font-weight: 800; font-size: 0.85rem; margin-bottom: 4px;">⚠️ REMEDIATION REQUIRED</div>
-<div style="color: #cbd5e1; font-size: 0.8rem;">{action}</div>
-</div>
-""", unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"""
-<div style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); padding: 1rem; border-radius: 12px; margin-top: 1rem;">
-<div style="color: #10b981; font-weight: 800; font-size: 0.85rem; margin-bottom: 4px;">✅ COMPLIANCE VERIFIED</div>
-<div style="color: #cbd5e1; font-size: 0.8rem;">Current status is OPTIMAL. No further action needed.</div>
-</div>
-""", unsafe_allow_html=True)
-                    
-                    # Generic drill-down for ALL frameworks using AI Discovery Data
-                    with st.expander(f"📋 Detailed {title} Discovery Evidence", expanded=True):
-                        st.markdown(f"##### 🧬 AI-Detected {title} Assets & Column Context")
-                        try:
-                            schema = _gv_schema()
-                            # Map the key to the appropriate filters for the AI results table
-                            category_filters = {
-                                'pii': "UPPER(AI_CATEGORY) IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER', 'NAME', 'EMAIL', 'PHONE')",
-                                'soc2': "UPPER(AI_CATEGORY) LIKE '%SECURITY%' OR UPPER(AI_CATEGORY) LIKE '%SOC2%' OR UPPER(AI_CATEGORY) LIKE '%CONTROL%'",
-                                'sox': "UPPER(AI_CATEGORY) LIKE '%FINANCIAL%' OR UPPER(AI_CATEGORY) LIKE '%SOX%' OR UPPER(AI_CATEGORY) LIKE '%ACCOUNTING%'",
-                                'gdpr': "UPPER(AI_CATEGORY) LIKE '%GDPR%' OR UPPER(AI_CATEGORY) LIKE '%PRIVACY%'",
-                                'hipaa': "UPPER(AI_CATEGORY) LIKE '%HIPAA%' OR UPPER(AI_CATEGORY) LIKE '%HEALTH%' OR UPPER(AI_CATEGORY) LIKE '%MEDICAL%'",
-                                'pci-dss': "UPPER(AI_CATEGORY) LIKE '%PCI%' OR UPPER(AI_CATEGORY) LIKE '%CARD%' OR UPPER(AI_CATEGORY) LIKE '%PAYMENT%'"
-                            }
-                            
-                            filter_clause = category_filters.get(key, f"UPPER(AI_CATEGORY) LIKE '%{key.upper().replace('_',' ')}%'")
-                            
-                            ai_q = f"""
-                            SELECT 
-                                TABLE_NAME as "Asset",
-                                COLUMN_NAME as "Column",
-                                AI_CATEGORY as "AI Category",
-                                SEMANTIC_CATEGORY as "Semantic",
-                                ROUND(FINAL_CONFIDENCE * 100, 1) || '%' as "Confidence",
-                                MODEL_VERSION as "Model",
-                                UPDATED_AT as "Discovery Date"
-                            FROM {db}.{schema}.CLASSIFICATION_AI_RESULTS
-                            WHERE {filter_clause}
-                            AND FINAL_CONFIDENCE >= 0.7
-                            ORDER BY FINAL_CONFIDENCE DESC
-                            LIMIT 100
-                            """
-                            
-                            ai_res = snowflake_connector.execute_query(ai_q)
-                            if ai_res:
-                                st.dataframe(pd.DataFrame(ai_res), width='stretch', hide_index=True)
-                                st.caption(f"💡 Showing top AI discoveries matching {title} criteria.")
-                            else:
-                                st.info(f"No active AI discoveries found in CLASSIFICATION_AI_RESULTS for {title} category.")
-                                
-                            # Logic for fetching assets from the ASSETS table
-                            st.markdown("---")
-                            st.markdown("##### 🛡️ Governance Registry Context")
-                            
-                            # Construct dynamic filter based on framework key
-                            f_upper = key.upper()
-                            if f_upper == 'PII':
-                                f_filter = "PII_RELEVANT = TRUE"
-                            elif f_upper == 'SOX':
-                                f_filter = "SOX_RELEVANT = TRUE"
-                            elif f_upper in ('SOC2', 'SOC_2'):
-                                f_filter = "SOC2_RELEVANT = TRUE"
-                            else:
-                                # Fallback if somehow a different key ends up here
-                                f_filter = "1=0"
-                            
-                            try:
-                                asset_q = f"""
-                                SELECT 
-                                    FULLY_QUALIFIED_NAME as "Asset",
-                                    CLASSIFICATION_LABEL as "Label",
-                                    CONFIDENTIALITY_LEVEL as "Sensitivity",
-                                    DATA_OWNER as "Owner",
-                                    REVIEW_STATUS as "Review Status"
-                                FROM {db}.{schema}.ASSETS
-                                WHERE {f_filter}
-                                LIMIT 25
-                                """
-                                asset_res = snowflake_connector.execute_query(asset_q)
-                                if asset_res:
-                                    st.dataframe(pd.DataFrame(asset_res), width='stretch', hide_index=True)
-                                    st.caption(f"Showing up to 25 assets explicitly tagged for {title} in the Governance Registry.")
-                                else:
-                                    st.info(f"No assets in the Governance Registry are explicitly mapped to the {title} framework.")
-                            except Exception as e:
-                                st.warning(f"Could not retrieve registry context: {e}")
-                        except Exception as e:
-                            st.error(f"Failed to fetch {title} details: {e}")
-
-        # Render dynamic framework cards
-        framework_keys = sorted(list(special.keys()))
-        
-        if not framework_keys:
-            st.info("No regulatory frameworks or special categories detected in the current scope.")
-        else:
-            for i in range(0, len(framework_keys), 3):
-                chunk = framework_keys[i:i+3]
-                cols = st.columns(3)
-                for idx, key in enumerate(chunk):
-                    # Basic metadata
-                    title = f"{key} Framework"
-                    min_req = "C2+" if key.upper() == 'PII' else "C3+"
-                    
-                    framework_data = special.get(key)
-                    # Pass snake_case key for drill-down mapping
-                    render_special_card(cols[idx], title, min_req, framework_data, key.lower().replace(' ', '_'))
-
-        
-        st.markdown("---")
-
     # ============================================================================
-# TAB 2: REVIEWS & AUDITS
-# ============================================================================
+    # TAB 2: REVIEWS & AUDITS
+    # ============================================================================
 
 with tab2:
-    st.header("Reviews & Audits")
+    st.header("Reviews & Violations")
     
-    # Sub-tabs for Reviews & Audits
-    review_tab1, review_tab2, review_tab3 = st.tabs([
-        "Annual Reviews",
-        "Audit Schedule",
-        "Governing Policies"
+    # Sub-tabs for Reviews & Violations
+    subtab2_1, subtab2_2 = st.tabs([
+        "📅 Annual Reviews",
+        "🚨 Policy Violations"
     ])
-    
-    # ========================================================================
-    # REVIEW TAB 1: ANNUAL REVIEWS
-    # ========================================================================
-    
-    with review_tab1:
+
+    with subtab2_1:
         st.markdown("""
 <div style="margin: 1.5rem 0 1rem 0;">
     <h3 style="margin-bottom: 0.25rem; font-size: 1.25rem;">📅 Annual Review Cycle</h3>
@@ -2691,261 +1932,8 @@ with tab2:
 
         else:
             st.info("No annual review lifecycle data found in the current environment.")
-    
-    # ========================================================================
-    # REVIEW TAB 2: AUDIT SCHEDULE
-    # ========================================================================
 
-    with review_tab2:
-        st.markdown("""
-<div style="margin: 1.5rem 0 1rem 0;">
-            <h3 style="margin-bottom: 0.25rem; font-size: 1.25rem;">📜 Audit Lifecycle Manager</h3>
-            <p style="color: #64748b; font-size: 0.875rem; font-weight: 500;">Scheduling and historical performance tracking for formal compliance audits</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Dashboard for Audit Schedule
-        col1, col2 = st.columns([1.5, 1], gap="large")
-        
-        with col1:
-            st.markdown('<div class="glass-panel" style="padding: 1.5rem;">', unsafe_allow_html=True)
-            st.markdown('<div style="color: #38bdf8; font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 1.25rem;">🗓️ 2026 Audit Sequence</div>', unsafe_allow_html=True)
-            
-            # Use dynamic dates relative to today
-            t = datetime.now()
-            
-            audits = [
-                {"Audit": "Monthly Governance Sync", "Scope": "Mandatory Controls", "Date": (t + timedelta(days=8)).strftime("%b %d"), "Status": "Ready"},
-                {"Audit": "Q1 2026 Regulatory Review", "Scope": "PII / SOC2 / SOX", "Date": (t + timedelta(days=32)).strftime("%b %d"), "Status": "Scheduled"},
-                {"Audit": "Cloud Infrastructure Audit", "Scope": "Network & Access", "Date": (t + timedelta(days=64)).strftime("%b %d"), "Status": "Planned"},
-                {"Audit": "Annual External Audit", "Scope": "Full Compliance", "Date": (t + timedelta(days=156)).strftime("%b %d"), "Status": "Planned"}
-            ]
-            
-            for audit in audits:
-                st.markdown(f"""
-<div style="display: flex; justify-content: space-between; align-items: center; padding: 1rem; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; margin-bottom: 0.75rem;">
-    <div style="display: flex; align-items: center; gap: 1rem;">
-        <div style="background: rgba(56, 189, 248, 0.15); width: 45px; height: 45px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1.2rem;">📅</div>
-        <div>
-            <div style="font-size: 0.9rem; font-weight: 700; color: #f8fafc;">{audit['Audit']}</div>
-            <div style="font-size: 0.7rem; color: #64748b;">Scope: {audit['Scope']}</div>
-        </div>
-    </div>
-    <div style="text-align: right;">
-        <div style="font-size: 0.85rem; font-weight: 700; color: #38bdf8;">{audit['Date']}</div>
-        <div style="font-size: 0.65rem; color: #94a3b8; text-transform: uppercase;">{audit['Status']}</div>
-    </div>
-                </div>
-                """, unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-        with col2:
-            st.markdown('<div class="glass-panel" style="padding: 1.5rem; height: 100%;">', unsafe_allow_html=True)
-            st.markdown('<div style="color: #10b981; font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 1.25rem;">🏆 Archive Performance</div>', unsafe_allow_html=True)
-            
-            history = [
-                {"Name": "Q4 2025 Audit", "Result": "PASS", "Score": "98%", "Date": "Dec 15"},
-                {"Name": "Nov Monthly", "Result": "PASS", "Score": "100%", "Date": "Nov 12"},
-                {"Name": "Q3 2025 Audit", "Result": "PASS*", "Score": "92%", "Date": "Sep 30"}
-            ]
-            
-            for item in history:
-                st.markdown(f"""
-<div style="margin-bottom: 1.25rem;">
-    <div style="display: flex; justify-content: space-between; align-items: center;">
-        <div style="font-size: 0.85rem; font-weight: 700; color: #f8fafc;">{item['Name']}</div>
-        <div style="font-size: 0.8rem; font-weight: 800; color: #10b981;">{item['Result']}</div>
-    </div>
-    <div style="display: flex; justify-content: space-between; color: #64748b; font-size: 0.7rem; margin-top: 4px;">
-        <span>Score: {item['Score']}</span>
-        <span>{item['Date']}</span>
-    </div>
-                </div>
-                """, unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-    # ========================================================================
-    # REVIEW TAB 3: GOVERNING POLICIES
-    # ========================================================================
-    with review_tab3:
-        st.markdown("""
-<div style="margin: 1.5rem 0 1rem 0;">
-    <h3 style="margin-bottom: 0.25rem; font-size: 1.25rem;">📄 Governing Policies & Evidence</h3>
-    <p style="color: #64748b; font-size: 0.875rem; font-weight: 500;">Authoritative governance documents, audit evidence, and handling standards.</p>
-</div>
-        """, unsafe_allow_html=True)
-
-        # Database Resolution for Policies
-        pol_db = settings.SNOWFLAKE_DATABASE
-        if not pol_db or str(pol_db).strip().upper() in {"", "NONE", "(NONE)", "NULL", "UNKNOWN"}:
-            pol_db = "DATA_CLASSIFICATION_DB"
-        pol_schema = "DATA_CLASSIFICATION_GOVERNANCE"
-        
-        # Ensure infrastructure
-        try:
-            snowflake_connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {pol_db}.{pol_schema}")
-            snowflake_connector.execute_non_query(f"""
-                CREATE TABLE IF NOT EXISTS {pol_db}.{pol_schema}.POLICIES (
-                    POLICY_ID STRING NOT NULL DEFAULT UUID_STRING(),
-                    POLICY_NAME STRING NOT NULL,
-                    FILE_CONTENT BINARY NOT NULL,
-                    FILE_NAME STRING NOT NULL,
-                    MIME_TYPE STRING,
-                    FILE_SIZE NUMBER,
-                    POLICY_CONTENT TEXT,
-                    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-                    CREATED_BY STRING DEFAULT CURRENT_USER(),
-                    CONSTRAINT PK_POLICIES PRIMARY KEY (POLICY_ID)
-                )
-            """)
-            # Migration/Safe Alter
-            snowflake_connector.execute_non_query(f"ALTER TABLE {pol_db}.{pol_schema}.POLICIES ADD COLUMN IF NOT EXISTS FILE_CONTENT BINARY")
-        except Exception as e:
-            logger.warning(f"Policy table init/alter warning: {e}")
-
-        m_col1, m_col2 = st.columns([1, 2], gap="large")
-        
-        with m_col1:
-            st.markdown("#### 📂 Policy Repository")
-            
-            # Fetch existing policies
-            try:
-                p_rows = snowflake_connector.execute_query(f"SELECT POLICY_ID, POLICY_NAME, MIME_TYPE, FILE_CONTENT as RAW_FILE_DATA, POLICY_CONTENT FROM {pol_db}.{pol_schema}.POLICIES ORDER BY CREATED_AT DESC") or []
-            except:
-                p_rows = []
-                
-            if not p_rows:
-                st.info("No documents found in the registry.")
-            else:
-                for p in p_rows:
-                    with st.container():
-                        st.markdown(f"""
-<div style="background: rgba(30, 41, 59, 0.2); padding: 1rem; border-radius: 12px; border: 1px solid rgba(255,255,255,0.05); margin-bottom: 0.75rem;">
-    <div style="font-weight: 700; color: #f8fafc; font-size: 0.95rem;">{p['POLICY_NAME']}</div>
-    <div style="font-size: 0.75rem; color: #64748b; margin-top: 2px;">{p['MIME_TYPE']}</div>
-</div>
-                        """, unsafe_allow_html=True)
-                        if st.button(f"View Document", key=f"comp_vw_{p['POLICY_ID']}", width='stretch'):
-                            st.session_state['active_compliance_policy'] = p
-            
-            st.markdown("---")
-            st.markdown("#### 📤 Upload New Document")
-            with st.form("comp_policy_upload"):
-                up_name = st.text_input("Evidence Title")
-                up_file = st.file_uploader("Select PDF or DOCX", type=['pdf', 'docx', 'doc', 'md', 'txt'])
-                up_submit = st.form_submit_button("Upload Evidence to Snowflake", width='stretch')
-                
-                if up_submit and up_file and up_name:
-                    try:
-                        import uuid
-                        raw_bytes = up_file.read()
-                        extracted_text = "[Policy stored as binary. Use reader to view.]"
-                        
-                        # Full text extraction for search/indexing
-                        if up_file.type and 'pdf' in up_file.type:
-                            try:
-                                if pypdf:
-                                    reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
-                                    extracted_text = "\n\n".join([p.extract_text() or "" for p in reader.pages]).strip()
-                                elif PyPDF2:
-                                    reader = PyPDF2.PdfReader(io.BytesIO(raw_bytes))
-                                    extracted_text = "\n\n".join([p.extract_text() or "" for p in reader.pages]).strip()
-                            except: pass
-                        elif up_file.name.lower().endswith(('.docx', '.doc')):
-                            if docx:
-                                try:
-                                    doc = docx.Document(io.BytesIO(raw_bytes))
-                                    extracted_text = "\n".join([para.text for para in doc.paragraphs]).strip()
-                                except: pass
-                            
-                        query = f"""
-                        INSERT INTO {pol_db}.{pol_schema}.POLICIES 
-                        (POLICY_NAME, FILE_CONTENT, FILE_NAME, MIME_TYPE, FILE_SIZE, POLICY_CONTENT, CREATED_AT, CREATED_BY)
-                        VALUES (%(name)s, %(file)s, %(fn)s, %(fmt)s, %(fs)s, %(cont)s, CURRENT_TIMESTAMP(), CURRENT_USER())
-                        """
-                        snowflake_connector.execute_non_query(query, {
-                            "name": up_name, "file": raw_bytes, "fn": up_file.name, 
-                            "fmt": up_file.type, "fs": up_file.size, "cont": extracted_text
-                        })
-                        st.success(f"Successfully stored '{up_name}'")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Storage failed: {e}")
-
-        with m_col2:
-            st.markdown("#### 📖 Document Reader")
-            if 'active_compliance_policy' in st.session_state:
-                ap = st.session_state['active_compliance_policy']
-                
-                # Check for RAW data
-                if ap.get('RAW_FILE_DATA') and ap.get('MIME_TYPE') == 'application/pdf':
-                    try:
-                        raw_data = ap['RAW_FILE_DATA']
-                        # Handle bytes vs memoryview
-                        if not isinstance(raw_data, (bytes, bytearray)):
-                            raw_data = bytes(raw_data)
-                        
-                        b64_pdf = base64.b64encode(raw_data).decode('utf-8')
-                        pdf_iframe = f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="800px" style="border: none; border-radius: 12px;"></iframe>'
-                        st.markdown(pdf_iframe, unsafe_allow_html=True)
-                    except Exception as viewer_err:
-                        st.error(f"Renderer Error: {viewer_err}")
-                        st.info("Falling back to text preview...")
-                        st.code(ap.get('POLICY_CONTENT') or "No text content available.")
-                else:
-                    st.info("Previewing as text content...")
-                    st.code(ap.get('POLICY_CONTENT') or "No readable content found. Please download the file to view.")
-                    if ap.get('MIME_TYPE') and ('word' in ap['MIME_TYPE'] or 'officedocument' in ap['MIME_TYPE']):
-                         st.warning("Note: Full DOC/DOCX rendering is not supported in-browser. Displaying extracted text index.")
-                
-                if st.button("Close Viewer", width='stretch'):
-                    del st.session_state['active_compliance_policy']
-                    st.rerun()
-            else:
-                st.markdown("""
-<div style="height: 400px; display: flex; align-items: center; justify-content: center; background: rgba(255,255,255,0.01); border: 2px dashed rgba(255,255,255,0.05); border-radius: 20px;">
-    <div style="text-align: center; color: #64748b;">
-        <div style="font-size: 3rem; margin-bottom: 1rem;">📄</div>
-        <div>Select a record from the repository to retrieve and view</div>
-    </div>
-</div>
-                """, unsafe_allow_html=True)
-
-        # Maintenance Link for Compliance
-        with st.expander("🛠️ Metadata Maintenance"):
-            if st.button("🔗 Synchronize Extraction Index", key="comp_sync_ext"):
-                try:
-                    pols = snowflake_connector.execute_query(f"SELECT POLICY_ID, POLICY_NAME, MIME_TYPE, RAW_FILE_DATA FROM {pol_db}.{pol_schema}.POLICIES WHERE RAW_FILE_DATA IS NOT NULL AND (POLICY_CONTENT IS NULL OR POLICY_CONTENT LIKE '[System:%')") or []
-                    if not pols: st.info("Index is healthy.")
-                    else:
-                        for p in pols:
-                            txt = ""
-                            data = p['RAW_FILE_DATA']
-                            mim = p['MIME_TYPE'] or ""
-                            if 'pdf' in mim.lower() and (pypdf or PyPDF2):
-                                rdr = pypdf.PdfReader(io.BytesIO(data)) if pypdf else PyPDF2.PdfReader(io.BytesIO(data))
-                                txt = "\n\n".join([pg.extract_text() or "" for pg in rdr.pages]).strip()
-                            elif ('word' in mim.lower() or 'officedocument' in mim.lower()) and docx:
-                                d = docx.Document(io.BytesIO(data))
-                                txt = "\n".join([para.text for para in d.paragraphs]).strip()
-                            
-                            if txt:
-                                snowflake_connector.execute_non_query(f"UPDATE {pol_db}.{pol_schema}.POLICIES SET POLICY_CONTENT=%(c)s WHERE POLICY_ID=%(id)s", {"c": txt, "id": p['POLICY_ID']})
-                        st.success(f"Synchronized {len(pols)} documents.")
-                        st.rerun()
-                except Exception as ex: st.error(f"Sync error: {ex}")
-# ============================================================================
-
-with tab3:
-    st.subheader("⚠️ Violations")
-    
-    # Sub-tabs for Violations
-    violation_tab1, violation_tab2 = st.tabs([
-        "Policy Violations",
-        "Corrective Actions"
-    ])
-    
-    with violation_tab1:
+    with subtab2_2:
         st.write("### Policy Violations (Section 8.2.1)")
         
         # Fetch policy violations data
@@ -2998,234 +1986,36 @@ with tab3:
             
             # Violation Escalation Path
             st.write("#### Violation Escalation Path (Section 8.2.1)")
-            col1, col2, col3, col4 = st.columns(4)
+            ec1, ec2, ec3, ec4 = st.columns(4)
             
-            with col1:
+            with ec1:
                 st.info("**Level 1**\n📧 Warning\n• Email notification\n• Policy reminder")
-            with col2:
+            with ec2:
                 st.warning("**Level 2**\n📚 Retraining\n• Mandatory training\n• Counseling session")
-            with col3:
+            with ec3:
                 st.error("**Level 3**\n🔒 Access Restriction\n• Temporary suspension\n• Manager review")
-            with col4:
-                st.error("**Level 4**\n⚖️ Formal Discipline\n• HR involvement\n• Written warning")
-    
-    with violation_tab2:
-        st.write("### Corrective Action Tracking")
-        
-        # Fetch corrective actions from the database
-        with st.spinner("Loading corrective actions..."):
-            try:
-                query = f"""
-                SELECT 
-                  ASSET_ID AS "Action ID",
-                  CREATED_BY AS "User",
-                  CASE 
-                    WHEN NEXT_REVIEW_DATE < CURRENT_DATE() THEN 'Annual Review Overdue'
-                    WHEN CLASSIFICATION_LABEL IS NULL OR CLASSIFICATION_LABEL = 'Unclassified' THEN 'Missing Classification'
-                    WHEN CORRECTIVE_ACTION_REQUIRED = TRUE THEN 'Policy Violation Detected'
-                    ELSE 'Governance Gap'
-                  END AS "Issue",
-                  CASE 
-                    WHEN CORRECTIVE_ACTION_REQUIRED = TRUE THEN COALESCE(CORRECTIVE_ACTION_DESCRIPTION, 'Perform required remediation steps')
-                    WHEN CLASSIFICATION_LABEL IS NULL OR CLASSIFICATION_LABEL = 'Unclassified' THEN 'Complete asset classification per Policy Sec 4.1'
-                    WHEN NEXT_REVIEW_DATE < CURRENT_DATE() THEN 'Execute mandatory annual review'
-                    ELSE 'Contact data owner for clarification'
-                  END AS "Action Plan",
-                  TO_CHAR(COALESCE(CORRECTIVE_ACTION_DUE_DATE, NEXT_REVIEW_DATE, DATEADD('day', 7, CURRENT_DATE())), 'YYYY-MM-DD') AS "Due Date",
-                  CASE 
-                    WHEN COMPLIANCE_STATUS = 'COMPLIANT' THEN '100%'
-                    WHEN CORRECTIVE_ACTION_REQUIRED = TRUE THEN '25%'
-                    WHEN CLASSIFICATION_LABEL IS NOT NULL THEN '50%'
-                    ELSE '0%'
-                  END AS "Progress",
-                  CASE 
-                    WHEN COMPLIANCE_STATUS = 'COMPLIANT' THEN 'Completed'
-                    WHEN NEXT_REVIEW_DATE < CURRENT_DATE() THEN 'Overdue'
-                    WHEN CORRECTIVE_ACTION_REQUIRED = TRUE THEN 'At Risk'
-                    ELSE 'In Progress'
-                  END AS "Status"
-                FROM {active_db}.{_gv_schema()}.ASSETS
-                WHERE COMPLIANCE_STATUS != 'COMPLIANT' 
-                   OR CLASSIFICATION_LABEL IS NULL 
-                   OR CLASSIFICATION_LABEL = 'Unclassified'
-                   OR NEXT_REVIEW_DATE < CURRENT_DATE()
-                ORDER BY 
-                  CASE WHEN "Status" = 'Overdue' THEN 1 WHEN "Status" = 'At Risk' THEN 2 ELSE 3 END,
-                  "Due Date" ASC
-                """
-                
-                # Execute the query
-                corrective_actions = snowflake_connector.execute_query(query)
-                
-                if not corrective_actions:
-                    st.info("No corrective actions found.")
-                else:
-                    # Convert to DataFrame for display
-                    df = pd.DataFrame(corrective_actions)
-                    
-                    # Display the data in a nice table
-                    st.dataframe(
-                        df,
-                        width='stretch',
-                        hide_index=True
-                    )
-                    
-                    # Add summary metrics
-                    st.markdown("---")
-                    
-                    # Calculate metrics
-                    total_actions = len(df)
-                    completed = len(df[df['Status'] == 'Completed'])
-                    in_progress = len(df[df['Status'] == 'In Progress'])
-                    at_risk = len(df[df['Status'] == 'At Risk'])
-                    overdue = len(df[df['Status'] == 'Overdue'])
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.metric("Total Actions", total_actions)
-                    
-                    with col2:
-                        st.metric("Completed", completed)
-                    
-                    with col3:
-                        st.metric("In Progress", in_progress)
-                        
-                    with col4:
-                        st.metric("Requires Attention", at_risk + overdue, delta=overdue, delta_color="inverse")
-                    
-            except Exception as e:
-                st.error(f"Error loading corrective actions: {str(e)}")
-                st.warning("Using sample data as fallback")
-                
-                # Fallback to sample data if there's an error
-                corrective_actions = pd.DataFrame({
-                    'Action ID': ['CA-2024-001', 'CA-2024-002', 'CA-2024-003', 'CA-2024-004'],
-                    'User': ['Sarah Chen', 'Mike Rodriguez', 'David Kim', 'Jennifer Wu'],
-                    'Issue': ['Late Classification', 'Wrong Classification', 'Missing Tags', 'No Documentation'],
-                    'Action Plan': ['Complete training by Dec 15', 'Reclassify 5 assets', 'Apply tags to 12 assets', 'Document 8 decisions'],
-                    'Due Date': ['2024-12-15', '2024-12-10', '2024-12-08', '2024-12-20'],
-                    'Progress': [60, 80, 100, 25],
-                    'Status': ['In Progress', 'In Progress', 'Completed', 'At Risk']
-                })
-                
-                st.dataframe(
-                    corrective_actions,
-                    width='stretch',
-                    hide_index=True
-                )
 
-# ============================================================================
-# TAB 4: REPORTS & ANALYTICS
-# ============================================================================
 
-    with tab4:
-        st.header("Reports & Analytics")
-        st.caption("Downloadable reports and trend analytics")
-        
-        # Report generation
-        st.markdown("### Generate Compliance Reports")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.markdown("**Executive Summary**")
-            if st.button("📊 Generate Executive Report", width='stretch'):
-                with st.spinner("Generating executive summary..."):
-                    # Fetch summarized metrics
-                    metrics = get_classification_requirements_metrics(db, filters=filters)
-                    
-                    summary_data = {
-                        'Metric': [
-                            'Classification Coverage', 
-                            '5-Day Rule Compliance', 
-                            'Annual Review Completion', 
-                            'Documentation Completeness',
-                            'Policy Violations'
-                        ],
-                        'Value': [
-                            f"{metrics.get('coverage', 0):.1f}%",
-                            f"{metrics.get('five_day_compliance', 0):.1f}%",
-                            f"{metrics.get('annual_review', 0):.1f}%",
-                            f"{metrics.get('doc_completeness', 0):.1f}%",
-                            f"{metrics.get('policy_violations', 0)}"
-                        ],
-                        'Status': [
-                            metrics.get('overall_status', 'Unknown'),
-                            'Healthy' if metrics.get('five_day_compliance', 0) >= 95 else 'Warning',
-                            'Healthy' if metrics.get('annual_review', 0) >= 80 else 'Warning',
-                            'Healthy' if metrics.get('doc_completeness', 0) >= 95 else 'Warning',
-                            'Action Required' if metrics.get('policy_violations', 0) > 0 else 'Healthy'
-                        ]
-                    }
-                    exec_df = pd.DataFrame(summary_data)
-                    csv = exec_df.to_csv(index=False).encode('utf-8')
-                    
-                    st.success("Executive summary generated!")
-                    st.download_button(
-                        label="📥 Download Summary CSV",
-                        data=csv,
-                        file_name=f"executive_summary_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                        key='download_exec'
-                    )
-        
-        with col2:
-            st.markdown("**Detailed Compliance**")
-            if st.button("📋 Generate Detailed Report", use_container_width=True):
-                with st.spinner("Fetching full asset inventory..."):
-                    try:
-                        # Full asset dump
-                        query = f"SELECT * FROM {db}.{_gv_schema()}.ASSETS LIMIT 10000"
-                        detailed_df = snowflake_connector.execute_query(query)
-                        
-                        if detailed_df:
-                            df = pd.DataFrame(detailed_df)
-                            csv = df.to_csv(index=False).encode('utf-8')
-                            
-                            st.success(f"Report generated for {len(df)} assets!")
-                            st.download_button(
-                                label="📥 Download Detailed CSV",
-                                data=csv,
-                                file_name=f"detailed_compliance_{datetime.now().strftime('%Y%m%d')}.csv",
-                                mime="text/csv",
-                                key='download_detailed'
-                            )
-                        else:
-                            st.warning("No data found in generic asset view.")
-                    except Exception as e:
-                        st.error(f"Error generating report: {e}")
-        
-        with col3:
-            st.markdown("**Audit Package**")
-            if st.button("📦 Generate Audit Package", use_container_width=True):
-                 with st.spinner("Compiling audit evidence..."):
-                    # Use policy violations as the core evidence log
-                    violations_log = get_policy_violations(db, filters=filters)
-                    
-                    if violations_log is not None and not violations_log.empty:
-                        csv = violations_log.to_csv(index=False).encode('utf-8')
-                        
-                        st.success("Audit package compiled!")
-                        st.download_button(
-                            label="📥 Download Audit Evidence Logs",
-                            data=csv,
-                            file_name=f"audit_pack_evidence_{datetime.now().strftime('%Y%m%d')}.csv",
-                            mime="text/csv",
-                            key='download_audit'
-                        )
-                    else:
-                        st.warning("No violations or audit evidence found to package.")
+    # ========================================================================
+    # TAB 3: REPORTS & TRENDS
+    # ========================================================================
+
+with tab3:
+    st.header("Reports & Trends")
     
-        st.markdown("---")
-        
-        # Trend analytics
-        st.markdown("### Trend Analytics")
+    # Sub-tabs for Reports & Trends
+    subtab3_1, subtab3_2 = st.tabs([
+        "📈 Trend Analytics",
+        "📥 Export & Reports"
+    ])
+    
+    with subtab3_1:
+        st.markdown("### Compliance Trend Analytics")
         
         with st.spinner("Calculating compliance trends..."):
             trend_df = get_compliance_trends_metrics(db, filters=filters)
         
-        if not trend_df.empty:
+        if trend_df is not None and not trend_df.empty:
             # Normalize column names to upper case
             trend_df.columns = [c.upper() for c in trend_df.columns]
             
@@ -3233,6 +2023,7 @@ with tab3:
             chart_df = trend_df.sort_values('MONTH_PERIOD')
             
             # Line chart for Overall Trends
+            import plotly.graph_objects as go
             fig = go.Figure()
             
             fig.add_trace(go.Scatter(
@@ -3240,7 +2031,7 @@ with tab3:
                 y=chart_df['OVERALL_COMPLIANCE_SCORE'],
                 name='Overall Compliance Score',
                 mode='lines+markers',
-                line=dict(color='#2C3E50', width=4),
+                line=dict(color='#38bdf8', width=4),
                 hovertemplate='%{y:.1f}%'
             ))
             
@@ -3249,7 +2040,7 @@ with tab3:
                 y=chart_df['POLICY_COMPLIANCE_PCT'],
                 name='Policy Compliance',
                 mode='lines+markers',
-                line=dict(color='#27AE60', width=2, dash='dot')
+                line=dict(color='#10b981', width=2, dash='dot')
             ))
             
             fig.add_trace(go.Scatter(
@@ -3257,7 +2048,7 @@ with tab3:
                 y=chart_df['GOVERNANCE_COMPLETION_PCT'],
                 name='Governance Completion',
                 mode='lines+markers',
-                line=dict(color='#2980B9', width=2, dash='dot')
+                line=dict(color='#3b82f6', width=2, dash='dot')
             ))
             
             fig.add_trace(go.Scatter(
@@ -3265,7 +2056,7 @@ with tab3:
                 y=chart_df['AUDIT_COMPLIANCE_PCT'],
                 name='Audit Status',
                 mode='lines+markers',
-                line=dict(color='#F1C40F', width=2, dash='dot')
+                line=dict(color='#f59e0b', width=2, dash='dot')
             ))
             
             fig.add_trace(go.Scatter(
@@ -3273,158 +2064,122 @@ with tab3:
                 y=chart_df['RISK_COMPLIANCE_PCT'],
                 name='Risk Score',
                 mode='lines+markers',
-                line=dict(color='#E74C3C', width=2, dash='dot')
+                line=dict(color='#ef4444', width=2, dash='dot')
             ))
             
             fig.update_layout(
                 title="Compliance Trends (Last 6 Months)",
                 xaxis_title="Month",
-                yaxis_title="Score / Percentage",
-                hovermode='x unified',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                )
+                yaxis_title="Compliance %",
+                yaxis=dict(range=[0, 105]),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color="#94a3b8"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
+            st.plotly_chart(fig, use_container_width=True, key="plotly_trend_chart")
             
-            st.plotly_chart(fig, use_container_width=True)
+            # Trend indicators
+            st.markdown("#### Key Indicators")
+            latest = chart_df.iloc[-1]
+            prev = chart_df.iloc[-2] if len(chart_df) > 1 else latest
             
-            # Detailed Trend Table
-            st.write("#### Detailed Trend Analysis")
-            
-            # Select and rename columns for meaningful display
-            display_cols = [
-                'MONTH_PERIOD',
-                'OVERALL_COMPLIANCE_SCORE', 'OVERALL_TREND',
-                'POLICY_COMPLIANCE_PCT', 'POLICY_TREND',
-                'GOVERNANCE_COMPLETION_PCT', 'GOVERNANCE_TREND',
-                'AUDIT_COMPLIANCE_PCT', 'AUDIT_TREND',
-                'RISK_COMPLIANCE_PCT', 'RISK_TREND'
-            ]
-            
-            # Check if columns exist (safety check)
-            available_cols = [c for c in display_cols if c in trend_df.columns]
-            
-            display_df = trend_df[available_cols].copy()
-            
-            # Rename for display
-            display_df.rename(columns={
-                'MONTH_PERIOD': 'Month',
-                'OVERALL_COMPLIANCE_SCORE': 'Overall Score',
-                'OVERALL_TREND': 'Trend',
-                'POLICY_COMPLIANCE_PCT': 'Policy %',
-                'POLICY_TREND': 'Trend ',
-                'GOVERNANCE_COMPLETION_PCT': 'Governance %',
-                'GOVERNANCE_TREND': 'Trend  ',
-                'AUDIT_COMPLIANCE_PCT': 'Audit %',
-                'AUDIT_TREND': 'Trend   ',
-                'RISK_COMPLIANCE_PCT': 'Risk Score',
-                'RISK_TREND': 'Trend    '
-            }, inplace=True)
-            
-            st.dataframe(
-                display_df, 
-                use_container_width=True, 
-                hide_index=True
-            )
-            
+            i1, i2, i3, i4 = st.columns(4)
+            i1.metric("Compliance Score", f"{latest['OVERALL_COMPLIANCE_SCORE']}%", f"{latest['OVERALL_COMPLIANCE_SCORE'] - prev['OVERALL_COMPLIANCE_SCORE']:.1f}%")
+            i2.metric("Policy Rate", f"{latest['POLICY_COMPLIANCE_PCT']}%", f"{latest['POLICY_COMPLIANCE_PCT'] - prev['POLICY_COMPLIANCE_PCT']:.1f}%")
+            i3.metric("Governance Rate", f"{latest['GOVERNANCE_COMPLETION_PCT']}%", f"{latest['GOVERNANCE_COMPLETION_PCT'] - prev['GOVERNANCE_COMPLETION_PCT']:.1f}%")
+            i4.metric("Risk Score", f"{latest['RISK_COMPLIANCE_PCT']}%", f"{latest['RISK_COMPLIANCE_PCT'] - prev['RISK_COMPLIANCE_PCT']:.1f}%")
         else:
-            st.warning("No trend data available for the last 6 months.")
+            st.info("Insufficient historical data to render trends.")
+
+    with subtab3_2:
+        st.markdown("### Export & Reports")
+        st.caption("Downloadable executive and detailed compliance reports")
         
-        st.markdown("---")
-        
-        # Export options
-        st.markdown("### Export Data")
-        
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         
         with col1:
-            if st.button("📥 Export as CSV", use_container_width=True):
-                csv = trend_df.to_csv(index=False)
-                st.download_button(
-                    label="Download CSV",
-                    data=csv,
-                    file_name=f"compliance_trends_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
-                )
-        
+            st.markdown("""
+<div class="glass-panel" style="padding: 1.5rem; margin-bottom: 1rem;">
+    <h4 style="margin-top:0;">📊 Executive Summary</h4>
+    <p style="color: #94a3b8; font-size: 0.85rem;">High-level compliance overview for management. Includes overall status, coverage, and major violations.</p>
+</div>
+""", unsafe_allow_html=True)
+            if st.button("Generate Executive Report", key="gen_exec", width='stretch'):
+                with st.spinner("Generating executive summary..."):
+                    metrics_exec = get_classification_requirements_metrics(db, filters=filters)
+                    summary_data = {
+                        'Metric': ['Coverage', '5-Day SLA', 'Annual Review', 'Documentation', 'Violations'],
+                        'Value': [
+                            f"{metrics_exec.get('coverage', 0):.1f}%",
+                            f"{metrics_exec.get('five_day_compliance', 0):.1f}%",
+                            f"{metrics_exec.get('annual_review', 0):.1f}%",
+                            f"{metrics_exec.get('doc_completeness', 0):.1f}%",
+                            metrics_exec.get('policy_violations', 0)
+                        ]
+                    }
+                    exec_df = pd.DataFrame(summary_data)
+                    csv_exec = exec_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Download Executive Summary (CSV)", data=csv_exec, file_name=f"executive_summary_{datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", width='stretch', key="exec_csv_btn")
+
         with col2:
-            if st.button("📥 Export as Excel", use_container_width=True):
-                try:
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                        trend_df.to_excel(writer, index=False, sheet_name='Compliance Trends')
-                        
-                        # Add a summary sheet
-                        summary_data = {
-                            'Metric': ['Generated Date', 'Database', 'Total Snapshots', 'Latest Score'],
-                            'Value': [
-                                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                db,
-                                len(trend_df),
-                                f"{trend_df['OVERALL_COMPLIANCE_SCORE'].iloc[-1]:.1f}%" if not trend_df.empty else "N/A"
-                            ]
-                        }
-                        pd.DataFrame(summary_data).to_excel(writer, index=False, sheet_name='Executive Summary')
-                    
-                    st.download_button(
-                        label="Download Excel",
-                        data=output.getvalue(),
-                        file_name=f"compliance_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key='download_excel'
-                    )
-                except Exception as e:
-                    st.error(f"Excel export failed: {str(e)}")
-        
-        with col3:
-            if st.button("📥 Export as PDF", use_container_width=True):
-                if FPDF is None:
-                    st.error("PDF library (fpdf2) not available. Please install it.")
-                else:
+            st.markdown("""
+<div class="glass-panel" style="padding: 1.5rem; margin-bottom: 1rem;">
+    <h4 style="margin-top:0;">📋 Detailed Compliance</h4>
+    <p style="color: #94a3b8; font-size: 0.85rem;">Full asset-level compliance details. Includes all classification metadata and risk scores.</p>
+</div>
+""", unsafe_allow_html=True)
+            if st.button("Generate Detailed Report", key="gen_detail", width='stretch'):
+                with st.spinner("Fetching full asset inventory..."):
                     try:
-                        pdf = FPDF()
-                        pdf.add_page()
-                        pdf.set_font("Arial", 'B', 16)
-                        pdf.cell(40, 10, 'Compliance Trend Report')
-                        pdf.ln(10)
-                        pdf.set_font("Arial", size=12)
-                        pdf.cell(40, 10, f"Generated On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                        pdf.ln(8)
-                        pdf.cell(40, 10, f"Database Context: {db}")
-                        pdf.ln(12)
-                        
-                        # Add latest metrics
-                        if not trend_df.empty:
-                            latest = trend_df.iloc[-1]
-                            pdf.set_font("Arial", 'B', 14)
-                            pdf.cell(40, 10, "Current Performance Snapshot")
-                            pdf.ln(8)
-                            pdf.set_font("Arial", size=11)
-                            pdf.cell(40, 10, f"- Overall Compliance: {latest.get('OVERALL_COMPLIANCE_SCORE', 0):.1f}%")
-                            pdf.ln(6)
-                            pdf.cell(40, 10, f"- Policy Alignment: {latest.get('POLICY_COMPLIANCE_PCT', 0):.1f}%")
-                            pdf.ln(6)
-                            pdf.cell(40, 10, f"- Governance Score: {latest.get('GOVERNANCE_COMPLETION_PCT', 0):.1f}%")
-                            pdf.ln(15)
-                        
-                        # Disclaimer
-                        pdf.set_font("Arial", 'I', 8)
-                        pdf.cell(40, 10, "This report is generated automatically by the Data Governance Application. Data reflects current Snowflake state.")
-                        
-                        pdf_output = pdf.output(dest='S')
-                        st.download_button(
-                            label="Download PDF",
-                            data=pdf_output if isinstance(pdf_output, bytes) else pdf_output.encode('latin-1'),
-                            file_name=f"compliance_summary_{datetime.now().strftime('%Y%m%d')}.pdf",
-                            mime="application/pdf",
-                            key='download_pdf'
-                        )
+                        query_detail = f"SELECT * FROM {db}.{_gv_schema()}.ASSETS LIMIT 10000"
+                        detailed_rows = snowflake_connector.execute_query(query_detail)
+                        if detailed_rows:
+                            df_detail = pd.DataFrame(detailed_rows)
+                            csv_detail = df_detail.to_csv(index=False).encode('utf-8')
+                            st.download_button("📥 Download Detailed Report (CSV)", data=csv_detail, file_name=f"detailed_compliance_{datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv", width='stretch', key="detail_csv_btn")
+                        else:
+                            st.warning("No data found in asset inventory.")
                     except Exception as e:
-                        st.error(f"PDF generation failed: {str(e)}")
+                        st.error(f"Error: {e}")
+        
+        st.markdown("---")
+        st.markdown("#### 📜 Audit & Policies")
+        p_col1, p_col2 = st.columns([1, 1.5])
+        
+        with p_col1:
+            st.markdown("""
+<div class="glass-panel" style="padding: 1.5rem; height: 100%;">
+    <h5 style="margin-top:0; color: #38bdf8;">🗓️ Audit Schedule</h5>
+    <p style="color: #64748b; font-size: 0.75rem;">Planned governance and regulatory reviews.</p>
+    <div style="font-size: 0.85rem; color: #f8fafc;">
+        <div style="margin-bottom: 0.5rem;">📅 <b>Monthly Sync</b>: Ready</div>
+        <div style="margin-bottom: 0.5rem;">📅 <b>Q1 Regulatory</b>: Scheduled</div>
+        <div style="margin-bottom: 0.5rem;">📅 <b>Annual External</b>: Planned</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+        with p_col2:
+            # Policy Reader Integration (Simplified)
+            st.markdown("""
+<div class="glass-panel" style="padding: 1.5rem;">
+    <h5 style="margin-top:0; color: #10b981;">📄 Policy Repository</h5>
+    <p style="color: #64748b; font-size: 0.75rem;">Access authoritative governance documents.</p>
+</div>
+""", unsafe_allow_html=True)
+            
+            pol_db = "DATA_CLASSIFICATION_DB"
+            pol_schema = "DATA_CLASSIFICATION_GOVERNANCE"
+            try:
+                p_rows = snowflake_connector.execute_query(f"SELECT POLICY_ID, POLICY_NAME, MIME_TYPE FROM {pol_db}.{pol_schema}.POLICIES ORDER BY CREATED_AT DESC LIMIT 3") or []
+                if not p_rows:
+                    st.info("No documents found.")
+                else:
+                    for p in p_rows:
+                        st.markdown(f"📄 **{p['POLICY_NAME']}** ({p['MIME_TYPE']})")
+            except:
+                st.info("Policy repository unavailable.")
 
 # ============================================================================
 # FOOTER

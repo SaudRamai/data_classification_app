@@ -72,22 +72,7 @@ def _send_email(to_email: str, subject: str, message: str) -> bool:
         logger.error(f"Failed to send email: {e}")
         return False
 
-def notify_slack(subject: str, message: str, target_url: Optional[str] = None) -> bool:
-    """Public wrapper to send a Slack notification.
-    Uses SLACK_WEBHOOK_URL env var if target_url is not provided.
-    Returns True on success, False otherwise.
-    """
-    url = (target_url or os.getenv("SLACK_WEBHOOK_URL", "").strip())
-    if not url:
-        logger.warning("No Slack webhook URL configured; skipping Slack notification")
-        return False
-    return _send_slack(url, subject, message)
 
-def notify_email(to_email: str, subject: str, message: str) -> bool:
-    """Public wrapper to send an email notification.
-    Returns True on success, False otherwise.
-    """
-    return _send_email(to_email, subject, message)
 
 def notify_owner(asset_full_name: str, subject: str, message: str, owner_email: Optional[str] = None) -> bool:
     """

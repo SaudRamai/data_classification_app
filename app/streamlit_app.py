@@ -160,6 +160,7 @@ try:
     from src.services.authorization_service import authz
     from src.services.oidc_service import oidc_service
     from src.connectors.snowflake_connector import snowflake_connector
+    from src.services.asset_catalog_service import run_asset_merge
 except ImportError as e:
     # We can only show an error if page config was already set or if it's the first command.
     # Note: st.error here is fine now as set_page_config is called above.
@@ -770,6 +771,10 @@ else:
                     # Create schema if not exists
                     snowflake_connector.execute_non_query("CREATE SCHEMA IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE")
                     
+                    # Run automated asset discovery on refresh/init
+                    with st.spinner("Syncing data assets..."):
+                        run_asset_merge()
+                    
                     # Views to create
                     views = {
                         'VW_CLASSIFICATION_REVIEW': """
@@ -903,6 +908,73 @@ else:
                                 END AS STATUS_LABEL,
                                 DETAILS
                             FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_TASKS
+                        """,
+                        'VW_ASSET_INVENTORY_ALL_LEVELS': """
+                            CREATE OR REPLACE VIEW DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS AS
+                            WITH asset_metrics AS (
+                                SELECT 
+                                    COALESCE(DATABASE_NAME, 'DATA_CLASSIFICATION_DB') as DATABASE_NAME,
+                                    SCHEMA_NAME,
+                                    OBJECT_NAME as ASSET_NAME,
+                                    ASSET_TYPE,
+                                    CASE 
+                                        WHEN CLASSIFICATION_LABEL IS NOT NULL 
+                                             AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN ('', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW')
+                                        THEN 1 ELSE 0 
+                                    END as IS_CLASSIFIED,
+                                    CASE WHEN CLASSIFICATION_DATE IS NOT NULL THEN 1 ELSE 0 END as HAS_CLASSIFICATION_DATE,
+                                    CASE WHEN CLASSIFICATION_DATE IS NOT NULL AND DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE) <= 5 THEN 1 ELSE 0 END as IS_CLASSIFIED_WITHIN_SLA,
+                                    CASE WHEN DATA_OWNER IS NOT NULL AND DATA_OWNER != '' THEN 1 ELSE 0 END as HAS_OWNER,
+                                    CASE WHEN PII_RELEVANT = TRUE THEN 1 ELSE 0 END as IS_PII,
+                                    CASE WHEN SOX_RELEVANT = TRUE THEN 1 ELSE 0 END as IS_SOX,
+                                    CASE WHEN SOC2_RELEVANT = TRUE THEN 1 ELSE 0 END as IS_SOC2,
+                                    CASE WHEN REVIEW_STATUS IN ('Approved', 'Validated', 'Compliant') THEN 1 ELSE 0 END as IS_ACCURATE_CLASSIFICATION,
+                                    DATEDIFF(day, CREATED_TIMESTAMP, CURRENT_DATE()) as DAYS_SINCE_CREATION,
+                                    CASE WHEN CLASSIFICATION_DATE IS NOT NULL THEN DATEDIFF(day, CREATED_TIMESTAMP, CLASSIFICATION_DATE) ELSE NULL END as DAYS_TO_CLASSIFY
+                                FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                                WHERE UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')
+                            )
+                            SELECT 
+                                'DATABASE' as LEVEL,
+                                am.DATABASE_NAME as "Database",
+                                NULL as "Schema",
+                                NULL as "Asset_Name",
+                                'DATABASE' as "Asset_Type",
+                                COUNT(*) as "Total_Assets",
+                                SUM(am.IS_CLASSIFIED) as "Classified",
+                                SUM(am.HAS_CLASSIFICATION_DATE) as "Has_Classification_Date",
+                                CASE WHEN COUNT(*) > 0 THEN CONCAT(ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '%') ELSE '0%' END as "Classification_Coverage",
+                                CONCAT(ROUND(SUM(am.IS_ACCURATE_CLASSIFICATION) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Accuracy_Percent",
+                                CONCAT(ROUND(SUM(am.IS_CLASSIFIED_WITHIN_SLA) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Timeliness_Percent",
+                                CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent' ELSE '❌ Poor' END as "Compliance_Status",
+                                CONCAT(ROUND(SUM(am.HAS_OWNER) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Owner_Coverage",
+                                COUNT(CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 END) as "SLA_Breach_Assets",
+                                COUNT(CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 END) as "New_Pending_Assets",
+                                CONCAT(SUM(am.IS_PII), ' PII, ', SUM(am.IS_SOX), ' SOX, ', SUM(am.IS_SOC2), ' SOC2') as "Sensitive_Columns",
+                                ROUND(AVG(am.DAYS_TO_CLASSIFY), 1) as "Avg_Days_To_Classify"
+                            FROM asset_metrics am
+                            GROUP BY am.DATABASE_NAME
+                            UNION ALL
+                            SELECT 
+                                'SCHEMA' as LEVEL,
+                                am.DATABASE_NAME,
+                                am.SCHEMA_NAME,
+                                NULL,
+                                'SCHEMA',
+                                COUNT(*),
+                                SUM(am.IS_CLASSIFIED),
+                                SUM(am.HAS_CLASSIFICATION_DATE),
+                                CASE WHEN COUNT(*) > 0 THEN CONCAT(ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '%') ELSE '0%' END,
+                                CONCAT(ROUND(SUM(am.IS_ACCURATE_CLASSIFICATION) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
+                                CONCAT(ROUND(SUM(am.IS_CLASSIFIED_WITHIN_SLA) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
+                                CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent' ELSE '❌ Poor' END,
+                                CONCAT(ROUND(SUM(am.HAS_OWNER) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
+                                COUNT(CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 END),
+                                COUNT(CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 END),
+                                CONCAT(SUM(am.IS_PII), ' PII, ', SUM(am.IS_SOX), ' SOX, ', SUM(am.IS_SOC2), ' SOC2'),
+                                ROUND(AVG(am.DAYS_TO_CLASSIFY), 1)
+                            FROM asset_metrics am
+                            GROUP BY am.DATABASE_NAME, am.SCHEMA_NAME
                         """
                     }
                     
@@ -960,6 +1032,23 @@ else:
         st.markdown('<div class="feature-card"><div class="card-icon">⚖️</div><div class="card-title">Compliance</div><div class="card-desc">Track regulatory status</div></div>', unsafe_allow_html=True)
         if st.button("Check Compliance", key="h_comp", use_container_width=True):
             st.switch_page("pages/4_Compliance.py")
+
+    # Add a manual sync option
+    st.markdown("---")
+    csync1, csync2 = st.columns([3, 1])
+    with csync1:
+        st.info("The app automatically syncs discovered assets (tables, views, procs, etc.) into the inventory on load. You can also trigger a manual refresh.")
+    with csync2:
+        if st.button("🔄 Sync Assets Now", key="btn_manual_sync", type="primary", use_container_width=True):
+            with st.spinner("Executing discovery sync..."):
+                _merge_result = run_asset_merge()
+                if "error" in _merge_result:
+                    st.error(f"Sync failed: {_merge_result['error']}")
+                else:
+                    i = _merge_result.get("inserted", 0)
+                    u = _merge_result.get("updated", 0)
+                    st.success(f"Sync complete: {i} new, {u} updated.")
+                st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.caption("Data Governance App v2.4 • Connected to Snowflake Performance Engine")

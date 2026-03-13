@@ -93,128 +93,9 @@ def _rt_show_error(msg: str, exc: Optional[Exception] = None):
             st.info("Snowflake credentials are not set. Please sign in on the Home page (app) to establish a session.")
 
 
-@st.cache_data(ttl=DEFAULT_TTL, show_spinner=False)
-def _rt_get_table_columns(table_fqn: str) -> Set[str]:
-    try:
-        parts = table_fqn.split(".")
-        if len(parts) != 3:
-            return set()
-        db, sch, tbl = parts
-        rows = _rt_run_query(
-            """
-            select column_name as C
-            from IDENTIFIER(%(db)s).information_schema.columns
-            where table_schema = %(sch)s and table_name = %(tbl)s
-            """,
-            {"db": db, "sch": sch, "tbl": tbl}
-        )
-        return {r.get("C") for r in (rows or []) if r.get("C")}
-    except Exception:
-        return set()
 
-def _rt_build_filters_for(sel_bu, sel_db, sel_schema, sel_asset_type, sel_class_status, sel_risk, start_date, end_date,
-                          table_fqn: str, time_candidates: Optional[List[str]] = None) -> Tuple[str, Dict[str, Any]]:
-    cols = _rt_get_table_columns(table_fqn)
-    conds = []
-    params: Dict[str, Any] = {}
-    if sel_bu and sel_bu != "All" and "BUSINESS_UNIT" in cols:
-        conds.append("BUSINESS_UNIT = %(bu)s")
-        params["bu"] = sel_bu
-    if sel_db and "DATABASE_NAME" in cols:
-        conds.append("DATABASE_NAME = %(db)s")
-        params["db"] = sel_db
-    if sel_schema and sel_schema != "All" and "SCHEMA_NAME" in cols:
-        conds.append("SCHEMA_NAME = %(schema)s")
-        params["schema"] = sel_schema
-    # Asset type filter (prefer ASSET_TYPE, fallback to TABLE_TYPE if present)
-    if sel_asset_type and sel_asset_type != "All":
-        if "ASSET_TYPE" in cols:
-            conds.append("ASSET_TYPE = %(atype)s")
-            params["atype"] = sel_asset_type
-        elif "TABLE_TYPE" in cols:
-            conds.append("TABLE_TYPE = %(atype)s")
-            params["atype"] = sel_asset_type
-    # Classification status via CLASSIFICATION_LABEL presence
-    if sel_class_status and sel_class_status != "All" and "CLASSIFICATION_LABEL" in cols:
-        if sel_class_status == "Classified":
-            conds.append("coalesce(CLASSIFICATION_LABEL,'') <> ''")
-        else:
-            conds.append("coalesce(CLASSIFICATION_LABEL,'') = ''")
-    if sel_risk and sel_risk != "All" and "OVERALL_RISK_CLASSIFICATION" in cols:
-        conds.append("OVERALL_RISK_CLASSIFICATION = %(risk)s")
-        params["risk"] = sel_risk
-    # Global compliance filters (if present in target table)
-    try:
-        sel_framework = st.session_state.get("rt_framework")
-        if sel_framework and sel_framework != "All":
-            fw_col = None
-            if "FRAMEWORK_NAME" in cols:
-                fw_col = "FRAMEWORK_NAME"
-            elif "COMPLIANCE_STANDARD" in cols:
-                fw_col = "COMPLIANCE_STANDARD"
-            if fw_col:
-                conds.append(f"{fw_col} = %(fw)s")
-                params["fw"] = sel_framework
-    except Exception:
-        pass
-    try:
-        sel_cstatus = st.session_state.get("rt_cstatus")
-        if sel_cstatus and sel_cstatus != "All" and "COMPLIANCE_STATUS" in cols:
-            conds.append("upper(coalesce(COMPLIANCE_STATUS,'')) = %(cstat)s")
-            params["cstat"] = str(sel_cstatus).upper()
-    except Exception:
-        pass
-    if start_date and end_date and time_candidates:
-        ts_col = next((c for c in time_candidates if c in cols), None)
-        if ts_col:
-            conds.append(f"{ts_col} BETWEEN %(start_ts)s AND %(end_ts)s")
-            params["start_ts"] = start_date
-            params["end_ts"] = end_date
-    where = (" WHERE " + " AND ".join(conds)) if conds else ""
-    return where, params
 
-def _rt_apply_compliance_filter(base_where: str, base_params: Dict[str, Any], asset_id_ref: str, T_CMAP: str) -> Tuple[str, Dict[str, Any]]:
-    """Append EXISTS compliance clause to the base where for asset-based queries.
 
-    asset_id_ref: the column reference for ASSET_ID in the outer query (e.g., 'a.ASSET_ID' or 'h.ASSET_ID').
-    """
-    try:
-        fw = st.session_state.get("rt_framework")
-        cs = st.session_state.get("rt_cstatus")
-    except Exception:
-        fw, cs = None, None
-    # Normalize values
-    fw = fw if fw and fw != "All" else None
-    cs_up = str(cs).upper() if cs and cs != "All" else None
-    if not fw and not cs_up:
-        return base_where, base_params
-    conds = [f"cm.ASSET_ID = {asset_id_ref}"]
-    params = dict(base_params)
-    cmap_cols = _rt_get_table_columns(T_CMAP)
-    fw_col = "FRAMEWORK_NAME" if "FRAMEWORK_NAME" in cmap_cols else ("COMPLIANCE_STANDARD" if "COMPLIANCE_STANDARD" in cmap_cols else None)
-    if fw and fw_col:
-        conds.append(f"upper(coalesce(cm.{fw_col},'')) = %(fw_up)s")
-        params["fw_up"] = str(fw).upper()
-    if cs_up:
-        # Flexible status mapping
-        if cs_up == "NON-COMPLIANT":
-            conds.append("upper(coalesce(cm.COMPLIANCE_STATUS,'')) <> 'COMPLIANT'")
-        elif cs_up == "PARTIAL":
-            conds.append("upper(coalesce(cm.COMPLIANCE_STATUS,'')) like '%PARTIAL%'")
-        else:
-            conds.append("upper(coalesce(cm.COMPLIANCE_STATUS,'')) = %(cstat)s")
-            params["cstat"] = cs_up
-    exists_sql = f"EXISTS (select 1 from {T_CMAP} cm where {' AND '.join(conds)})"
-    where = base_where + ((" AND " if base_where else " WHERE ") + exists_sql)
-    return where, params
-
-def _rt_paginate_df(df: pd.DataFrame, page: int, page_size: int) -> Tuple[pd.DataFrame, int]:
-    if df is None or df.empty:
-        return df, 0
-    total = len(df)
-    start = max(0, (page - 1) * page_size)
-    end = min(total, start + page_size)
-    return df.iloc[start:end], total
 
 def render_realtime_dashboard():
     apply_global_theme()
@@ -358,7 +239,7 @@ def render_realtime_dashboard():
         st.markdown("---")
         st.subheader("🛠️ Developer Tools")
         if st.button("Refresh Demo Data", key="refresh_demo_btn"):
-            from src.services.asset_utils import seed_sample_assets
+            from src.services.asset_catalog_service import seed_sample_assets
             res = seed_sample_assets(active_db, _SCHEMA, snowflake_connector)
             if any("Error" in str(r) for r in res.get("results", [])):
                 st.error(f"Failed to seed data: {res.get('results')}")
@@ -386,8 +267,8 @@ def render_realtime_dashboard():
     st.header("🛡️ Classification Health Program")
     
     try:
-        from src.services.asset_utils import get_health_score_metrics
-        health = get_health_score_metrics(active_db, _SCHEMA, snowflake_connector)
+        from src.services.asset_catalog_service import get_health_score_metrics
+        health = get_health_score_metrics(active_db, _SCHEMA)
         
         # Premium UI CSS
         st.markdown("""
@@ -692,11 +573,10 @@ def render_realtime_dashboard():
     st.markdown("Risk & exposure snapshot")
     
     try:
-        from src.services.asset_utils import get_dashboard_sensitivity_overview
+        from src.services.asset_catalog_service import get_dashboard_sensitivity_overview
         sens_data = get_dashboard_sensitivity_overview(
             active_db,
             _SCHEMA,
-            snowflake_connector,
             filters=st.session_state.get("rt_filters", {}),
         )
         total_assets = int(sens_data.get('total_assets', 0) or 0)
@@ -812,8 +692,8 @@ def render_realtime_dashboard():
     st.markdown("Early risk detection & backlog management")
     
     try:
-        from src.services.asset_utils import get_unclassified_assets_summary
-        unclassified_data = get_unclassified_assets_summary(active_db, _SCHEMA, snowflake_connector)
+        from src.services.asset_catalog_service import get_unclassified_assets_summary
+        unclassified_data = get_unclassified_assets_summary(active_db, _SCHEMA)
         
         # Better UI: Background card for metrics
         st.markdown(f"""
@@ -866,8 +746,8 @@ def render_realtime_dashboard():
     st.markdown("Governance maintenance & audit readiness")
     
     try:
-        from src.services.asset_utils import get_review_due_summary
-        review_data = get_review_due_summary(active_db, _SCHEMA, snowflake_connector)
+        from src.services.asset_catalog_service import get_review_due_summary
+        review_data = get_review_due_summary(active_db, _SCHEMA)
         
         # Summary for Section 4
         col_r1, col_r2, col_r3 = st.columns(3)
@@ -912,8 +792,8 @@ def render_realtime_dashboard():
     st.markdown("Policy violation view & remediation tracking")
     
     try:
-        from src.services.asset_utils import get_non_compliant_assets_detail
-        violations = get_non_compliant_assets_detail(active_db, _SCHEMA, snowflake_connector)
+        from src.services.asset_catalog_service import get_non_compliant_assets_detail
+        violations = get_non_compliant_assets_detail(active_db, _SCHEMA)
         
         if violations.empty:
             st.success("🎉 No active policy violations detected! All assets are compliant.")

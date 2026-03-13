@@ -29,8 +29,7 @@ class Settings(BaseModel):
     if ConfigDict:
         model_config = ConfigDict(case_sensitive=True)
     else:
-        class Config:
-            case_sensitive = True
+        pass
 
     # Snowflake connection settings (optional for local dev; enforced at connection time)
     SNOWFLAKE_ACCOUNT: Optional[str] = None

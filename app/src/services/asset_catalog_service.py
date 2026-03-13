@@ -44,11 +44,12 @@ class MetadataCatalogService:
             # Call the SP
             self._x(f"CALL {database}.DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS()")
             
-            # Get count of total assets for feedback
-            stats = self._q(f"SELECT COUNT(*) AS CNT FROM {database}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE CREATED_TIMESTAMP >= DATEADD(minute, -5, CURRENT_TIMESTAMP())")
+            # Get count of newly inserted assets (version 1, created recently)
+            stats = self._q(f"SELECT COUNT(*) AS CNT FROM {database}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE CREATED_TIMESTAMP >= DATEADD(minute, -5, CURRENT_TIMESTAMP()) AND RECORD_VERSION = 1")
             new_count = stats[0]['CNT'] if stats else 0
             
-            upd_stats = self._q(f"SELECT COUNT(*) AS CNT FROM {database}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE UPDATED_TIMESTAMP >= DATEADD(minute, -5, CURRENT_TIMESTAMP())")
+            # Get count of updated assets (version > 1, modified recently)
+            upd_stats = self._q(f"SELECT COUNT(*) AS CNT FROM {database}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE LAST_MODIFIED_TIMESTAMP >= DATEADD(minute, -5, CURRENT_TIMESTAMP()) AND RECORD_VERSION > 1")
             upd_count = upd_stats[0]['CNT'] if upd_stats else 0
             
             return {"inserted": new_count, "updated": upd_count}
@@ -68,7 +69,7 @@ class MetadataCatalogService:
                         AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN {UNCLASSIFIED_VALS} 
                         THEN 1 END) AS TAGGED
                 FROM {fqn}
-                WHERE UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')
+                WHERE UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE', 'DATABASE')
             """
             rows = self._q(query) or [{}]
             r = rows[0]
@@ -167,7 +168,7 @@ class MetadataCatalogService:
                        COALESCE(SUM(CAST(PII_RELEVANT AS INT)), 0) AS PII,
                        COALESCE(SUM(CAST(SOX_RELEVANT AS INT)), 0) AS SOX,
                        COALESCE(SUM(CAST(SOC2_RELEVANT AS INT)), 0) AS SOC2,
-                       COALESCE(SUM(CAST(REGULATORY_DATA AS INT)), 0) AS REG,
+                       COALESCE(SUM(CASE WHEN PII_RELEVANT = TRUE OR SOX_RELEVANT = TRUE OR SOC2_RELEVANT = TRUE THEN 1 ELSE 0 END), 0) AS REG,
                        COALESCE(SUM(CASE WHEN CLASSIFICATION_LABEL IS NOT NULL AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN {UNCLASSIFIED_VALS} THEN 1 ELSE 0 END), 0) AS LABELED
                 FROM {fqn}
                 WHERE {where_sql} AND DATABASE_NAME IS NOT NULL

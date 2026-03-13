@@ -82,7 +82,7 @@ import os
 import pathlib
 import logging
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Suppress Streamlit warnings that are not applicable in Snowflake Native Apps
 logging.getLogger('streamlit.runtime.scriptrunner.script_runner').setLevel(logging.ERROR)
@@ -195,7 +195,7 @@ if st.session_state.user is None and snowflake_connector.is_sis():
                 username=ident.user,
                 email=f"{ident.user}@snowflake",
                 role=ident.current_role or "",
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             )
             # Re-initialize connector if needed
             logger.info(f"Auto-logged in as {ident.user} via SiS")
@@ -213,7 +213,7 @@ if st.session_state.get("REVERSE_RBAC") and st.session_state.user is None:
         username="GUEST_USER",
         email="guest@example.com",
         role="GUEST",
-        created_at=datetime.utcnow()
+        created_at=datetime.now(timezone.utc)
     )
     st.session_state["RBAC_BYPASS_ACTIVE"] = True
     st.session_state["RBAC_BYPASS_WARNED"] = False # Reset warning flag for new sessions
@@ -320,7 +320,7 @@ try:
                 username=email or sub,
                 email=email or f"{sub}@idp",
                 role="",
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             )
             st.success("SSO login successful")
             # Clear code from URL to avoid reprocessing
@@ -329,7 +329,7 @@ try:
             # Redirect to Dashboard page
             try:
                 if hasattr(st, "switch_page"):
-                    st.switch_page("pages/2_Dashboard.py")
+                    st.switch_page("pages/02_Dashboard.py")
                 else:
                     raise AttributeError("switch_page not available")
             except Exception:
@@ -388,12 +388,12 @@ def _login_section():
                     username=ident.user,
                     email=f"{ident.user}@snowflake",  # placeholder
                     role=ident.current_role or "",
-                    created_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc),
                 )
                 # Redirect to Dashboard page
                 try:
                     if hasattr(st, "switch_page"):
-                        st.switch_page("pages/2_Dashboard.py")
+                        st.switch_page("pages/02_Dashboard.py")
                     else:
                         raise AttributeError("switch_page not available")
                 except Exception:
@@ -422,11 +422,11 @@ def _login_section():
                                 username=ident2.user,
                                 email=f"{ident2.user}@snowflake",
                                 role=ident2.current_role or "",
-                                created_at=datetime.utcnow(),
+                                created_at=datetime.now(timezone.utc),
                             )
                             try:
                                 if hasattr(st, "switch_page"):
-                                    st.switch_page("pages/2_Dashboard.py")
+                                    st.switch_page("pages/02_Dashboard.py")
                                 else:
                                     raise AttributeError("switch_page not available")
                             except Exception:
@@ -450,11 +450,11 @@ def _login_section():
                                     username=ident2.user,
                                     email=f"{ident2.user}@snowflake",
                                     role=ident2.current_role or "",
-                                    created_at=datetime.utcnow(),
+                                    created_at=datetime.now(timezone.utc),
                                 )
                                 try:
                                     if hasattr(st, "switch_page"):
-                                        st.switch_page("pages/2_Dashboard.py")
+                                        st.switch_page("pages/02_Dashboard.py")
                                     else:
                                         raise AttributeError("switch_page not available")
                                 except Exception:
@@ -1016,7 +1016,7 @@ else:
     with c1:
         st.markdown('<div class="feature-card"><div class="card-icon">📦</div><div class="card-title">Data Assets</div><div class="card-desc">Browse inventory and metadata</div></div>', unsafe_allow_html=True)
         if st.button("Browse Assets", key="h_assets", use_container_width=True):
-            st.switch_page("pages/1_Data_Assets.py")
+            st.switch_page("pages/01_Data_Assets.py")
 
     with c2:
         st.markdown('<div class="feature-card"><div class="card-icon">📊</div><div class="card-title">Dashboard</div><div class="card-desc">Overview and metrics</div></div>', unsafe_allow_html=True)
@@ -1026,12 +1026,12 @@ else:
     with c3:
         st.markdown('<div class="feature-card"><div class="card-icon">🏷️</div><div class="card-title">Classification</div><div class="card-desc">Label and tag data</div></div>', unsafe_allow_html=True)
         if st.button("Classify Data", key="h_class", use_container_width=True):
-            st.switch_page("pages/3_Classification.py")
+            st.switch_page("pages/03_Classification.py")
 
     with c4:
         st.markdown('<div class="feature-card"><div class="card-icon">⚖️</div><div class="card-title">Compliance</div><div class="card-desc">Track regulatory status</div></div>', unsafe_allow_html=True)
         if st.button("Check Compliance", key="h_comp", use_container_width=True):
-            st.switch_page("pages/4_Compliance.py")
+            st.switch_page("pages/04_Compliance.py")
 
     # Add a manual sync option
     st.markdown("---")

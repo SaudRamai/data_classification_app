@@ -1,0 +1,12 @@
+streamlit
+streamlit-autorefresh
+snowflake-snowpark-python
+snowflake-connector-python
+pandas
+numpy
+pydantic
+requests
+plotly
+altair
+python-dateutil
+pytz

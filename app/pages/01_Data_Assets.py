@@ -48,6 +48,7 @@ from src.services.classification_audit_service import classification_audit_servi
 from src.services.compliance_service import compliance_service
 from src.services.authorization_service import authz
 from src.components.filters import render_global_filters
+from src.services.asset_catalog_service import run_asset_merge
 # Removed broken system_classify_service import
 
 # Use dark theme for Altair charts to match black app theme
@@ -173,6 +174,24 @@ with st.sidebar:
     
     # Store filters for page logic
     st.session_state["global_filters"] = g_filters
+
+    # Manual Refresh Assets button
+    st.markdown("---")
+    if st.button("🔄 Refresh Assets", key="btn_refresh_assets_sidebar", type="primary", use_container_width=True):
+        with st.spinner("Running asset discovery & merge..."):
+            try:
+                _merge_result = run_asset_merge()
+                if "error" in _merge_result:
+                    st.error(f"Sync failed: {_merge_result['error']}")
+                else:
+                    i = _merge_result.get("inserted", 0)
+                    u = _merge_result.get("updated", 0)
+                    st.success(f"✅ Sync complete: {i} new, {u} updated.")
+            except Exception as e:
+                st.error(f"Merge failed: {e}")
+            # Clear all caches so the UI picks up fresh data
+            st.cache_data.clear()
+            st.rerun()
 
 # --- Policy enforcement helpers (Decision Matrix & Audit persistence) ---
 
@@ -365,8 +384,18 @@ tab_inv_browser, tab_adv_search, tab_favorites = st.tabs([
 with tab_inv_browser:
     st.caption("")
 
+# Function to trigger the automated asset discovery in Snowflake
+@st.cache_data(ttl=300) # Only run discovery every 5 minutes to save credits and performance
+def trigger_asset_discovery():
+    try:
+        snowflake_connector.execute_non_query("CALL DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS()")
+        return True
+    except Exception as e:
+        logger.error(f"Discovery trigger failed: {e}")
+        return False
+
 # Function to get real data assets from Snowflake
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_data(ttl=15)  # Cache for 15 seconds to allow auto-refresh to see new assets
 def get_real_data_assets(selected_dbs: Optional[List[str]] = None):
     try:
         # Resolve database scope
@@ -418,7 +447,7 @@ def get_real_data_assets(selected_dbs: Optional[List[str]] = None):
                 LAST_MODIFIED_TIMESTAMP AS "last_modified"
             FROM {governance_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
             WHERE DATABASE_NAME IN ({in_list})
-            AND UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')
+            AND UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE', 'DATABASE')
             ORDER BY DATABASE_NAME, SCHEMA_NAME, ASSET_NAME
             LIMIT 5000
         """
@@ -471,7 +500,7 @@ def get_real_data_assets(selected_dbs: Optional[List[str]] = None):
             pass
         return pd.DataFrame()
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=15)
 def get_tags_batch(full_names: list) -> dict:
     if not full_names: return {}
     try:
@@ -550,7 +579,7 @@ def compute_policy_fields(df: pd.DataFrame) -> pd.DataFrame:
     # 3. Fallback derivation for Business Unit, Business Domain, Lifecycle from tags if empty
     for col, tag_key in [('Business Unit', 'BUSINESS_UNIT'), ('Business Domain', 'BUSINESS_DOMAIN'), ('Lifecycle', 'LIFECYCLE')]:
         if col not in df.columns or df[col].isnull().all() or (df[col] == 'Unknown').all():
-             df[col] = df['Tags'].apply(lambda x: _parse_tag(x, tag_key) or df.get(col, 'Unknown'))
+             df[col] = df['Tags'].apply(lambda x: _parse_tag(x, tag_key) or 'Unknown')
              
     return df
 
@@ -573,6 +602,9 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
         st.info("Select one or more databases in the sidebar to load the Data Assets inventory. Skipping account-wide scan for performance.")
         assets_df = pd.DataFrame()
     else:
+        with st.spinner("Checking for new assets in Snowflake..."):
+            trigger_asset_discovery()
+            
         with st.spinner("Loading assets from Snowflake..."):
             base_df = get_real_data_assets(_sel_dbs)
         assets_df = compute_policy_fields(base_df)
@@ -620,7 +652,7 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
         except Exception:
             return {}
 
-    @st.cache_data(ttl=600)
+    @st.cache_data(ttl=15)
     def get_tags_map(full_names: list) -> dict:
         """Get tags map keyed by Fully Qualified Name."""
         if not full_names: return {}
@@ -645,9 +677,15 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
             return {}
 
 
-
-
 with tab_inv_browser:
+    # Auto-refresh mechanism for live updates (e.g. from background tasks)
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st.caption("Live mode active: auto-refreshing every 30 seconds.")
+        st_autorefresh(interval=30000, limit=3000, key="data_assets_autorefresh")
+    except ImportError:
+        pass
+
     # KPI Cards Section
     try:
         # Determine active database and ASSETS table FQN similar to Dashboard
@@ -663,7 +701,7 @@ with tab_inv_browser:
         params = {}
 
         # Use the newly created VW_ASSET_INVENTORY_ALL_LEVELS view for KPIs
-        @st.cache_data(ttl=600)
+        @st.cache_data(ttl=15)
         def _get_inventory_metrics(db_name):
             try:
                 query = f"""
@@ -690,7 +728,7 @@ with tab_inv_browser:
         # The user view specifies: CONCAT(ROUND(...), '% ', CASE WHEN ... THEN '✅' ... END) as "Classification_Coverage"
 
         # High Risk Assets via tag-derived CIA mapping (filtered to current DB scope)
-        @st.cache_data(ttl=600)
+        @st.cache_data(ttl=15)
         def _get_high_risk_count(db_name):
             try:
                 risk_rows = snowflake_connector.execute_query(
@@ -709,13 +747,13 @@ with tab_inv_browser:
 
         # Policy alerts - Keep existing logic or use SLA_Breach_Assets from the view?
         # The view provides SLA_Breach_Assets, let's use that as the proxy for Policy Alerts or just fetch violations explicitly
-        @st.cache_data(ttl=600)
+        @st.cache_data(ttl=15)
         def _get_policy_violations(db_name):
             try:
                 query = f"""
                     SELECT COUNT(CASE WHEN COMPLIANCE_STATUS <> 'COMPLIANT' THEN 1 END) AS policy_violations
                     FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                    WHERE UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')
+                    WHERE UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE', 'DATABASE')
                 """
                 rows = snowflake_connector.execute_query(query) or []
                 return int(rows[0].get('POLICY_VIOLATIONS', 0)) if rows else 0
@@ -767,7 +805,7 @@ with tab_inv_browser:
 """, unsafe_allow_html=True)
         
         # --- NEW: Compliance Counts (Source: ASSETS only) ---
-        @st.cache_data(ttl=600)
+        @st.cache_data(ttl=15)
         def _get_compliance_counts_from_governance(db_name):
             if not db_name: return {'pii':0, 'sox':0, 'soc':0}
             try:
@@ -779,7 +817,7 @@ with tab_inv_browser:
                         COUNT(DISTINCT CASE WHEN SOC2_RELEVANT = TRUE THEN FULLY_QUALIFIED_NAME END) AS SOC2_ASSET_COUNT
                     FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
                     WHERE DATABASE_NAME = '{db_name}'
-                    AND UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')
+                    AND UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE', 'DATABASE')
                 """
                 
                 rows = snowflake_connector.execute_query(query)
@@ -875,7 +913,7 @@ with tab_inv_browser:
 
     # Helper: summarize by a grouping key
     # Helper: Ensure the view exists
-    @st.cache_data(ttl=600)
+    @st.cache_data(ttl=15)
     def _ensure_inventory_view_enrichment(db_name: str):
         try:
             # Create the view using {db_name} dynamically
@@ -975,7 +1013,7 @@ with tab_inv_browser:
                     LIFECYCLE
                     
                 FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                WHERE UPPER(TRIM(ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE')
+                WHERE UPPER(TRIM(ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE')
             ),
             column_metrics AS (
                 SELECT 
@@ -1214,7 +1252,7 @@ with tab_inv_browser:
                 AND am.SCHEMA_NAME = cm.SCHEMA_NAME 
                 AND am.ASSET_NAME = cm.ASSET_NAME
             WHERE am.ASSET_NAME IS NOT NULL
-              AND UPPER(TRIM(am.ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE');
+              AND UPPER(TRIM(am.ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE');
             """
             snowflake_connector.execute_non_query(ddl)
             return True
@@ -1425,7 +1463,7 @@ with tab_inv_browser:
         else:
             # Explicitly filter for Tables and Views in the UI as well
             if "Asset_Type" in tbl_df.columns:
-                target_types = ['TABLE', 'VIEW', 'BASE TABLE']
+                target_types = ['TABLE', 'VIEW', 'BASE TABLE', 'DATABASE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE']
                 tbl_df = tbl_df[tbl_df['Asset_Type'].str.upper().str.strip().isin(target_types)]
                 
             if tbl_df.empty:
@@ -1482,7 +1520,7 @@ with tab_inv_browser:
                         a.CLASSIFICATION_DATE
                     FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS a
                     WHERE {where_clause}
-                    AND UPPER(a.ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')
+                    AND UPPER(a.ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'DATABASE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE')
                     ORDER BY a.SCHEMA_NAME, a.ASSET_NAME
                 """
                 
@@ -1730,7 +1768,7 @@ with tab_inv_browser:
             else:
                 conds = [
                     f"DATABASE_NAME = '{db_name}'",
-                    "UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')",
+                    "UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE', 'DATABASE')",
                     "SOX_RELEVANT = TRUE",
                 ]
                 if sox_filters.get("schema") and sox_filters["schema"] != "All":
@@ -1779,7 +1817,7 @@ with tab_inv_browser:
             else:
                 conds = [
                     f"DATABASE_NAME = '{db_name}'",
-                    "UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')",
+                    "UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE', 'DATABASE')",
                     "SOC2_RELEVANT = TRUE",
                 ]
                 if soc_filters.get("schema") and soc_filters["schema"] != "All":
@@ -1881,7 +1919,7 @@ with tab_inv_browser:
                 FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS a
                 WHERE a.DATABASE_NAME = '{db_name}'
                   AND a.ASSET_NAME IS NOT NULL
-                  AND UPPER(a.ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')
+                  AND UPPER(a.ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE')
             )
             SELECT 
                 cd.COLUMN_NAME as "Column Name",

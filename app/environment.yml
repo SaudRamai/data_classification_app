@@ -4,6 +4,7 @@ channels:
 dependencies:
   - python=3.11
   - streamlit
+  - streamlit-autorefresh
   - snowflake-snowpark-python
   - snowflake-connector-python
   - pandas

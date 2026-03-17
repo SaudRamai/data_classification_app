@@ -304,11 +304,11 @@ if not db_name or str(db_name).upper() in ['NONE', '', 'NULL', 'UNKNOWN', '(NONE
 
 # Ensure Schema and Table exist
 try:
-    snowflake_connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {db_name}.DATA_CLASSIFICATION_GOVERNANCE")
+    snowflake_connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE")
     
     # Standardize Table Schema
     snowflake_connector.execute_non_query(f"""
-        CREATE TABLE IF NOT EXISTS {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES (
+        CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.POLICIES (
             POLICY_ID STRING NOT NULL DEFAULT UUID_STRING(),
             POLICY_NAME STRING NOT NULL,
             FILE_CONTENT BINARY NOT NULL,
@@ -325,7 +325,7 @@ try:
     # Ensure all target columns exist for older tables
     for col, ctype in [("FILE_CONTENT", "BINARY"), ("POLICY_CONTENT", "TEXT"), ("UPDATED_AT", "TIMESTAMP_NTZ")]:
         try:
-            snowflake_connector.execute_non_query(f"ALTER TABLE {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES ADD COLUMN IF NOT EXISTS {col} {ctype}")
+            snowflake_connector.execute_non_query(f"ALTER TABLE DATA_CLASSIFICATION_GOVERNANCE.POLICIES ADD COLUMN IF NOT EXISTS {col} {ctype}")
         except Exception: pass
 except Exception:
     pass
@@ -334,7 +334,7 @@ except Exception:
 if 'cleanup_done' not in st.session_state:
     try:
         snowflake_connector.execute_non_query(
-            f"DELETE FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES WHERE POLICY_NAME IN ('data classification', 'Data_classification_test')"
+            f"DELETE FROM DATA_CLASSIFICATION_GOVERNANCE.POLICIES WHERE POLICY_NAME IN ('data classification', 'Data_classification_test')"
         )
         st.session_state['cleanup_done'] = True
     except Exception: pass
@@ -348,7 +348,7 @@ def get_role_counts():
     """Fetch counts per major governance category for the dashboard."""
     counts = {"Owners": 0, "Stewards": 0, "Analysts": 0, "Consumers": 0}
     try:
-        query = f"SELECT ROLE_NAME, COUNT(DISTINCT USER_EMAIL) as CNT FROM {db_name}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS GROUP BY 1"
+        query = f"SELECT ROLE_NAME, COUNT(DISTINCT USER_EMAIL) as CNT FROM DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS GROUP BY 1"
         rows = snowflake_connector.execute_query(query) or []
         for r in rows:
             rn = str(r['ROLE_NAME']).upper()
@@ -365,7 +365,7 @@ def get_key_policies():
     policies = []
     try:
         # Check if table exists
-        snowflake_connector.execute_query(f"SELECT 1 FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.POLICIES LIMIT 1")
+        snowflake_connector.execute_query(f"SELECT 1 FROM DATA_CLASSIFICATION_GOVERNANCE.POLICIES LIMIT 1")
         
         query = f"""
             SELECT POLICY_ID, POLICY_NAME, POLICY_CONTENT, FILE_NAME, MIME_TYPE, 

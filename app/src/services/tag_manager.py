@@ -268,7 +268,7 @@ def seed_standard_tags():
             'tag_type': 'COMPLIANCE',
             'tag_name': 'FRAMEWORKS',
             'description': 'Applicable compliance frameworks',
-            'allowed_values': ['PII', 'SOX', 'SOC2', 'HIPAA', 'PCI', 'GDPR', 'CCPA'],
+            'allowed_values': ['PII', 'SOX', 'SOC2'],
             'is_multi_value': True,
             'is_system': True
         },

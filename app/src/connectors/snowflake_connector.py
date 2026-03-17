@@ -10,6 +10,16 @@ import logging
 from contextlib import contextmanager
 import os
 
+# Fix TLS certificate issue at module level
+try:
+    import certifi
+    cert_path = certifi.where()
+    if os.path.exists(cert_path):
+        os.environ['SSL_CERT_FILE'] = cert_path
+        os.environ['REQUESTS_CA_BUNDLE'] = cert_path
+except Exception:
+    pass
+
 class CredentialsMissingError(ValueError):
     """Raised when Snowflake credentials are missing."""
     pass
@@ -27,15 +37,41 @@ try:
 except Exception:
     st = None
 
-# Provide a cached connection factory when Streamlit is available. This avoids
-# repeated connection handshakes and is safe per-user/session.
 if st is not None:
     @st.cache_resource(show_spinner=False)
     def _sf_connect_cached(**kwargs):
-        return snowflake.connector.connect(**kwargs)
+        """
+        Cached connection factory. 
+        We rely on environment variables (SSL_CERT_FILE) set in SnowflakeConnector 
+        for certificate handling, avoiding unhashable ssl.SSLContext objects.
+        """
+        import snowflake.connector
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        
+        # Pull out our custom internal control flags
+        insecure = kwargs.pop('_insecure_mode', False)
+        
+        # Local copy of params to avoid mutating original kwargs
+        connect_params = dict(kwargs)
+        connect_params['insecure_mode'] = insecure
+        
+        # Log connection attempt details (excluding password)
+        try:
+            safe_params = {k: v for k, v in connect_params.items() if k not in ('password', 'token', 'passcode')}
+            logger.info(f"Attempting Snowflake connection with params: {safe_params}")
+        except Exception:
+            pass
+
+        return snowflake.connector.connect(**connect_params)
 else:
     def _sf_connect_cached(**kwargs):
-        return snowflake.connector.connect(**kwargs)
+        import snowflake.connector
+        insecure = kwargs.pop('_insecure_mode', False)
+        connect_params = dict(kwargs)
+        connect_params['insecure_mode'] = insecure
+        return snowflake.connector.connect(**connect_params)
 
 logger = logging.getLogger(__name__)
 
@@ -209,9 +245,56 @@ class SnowflakeConnector:
             raise CredentialsMissingError("Snowflake connection failed: 'account' or 'user' is missing. "
                              "Please provide credentials via .env file or sign in via the UI.")
                              
-        # Use cached connection factory
-        # Keep session alive on cached connections as well
-        params["client_session_keep_alive"] = True
+        # Prepare for cached connection call
+        insecure_mode_to_pass = False
+        
+        try:
+            import certifi
+            c_path = certifi.where()
+            if os.path.exists(c_path):
+                # Set environment variables - the connector will use these automatically
+                os.environ['SSL_CERT_FILE'] = c_path
+                os.environ['REQUESTS_CA_BUNDLE'] = c_path
+                params['validate_default_parameters'] = False
+                # OCSP bypass/cache settings
+                params['ocsp_response_cache_filename'] = None
+        except Exception:
+            # Fallback discovery
+            possible_paths = [
+                os.environ.get('SSL_CERT_FILE'),
+                r'C:\Program Files\Common Files\SSL\cert.pem',
+                r'C:\Windows\System32\curl-ca-bundle.crt',
+            ]
+            found_path = False
+            for p in possible_paths:
+                if p and os.path.exists(p):
+                    os.environ['SSL_CERT_FILE'] = p
+                    found_path = True
+                    break
+            
+            if not found_path:
+                insecure_mode_to_pass = True
+            params['validate_default_parameters'] = False
+
+        # Ensure no unhashable objects are in params
+        params.pop('_ssl_context', None)
+        params.pop('ssl_context', None)
+        params['_insecure_mode'] = insecure_mode_to_pass
+        
+        # Connection timeouts and resilience
+        params['login_timeout'] = 60
+        params['network_timeout'] = 60
+        
+        # Clean up account name one last time
+        if 'account' in params and params['account']:
+             acc = str(params['account']).strip().lower()
+             if acc.startswith("http"): # somehow missed by normalization
+                 from urllib.parse import urlparse
+                 acc = urlparse(acc).netloc or acc
+             if ".snowflakecomputing.com" in acc:
+                 acc = acc.replace(".snowflakecomputing.com", "")
+             params['account'] = acc
+        
         conn = _sf_connect_cached(**params)
         return conn
     

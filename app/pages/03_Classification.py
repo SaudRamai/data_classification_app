@@ -532,7 +532,7 @@ with st.sidebar:
                     pass
             try:
                 # AI Service initialization is now handled lazily by _lazy_init_ai_service()
-                # in the specific tabs/functions that require it (e.g. Discovery, Sensitivity Scan).
+                # in the specific tabs/functions that require it (e.g. Discovery, All columns).
                 # This prevents unnecessary overhead when just browsing tasks or history.
                 pass
             except Exception:
@@ -755,21 +755,29 @@ def _ensure_governance_objects(db: str) -> bool:
         snowflake_connector.execute_non_query(
             f"""
             CREATE TABLE IF NOT EXISTS {db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_TASKS (
-              TASK_ID STRING,
-              DATASET_NAME STRING,
-              ASSET_FULL_NAME STRING,
-              ASSIGNED_TO STRING,
-              STATUS STRING,
-              CONFIDENTIALITY_LEVEL STRING,
-              INTEGRITY_LEVEL STRING,
-              AVAILABILITY_LEVEL STRING,
-              DUE_DATE DATE,
-              CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-              UPDATED_AT TIMESTAMP_NTZ,
-              DETAILS VARIANT
+                TASK_ID STRING,
+                DATASET_NAME STRING,
+                ASSET_FULL_NAME STRING,
+                ASSIGNED_TO STRING,
+                STATUS STRING,
+                TASK_TYPE STRING DEFAULT 'Initial Classification',
+                PRIORITY STRING DEFAULT 'Normal',
+                CONFIDENTIALITY_LEVEL STRING,
+                INTEGRITY_LEVEL STRING,
+                AVAILABILITY_LEVEL STRING,
+                DUE_DATE DATE,
+                CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                UPDATED_AT TIMESTAMP_NTZ,
+                DETAILS VARIANT
             )
             """
         )
+        # Ensure new columns exist for existing tables
+        try:
+            snowflake_connector.execute_non_query(f"ALTER TABLE {db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_TASKS ADD COLUMN IF NOT EXISTS TASK_TYPE STRING DEFAULT 'Initial Classification'")
+            snowflake_connector.execute_non_query(f"ALTER TABLE {db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_TASKS ADD COLUMN IF NOT EXISTS PRIORITY STRING DEFAULT 'Normal'")
+        except Exception:
+            pass
         # Create View (Heavy/Synchronous in Snowflake - Cache ensures once-per-hour max)
         snowflake_connector.execute_non_query(
             f"""
@@ -784,6 +792,8 @@ def _ensure_governance_objects(db: str) -> bool:
                 INTEGRITY_LEVEL,
                 AVAILABILITY_LEVEL,
                 DUE_DATE,
+                TASK_TYPE,
+                PRIORITY,
                 CREATED_AT,
                 UPDATED_AT,
                 CASE 
@@ -866,9 +876,6 @@ tab_new, tab_tasks = st.tabs([
 
 with tab_new:
     st.subheader("New Classification")
-    # Debug: Show this tab is rendering
-    st.write("DEBUG: New Classification tab is rendering")
-    st.info("If you can see this message, the New Classification tab is working.")
     sub_guided, sub_bulk, sub_ai = st.tabs(["🧭 Guided Workflow", "📤 Bulk Upload", "🤖 AI Assistant"])
 
     # ── Guided Workflow Wizard ──────────────────────────────────────────────────
@@ -1005,7 +1012,7 @@ with tab_new:
 
         # ── Step Progress Indicator ─────────────────────────────────────────
         steps_meta = [
-            ("1","Select Asset"),("2","AI Discovery"),("3","Impact"),
+            ("1","Select Asset"),("2","All columns"),("3","Impact"),
             ("4","Result"),("5","Governance"),("6","Review"),("7","Enforce")
         ]
         bar_html = '<div class="gw-step-bar">'
@@ -1107,7 +1114,7 @@ with tab_new:
             st.divider()
             btn_col = st.columns([4, 1])[1]
             with btn_col:
-                if st.button("Next: AI Discovery →", type="primary", width='stretch', key="gw1_next"):
+                if st.button("Next: All columns →", type="primary", width='stretch', key="gw1_next"):
                     if not db_input or not schema_input or table_input in ("No tables found",""):
                         st.error("Please select a valid Database, Schema, and Table.")
                     else:
@@ -1120,14 +1127,14 @@ with tab_new:
                         st.rerun()
 
         # ════════════════════════════════════════════════════════════════════
-        # STEP 2 — AI Discovery
+        # STEP 2 — All columns
         # ════════════════════════════════════════════════════════════════════
         elif step == 2:
             fqn = gw.get("fqn","")
             col_main, col_side = st.columns([2, 1])
 
             with col_main:
-                st.markdown(f'<div class="gw-section-title">🤖 AI Sensitivity Scan — <code style="font-size:11px">{fqn}</code></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="gw-section-title">🤖 AI All columns — <code style="font-size:11px">{fqn}</code></div>', unsafe_allow_html=True)
 
                 with st.spinner("Scanning columns for sensitive data patterns..."):
                     ai_cols = []
@@ -1228,13 +1235,13 @@ with tab_new:
                 )
                 q2 = st.multiselect(
                     "2. This dataset contains (select all that apply):",
-                    ["Personal Identifiable Information (PII)", "Financial / Banking data", "Health / Medical records",
-                     "HR / Employee data", "Trade secrets / IP", "Internal-only business data", "Public / Marketing data"],
+                    ["PII (Personal Identifiable Information)", "Financial Data", "System/IT Infrastructure Data",
+                     "HR / Employee data", "Internal business data", "Public data"],
                     default=gw.get("q2",[]), key="gw3_q2"
                 )
                 q3 = st.multiselect(
                     "3. Which regulatory frameworks apply?",
-                    ["GDPR", "CCPA", "SOX", "HIPAA", "PCI-DSS", "ISO 27001", "None / Not sure"],
+                    ["PII", "SOX", "SOC2", "None / Not sure"],
                     default=gw.get("q3",[]), key="gw3_q3"
                 )
                 q4 = st.radio(
@@ -1253,8 +1260,8 @@ with tab_new:
                 risk_score = 0
                 if "Major" in q1 or "Severe" in q1: risk_score += 40
                 elif "Minor" in q1: risk_score += 15
-                if any(k in q2 for k in ["PII","Financial","Health"]): risk_score += 30
-                if any(k in q3 for k in ["GDPR","HIPAA","SOX"]): risk_score += 20
+                if any("PII" in k or "Financial" in k or "Health" in k for k in q2): risk_score += 30
+                if any(k in q3 for k in ["PII", "SOX", "SOC2"]): risk_score += 20
                 if "need-to-know" in q4: risk_score += 10
                 risk_level = "HIGH" if risk_score >= 60 else ("MEDIUM" if risk_score >= 30 else "LOW")
                 risk_color = {"HIGH":"#f87171","MEDIUM":"#fbbf24","LOW":"#4ade80"}[risk_level]
@@ -1271,7 +1278,7 @@ with tab_new:
                   <div class="gw-section-title">Detected Signals</div>
                   <div style="font-size:12px;color:rgba(255,255,255,.5);line-height:1.9">
                     {"⚠️ External breach risk high<br>" if "Severe" in q1 or "Major" in q1 else ""}
-                    {"🔐 PII/health data requires masking<br>" if any(k in q2 for k in ["PII","Health"]) else ""}
+                    {"🔐 PII/regulated data requires masking<br>" if any("PII" in k or "Financial" in k for k in q2) or any(k in q3 for k in ["PII","SOX","SOC2"]) else ""}
                     {"📋 Regulatory frameworks active<br>" if q3 and "None" not in str(q3) else ""}
                     {"🔒 Restricted access recommended<br>" if "need-to-know" in q4 else ""}
                   </div>
@@ -1593,6 +1600,7 @@ with tab_new:
                         upsert_q = f"""
                             MERGE INTO {db}.{gv_schema}.ASSETS AS tgt
                             USING (SELECT
+                                MD5('{fqn}')  AS ASSET_ID,
                                 '{db_s}'      AS DATABASE_NAME,
                                 '{sc_s}'      AS SCHEMA_NAME,
                                 '{tb_s}'      AS ASSET_NAME,
@@ -1605,9 +1613,7 @@ with tab_new:
                                 {gw.get("risk_score",0)}  AS SENSITIVE_DATA_USAGE_COUNT,
                                 CURRENT_TIMESTAMP()       AS CLASSIFICATION_DATE,
                                 'Approved'                AS REVIEW_STATUS
-                            ) AS src ON tgt.DATABASE_NAME=src.DATABASE_NAME
-                                      AND tgt.SCHEMA_NAME=src.SCHEMA_NAME
-                                      AND tgt.ASSET_NAME=src.ASSET_NAME
+                            ) AS src ON tgt.FULLY_QUALIFIED_NAME = src.FULLY_QUALIFIED_NAME
                             WHEN MATCHED THEN UPDATE SET
                                 tgt.CLASSIFICATION_LABEL=src.CLASSIFICATION_LABEL,
                                 tgt.DATA_OWNER=src.DATA_OWNER,
@@ -1616,8 +1622,16 @@ with tab_new:
                                 tgt.SENSITIVE_DATA_USAGE_COUNT=src.SENSITIVE_DATA_USAGE_COUNT,
                                 tgt.REVIEW_STATUS=src.REVIEW_STATUS,
                                 tgt.LAST_MODIFIED_TIMESTAMP=CURRENT_TIMESTAMP()
-                            WHEN NOT MATCHED THEN INSERT (DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, ASSET_TYPE, FULLY_QUALIFIED_NAME, CLASSIFICATION_LABEL, DATA_OWNER, BUSINESS_PURPOSE, OVERALL_RISK_CLASSIFICATION, SENSITIVE_DATA_USAGE_COUNT, CLASSIFICATION_DATE, LAST_MODIFIED_TIMESTAMP, REVIEW_STATUS)
-                            VALUES (src.DATABASE_NAME, src.SCHEMA_NAME, src.ASSET_NAME, src.ASSET_TYPE, src.FULLY_QUALIFIED_NAME, src.CLASSIFICATION_LABEL, src.DATA_OWNER, src.BUSINESS_PURPOSE, src.OVERALL_RISK_CLASSIFICATION, src.SENSITIVE_DATA_USAGE_COUNT, src.CLASSIFICATION_DATE, CURRENT_TIMESTAMP(), src.REVIEW_STATUS)
+                            WHEN NOT MATCHED THEN INSERT (
+                                ASSET_ID, DATABASE_NAME, SCHEMA_NAME, ASSET_NAME, ASSET_TYPE, FULLY_QUALIFIED_NAME, 
+                                CLASSIFICATION_LABEL, DATA_OWNER, BUSINESS_PURPOSE, OVERALL_RISK_CLASSIFICATION, 
+                                SENSITIVE_DATA_USAGE_COUNT, CLASSIFICATION_DATE, LAST_MODIFIED_TIMESTAMP, REVIEW_STATUS
+                            )
+                            VALUES (
+                                src.ASSET_ID, src.DATABASE_NAME, src.SCHEMA_NAME, src.ASSET_NAME, src.ASSET_TYPE, src.FULLY_QUALIFIED_NAME, 
+                                src.CLASSIFICATION_LABEL, src.DATA_OWNER, src.BUSINESS_PURPOSE, src.OVERALL_RISK_CLASSIFICATION, 
+                                src.SENSITIVE_DATA_USAGE_COUNT, src.CLASSIFICATION_DATE, CURRENT_TIMESTAMP(), src.REVIEW_STATUS
+                            )
                         """
                         snowflake_connector.execute_query(upsert_q)
                         
@@ -2106,14 +2120,16 @@ with tab_new:
                     st.rerun()
 
 with tab_tasks:
-    st.subheader("Classification Management")
-    # Debug: Show this tab is rendering
-    st.write("DEBUG: Classification Management tab is rendering")
-    st.info("If you can see this message, the Classification Management tab is working.")
+    st.subheader("🗂️ Classification Management")
     
-    # Restore earlier sub-tabs
-    sub_my, sub_pending, sub_history, sub_reclass = st.tabs([
-        "My Tasks", "Classification review", "History", "Reclassification Requests"
+    # Sub-tabs for management
+    sub_my, sub_pending, sub_history, sub_reclass, sub_rules, sub_exclusions = st.tabs([
+        "📋 My Tasks", 
+        "🔍 Classification review", 
+        "📜 History", 
+        "🔄 Reclassification Requests",
+        "🛡️ Governance Rules",
+        "🚫 Exclusion Patterns"
     ])
 
     # My Tasks (Unified)
@@ -2152,7 +2168,18 @@ with tab_tasks:
         @st.cache_data(ttl=30, show_spinner="Loading your tasks...")
         def _get_user_tasks(db: str):
             try:
-                q = f"SELECT SCHEMA_NAME, ASSET_NAME, ASSET_TYPE, FULLY_QUALIFIED_NAME, CLASSIFICATION_LABEL, DATA_OWNER, PII_RELEVANT, SOX_RELEVANT, SOC2_RELEVANT, CLASSIFICATION_DATE FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_MY_CLASSIFICATION_TASKS LIMIT 500"
+                # Query from the view for consistent status labeling and owner mapping
+                q = f"""
+                SELECT 
+                    TASK_ID, DATASET_NAME, ASSET_FULL_NAME, 
+                    OWNER AS ASSIGNED_TO, 
+                    STATUS_LABEL AS STATUS, 
+                    TASK_TYPE, PRIORITY, 
+                    CONFIDENTIALITY_LEVEL, DUE_DATE,
+                    CREATED_AT AS CREATED_DATE
+                FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.VW_MY_CLASSIFICATION_TASKS 
+                LIMIT 500
+                """
                 return snowflake_connector.execute_query(q) or []
             except Exception as e:
                 logger.error(f"Task fetch failed: {e}")
@@ -2167,41 +2194,10 @@ with tab_tasks:
             df_tasks = pd.DataFrame()
 
         if not df_tasks.empty:
-            # Check if required columns exist, if not create empty dataframe with proper structure
-            required_columns = ['ASSIGNED_TO', 'DUE_DATE', 'TASK_TYPE', 'PRIORITY', 'STATUS']
-            missing_columns = [col for col in required_columns if col not in df_tasks.columns]
-            
-            if missing_columns:
-                st.warning(f"Task view is missing required columns: {missing_columns}. Creating sample tasks for demonstration.")
-                # Create sample tasks dataframe with required structure
-                sample_tasks = [
-                    {
-                        'TASK_ID': 'TASK-001',
-                        'TASK_TYPE': 'Classification Review',
-                        'PRIORITY': 'Medium',
-                        'STATUS': 'Pending',
-                        'ASSIGNED_TO': me_user,
-                        'DUE_DATE': (datetime.utcnow() + timedelta(days=3)).strftime('%Y-%m-%d'),
-                        'TITLE': 'Review Customer Data Classification',
-                        'DESCRIPTION': 'Review and approve classification for customer tables'
-                    },
-                    {
-                        'TASK_ID': 'TASK-002', 
-                        'TASK_TYPE': 'Reclassification Request',
-                        'PRIORITY': 'High',
-                        'STATUS': 'Pending',
-                        'ASSIGNED_TO': '',
-                        'DUE_DATE': (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%d'),
-                        'TITLE': 'Urgent Reclassification Needed',
-                        'DESCRIPTION': 'Reclassify sensitive data per compliance requirements'
-                    }
-                ]
-                df_tasks = pd.DataFrame(sample_tasks)
-            
+            # ... existing filtering logic ... (kept as is)
             now = datetime.utcnow()
             me = me_user.lower()
 
-            # Derived fields for filtering with null safety
             def _get_due_bucket(d):
                 try:
                     if d is None: return "Future"
@@ -2214,7 +2210,6 @@ with tab_tasks:
                 except Exception:
                     return "Future"
 
-            # Apply filters with column existence checks
             if 'DUE_DATE' in df_tasks.columns:
                 df_tasks['_DUE_BUCKET'] = df_tasks['DUE_DATE'].apply(_get_due_bucket)
             else:
@@ -2241,74 +2236,84 @@ with tab_tasks:
             if df_filtered.empty:
                 st.info("No tasks match your filters. Try adjusting the criteria.")
             else:
-                # Display metrics
                 m1, m2, m3 = st.columns(3)
-                with m1:
-                    st.metric("Total Tasks", len(df_filtered))
+                with m1: st.metric("Total Tasks", len(df_filtered))
                 with m2:
-                    if '_DUE_BUCKET' in df_filtered.columns:
-                        overdue = len(df_filtered[df_filtered['_DUE_BUCKET'].eq('Overdue')])
-                    else:
-                        overdue = 0
-                    st.metric("Overdue", overdue, delta=None, delta_color="inverse")
+                    overdue = len(df_filtered[df_filtered['_DUE_BUCKET'].eq('Overdue')]) if '_DUE_BUCKET' in df_filtered.columns else 0
+                    st.metric("Overdue", overdue, delta_color="inverse")
                 with m3:
-                    if 'PRIORITY' in df_filtered.columns:
-                        critical = len(df_filtered[df_filtered['PRIORITY'].eq('Critical')])
-                    else:
-                        critical = 0
-                    st.metric("Critical", critical, delta=None, delta_color="normal")
+                    critical = len(df_filtered[df_filtered['PRIORITY'].eq('Critical')]) if 'PRIORITY' in df_filtered.columns else 0
+                    st.metric("Critical", critical)
 
-                # Task table
                 display_cols = ['TASK_TYPE','ASSET_FULL_NAME','DUE_DATE','PRIORITY','STATUS','ASSIGNED_TO','CREATED_DATE']
                 display_cols = [c for c in display_cols if c in df_filtered.columns]
                 if display_cols:
-                    # Check if DUE_DATE exists for sorting, otherwise use first available column
                     sort_col = 'DUE_DATE' if 'DUE_DATE' in df_filtered.columns else display_cols[0]
-                    st.dataframe(
-                        df_filtered[display_cols].sort_values(sort_col),
-                        width='stretch'
-                    )
+                    st.dataframe(df_filtered[display_cols].sort_values(sort_col), width='stretch')
                 else:
-                    st.warning("No displayable columns available in task data.")
+                    st.warning("No displayable columns available.")
         else:
-            st.info("No tasks found. Check your permissions or database connection.")
+            st.info("No tasks found.")
 
-with sub_pending:
-            st.caption("Review queue for all pending classifications (admin/steward view)")
-            # Similar loading logic for pending review
-            try:
-                q = f"SELECT ASSET_FULL_NAME, CLASSIFICATION_LABEL, CREATED_DATE, STATUS, ASSIGNED_TO FROM {db_target}.DATA_CLASSIFICATION_GOVERNANCE.VW_CLASSIFICATION_REVIEW WHERE STATUS = 'Pending' LIMIT 200"
-                pending_rows = snowflake_connector.execute_query(q) or []
-                if pending_rows:
-                    st.dataframe(pd.DataFrame(pending_rows), width='stretch')
-                else:
-                    st.info("No pending classifications to review.")
-            except Exception as e:
-                st.error(f"Failed to load pending reviews: {e}")
+    with sub_pending:
+        st.caption("Review queue for all pending classifications (admin/steward view)")
+        try:
+            q = f"SELECT * FROM {db_target}.DATA_CLASSIFICATION_GOVERNANCE.VW_CLASSIFICATION_REVIEW WHERE STATUS = 'Pending' LIMIT 200"
+            pending_rows = snowflake_connector.execute_query(q) or []
+            if pending_rows:
+                st.dataframe(pd.DataFrame(pending_rows), width='stretch')
+            else:
+                st.info("No pending classifications to review.")
+        except Exception as e:
+            st.error(f"Failed to load pending reviews: {e}")
 
-with sub_history:
-            st.caption("Historical classification records and audit trail")
-            try:
-                q = f"SELECT ASSET_FULL_NAME, CLASSIFICATION_LABEL, DECISION_MAKER, CREATED_DATE, RATIONALE FROM {db_target}.DATA_CLASSIFICATION_GOVERNANCE.VW_CLASSIFICATION_HISTORY ORDER BY CREATED_DATE DESC LIMIT 100"
-                history_rows = snowflake_connector.execute_query(q) or []
-                if history_rows:
-                    st.dataframe(pd.DataFrame(history_rows), width='stretch')
-                else:
-                    st.info("No classification history found.")
-            except Exception as e:
-                st.error(f"Failed to load history: {e}")
+    with sub_history:
+        st.caption("Historical classification records and audit trail")
+        try:
+            q = f"SELECT * FROM {db_target}.DATA_CLASSIFICATION_GOVERNANCE.VW_CLASSIFICATION_HISTORY LIMIT 100"
+            history_rows = snowflake_connector.execute_query(q) or []
+            if history_rows:
+                st.dataframe(pd.DataFrame(history_rows), width='stretch')
+            else:
+                st.info("No classification history found.")
+        except Exception as e:
+            st.error(f"Failed to load history: {e}")
 
-with sub_reclass:
-            st.caption("Reclassification requests and change management")
-            try:
-                q = f"SELECT ASSET_FULL_NAME, CURRENT_LABEL, REQUESTED_LABEL, REQUESTOR_EMAIL, REQUEST_DATE, STATUS FROM {db_target}.DATA_CLASSIFICATION_GOVERNANCE.VW_RECLASSIFICATION_REQUESTS ORDER BY REQUEST_DATE DESC LIMIT 100"
-                reclass_rows = snowflake_connector.execute_query(q) or []
-                if reclass_rows:
-                    st.dataframe(pd.DataFrame(reclass_rows), width='stretch')
-                else:
-                    st.info("No reclassification requests found.")
-            except Exception as e:
-                st.error(f"Failed to load reclassification requests: {e}")
+    with sub_reclass:
+        st.caption("Reclassification requests and change management")
+        try:
+            q = f"SELECT * FROM {db_target}.DATA_CLASSIFICATION_GOVERNANCE.VW_RECLASSIFICATION_REQUESTS LIMIT 100"
+            reclass_rows = snowflake_connector.execute_query(q) or []
+            if reclass_rows:
+                st.dataframe(pd.DataFrame(reclass_rows), width='stretch')
+            else:
+                st.info("No reclassification requests found.")
+        except Exception as e:
+            st.error(f"Failed to load reclassification requests: {e}")
+
+    with sub_rules:
+        st.caption("Active classification rules and category mapping")
+        try:
+            q = f"SELECT * FROM {db_target}.DATA_CLASSIFICATION_GOVERNANCE.VW_CLASSIFICATION_RULES WHERE IS_ACTIVE = TRUE LIMIT 200"
+            rules_rows = snowflake_connector.execute_query(q) or []
+            if rules_rows:
+                st.dataframe(pd.DataFrame(rules_rows), width='stretch')
+            else:
+                st.info("No active classification rules found.")
+        except Exception as e:
+            st.error(f"Failed to load governance rules: {e}")
+
+    with sub_exclusions:
+        st.caption("Patterns and keywords excluded from classification analysis")
+        try:
+            q = f"SELECT * FROM {db_target}.DATA_CLASSIFICATION_GOVERNANCE.VW_EXCLUSION_PATTERNS LIMIT 200"
+            exclusion_rows = snowflake_connector.execute_query(q) or []
+            if exclusion_rows:
+                st.dataframe(pd.DataFrame(exclusion_rows), width='stretch')
+            else:
+                st.info("No exclusion patterns found.")
+        except Exception as e:
+            st.error(f"Failed to load exclusion patterns: {e}")
 
 # End of Classification Management section
 

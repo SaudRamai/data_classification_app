@@ -225,7 +225,7 @@ class AuthorizationService:
                             in_list = ",".join(["%(g"+str(i)+")s" for i, _ in enumerate(idp_groups)])
                             params = {"g"+str(i): v for i, v in enumerate(idp_groups)}
                             rows = snowflake_connector.execute_query(
-                                f"SELECT ROLE_NAME FROM {g_db}.DATA_GOVERNANCE.IDP_GROUP_MAP WHERE GROUP_NAME IN ({in_list})",
+                                f"SELECT ROLE_NAME FROM DATA_CLASSIFICATION_GOVERNANCE.IDP_GROUP_MAP WHERE GROUP_NAME IN ({in_list})",
                                 params
                             ) or []
                             for r in rows:
@@ -238,7 +238,7 @@ class AuthorizationService:
                     if app_email:
                         try:
                             rows = snowflake_connector.execute_query(
-                                f"SELECT ROLE_NAME FROM {g_db}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS WHERE USER_EMAIL = %(e)s",
+                                f"SELECT ROLE_NAME FROM DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS WHERE USER_EMAIL = %(e)s",
                                 {"e": app_email}
                             ) or []
                             for r in rows:

@@ -357,10 +357,10 @@ _SEMANTIC_TO_AVENDRA = {
 
 # Compliance hints per Avendra category
 _COMPLIANCE_MAP = {
-    'PERSONAL_DATA': ['GDPR', 'CCPA'],
+    'PERSONAL_DATA': ['PII'],
     'FINANCIAL_DATA': ['SOX'],
-    'REGULATORY_DATA': ['HIPAA', 'PCI-DSS'],
-    'PROPRIETARY_DATA': ['NDA', 'IP'],
+    'REGULATORY_DATA': ['SOC2'],
+    'PROPRIETARY_DATA': ['Internal Policy'],
     'INTERNAL': ['Internal Policy'],
     'PUBLIC_DATA': ['Public Policy'],
 }
@@ -540,6 +540,21 @@ class DiscoveryService:
         gov_db = self._normalize_db()
         for r in rows:
             try:
+                # Defensive filtering: skip restricted databases and schemas
+                full_name = r.get("FULL_NAME")
+                if not full_name:
+                    continue
+                
+                parts = full_name.split('.')
+                if len(parts) >= 1:
+                    db_part = parts[0].upper()
+                    if db_part in ('SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA', 'INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE'):
+                        continue
+                if len(parts) >= 2:
+                    schema_part = parts[1].upper()
+                    if schema_part in ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE'):
+                        continue
+
                 self.connector.execute_non_query(
                     f"""
                     MERGE INTO {gov_db}.{self._schema}.{self._inventory} t
@@ -552,6 +567,8 @@ class DiscoveryService:
                             %(wh)s AS WAREHOUSE
                     ) s
                     ON t.FULLY_QUALIFIED_NAME = s.FULL_NAME
+                    AND UPPER(SPLIT_PART(s.FULL_NAME, '.', 1)) NOT IN ('SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA', 'INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
+                    AND UPPER(SPLIT_PART(s.FULL_NAME, '.', 2)) NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
                     WHEN MATCHED THEN UPDATE SET 
                         ASSET_TYPE = s.OBJECT_DOMAIN,
                         WAREHOUSE_NAME = COALESCE(s.WAREHOUSE, t.WAREHOUSE_NAME),
@@ -1125,6 +1142,26 @@ class AIClassificationPipelineService:
         if df_results.empty:
              with st.spinner("Fetching classification history..."):
                 df_results = self._fetch_classification_history()
+                if not df_results.empty:
+                    logger.info(f"Successfully fetched {len(df_results)} historical records from DB.")
+                else:
+                    logger.warning("No historical records found in CLASSIFICATION_AI_RESULTS table.")
+
+        # Debug info for developers (only if data is missing)
+        if df_results.empty:
+            with st.expander("🔍 Connection Diagnostics"):
+                # FORCE DATA SOURCE INFO
+                gov_db = "DATA_CLASSIFICATION_DB"
+                st.write(f"**Target Database (Forced):** `{gov_db}`")
+                st.write(f"**Target Table:** `{gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS` Rose")
+                
+                if st.button("Test Connection & Schema"):
+                    try:
+                        test_query = f"SELECT COUNT(*) as CNT FROM {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS"
+                        res = snowflake_connector.execute_query(test_query)
+                        st.success(f"Connection successful! Found {res[0]['CNT'] if res else 0} records.")
+                    except Exception as e:
+                        st.error(f"Connection failed: {e}")
 
         # Layout for filters and actions
         f_col1, f_col2 = st.columns([3, 1])
@@ -1272,11 +1309,18 @@ class AIClassificationPipelineService:
             df_risk['Combined_Risk'] = df_risk['Risk_Weight']
         
         # Aggregate risk scores per table
-        table_risk_agg = df_risk.groupby('Table').agg({
+        # NEW SCHEMA: Using 'Asset' as the table identifier
+        group_col = 'Asset' if 'Asset' in df_risk.columns else 'Table'
+        
+        table_risk_agg = df_risk.groupby(group_col).agg({
             'Combined_Risk': 'max',  # Use max risk score for the table
             'Column': 'count',       # Count of columns in the table
             'Risk_Weight': 'sum'     # Sum of sensitivity weights
         }).reset_index()
+        
+        # Rename group column to 'Table' for consistency in subsequent logic if it was 'Asset'
+        if group_col == 'Asset':
+            table_risk_agg = table_risk_agg.rename(columns={'Asset': 'Table'})
         
         # Define risk classification rules with improved documentation and logging
         cat_series = df_risk['Category'].astype(str).str.upper() if 'Category' in df_risk.columns else pd.Series([''] * len(df_risk), index=df_risk.index)
@@ -1305,8 +1349,10 @@ class AIClassificationPipelineService:
         df_risk.loc[high_risk_col_mask & ~critical_col_mask, 'Risk_Level'] = 'High'
         
         # Get unique tables by risk level
-        critical_tables = set(df_risk[df_risk['Risk_Level'] == 'Critical']['Table'].unique())
-        high_risk_tables = set(df_risk[df_risk['Risk_Level'] == 'High']['Table'].unique()) - critical_tables
+        # NEW SCHEMA: Using 'Asset' as the table identifier if 'Table' is missing
+        table_col = 'Asset' if 'Asset' in df_risk.columns else 'Table'
+        critical_tables = set(df_risk[df_risk['Risk_Level'] == 'Critical'][table_col].unique())
+        high_risk_tables = set(df_risk[df_risk['Risk_Level'] == 'High'][table_col].unique()) - critical_tables
         
         # Calculate column counts for each risk level
         critical_col_count = int(critical_col_mask.sum())
@@ -1469,21 +1515,59 @@ class AIClassificationPipelineService:
             
             st.markdown("---")
             
+            # Table Overview and Stats
+            if not df_filtered.empty:
+                # NEW SCHEMA: Ensure 'Table' column exists for display and stats
+                if 'Table' not in df_filtered.columns and 'Asset' in df_filtered.columns:
+                    df_filtered['Table'] = df_filtered['Asset']
+                
+                with st.expander("📊 Classification Summary", expanded=True):
+                    # Count distinct tables affected
+                    table_count = len(df_filtered['Table'].unique()) if 'Table' in df_filtered.columns else 0
+                    
+                    st.markdown(f"""
+                            <div style="background-color: #f0f7ff; padding: 15px; border-radius: 10px; border-left: 5px solid #0066cc;">
+                                <h4 style="margin-top: 0; color: #004080;">Pipeline Insights</h4>
+                                <ul>
+                                    <li><strong>{pii_count}</strong> PII-related data columns detected</li>
+                                    <li><strong>{sox_count}</strong> SOX-regulated financial data columns</li>
+                                    <li><strong>{soc2_count}</strong> SOC2 security-sensitive columns</li>
+                                    <li>Coverage: <strong>{table_count}</strong> tables affected</li>
+                                </ul>
+                            </div>
+                        """, unsafe_allow_html=True)
+                
+                st.markdown("---")
+            
             # Aggregate by Table
-            grouped = df_filtered.groupby(['Schema', 'Table']).agg({
-                'Column': 'count',
-                'Category': lambda x: sorted(list(set(x))),
-                'Compliance': lambda x: sorted(list(set(x))),
-                'Sensitivity': lambda x: sorted(list(set(x))),
-                'Confidentiality': lambda x: sorted(list(set(x))),
-                'Integrity': lambda x: sorted(list(set(x))),
-                'Availability': lambda x: sorted(list(set(x))),
-                'Confidence': 'max'
-            }).reset_index()
+            # NEW SCHEMA: Ensure grouping columns exist
+            group_cols = []
+            if 'Schema' in df_filtered.columns: group_cols.append('Schema')
+            if 'Table' in df_filtered.columns: group_cols.append('Table')
             
-            grouped.rename(columns={'Column': 'Sensitive Cols'}, inplace=True)
+            # Ensure we have Asset for grouping if Table is missing or we want full FQN
+            if 'Asset' in df_filtered.columns and 'Asset' not in group_cols:
+                group_cols.append('Asset')
             
-            # Format lists as strings with badges
+            if not group_cols:
+                st.warning("Could not identify grouping columns (Schema/Table/Asset).")
+                grouped = pd.DataFrame()
+            else:
+                grouped = df_filtered.groupby(group_cols).agg({
+                    'Column': 'count',
+                    'Category': lambda x: sorted(list(set(x))),
+                    'Compliance': lambda x: sorted(list(set(x))),
+                    'Sensitivity': lambda x: sorted(list(set(x))),
+                    'Confidentiality': lambda x: sorted(list(set(x))),
+                    'Integrity': lambda x: sorted(list(set(x))),
+                    'Availability': lambda x: sorted(list(set(x))),
+                    'Confidence': 'max'
+                }).reset_index()
+            
+            if not grouped.empty:
+                grouped.rename(columns={'Column': 'Sensitive Cols'}, inplace=True)
+            
+            # Format compliance with badges (Inline function to avoid scope issues)
             def format_compliance(items):
                 badges = []
                 # Handle comma-separated values (e.g. from multi-label columns)
@@ -1573,8 +1657,18 @@ class AIClassificationPipelineService:
             grouped['Integrity'] = grouped['Integrity'].apply(lambda x: format_list_helper(x, format_integrity_val))
             grouped['Availability'] = grouped['Availability'].apply(lambda x: format_list_helper(x, format_availability_val))
             
+            # NEW SCHEMA: Ensure columns exist for display
+            display_cols = ['Sensitive Cols', 'Category', 'Confidentiality', 'Integrity', 'Availability']
+            # Prioritize Asset (FQN) if available, then Schema/Table
+            name_cols = []
+            if 'Asset' in grouped.columns: name_cols.append('Asset')
+            if 'Schema' in grouped.columns: name_cols.append('Schema')
+            if 'Table' in grouped.columns: name_cols.append('Table')
+            
+            final_display_cols = name_cols + display_cols
+            
             st.dataframe(
-                grouped[['Schema', 'Table', 'Sensitive Cols', 'Category', 'Confidentiality', 'Integrity', 'Availability']],
+                grouped[final_display_cols],
                 hide_index=True
             )
             
@@ -1594,8 +1688,12 @@ class AIClassificationPipelineService:
             st.divider()
             st.subheader("🔬 Table Drill-Down")
             
+            # NEW SCHEMA: Ensure 'Table' column exists in grouped DataFrame
+            if 'Table' not in grouped.columns and 'Asset' in grouped.columns:
+                grouped['Table'] = grouped['Asset']
+            
             # Get list of tables for dropdown
-            table_options = sorted(grouped['Table'].unique().tolist())
+            table_options = sorted(grouped['Table'].unique().tolist()) if 'Table' in grouped.columns else []
             selected_table = st.selectbox(
                 "Select a table to view detailed column analysis:",
                 options=table_options,
@@ -3834,6 +3932,8 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
         
         This ensures that when a global rule is added/removed for a column name,
         the results table reflects the new set of categories immediately.
+        
+        Updated for new schema: Uses ASSET_FULL_NAME and compliance flags instead of deprecated fields.
         """
         try:
             schema_fqn = "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE"
@@ -3841,7 +3941,8 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
             
             # 1. Get all active categories for this column name
             q_cats = f"""
-                SELECT sc.CATEGORY_NAME
+                SELECT sc.CATEGORY_NAME, sc.PII_RELEVANT, sc.SOX_RELEVANT, sc.SOC2_RELEVANT,
+                       sc.CONFIDENTIALITY_LEVEL, sc.INTEGRITY_LEVEL, sc.AVAILABILITY_LEVEL
                 FROM {schema_fqn}.SENSITIVE_KEYWORDS sk
                 JOIN {schema_fqn}.SENSITIVITY_CATEGORIES sc ON sk.CATEGORY_ID = sc.CATEGORY_ID
                 WHERE sk.IS_ACTIVE = TRUE
@@ -3849,58 +3950,74 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                 ORDER BY sc.CATEGORY_NAME
             """
             rows = snowflake_connector.execute_query(q_cats) or []
-            active_cats = [r['CATEGORY_NAME'] for r in rows if r.get('CATEGORY_NAME')]
             
-            # 2. Update CLASSIFICATION_AI_RESULTS
-            if active_cats:
-                # Construct data for update
-                new_cat_str = ', '.join(sorted(set(active_cats)))
+            if rows:
+                # Aggregate compliance flags from all active categories
+                aggregated_pii = any(r.get('PII_RELEVANT', False) for r in rows)
+                aggregated_sox = any(r.get('SOX_RELEVANT', False) for r in rows)
+                aggregated_soc2 = any(r.get('SOC2_RELEVANT', False) for r in rows)
                 
-                # Derive policy group (simple logic: take highest priority)
-                policy = 'None'
-                for c in active_cats:
-                    pg = self._map_category_to_policy_group(c)
-                    if pg and pg != 'None':
-                        policy = pg
-                        break # Take first specific one
+                # Get highest CIA level (most restrictive)
+                c_levels = [r.get('CONFIDENTIALITY_LEVEL', 'C1') for r in rows if r.get('CONFIDENTIALITY_LEVEL')]
+                i_levels = [r.get('INTEGRITY_LEVEL', 'I1') for r in rows if r.get('INTEGRITY_LEVEL')]
+                a_levels = [r.get('AVAILABILITY_LEVEL', 'A1') for r in rows if r.get('AVAILABILITY_LEVEL')]
                 
-                # Update Query
+                # Simple level prioritization (higher number = more restrictive)
+                def get_highest_level(levels, default='1'):
+                    if not levels:
+                        return default
+                    # Extract numeric part and get highest
+                    numeric_levels = []
+                    for level in levels:
+                        try:
+                            num = int(''.join(filter(str.isdigit, level)))
+                            numeric_levels.append(num)
+                        except:
+                            continue
+                    return str(max(numeric_levels)) if numeric_levels else default
+                
+                highest_c = 'C' + get_highest_level(c_levels, '1')
+                highest_i = 'I' + get_highest_level(i_levels, '1')
+                highest_a = 'A' + get_highest_level(a_levels, '1')
+                
+                # Update Query with new schema
                 update_q = f"""
                     UPDATE {schema_fqn}.CLASSIFICATION_AI_RESULTS
                     SET 
-                        AI_CATEGORY = '{new_cat_str}',
-                        FINAL_CONFIDENCE = 1.0,
-                        DETAILS = PARSE_JSON('{{"manual_override": true, "sync_update": true, "detected_categories": {[{{"category": c, "confidence": 1.0}} for c in active_cats]}}}')
-                    WHERE LOWER(COLUMN_NAME) = LOWER('{safe_col}')
-                """
-                # Note: The JSON construction in f-string needs careful escaping of braces
-                # Fix JSON escaping:
-                json_str = '[' + ', '.join([f'{{"category": "{c}", "confidence": 1.0}}' for c in active_cats]) + ']'
-                update_q = f"""
-                    UPDATE {schema_fqn}.CLASSIFICATION_AI_RESULTS
-                    SET 
-                        AI_CATEGORY = '{new_cat_str}',
-                        FINAL_CONFIDENCE = 1.0,
-                        DETAILS = PARSE_JSON('{{"manual_override": true, "sync_update": true, "detected_categories": {json_str} }}')
+                        PII_RELEVANT = {str(aggregated_pii).upper()},
+                        SOX_RELEVANT = {str(aggregated_sox).upper()},
+                        SOC2_RELEVANT = {str(aggregated_soc2).upper()},
+                        CONFIDENTIALITY_LEVEL = '{highest_c}',
+                        INTEGRITY_LEVEL = '{highest_i}',
+                        AVAILABILITY_LEVEL = '{highest_a}',
+                        IS_UPDATED = TRUE,
+                        SENSITIVITY_CATEGORY_ID = (
+                            SELECT CATEGORY_ID FROM {schema_fqn}.SENSITIVITY_CATEGORIES 
+                            WHERE CATEGORY_NAME = '{rows[0].get('CATEGORY_NAME', 'UNKNOWN')}'
+                            LIMIT 1
+                        )
                     WHERE LOWER(COLUMN_NAME) = LOWER('{safe_col}')
                 """
                 
                 snowflake_connector.execute_non_query(update_q)
-                logger.info(f"? [SYNC] Updated CLASSIFICATION_AI_RESULTS for '{col_name}' to '{new_cat_str}'")
+                logger.info(f"? [SYNC] Updated CLASSIFICATION_AI_RESULTS for '{col_name}' with compliance flags")
             else:
-                # If no active categories remain, revert to NON_SENSITIVE??
-                # Or just leave it? Usually if we delete the last rule, it should probably become NON_SENSITIVE?
-                # Let's set it to NON_SENSITIVE to be safe/clean.
+                # If no active categories remain, reset to defaults
                 update_q = f"""
                     UPDATE {schema_fqn}.CLASSIFICATION_AI_RESULTS
                     SET 
-                        AI_CATEGORY = 'NON_SENSITIVE',
-                        FINAL_CONFIDENCE = 0.0,
-                        DETAILS = PARSE_JSON('{{"manual_override": true, "sync_update": true, "reason": "all_keywords_removed"}}')
+                        PII_RELEVANT = FALSE,
+                        SOX_RELEVANT = FALSE,
+                        SOC2_RELEVANT = FALSE,
+                        CONFIDENTIALITY_LEVEL = NULL,
+                        INTEGRITY_LEVEL = NULL,
+                        AVAILABILITY_LEVEL = NULL,
+                        IS_UPDATED = TRUE,
+                        SENSITIVITY_CATEGORY_ID = NULL
                     WHERE LOWER(COLUMN_NAME) = LOWER('{safe_col}')
                 """
                 snowflake_connector.execute_non_query(update_q)
-                logger.info(f"? [SYNC] Keyword rules removed for '{col_name}'. Reverted to NON_SENSITIVE in results.")
+                logger.info(f"? [SYNC] Keyword rules removed for '{col_name}'. Reset to defaults in results.")
 
         except Exception as e:
             logger.warning(f"?? [SYNC] Failed to sync results for '{col_name}': {e}")
@@ -4966,19 +5083,29 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
     def _fetch_classification_history(self) -> pd.DataFrame:
         """Fetch all classification results from the governance database."""
         try:
-            # Get the current database to use as context for governance DB resolution
-            current_db = self._get_active_database()
-            gov_db = self._get_governance_database(current_db)
-            if not gov_db:
-                logger.warning("No governance database configured")
-                return pd.DataFrame()
+            # FORCE DATA SOURCE: Always use DATA_CLASSIFICATION_DB per user request
+            gov_db = "DATA_CLASSIFICATION_DB"
+            logger.info(f"FORCED DATA SOURCE: Fetching from {gov_db}")
 
             # PERFORMANCE: Cache column existence in session state to avoid repeated Information Schema queries
             cache_col_key = f"db_cols_{gov_db}_classification_ai_results"
+            
+            # Use local variables to track column existence
+            has_asset_fqn = False
+            has_schema_name = False
+            has_database_name = False
+            has_table_name = False
+            has_sens_cat_id = False
+            col_names = set()
+
             if cache_col_key in st.session_state:
                 metadata = st.session_state[cache_col_key]
+                has_asset_fqn = metadata.get('has_asset_fqn', False)
                 has_schema_name = metadata.get('has_schema_name', False)
+                has_database_name = metadata.get('has_database_name', False)
+                has_table_name = metadata.get('has_table_name', False)
                 has_sens_cat_id = metadata.get('has_sens_cat_id', False)
+                col_names = metadata.get('col_names', set())
                 logger.info(f"Using cached metadata for CLASSIFICATION_AI_RESULTS: {metadata}")
             else:
                 try:
@@ -4991,40 +5118,64 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                     available_cols = snowflake_connector.execute_query(col_check_query) or []
                     col_names = {str(c.get('COLUMN_NAME', '')).upper() for c in available_cols}
                     
+                    # Check for NEW schema fields
+                    has_asset_fqn = 'ASSET_FULL_NAME' in col_names
                     has_schema_name = 'SCHEMA_NAME' in col_names
+                    has_database_name = 'DATABASE_NAME' in col_names
+                    has_table_name = 'TABLE_NAME' in col_names
                     has_sens_cat_id = 'SENSITIVITY_CATEGORY_ID' in col_names
                     
                     # Store in cache
                     st.session_state[cache_col_key] = {
+                        'has_asset_fqn': has_asset_fqn,
                         'has_schema_name': has_schema_name,
-                        'has_sens_cat_id': has_sens_cat_id
+                        'has_database_name': has_database_name,
+                        'has_table_name': has_table_name,
+                        'has_sens_cat_id': has_sens_cat_id,
+                        'col_names': col_names
                     }
-                    logger.info(f"CLASSIFICATION_AI_RESULTS columns: SCHEMA_NAME={has_schema_name}, SENSITIVITY_CATEGORY_ID={has_sens_cat_id}")
+                    logger.info(f"CLASSIFICATION_AI_RESULTS columns: ASSET_FULL_NAME={has_asset_fqn}, SCHEMA_NAME={has_schema_name}, DATABASE_NAME={has_database_name}, TABLE_NAME={has_table_name}, SENSITIVITY_CATEGORY_ID={has_sens_cat_id}")
                 except Exception as col_err:
                     logger.warning(f"Could not check columns: {col_err}. Using defaults.")
-                    has_schema_name = has_sens_cat_id = False
+                    has_asset_fqn = has_schema_name = has_database_name = has_table_name = has_sens_cat_id = False
 
             # Build query dynamically based on available columns
-            schema_col = "r.SCHEMA_NAME" if has_schema_name else "NULL AS SCHEMA_NAME"
+            if has_asset_fqn:
+                asset_fqn_col = "r.ASSET_FULL_NAME"
+            elif has_database_name and has_schema_name and has_table_name:
+                asset_fqn_col = "CONCAT(COALESCE(r.DATABASE_NAME, 'UNKNOWN'), '.', COALESCE(r.SCHEMA_NAME, 'UNKNOWN'), '.', COALESCE(r.TABLE_NAME, 'UNKNOWN')) as ASSET_FULL_NAME"
+            else:
+                # Fallback for completely missing FQN components
+                asset_fqn_col = "'UNKNOWN.UNKNOWN.UNKNOWN' as ASSET_FULL_NAME"
+                logger.warning("ASSET_FULL_NAME and component columns not found. Using placeholder.")
+            
             sens_cat_col = "r.SENSITIVITY_CATEGORY_ID" if has_sens_cat_id else "NULL AS SENSITIVITY_CATEGORY_ID"
             
-            # Query using ONLY SENSITIVITY_CATEGORIES (no COMPLIANCE_CATEGORIES)
-            # Get POLICY_GROUP directly from SENSITIVITY_CATEGORIES
+            # Determine how to handle Category/AI_CATEGORY
+            ai_cat_expr = "r.AI_CATEGORY" if 'AI_CATEGORY' in col_names else "NULL"
+            
+            # Query using NEW schema fields
             query = f"""
                 SELECT 
-                    r.TABLE_NAME,
+                    {asset_fqn_col},
                     r.COLUMN_NAME,
-                    r.AI_CATEGORY,
-                    r.FINAL_CONFIDENCE,
-                    r.DETAILS,
-                    {schema_col},
+                    r.SENSITIVITY_CATEGORY_ID,
+                    r.PII_RELEVANT,
+                    r.SOX_RELEVANT,
+                    r.SOC2_RELEVANT,
+                    r.CONFIDENTIALITY_LEVEL,
+                    r.INTEGRITY_LEVEL,
+                    r.AVAILABILITY_LEVEL,
+                    r.IS_UPDATED,
+                    r.CREATED_AT,
+                    {ai_cat_expr} as AI_CATEGORY,
                     {sens_cat_col},
                     sc.CATEGORY_NAME as SENSITIVITY_NAME,
                     sc.POLICY_GROUP as COMPLIANCE_NAME
                 FROM {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS r
                 LEFT JOIN {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES sc
                     ON {('r.SENSITIVITY_CATEGORY_ID = sc.CATEGORY_ID') if has_sens_cat_id else '1=0'}
-                ORDER BY r.FINAL_CONFIDENCE DESC
+                ORDER BY r.CREATED_AT DESC
             """
             
             # Execute query and ensure we have a list of rows
@@ -5127,17 +5278,37 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                             if not row_data['compliance_name']:
                                 row_data['compliance_name'] = 'None'
                     
-                    # Build the result dictionary with safe access
+                    # Build the result dictionary with safe access (NEW SCHEMA)
+                    asset_val = str(row.get('ASSET_FULL_NAME', '') or '').strip()
+                    schema_name = 'Unknown'
+                    table_name = 'Unknown'
+                    
+                    # Split ASSET_FULL_NAME (Format: DB.SCHEMA.TABLE)
+                    if asset_val:
+                        parts = asset_val.split('.')
+                        if len(parts) >= 3:
+                            schema_name = parts[-2]
+                            table_name = parts[-1]
+                        elif len(parts) == 2:
+                            schema_name = parts[0]
+                            table_name = parts[1]
+                        elif len(parts) == 1:
+                            table_name = parts[0]
+
                     result = {
-                        'Schema': str(row.get('SCHEMA_NAME', '') or '').strip() or 'Unknown',
-                        'Table': str(row.get('TABLE_NAME', '') or '').strip() or 'Unknown',
+                        'Schema': schema_name,
+                        'Table': table_name,
+                        'Asset': asset_val or 'Unknown',
                         'Column': str(row.get('COLUMN_NAME', '') or '').strip() or 'Unknown',
-                        'Category': row_data['ai_category'],
-                        'Confidence': 0.0,
-                        'Sensitivity': str(row.get('SENSITIVITY_NAME', '') or '').strip() or row_data['ai_category'],
-                        'Compliance': row_data['compliance_name'],
-                        'CIA': self._extract_cia_from_details(row.get('DETAILS')),
-                        'Rationale': str(row.get('DETAILS', '') or '').strip()
+                        'Category': str(row.get('SENSITIVITY_NAME', '') or '').strip() or 'Unknown',
+                        'Confidence': 100.0,  # Default confidence for new schema
+                        'Sensitivity': str(row.get('SENSITIVITY_NAME', '') or '').strip() or 'Unknown',
+                        'Compliance': str(row.get('COMPLIANCE_NAME', '') or '').strip() or 'Unknown',
+                        'CIA': f"C:{row.get('CONFIDENTIALITY_LEVEL', 'C1')} I:{row.get('INTEGRITY_LEVEL', 'I1')} A:{row.get('AVAILABILITY_LEVEL', 'A1')}",
+                        'PII': row.get('PII_RELEVANT', False),
+                        'SOX': row.get('SOX_RELEVANT', False),
+                        'SOC2': row.get('SOC2_RELEVANT', False),
+                        'Rationale': f"Updated: {row.get('IS_UPDATED', False)}"
                     }
                     
                     # CRITICAL FIX: If CIA is empty/dashes, derive from category
@@ -5155,15 +5326,13 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                             # Final fallback
                             result['CIA'] = "C:1 I:1 A:1"
                     
-                    # Handle numeric conversion separately
+                    # Handle compliance flags for new schema
                     try:
-                        confidence_val = row.get('FINAL_CONFIDENCE', 0.0)
-                        if confidence_val is not None:
-                            result['Confidence'] = float(confidence_val) * 100
-                        else:
-                            result['Confidence'] = 0.0
+                        result['PII'] = bool(row.get('PII_RELEVANT', False))
+                        result['SOX'] = bool(row.get('SOX_RELEVANT', False))
+                        result['SOC2'] = bool(row.get('SOC2_RELEVANT', False))
                     except (ValueError, TypeError):
-                        result['Confidence'] = 0.0
+                        result['PII'] = result['SOX'] = result['SOC2'] = False
 
                     data.append(result)
                     processed_rows += 1
@@ -5180,26 +5349,30 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
 
 
     def _ensure_results_table_columns(self, gov_db: str) -> None:
-        """Ensure CLASSIFICATION_AI_RESULTS has all required columns per the latest schema."""
+        """Ensure CLASSIFICATION_AI_RESULTS has all required columns per the latest schema.
+        
+        Updated for new schema: ASSET_FULL_NAME instead of SCHEMA_NAME/TABLE_NAME,
+        compliance flags instead of confidence scores.
+        """
         try:
             # Check existing columns
             check_query = f"SELECT COLUMN_NAME FROM {gov_db}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = 'DATA_CLASSIFICATION_GOVERNANCE' AND TABLE_NAME = 'CLASSIFICATION_AI_RESULTS'"
             rows = snowflake_connector.execute_query(check_query) or []
             existing_cols = {str(r.get('COLUMN_NAME', '')).upper() for r in rows}
             
-            # List of required columns and their types/defaults
+            # List of required columns for NEW schema
             required_columns = [
-                ('SCHEMA_NAME', 'VARCHAR(255)'),
+                ('ASSET_FULL_NAME', 'VARCHAR(16777216) NOT NULL'),
+                ('COLUMN_NAME', 'VARCHAR(16777216)'),
                 ('SENSITIVITY_CATEGORY_ID', 'VARCHAR(200)'),
-                ('DETAILS', 'VARIANT'),
-                ('REGEX_CONFIDENCE', 'FLOAT'),
-                ('KEYWORD_CONFIDENCE', 'FLOAT'),
-                ('ML_CONFIDENCE', 'FLOAT'),
-                ('SEMANTIC_CONFIDENCE', 'FLOAT'),
-                ('SEMANTIC_CATEGORY', 'VARCHAR(16777216)'),
-                ('MODEL_VERSION', 'VARCHAR(16777216)'),
-                ('CREATED_AT', 'TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()'),
-                ('UPDATED_AT', 'TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()')
+                ('PII_RELEVANT', 'BOOLEAN DEFAULT FALSE NOT NULL'),
+                ('SOX_RELEVANT', 'BOOLEAN DEFAULT FALSE NOT NULL'), 
+                ('SOC2_RELEVANT', 'BOOLEAN DEFAULT FALSE NOT NULL'),
+                ('CONFIDENTIALITY_LEVEL', 'VARCHAR(10)'),
+                ('INTEGRITY_LEVEL', 'VARCHAR(10)'),
+                ('AVAILABILITY_LEVEL', 'VARCHAR(10)'),
+                ('IS_UPDATED', 'BOOLEAN DEFAULT FALSE'),
+                ('CREATED_AT', 'TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()')
             ]
             
             for col_name, col_def in required_columns:
@@ -5333,26 +5506,35 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
                 # Param keys
                 k_prefix = f"p{p_idx}_"
                 
+                # Create ASSET_FULL_NAME from schema and table
+                asset_full_name = f"{schema}.{table}" if schema and table else "UNKNOWN.UNKNOWN"
+                
+                # Extract compliance flags from column data
+                pii_relevant = col.get('pii_relevant', False)
+                sox_relevant = col.get('sox_relevant', False) 
+                soc2_relevant = col.get('soc2_relevant', False)
+                
+                # Get CIA levels from column data or defaults
+                c_level = col.get('c', 'C1')
+                i_level = col.get('i', 'I1')
+                a_level = col.get('a', 'A1')
+                
                 values.append(f"""
-                    (%({k_prefix}s)s, %({k_prefix}t)s, %({k_prefix}c)s, %({k_prefix}cat)s, 
-                     %({k_prefix}rc)s, %({k_prefix}kc)s, %({k_prefix}mc)s, %({k_prefix}sc)s, 
-                     %({k_prefix}fc)s, %({k_prefix}scat)s, %({k_prefix}mv)s, 
-                     %({k_prefix}det)s, %({k_prefix}cid)s)
+                    (%({k_prefix}afqn)s, %({k_prefix}c)s, %({k_prefix}cid)s, %({k_prefix}pii)s, 
+                     %({k_prefix}sox)s, %({k_prefix}soc2)s, %({k_prefix}c_lvl)s, %({k_prefix}i_lvl)s, 
+                     %({k_prefix}a_lvl)s, %({k_prefix}updated)s)
                 """)
                 
-                params[f"{k_prefix}s"] = schema
-                params[f"{k_prefix}t"] = table
+                params[f"{k_prefix}afqn"] = asset_full_name
                 params[f"{k_prefix}c"] = column
-                params[f"{k_prefix}cat"] = category
-                params[f"{k_prefix}rc"] = regex_conf
-                params[f"{k_prefix}kc"] = keyword_conf
-                params[f"{k_prefix}mc"] = ml_conf
-                params[f"{k_prefix}sc"] = semantic_conf
-                params[f"{k_prefix}fc"] = final_conf
-                params[f"{k_prefix}scat"] = semantic_cat
-                params[f"{k_prefix}mv"] = model_version
-                params[f"{k_prefix}det"] = details
                 params[f"{k_prefix}cid"] = cat_id
+                params[f"{k_prefix}pii"] = pii_relevant
+                params[f"{k_prefix}sox"] = sox_relevant
+                params[f"{k_prefix}soc2"] = soc2_relevant
+                params[f"{k_prefix}c_lvl"] = c_level
+                params[f"{k_prefix}i_lvl"] = i_level
+                params[f"{k_prefix}a_lvl"] = a_level
+                params[f"{k_prefix}updated"] = True
             
             if not values:
                 continue
@@ -5362,38 +5544,36 @@ SHOW TABLES LIKE 'SENSITIVITY_CATEGORIES' IN DATABASE <YOUR_DATABASE>;
             query = f"""
             MERGE INTO {gov_db}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS AS target
             USING (SELECT 
-                column_0 as SCHEMA_NAME, column_1 as TABLE_NAME, column_2 as COLUMN_NAME, 
-                column_3 as AI_CATEGORY, column_4 as REGEX_CONFIDENCE, column_5 as KEYWORD_CONFIDENCE, 
-                column_6 as ML_CONFIDENCE, column_7 as SEMANTIC_CONFIDENCE, column_8 as FINAL_CONFIDENCE, 
-                column_9 as SEMANTIC_CATEGORY, column_10 as MODEL_VERSION, column_11 as DETAILS 
+                column_0 as ASSET_FULL_NAME, column_1 as COLUMN_NAME, 
+                column_2 as SENSITIVITY_CATEGORY_ID, column_3 as PII_RELEVANT, column_4 as SOX_RELEVANT, 
+                column_5 as SOC2_RELEVANT, column_6 as CONFIDENTIALITY_LEVEL, column_7 as INTEGRITY_LEVEL, 
+                column_8 as AVAILABILITY_LEVEL, column_9 as IS_UPDATED
                 FROM VALUES {values_str}) AS source
-            ON target.SCHEMA_NAME = source.SCHEMA_NAME 
-               AND target.TABLE_NAME = source.TABLE_NAME 
+            ON target.ASSET_FULL_NAME = source.ASSET_FULL_NAME 
                AND target.COLUMN_NAME = source.COLUMN_NAME
             WHEN MATCHED THEN
                 UPDATE SET 
-                    target.AI_CATEGORY = source.AI_CATEGORY,
-                    target.REGEX_CONFIDENCE = source.REGEX_CONFIDENCE,
-                    target.KEYWORD_CONFIDENCE = source.KEYWORD_CONFIDENCE,
-                    target.ML_CONFIDENCE = source.ML_CONFIDENCE,
-                    target.SEMANTIC_CONFIDENCE = source.SEMANTIC_CONFIDENCE,
-                    target.FINAL_CONFIDENCE = source.FINAL_CONFIDENCE,
-                    target.SEMANTIC_CATEGORY = source.SEMANTIC_CATEGORY,
-                    target.MODEL_VERSION = source.MODEL_VERSION,
-                    target.DETAILS = source.DETAILS,
-                    target.UPDATED_AT = CURRENT_TIMESTAMP()
+                    target.SENSITIVITY_CATEGORY_ID = source.SENSITIVITY_CATEGORY_ID,
+                    target.PII_RELEVANT = source.PII_RELEVANT,
+                    target.SOX_RELEVANT = source.SOX_RELEVANT,
+                    target.SOC2_RELEVANT = source.SOC2_RELEVANT,
+                    target.CONFIDENTIALITY_LEVEL = source.CONFIDENTIALITY_LEVEL,
+                    target.INTEGRITY_LEVEL = source.INTEGRITY_LEVEL,
+                    target.AVAILABILITY_LEVEL = source.AVAILABILITY_LEVEL,
+                    target.IS_UPDATED = source.IS_UPDATED,
+                    target.CREATED_AT = CURRENT_TIMESTAMP()
             WHEN NOT MATCHED THEN
                 INSERT (
-                    SCHEMA_NAME, TABLE_NAME, COLUMN_NAME, AI_CATEGORY, 
-                    REGEX_CONFIDENCE, KEYWORD_CONFIDENCE, ML_CONFIDENCE, SEMANTIC_CONFIDENCE, 
-                    FINAL_CONFIDENCE, SEMANTIC_CATEGORY, MODEL_VERSION, DETAILS, 
-                    CREATED_AT, UPDATED_AT
+                    ASSET_FULL_NAME, COLUMN_NAME, SENSITIVITY_CATEGORY_ID, 
+                    PII_RELEVANT, SOX_RELEVANT, SOC2_RELEVANT, 
+                    CONFIDENTIALITY_LEVEL, INTEGRITY_LEVEL, AVAILABILITY_LEVEL, 
+                    IS_UPDATED, CREATED_AT
                 )
                 VALUES (
-                    source.SCHEMA_NAME, source.TABLE_NAME, source.COLUMN_NAME, source.AI_CATEGORY,
-                    source.REGEX_CONFIDENCE, source.KEYWORD_CONFIDENCE, source.ML_CONFIDENCE, source.SEMANTIC_CONFIDENCE,
-                    source.FINAL_CONFIDENCE, source.SEMANTIC_CATEGORY, source.MODEL_VERSION, source.DETAILS,
-                    CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+                    source.ASSET_FULL_NAME, source.COLUMN_NAME, source.SENSITIVITY_CATEGORY_ID,
+                    source.PII_RELEVANT, source.SOX_RELEVANT, source.SOC2_RELEVANT,
+                    source.CONFIDENTIALITY_LEVEL, source.INTEGRITY_LEVEL, source.AVAILABILITY_LEVEL,
+                    source.IS_UPDATED, CURRENT_TIMESTAMP()
                 )
             """
             

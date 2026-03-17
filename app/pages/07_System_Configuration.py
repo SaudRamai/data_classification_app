@@ -303,24 +303,24 @@ if st.session_state.admin_view != 'Dashboard':
         st.caption("Manage roles and assignments.")
         try:
             # Reusing existing RBAC logic
-            snowflake_connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {db_name}.DATA_GOVERNANCE")
+            snowflake_connector.execute_non_query(f"CREATE SCHEMA IF NOT EXISTS {db_name}.DATA_CLASSIFICATION_GOVERNANCE")
             snowflake_connector.execute_non_query(
                 f"""
-                CREATE TABLE IF NOT EXISTS {db_name}.DATA_GOVERNANCE.ROLES (
+                CREATE TABLE IF NOT EXISTS {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ROLES (
                     ROLE_NAME STRING PRIMARY KEY, DESCRIPTION STRING
                 )
                 """
             )
             snowflake_connector.execute_non_query(
                 f"""
-                CREATE TABLE IF NOT EXISTS {db_name}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS (
+                CREATE TABLE IF NOT EXISTS {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS (
                     USER_EMAIL STRING, ROLE_NAME STRING, ASSIGNED_AT TIMESTAMP_NTZ, PRIMARY KEY (USER_EMAIL, ROLE_NAME)
                 )
                 """
             )
             # Get current roles for display
             roles = snowflake_connector.execute_query(
-                f"SELECT ROLE_NAME, DESCRIPTION FROM {db_name}.DATA_GOVERNANCE.ROLES ORDER BY ROLE_NAME"
+                f"SELECT ROLE_NAME, DESCRIPTION FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ROLES ORDER BY ROLE_NAME"
             ) or []
             
             # Display roles in a dataframe with a form to add new roles
@@ -345,7 +345,7 @@ if st.session_state.admin_view != 'Dashboard':
                             try:
                                 snowflake_connector.execute_non_query(
                                     f"""
-                                    INSERT INTO {db_name}.DATA_GOVERNANCE.ROLES (ROLE_NAME, DESCRIPTION)
+                                    INSERT INTO {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ROLES (ROLE_NAME, DESCRIPTION)
                                     VALUES (%(role_name)s, %(description)s)
                                     """,
                                     {"role_name": new_role.strip(), "description": role_desc.strip()}
@@ -364,7 +364,7 @@ if st.session_state.admin_view != 'Dashboard':
             # Assignments
             st.write("Active Assignments:")
             assigns = snowflake_connector.execute_query(
-                f"SELECT USER_EMAIL, ROLE_NAME, ASSIGNED_AT FROM {db_name}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS ORDER BY ASSIGNED_AT DESC LIMIT 200"
+                f"SELECT USER_EMAIL, ROLE_NAME, ASSIGNED_AT FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS ORDER BY ASSIGNED_AT DESC LIMIT 200"
             ) or []
             st.dataframe(pd.DataFrame(assigns), width='stretch')
             
@@ -383,7 +383,7 @@ if st.session_state.admin_view != 'Dashboard':
                         try:
                             # 1. Update Application Metadata (Audit/Tracking)
                             snowflake_connector.execute_non_query(
-                                f"MERGE INTO {db_name}.DATA_GOVERNANCE.ROLE_ASSIGNMENTS t "
+                                f"MERGE INTO {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS t "
                                 f"USING (SELECT %(u)s AS U, %(r)s AS R) s ON t.USER_EMAIL=s.U AND t.ROLE_NAME=s.R "
                                 f"WHEN MATCHED THEN UPDATE SET ASSIGNED_AT=CURRENT_TIMESTAMP "
                                 f"WHEN NOT MATCHED THEN INSERT (USER_EMAIL, ROLE_NAME, ASSIGNED_AT) VALUES (s.U, s.R, CURRENT_TIMESTAMP)",

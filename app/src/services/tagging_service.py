@@ -61,7 +61,7 @@ from src.services.governance_config_service import governance_config_service
 
 # Default fallback values
 DEFAULT_TAG_DB = "DATA_CLASSIFICATION_DB"
-DEFAULT_TAG_SCHEMA = "DATA_GOVERNANCE"
+DEFAULT_TAG_SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
 
 def get_tag_definitions() -> Dict[str, Any]:
     """Load all tag definitions from the database with fallback to defaults."""

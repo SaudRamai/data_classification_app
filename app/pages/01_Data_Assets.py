@@ -60,6 +60,94 @@ except Exception:
 # Apply centralized theme (fonts, CSS variables, Plotly template)
 apply_global_theme()
 
+# ── Constants & Sync Helpers ──────────────────────────────────────────────────
+_GOV_DB = "DATA_CLASSIFICATION_DB"
+_GOV_SCH = "DATA_CLASSIFICATION_GOVERNANCE"
+_ASSETS_TABLE = f"{_GOV_DB}.{_GOV_SCH}.ASSETS"
+_MERGE_SP = f"CALL {_GOV_DB}.{_GOV_SCH}.SP_MERGE_ASSETS()"
+
+def _get_asset_count() -> int:
+    """Read asset count directly from ASSETS. Never calls SP_MERGE_ASSETS."""
+    try:
+        rows = snowflake_connector.execute_query(f"SELECT COUNT(*) AS CNT FROM {_ASSETS_TABLE}") or []
+        return int(rows[0]["CNT"]) if rows else 0
+    except Exception: return 0
+
+def _load_assets() -> pd.DataFrame:
+    """Load all assets directly from ASSETS. Never calls SP_MERGE_ASSETS."""
+    try:
+        query = f"""
+            SELECT 
+                ASSET_ID AS "ID",
+                ASSET_NAME AS "Name",
+                COALESCE(DATA_DESCRIPTION, ASSET_TYPE || ' asset') AS "Description",
+                FULLY_QUALIFIED_NAME AS "Location",
+                DATABASE_NAME AS "Database",
+                COALESCE(CLASSIFICATION_LABEL, 'Unclassified') AS "Classification",
+                'C' || COALESCE(CONFIDENTIALITY_LEVEL, '1') || 
+                '-I' || COALESCE(INTEGRITY_LEVEL, '1') || 
+                '-A' || COALESCE(AVAILABILITY_LEVEL, '1') AS "CIA Score",
+                COALESCE(DATA_OWNER, 'Unknown') AS "Owner",
+                DATA_OWNER_EMAIL AS "Owner Email",
+                BUSINESS_UNIT AS "Business Unit",
+                BUSINESS_DOMAIN AS "Business Domain",
+                LIFECYCLE AS "Lifecycle",
+                REVIEW_STATUS AS "Review Status",
+                PII_RELEVANT AS "is_pii",
+                SOX_RELEVANT AS "is_sox",
+                SOC2_RELEVANT AS "is_soc2",
+                'N/A' AS "Rows",
+                0.0 AS "Size (MB)",
+                'Medium' AS "Data Quality",
+                TO_VARCHAR(LAST_MODIFIED_TIMESTAMP, 'YYYY-MM-DD') AS "Last Updated",
+                ASSET_TYPE AS "Type",
+                CONFIDENTIALITY_LEVEL AS "C",
+                INTEGRITY_LEVEL AS "I",
+                AVAILABILITY_LEVEL AS "A",
+                OVERALL_RISK_CLASSIFICATION AS "Risk",
+                COALESCE(COMPLIANCE_STATUS, 'UNKNOWN') AS "Status",
+                CASE 
+                    WHEN CLASSIFICATION_LABEL IS NOT NULL AND UPPER(CLASSIFICATION_LABEL) NOT IN ('','UNCLASSIFIED') THEN 'Classified'
+                    WHEN DATEDIFF('day', CREATED_TIMESTAMP, CURRENT_TIMESTAMP()) >= 5 THEN 'Overdue'
+                    ELSE 'Unclassified'
+                END AS "SLA State",
+                CREATED_TIMESTAMP AS "created_date",
+                LAST_MODIFIED_TIMESTAMP AS "last_modified"
+            FROM {_ASSETS_TABLE}
+            ORDER BY LAST_MODIFIED_TIMESTAMP DESC
+        """
+        rows = snowflake_connector.execute_query(query) or []
+        return pd.DataFrame(rows)
+    except Exception as e:
+        logger.error(f"Error loading assets: {e}")
+        return pd.DataFrame()
+
+def _run_sync() -> str:
+    """Call SP_MERGE_ASSETS. Only triggered by Manual/First-Run/New-Asset events."""
+    try:
+        rows = snowflake_connector.execute_query(_MERGE_SP) or []
+        if rows:
+            return next(iter(rows[0].values()))
+        return "No result returned"
+    except Exception as e:
+        return f"MERGE_FAILED — {str(e)}"
+
+def _register_decision_and_sync(payload: dict) -> str:
+    """Trigger 3 — Saves decision then triggers sync immediately after."""
+    try:
+        write_result = snowflake_connector.execute_non_query(
+            f"""
+            INSERT INTO {_GOV_DB}.{_GOV_SCH}.CLASSIFICATION_DECISIONS
+                (ASSET_FULL_NAME, STATUS, LABEL, C, I, A, DECISION_BY, DECISION_AT)
+            VALUES (%(asset)s, 'Approved', %(label)s, %(c)s, %(i)s, %(a)s, 
+                    CURRENT_USER(), CURRENT_TIMESTAMP())
+            """,
+            params=payload
+        )
+        if write_result == 0: return "WRITE_FAILED — decision not saved"
+        return _run_sync()
+    except Exception as e:
+        return f"WRITE_FAILED — {str(e)}"
 # Enhanced page header with description
 # Standardized Hero Section
 st.markdown("""
@@ -175,23 +263,20 @@ with st.sidebar:
     # Store filters for page logic
     st.session_state["global_filters"] = g_filters
 
-    # Manual Refresh Assets button
     st.markdown("---")
-    if st.button("🔄 Refresh Assets", key="btn_refresh_assets_sidebar", type="primary", use_container_width=True):
-        with st.spinner("Running asset discovery & merge..."):
-            try:
-                _merge_result = run_asset_merge()
-                if "error" in _merge_result:
-                    st.error(f"Sync failed: {_merge_result['error']}")
-                else:
-                    i = _merge_result.get("inserted", 0)
-                    u = _merge_result.get("updated", 0)
-                    st.success(f"✅ Sync complete: {i} new, {u} updated.")
-            except Exception as e:
-                st.error(f"Merge failed: {e}")
-            # Clear all caches so the UI picks up fresh data
-            st.cache_data.clear()
-            st.rerun()
+    # Manual sync button - User must explicitly click this
+    if st.button("🔄 Sync Assets", key="btn_sync_assets_sidebar", type="primary", use_container_width=True):
+        with st.spinner("Syncing assets from Snowflake..."):
+            _res = _run_sync()
+
+        if "MERGE_COMPLETE" in _res:
+            st.success(_res)
+        elif "NO_CHANGES" in _res:
+            st.info(_res)
+        else:
+            st.error(_res)
+
+        st.rerun()
 
 # --- Policy enforcement helpers (Decision Matrix & Audit persistence) ---
 
@@ -214,8 +299,8 @@ def _validate_decision_matrix(label: str, c: int, i: int, a: int, has_pii: bool,
         regs_up = {r.upper() for r in (regs or [])}
         if "SOX" in regs_up and lab != "CONFIDENTIAL":
             return False, "SOX-relevant data must be classified 'Confidential'."
-        if ("GDPR" in regs_up or "HIPAA" in regs_up or "PCI" in regs_up) and lab in ("PUBLIC", "INTERNAL"):
-            return False, "Regulated data (GDPR/HIPAA/PCI) requires at least 'Restricted'."
+        if "SOC2" in regs_up and lab not in ("RESTRICTED", "CONFIDENTIAL"):
+            return False, "SOC2-relevant data requires at least 'Restricted'."
         # Availability/Integrity high criticality guidance (allow Restricted or Confidential)
         if int(i) >= 3 and lab not in ("RESTRICTED", "CONFIDENTIAL"):
             return False, "I=3 requires label at least 'Restricted'."
@@ -384,121 +469,7 @@ tab_inv_browser, tab_adv_search, tab_favorites = st.tabs([
 with tab_inv_browser:
     st.caption("")
 
-# Function to trigger the automated asset discovery in Snowflake
-@st.cache_data(ttl=300) # Only run discovery every 5 minutes to save credits and performance
-def trigger_asset_discovery():
-    try:
-        snowflake_connector.execute_non_query("CALL DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS()")
-        return True
-    except Exception as e:
-        logger.error(f"Discovery trigger failed: {e}")
-        return False
-
-# Function to get real data assets from Snowflake
-@st.cache_data(ttl=15)  # Cache for 15 seconds to allow auto-refresh to see new assets
-def get_real_data_assets(selected_dbs: Optional[List[str]] = None):
-    try:
-        # Resolve database scope
-        dbs: List[str] = [d for d in (selected_dbs or []) if d]
-        if not dbs:
-            return pd.DataFrame()
-
-        governance_db = dbs[0]
-        in_list = ",".join([f"'{d}'" for d in dbs])
-        
-        # Unified high-performance query: All governed metadata in one pass
-        # Includes raw timestamps for sorting and formatted strings for display
-        query = f"""
-            SELECT 
-                ASSET_ID AS "ID",
-                ASSET_NAME AS "Name",
-                COALESCE(DATA_DESCRIPTION, ASSET_TYPE || ' asset') AS "Description",
-                FULLY_QUALIFIED_NAME AS "Location",
-                DATABASE_NAME AS "Database",
-                COALESCE(CLASSIFICATION_LABEL, 'Unclassified') AS "Classification",
-                'C' || COALESCE(CONFIDENTIALITY_LEVEL, '1') || 
-                '-I' || COALESCE(INTEGRITY_LEVEL, '1') || 
-                '-A' || COALESCE(AVAILABILITY_LEVEL, '1') AS "CIA Score",
-                COALESCE(DATA_OWNER, 'Unknown') AS "Owner",
-                DATA_OWNER_EMAIL AS "Owner Email",
-                BUSINESS_UNIT AS "Business Unit",
-                BUSINESS_DOMAIN AS "Business Domain",
-                LIFECYCLE AS "Lifecycle",
-                REVIEW_STATUS AS "Review Status",
-                PII_RELEVANT AS "is_pii",
-                SOX_RELEVANT AS "is_sox",
-                SOC2_RELEVANT AS "is_soc2",
-                'N/A' AS "Rows",
-                0.0 AS "Size (MB)",
-                'Medium' AS "Data Quality",
-                TO_VARCHAR(LAST_MODIFIED_TIMESTAMP, 'YYYY-MM-DD') AS "Last Updated",
-                ASSET_TYPE AS "Type",
-                CONFIDENTIALITY_LEVEL AS "C",
-                INTEGRITY_LEVEL AS "I",
-                AVAILABILITY_LEVEL AS "A",
-                OVERALL_RISK_CLASSIFICATION AS "Risk",
-                COALESCE(COMPLIANCE_STATUS, 'UNKNOWN') AS "Status",
-                CASE 
-                    WHEN CLASSIFICATION_LABEL IS NOT NULL AND UPPER(CLASSIFICATION_LABEL) NOT IN ('','UNCLASSIFIED') THEN 'Classified'
-                    WHEN DATEDIFF('day', CREATED_TIMESTAMP, CURRENT_TIMESTAMP()) >= 5 THEN 'Overdue'
-                    ELSE 'Unclassified'
-                END AS "SLA State",
-                CREATED_TIMESTAMP AS "created_date",
-                LAST_MODIFIED_TIMESTAMP AS "last_modified"
-            FROM {governance_db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-            WHERE DATABASE_NAME IN ({in_list})
-            AND UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE', 'DATABASE')
-            ORDER BY DATABASE_NAME, SCHEMA_NAME, ASSET_NAME
-            LIMIT 5000
-        """
-        rows = snowflake_connector.execute_query(query) or []
-        return pd.DataFrame(rows)
-            
-    except Exception as e:
-        if 'logger' in globals():
-            logger.error(f"Error fetching data assets: {e}")
-        return pd.DataFrame()
-            
-    except Exception as e:
-        st.error(f"Error fetching data assets from Snowflake: {str(e)}")
-        # Fallback in exception case as well
-        try:
-            from src.demo_data import UNCLASSIFIED_ASSETS_TSV
-            if UNCLASSIFIED_ASSETS_TSV:
-                df_demo = pd.read_csv(StringIO(UNCLASSIFIED_ASSETS_TSV), sep='\t')
-                assets_data = []
-                for i, row in df_demo.iterrows():
-                    fqn = str(row.get('FULLY_QUALIFIED_NAME', ''))
-                    assets_data.append({
-                        "ID": f"asset_demo_{i+1:03d}",
-                        "Name": row.get('ASSET_NAME', ''),
-                        "Description": "Demo Asset",
-                        "Location": fqn,
-                        "Database": fqn.split('.')[0] if '.' in fqn else '',
-                        "Classification": row.get('CLASSIFICATION_LABEL') or 'Unclassified',
-                        "CIA Score": "C1-I1-A1",
-                        "Owner": row.get('DATA_OWNER') or 'Unknown',
-                        "Owner Email": "",
-                        "Business Unit": "Marketing",
-                        "Review Status": "Pending",
-                        "is_pii": False,
-                        "is_sox": False,
-                        "is_soc2": False,
-                        "Rows": "1,000",
-                        "Size (MB)": 1.0,
-                        "Data Quality": "Medium",
-                        "Last Updated": str(row.get('CLASSIFICATION_DATE') or datetime.now().strftime('%Y-%m-%d')),
-                        "Type": row.get('ASSET_TYPE') or 'TABLE',
-                        "Risk": "Low", # Default for demo
-                        "Status": "Unclassified", # Default for demo
-                        "SLA State": "Unclassified", # Default for demo
-                        "created_date": datetime.now(),
-                        "last_modified": datetime.now()
-                    })
-                return pd.DataFrame(assets_data)
-        except Exception:
-            pass
-        return pd.DataFrame()
+# ─────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=15)
 def get_tags_batch(full_names: list) -> dict:
@@ -567,9 +538,9 @@ def compute_policy_fields(df: pd.DataFrame) -> pd.DataFrame:
 
         # Regulatory
         if 'is_soc2' in df.columns:
-             df['Has Regulatory'] = df['is_soc2'].fillna(False).astype(bool) | tags_upper.str.contains('REGULATORY|GDPR|HIPAA|PHI|SOC2', na=False)
+             df['Has Regulatory'] = df['is_soc2'].fillna(False).astype(bool) | tags_upper.str.contains('REGULATORY|SOC2|SOX|PII', na=False)
         else:
-             df['Has Regulatory'] = tags_upper.str.contains('REGULATORY|GDPR|HIPAA|PHI|SOC2', na=False)
+             df['Has Regulatory'] = tags_upper.str.contains('REGULATORY|SOC2|SOX|PII', na=False)
              
     except Exception:
         df['Has PII'] = False
@@ -583,31 +554,25 @@ def compute_policy_fields(df: pd.DataFrame) -> pd.DataFrame:
              
     return df
 
-# Get data assets
-with st.spinner("Fetching real data assets from your Snowflake database..."):
-    # Use selected database from global filters
-    _sel_dbs = [st.session_state.get('sf_database')] if st.session_state.get('sf_database') else []
-    
-    if not _sel_dbs:
-        # Fallback to account databases if warehouse selected but no DB chosen
-        if st.session_state.get('sf_warehouse'):
-            try:
-                _rows = snowflake_connector.execute_query("SHOW DATABASES") or []
-                _sel_dbs = sorted([r.get('name') or r.get('NAME') for r in _rows if (r.get('name') or r.get('NAME'))])
-            except Exception:
-                _sel_dbs = []
+# ── First-run auto-populate ───────────────────────────────
+# Only fires when ASSETS is completely empty.
+if _get_asset_count() == 0:
+    with st.spinner("First run detected — populating asset inventory from Snowflake..."):
+        _res = _run_sync()
 
-    # Use the resolved database list; avoid account-wide scans when none selected
-    if not _sel_dbs:
-        st.info("Select one or more databases in the sidebar to load the Data Assets inventory. Skipping account-wide scan for performance.")
-        assets_df = pd.DataFrame()
+    if "MERGE_COMPLETE" in _res:
+        st.success(f"Initial inventory loaded. {_res}")
+    elif "NO_CHANGES" in _res:
+        st.info("Inventory is already current.")
     else:
-        with st.spinner("Checking for new assets in Snowflake..."):
-            trigger_asset_discovery()
-            
-        with st.spinner("Loading assets from Snowflake..."):
-            base_df = get_real_data_assets(_sel_dbs)
-        assets_df = compute_policy_fields(base_df)
+        st.error(f"Sync failed: {_res}")
+
+# ── Display ───────────────────────────────────────────────
+# Always reads directly from ASSETS.
+with st.spinner("Loading inventory..."):
+    base_df = _load_assets()
+    assets_df = compute_policy_fields(base_df)
+
     # Attach base created/modified timestamps to assets_df for sorting
     try:
         if not base_df.empty:
@@ -678,13 +643,6 @@ with st.spinner("Fetching real data assets from your Snowflake database..."):
 
 
 with tab_inv_browser:
-    # Auto-refresh mechanism for live updates (e.g. from background tasks)
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st.caption("Live mode active: auto-refreshing every 30 seconds.")
-        st_autorefresh(interval=30000, limit=3000, key="data_assets_autorefresh")
-    except ImportError:
-        pass
 
     # KPI Cards Section
     try:
@@ -702,20 +660,40 @@ with tab_inv_browser:
 
         # Use the newly created VW_ASSET_INVENTORY_ALL_LEVELS view for KPIs
         @st.cache_data(ttl=15)
-        def _get_inventory_metrics(db_name):
+        def _get_inventory_metrics(db_name=None):
             try:
-                query = f"""
-                    SELECT 
-                        "Total_Assets", 
-                        "Classified",
-                        "Classification_Coverage",
-                        "SLA_Breach_Assets"
-                    FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS
-                    WHERE LEVEL = 'DATABASE' AND UPPER("Database") = UPPER('{db_name}')
-                """
+                # The view uses specific quoted identifiers
+                db_col = "Database"
+
+                # If db_name is provided, filter; otherwise aggregate all database-level metrics
+                if db_name and db_name.upper() not in ('ALL', ''):
+                    query = f"""
+                        SELECT 
+                            "Total_Assets", "Classified", "Classification_Coverage"
+                        FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS
+                        WHERE LEVEL = 'DATABASE' AND UPPER("{db_col}") = UPPER('{db_name}')
+                    """
+                else:
+                    query = """
+                        SELECT 
+                            SUM("Total_Assets") as "Total_Assets", 
+                            SUM("Classified") as "Classified"
+                        FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS
+                        WHERE LEVEL = 'DATABASE'
+                    """
                 rows = snowflake_connector.execute_query(query) or []
-                return rows[0] if rows else {}
+                if rows:
+                    res = rows[0]
+                    # Calculate coverage manually if aggregating
+                    if not db_name or db_name.upper() in ('ALL', ''):
+                        total = res.get('Total_Assets', 0) or 0
+                        classified = res.get('Classified', 0) or 0
+                        cov = (classified * 100 // total) if total > 0 else 0
+                        res['Classification_Coverage'] = f"{cov}%"
+                    return res
+                return {}
             except Exception as e:
+                logger.error(f"Error in _get_inventory_metrics: {e}")
                 return {}
 
         kpi_data_view = _get_inventory_metrics(active_db)
@@ -727,17 +705,18 @@ with tab_inv_browser:
         # Or just show the view's coverage string directly since it has "50% ⚠️" pattern
         # The user view specifies: CONCAT(ROUND(...), '% ', CASE WHEN ... THEN '✅' ... END) as "Classification_Coverage"
 
-        # High Risk Assets via tag-derived CIA mapping (filtered to current DB scope)
+        # High Risk Assets via tag-derived CIA mapping (Account-Wide)
         @st.cache_data(ttl=15)
-        def _get_high_risk_count(db_name):
+        def _get_high_risk_count(db_name=None):
             try:
+                where_db = f"AND object_database = '{db_name}'" if db_name and db_name.upper() not in ('ALL', '') else ""
                 risk_rows = snowflake_connector.execute_query(
                     f"""
-                    SELECT COUNT(DISTINCT object_name) AS CNT
+                    SELECT COUNT(DISTINCT object_database || '.' || object_schema || '.' || object_name) AS CNT
                     FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
                     WHERE tag_name IN ('CONFIDENTIALITY_LEVEL', 'INTEGRITY_LEVEL', 'AVAILABILITY_LEVEL')
                       AND tag_value IN ('C3', 'I3', 'A3')
-                      AND object_database = '{db_name}'
+                      {where_db}
                     """
                 ) or []
                 return int((risk_rows[0] or {}).get('CNT', 0)) if risk_rows else 0
@@ -748,12 +727,14 @@ with tab_inv_browser:
         # Policy alerts - Keep existing logic or use SLA_Breach_Assets from the view?
         # The view provides SLA_Breach_Assets, let's use that as the proxy for Policy Alerts or just fetch violations explicitly
         @st.cache_data(ttl=15)
-        def _get_policy_violations(db_name):
+        def _get_policy_violations(db_name=None):
             try:
+                where_db = f"AND DATABASE_NAME = '{db_name}'" if db_name and db_name.upper() not in ('ALL', '') else ""
                 query = f"""
-                    SELECT COUNT(CASE WHEN COMPLIANCE_STATUS <> 'COMPLIANT' THEN 1 END) AS policy_violations
-                    FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                    WHERE UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE', 'DATABASE')
+                    SELECT COUNT(*) AS policy_violations
+                    FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                    WHERE COMPLIANCE_STATUS <> 'COMPLIANT'
+                      {where_db}
                 """
                 rows = snowflake_connector.execute_query(query) or []
                 return int(rows[0].get('POLICY_VIOLATIONS', 0)) if rows else 0
@@ -804,20 +785,18 @@ with tab_inv_browser:
 </div>
 """, unsafe_allow_html=True)
         
-        # --- NEW: Compliance Counts (Source: ASSETS only) ---
+        # --- Compliance Counts (Account-Wide) ---
         @st.cache_data(ttl=15)
-        def _get_compliance_counts_from_governance(db_name):
-            if not db_name: return {'pii':0, 'sox':0, 'soc':0}
+        def _get_compliance_counts_from_governance(db_name=None):
             try:
-                # Simple query: Fetch counts directly from ASSETS table flags
+                where_db = f"AND DATABASE_NAME = '{db_name}'" if db_name and db_name.upper() not in ('ALL', '') else ""
                 query = f"""
                     SELECT
                         COUNT(DISTINCT CASE WHEN PII_RELEVANT = TRUE THEN FULLY_QUALIFIED_NAME END) AS PII_ASSET_COUNT,
                         COUNT(DISTINCT CASE WHEN SOX_RELEVANT = TRUE THEN FULLY_QUALIFIED_NAME END) AS SOX_ASSET_COUNT,
                         COUNT(DISTINCT CASE WHEN SOC2_RELEVANT = TRUE THEN FULLY_QUALIFIED_NAME END) AS SOC2_ASSET_COUNT
-                    FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                    WHERE DATABASE_NAME = '{db_name}'
-                    AND UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE', 'DATABASE')
+                    FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+                    WHERE 1=1 {where_db}
                 """
                 
                 rows = snowflake_connector.execute_query(query)
@@ -827,9 +806,7 @@ with tab_inv_browser:
                         'sox': int(rows[0].get('SOX_ASSET_COUNT') or 0),
                         'soc': int(rows[0].get('SOC2_ASSET_COUNT') or 0)
                     }
-            except Exception as e:
-                logger.error(f"Failed to get compliance counts: {e}")
-                pass
+            except Exception: pass
             return {'pii':0, 'sox':0, 'soc':0}
 
         c_counts = _get_compliance_counts_from_governance(active_db)
@@ -912,487 +889,75 @@ with tab_inv_browser:
     ])
 
     # Helper: summarize by a grouping key
-    # Helper: Ensure the view exists
-    @st.cache_data(ttl=15)
-    def _ensure_inventory_view_enrichment(db_name: str):
-        try:
-            # Create the view using {db_name} dynamically
-            ddl = f"""
-            CREATE OR REPLACE VIEW {db_name}.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS AS
-            WITH asset_metrics AS (
-                SELECT 
-                    COALESCE(DATABASE_NAME, '{db_name}') as DATABASE_NAME,
-                    SCHEMA_NAME,
-                    ASSET_NAME,
-                    ASSET_TYPE,
-                    
-                    -- FIXED: Classification check matching dashboard logic
-                    -- An asset is classified if CLASSIFICATION_LABEL is not null and not in unclassified values
-                    CASE 
-                        WHEN CLASSIFICATION_LABEL IS NOT NULL 
-                             AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN (
-                                 '', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 
-                                 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'
-                             )
-                        THEN 1 
-                        ELSE 0 
-                    END as IS_CLASSIFIED,
-                    
-                    -- Also track if there's a classification date for SLA calculation
-                    CASE WHEN CLASSIFICATION_DATE IS NOT NULL THEN 1 ELSE 0 END as HAS_CLASSIFICATION_DATE,
-                    
-                    -- Check for SLA compliance (classified within 5 days)
-                    CASE 
-                        WHEN CLASSIFICATION_DATE IS NOT NULL 
-                             AND DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE) <= 5 
-                        THEN 1
-                        ELSE 0
-                    END as IS_CLASSIFIED_WITHIN_SLA,
-                    
-                    -- Owner check
-                    CASE WHEN DATA_OWNER IS NOT NULL AND DATA_OWNER != '' THEN 1 ELSE 0 END as HAS_OWNER,
-                    
-                    -- Compliance flags enriched with native Snowflake PII discovery (EXTRACT_SEMANTIC_CATEGORIES results)
-                    CASE 
-                        WHEN PII_RELEVANT = TRUE THEN 1
-                        WHEN FULLY_QUALIFIED_NAME IN (
-                            SELECT DISTINCT (UPPER(DATABASE_NAME) || '.' || UPPER(SCHEMA_NAME) || '.' || UPPER(TABLE_NAME))
-                            FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
-                            WHERE (SEMANTIC_CATEGORY IS NOT NULL AND DETAILS:privacy_category::STRING IN ('IDENTIFIER', 'QUASI_IDENTIFIER'))
-                               OR UPPER(AI_CATEGORY) IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER', 'PERSON', 'NAME', 'EMAIL', 'PHONE_NUMBER', 'SENSITIVE')
-                        ) THEN 1
-                        ELSE 0
-                    END as IS_PII,
-                    SOX_RELEVANT as IS_SOX,
-                    SOC2_RELEVANT as IS_SOC2,
-                    
-                    -- Classification details
-                    CLASSIFICATION_LABEL,
-                    CONFIDENTIALITY_LEVEL,
-                    INTEGRITY_LEVEL,
-                    AVAILABILITY_LEVEL,
-                    OVERALL_RISK_CLASSIFICATION,
-                    
-                    -- Review status (matching dashboard logic)
-                    CASE 
-                        WHEN UPPER(TRIM(COMPLIANCE_STATUS)) = 'COMPLIANT' THEN 'Compliant'
-                        WHEN REVIEW_STATUS IN ('Approved', 'Validated') THEN 'Reviewed'
-                        WHEN LAST_REVIEW_DATE IS NOT NULL 
-                             AND DATEDIFF(day, LAST_REVIEW_DATE, CURRENT_DATE()) <= REVIEW_FREQUENCY_DAYS 
-                        THEN 'Compliant'
-                        WHEN NEXT_REVIEW_DATE < CURRENT_DATE() THEN 'Overdue'
-                        ELSE 'Pending'
-                    END as REVIEW_STATUS,
-                    
-                    HAS_EXCEPTION,
-                    
-                    -- Classification accuracy (from dashboard logic)
-                    CASE 
-                        WHEN CLASSIFICATION_LABEL IS NOT NULL 
-                             AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN (
-                                 '', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 
-                                 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'
-                             )
-                             AND REVIEW_STATUS IN ('Approved', 'Validated') 
-                        THEN 1 
-                        ELSE 0 
-                    END as IS_ACCURATE_CLASSIFICATION,
-                    
-                    -- Days since creation for SLA tracking
-                    DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CURRENT_DATE()) as DAYS_SINCE_CREATION,
-                    
-                    -- Days to classify (if classified)
-                    CASE 
-                        WHEN CLASSIFICATION_DATE IS NOT NULL 
-                        THEN DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE)
-                        ELSE NULL
-                    END as DAYS_TO_CLASSIFY,
-                    
-                    BUSINESS_UNIT,
-                    BUSINESS_DOMAIN,
-                    LIFECYCLE
-                    
-                FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                WHERE UPPER(TRIM(ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE')
-            ),
-            column_metrics AS (
-                SELECT 
-                    '{db_name}' as DATABASE_NAME,
-                    SCHEMA_NAME,
-                    TABLE_NAME as ASSET_NAME,
-                    
-                    -- Column counts
-                    COUNT(*) as TOTAL_COLUMNS,
-                    COUNT(CASE WHEN AI_CATEGORY IS NOT NULL THEN 1 END) as CLASSIFIED_COLUMNS,
-                    COUNT(CASE WHEN AI_CATEGORY IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER') THEN 1 END) as PII_COLUMNS,
-                    
-                    -- Data types
-                    LISTAGG(DISTINCT 
-                        TRY_PARSE_JSON(DETAILS):"data_type"::STRING, 
-                        ', '
-                    ) WITHIN GROUP (ORDER BY TRY_PARSE_JSON(DETAILS):"data_type"::STRING) as DATA_TYPES,
-                    
-                    -- Masking status
-                    COUNT(CASE WHEN TRY_PARSE_JSON(DETAILS):"is_masked"::BOOLEAN = TRUE THEN 1 END) as MASKED_COLUMNS,
-                    
-                    -- Tags
-                    LISTAGG(DISTINCT 
-                        TRY_PARSE_JSON(DETAILS):"tags"::STRING, 
-                        ', '
-                    ) WITHIN GROUP (ORDER BY TRY_PARSE_JSON(DETAILS):"tags"::STRING) as COLUMN_TAGS
-                    
-                FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
-                WHERE FINAL_CONFIDENCE >= 0.7
-                  AND TABLE_NAME IS NOT NULL
-                  AND COLUMN_NAME IS NOT NULL
-                GROUP BY SCHEMA_NAME, TABLE_NAME
-            )
-            SELECT 
-                'DATABASE' as LEVEL,
-                am.DATABASE_NAME as "Database",
-                NULL as "Schema",
-                NULL as "Asset_Name",
-                'DATABASE' as "Asset_Type",
-                NULL as "Business_Unit",
-                NULL as "Business_Domain",
-                NULL as "Lifecycle",
-                COUNT(*) as "Total_Assets",
-                SUM(am.IS_CLASSIFIED) as "Classified",
-                SUM(am.HAS_CLASSIFICATION_DATE) as "Has_Classification_Date",
-                
-                -- FIXED: Classification percentage with emoji
-                CASE 
-                    WHEN COUNT(*) > 0 THEN
-                        CONCAT(
-                            ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '% ',
-                            CASE 
-                                WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 90 THEN '✅'
-                                WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 70 THEN '☑️'
-                                WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 50 THEN '⚠️'
-                                ELSE '❌'
-                            END
-                        )
-                    ELSE '0% ❌'
-                END as "Classification_Coverage",
-                
-                -- Additional metrics from dashboard
-                CONCAT(ROUND(SUM(am.IS_ACCURATE_CLASSIFICATION) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Accuracy_Percent",
-                CONCAT(ROUND(SUM(am.IS_CLASSIFIED_WITHIN_SLA) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Timeliness_Percent",
-                
-                -- Compliance Status - using combined score like dashboard
-                CASE 
-                    WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent'
-                    WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 70 THEN '☑️ Good'
-                    WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 50 THEN '⚠️ Fair'
-                    ELSE '❌ Poor'
-                END as "Compliance_Status",
-                
-                CONCAT(ROUND(SUM(am.HAS_OWNER) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Owner_Coverage",
-                
-                -- SLA Status
-                COUNT(CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 END) as "SLA_Breach_Assets",
-                COUNT(CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 END) as "New_Pending_Assets",
-                
-                NULL as "Column_Stats",
-                NULL as "Column_Classification_Percent",
-                NULL as "Data_Types",
-                NULL as "Masking_Status",
-                NULL as "Column_Tags",
-                CONCAT(SUM(am.IS_PII::INT), ' PII, ', SUM(am.IS_SOX::INT), ' SOX, ', SUM(am.IS_SOC2::INT), ' SOC2') as "Sensitive_Columns",
-                
-                -- Average days to classify (for classified assets)
-                ROUND(AVG(am.DAYS_TO_CLASSIFY), 1) as "Avg_Days_To_Classify"
-                
-            FROM asset_metrics am
-            GROUP BY am.DATABASE_NAME
-
-            UNION ALL
-
-            SELECT 
-                'SCHEMA' as LEVEL,
-                am.DATABASE_NAME,
-                am.SCHEMA_NAME,
-                NULL,
-                'SCHEMA',
-                NULL,
-                NULL,
-                NULL,
-                COUNT(*),
-                SUM(am.IS_CLASSIFIED),
-                SUM(am.HAS_CLASSIFICATION_DATE),
-                
-                -- Schema Classification Coverage with emoji
-                CASE 
-                    WHEN COUNT(*) > 0 THEN
-                        CONCAT(
-                            ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '% ',
-                            CASE 
-                                WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 90 THEN '✅'
-                                WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 70 THEN '☑️'
-                                WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 50 THEN '⚠️'
-                                ELSE '❌'
-                            END
-                        )
-                    ELSE '0% ❌'
-                END,
-                
-                CONCAT(ROUND(SUM(am.IS_ACCURATE_CLASSIFICATION) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
-                CONCAT(ROUND(SUM(am.IS_CLASSIFIED_WITHIN_SLA) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
-                
-                CASE 
-                    WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent'
-                    WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 70 THEN '☑️ Good'
-                    WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 50 THEN '⚠️ Fair'
-                    ELSE '❌ Poor'
-                END,
-                
-                CONCAT(ROUND(SUM(am.HAS_OWNER) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
-                
-                COUNT(CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 END),
-                COUNT(CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 END),
-                
-                NULL,
-                NULL,
-                NULL,
-                NULL,
-                NULL,
-                CONCAT(SUM(am.IS_PII::INT), ' PII, ', SUM(am.IS_SOX::INT), ' SOX, ', SUM(am.IS_SOC2::INT), ' SOC2'),
-                
-                ROUND(AVG(am.DAYS_TO_CLASSIFY), 1)
-                
-            FROM asset_metrics am
-            WHERE am.SCHEMA_NAME IS NOT NULL
-            GROUP BY am.DATABASE_NAME, am.SCHEMA_NAME
-
-            UNION ALL
-
-            SELECT 
-                'ASSET' as LEVEL,
-                am.DATABASE_NAME,
-                am.SCHEMA_NAME,
-                am.ASSET_NAME,
-                am.ASSET_TYPE,
-                am.BUSINESS_UNIT,
-                am.BUSINESS_DOMAIN,
-                am.LIFECYCLE,
-                1,
-                am.IS_CLASSIFIED,
-                am.HAS_CLASSIFICATION_DATE,
-                
-                -- Asset Classification Coverage with emoji
-                CONCAT(
-                    am.IS_CLASSIFIED * 100, '% ',
-                    CASE 
-                        WHEN am.IS_CLASSIFIED = 1 THEN '✅'
-                        ELSE '❌'
-                    END
-                ),
-                
-                CONCAT(am.IS_ACCURATE_CLASSIFICATION * 100, '%'),
-                CONCAT(am.IS_CLASSIFIED_WITHIN_SLA * 100, '%'),
-                
-                -- Asset-level compliance status
-                CASE 
-                    WHEN am.IS_CLASSIFIED = 1 AND am.HAS_OWNER = 1 AND am.REVIEW_STATUS IN ('Compliant', 'Reviewed') AND am.HAS_EXCEPTION = 0
-                    THEN '✅ Excellent'
-                    WHEN am.IS_CLASSIFIED = 1 AND am.HAS_OWNER = 1 AND am.REVIEW_STATUS NOT IN ('Overdue')
-                    THEN '☑️ Good'
-                    WHEN am.IS_CLASSIFIED = 1 OR am.HAS_OWNER = 1
-                    THEN '⚠️ Fair'
-                    ELSE '❌ Poor'
-                END,
-                
-                CONCAT(am.HAS_OWNER * 100, '%'),
-                
-                -- Asset SLA status
-                CASE 
-                    WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1
-                    ELSE 0
-                END,
-                
-                CASE 
-                    WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1
-                    ELSE 0
-                END,
-                
-                -- Column metrics
-                CASE 
-                    WHEN cm.TOTAL_COLUMNS IS NOT NULL 
-                    THEN CONCAT(cm.CLASSIFIED_COLUMNS, '/', cm.TOTAL_COLUMNS, ' cols')
-                    ELSE NULL
-                END,
-                
-                CASE 
-                    WHEN cm.TOTAL_COLUMNS IS NOT NULL 
-                    THEN CONCAT(ROUND(cm.CLASSIFIED_COLUMNS * 100.0 / NULLIF(cm.TOTAL_COLUMNS, 0), 0), '%')
-                    ELSE NULL
-                END,
-                
-                cm.DATA_TYPES,
-                
-                CASE 
-                    WHEN cm.TOTAL_COLUMNS IS NOT NULL 
-                    THEN CONCAT(cm.MASKED_COLUMNS, '/', cm.TOTAL_COLUMNS, ' masked')
-                    ELSE NULL
-                END,
-                
-                cm.COLUMN_TAGS,
-                
-                CONCAT(
-                    COALESCE(am.IS_PII::INT, 0), ' PII, ',
-                    COALESCE(am.IS_SOX::INT, 0), ' SOX, ',
-                    COALESCE(am.IS_SOC2::INT, 0), ' SOC2'
-                ),
-                
-                am.DAYS_TO_CLASSIFY
-                
-            FROM asset_metrics am
-            LEFT JOIN column_metrics cm 
-                ON am.DATABASE_NAME = cm.DATABASE_NAME 
-                AND am.SCHEMA_NAME = cm.SCHEMA_NAME 
-                AND am.ASSET_NAME = cm.ASSET_NAME
-            WHERE am.ASSET_NAME IS NOT NULL
-              AND UPPER(TRIM(am.ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE');
-            """
-            snowflake_connector.execute_non_query(ddl)
-            return True
-        except Exception as e:
-            if not is_bypassed:
-                st.error(f"Failed to create inventory view: {e}")
-            else:
-                logger.error(f"Failed to create inventory view (bypassed): {e}")
-            return False
+    # Fetch data from the central account-wide view
 
     @st.cache_data(ttl=120)
     def _fetch_inventory_view(level: str, filters: dict = None) -> pd.DataFrame:
         try:
-            db_name = (
-                st.session_state.get("sf_database")
-                or getattr(settings, "SNOWFLAKE_DATABASE", "")
-            )
-            if not db_name or str(db_name).upper() in ("NONE", "NULL", "(NONE)"):
-                return pd.DataFrame()
-            
-            # Ensure view exists (v2 with enrichment)
-            _ensure_inventory_view_enrichment(db_name)
-            
+            # The view uses specific quoted identifiers exactly as defined in setup.sql
+            view_fqn = "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS"
+            asset_col = "Asset_Name"
+            schema_col = "Schema"
+            db_col = "Database"
+
             # Build WHERE clause based on filters
             conditions = [f"LEVEL = '{level}'"]
             
             if filters:
-                # Database filter applies to all levels (column "Database")
                 if filters.get("database") and filters["database"] != "All":
-                    conditions.append(f"\"Database\" = '{filters['database']}'")
+                    conditions.append(f"\"{db_col}\" = '{filters['database']}'")
                 
-                # Schema filter applies to SCHEMA and ASSET levels (column "Schema")
                 if level in ('SCHEMA', 'ASSET'):
                      if filters.get("schema") and filters["schema"] != "All":
-                         conditions.append(f"\"Schema\" = '{filters['schema']}'")
+                         conditions.append(f"\"{schema_col}\" = '{filters['schema']}'")
                 
-                # Asset/Table filter applies to ASSET level only (column "Asset_Name")
                 if level == 'ASSET':
                      if filters.get("table") and filters["table"] != "All":
-                         conditions.append(f"\"Asset_Name\" = '{filters['table']}'")
+                         conditions.append(f"\"{asset_col}\" = '{filters['table']}'")
 
             where_sql = " AND ".join(conditions)
 
             query = f"""
             SELECT 
-                LEVEL, 
-                "Database", 
-                "Schema", 
-                "Asset_Name", 
-                "Asset_Type", 
-                "Total_Assets", 
-                "Classified", 
-                "Classification_Coverage", 
-                "Compliance_Status", 
-                "Sensitive_Columns", 
-                "Column_Stats"
-            FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS
+                LEVEL, "{db_col}", "{schema_col}", "{asset_col}", "Asset_Type", 
+                "Total_Assets", "Classified", "Classification_Coverage", 
+                "Compliance_Status", "Sensitive_Columns", "Column_Stats"
+            FROM {view_fqn}
             WHERE {where_sql}
-            ORDER BY 1, 2
+            ORDER BY "{db_col}", "{schema_col}", "{asset_col}"
             """
-            rows = snowflake_connector.execute_query(query)
-            df_metrics = pd.DataFrame(rows)
+            rows = snowflake_connector.execute_query(query) or []
+            df = pd.DataFrame(rows)
             
-            # If fetching Databases, enrich with "SHOW DATABASES" to include empty/unscanned ones
-            if level == 'DATABASE':
+            # Normalize column names in the resulting DataFrame if they differ from expectations
+            if not df.empty:
+                rename_map = {}
+                if db_col != "Database" and db_col in df.columns: rename_map[db_col] = "Database"
+                if schema_col != "Schema" and schema_col in df.columns: rename_map[schema_col] = "Schema"
+                if asset_col != "Asset_Name" and asset_col in df.columns: rename_map[asset_col] = "Asset_Name"
+                if rename_map:
+                    df = df.rename(columns=rename_map)
+            
+            # For Database level, we want to see even those not in the view
+            if level == 'DATABASE' and (not filters or not filters.get("database") or filters["database"] == "All"):
                 try:
                     all_rows = snowflake_connector.execute_query("SHOW DATABASES") or []
-                    # Extract database names safely (keys might be lower or upper case)
-                    all_dbs = []
-                    for r in all_rows:
-                        # Try common key variations
-                        nm = r.get('name') or r.get('NAME')
-                        if nm:
-                            all_dbs.append(nm)
+                    all_dbs = [r.get('name') or r.get('NAME') for r in all_rows if (r.get('name') or r.get('NAME'))]
                     
-                    # Apply specific DB filter to the "SHOW DATABASES" list too
-                    if filters and filters.get("database") and filters["database"] != "All":
-                        all_dbs = [d for d in all_dbs if d == filters["database"]]
+                    df_all = pd.DataFrame({'Database': all_dbs})
+                    if not df.empty:
+                        df = pd.merge(df_all, df, on='Database', how='left')
+                    else:
+                        df = df_all
+                    
+                    df["Total_Assets"] = df["Total_Assets"].fillna(0)
+                    df["Classification_Coverage"] = df["Classification_Coverage"].fillna("0% ❌")
+                    df["Compliance_Status"] = df["Compliance_Status"].fillna("❌ Poor")
+                except Exception: pass
 
-                    if all_dbs:
-                        # Create a base DataFrame of all available databases
-                        df_all = pd.DataFrame({'Database': all_dbs})
-                        
-                        # Merge with the metrics we found
-                        if not df_metrics.empty:
-                            # Normalize column names just in case
-                            if 'Database' in df_metrics.columns:
-                                df_combined = pd.merge(df_all, df_metrics, on='Database', how='left')
-                            else:
-                                df_combined = df_metrics # Fallback if schema mismatch
-                        else:
-                            df_combined = df_all
-                            
-                        # Fill default values for databases that have no assets in the governance table yet
-                        fill_map = {
-                            "Total_Assets": 0,
-                            "Classified": 0,
-                            "Has_Classification_Date": 0,
-                            "Classification_Coverage": '0% ❌',
-                            "Accuracy_Percent": '0%', 
-                            "Timeliness_Percent": '0%',
-                            "Compliance_Status": '❌ Poor', 
-                            "Owner_Coverage": '0%',
-                            "SLA_Breach_Assets": 0,
-                            "New_Pending_Assets": 0,
-                            "Sensitive_Columns": '0 PII, 0 SOX, 0 SOC2',
-                            "Avg_Days_To_Classify": 0.0,
-                            "Business_Unit": None,
-                            "Business_Domain": None,
-                            "Lifecycle": None
-                        }
-                        for col, val in fill_map.items():
-                            if col not in df_combined.columns:
-                                df_combined[col] = val
-                            else:
-                                df_combined[col] = df_combined[col].fillna(val)
-                        
-                        # Sort: Active (tracked) databases first, then others
-                        df_combined = df_combined.sort_values(by=['Total_Assets', 'Database'], ascending=[False, True])
-                        return df_combined
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to blend SHOW DATABASES: {e}")
-                    # Fallback to just returning what the view has
-            
-            # Ensure numeric columns are float to avoid Arrow conversion errors (mixed None/Int/Float)
-            if not df_metrics.empty:
-                for col in ["Avg_Days_To_Classify", "SLA_Breach_Assets", "Total_Assets", "Classified"]:
-                    if col in df_metrics.columns:
-                        try:
-                            df_metrics[col] = pd.to_numeric(df_metrics[col], errors='coerce').fillna(0.0)
-                        except Exception: 
-                            pass
-
-            return df_metrics
+            return df
         except Exception as e:
-            if not is_bypassed:
-                st.error(f"Failed to fetch inventory view: {e}")
-            else:
-                logger.error(f"Failed to fetch inventory view (bypassed): {e}")
+            st.error(f"Failed to fetch inventory view: {e}")
             return pd.DataFrame()
 
     # Database View
@@ -1861,43 +1426,34 @@ with tab_inv_browser:
             query = f"""
             WITH column_details AS (
                 SELECT 
-                    car.SCHEMA_NAME,
-                    car.TABLE_NAME,
+                    car.ASSET_FULL_NAME,
                     car.COLUMN_NAME,
-                    car.AI_CATEGORY,
                     car.SENSITIVITY_CATEGORY_ID,
-                    car.SEMANTIC_CATEGORY,
-                    ROUND(car.REGEX_CONFIDENCE * 100, 1) as REGEX_CONFIDENCE_PERCENT,
-                    ROUND(car.KEYWORD_CONFIDENCE * 100, 1) as KEYWORD_CONFIDENCE_PERCENT,
-                    ROUND(car.ML_CONFIDENCE * 100, 1) as ML_CONFIDENCE_PERCENT,
-                    ROUND(car.SEMANTIC_CONFIDENCE * 100, 1) as SEMANTIC_CONFIDENCE_PERCENT,
-                    ROUND(car.FINAL_CONFIDENCE * 100, 1) as FINAL_CONFIDENCE_PERCENT,
-                    TRY_PARSE_JSON(car.DETAILS):"data_type"::STRING as DATA_TYPE,
-                    TRY_PARSE_JSON(car.DETAILS):"is_masked"::BOOLEAN as IS_MASKED,
-                    TRY_PARSE_JSON(car.DETAILS):"masking_policy"::STRING as MASKING_POLICY,
-                    TRY_PARSE_JSON(car.DETAILS):"masking_function"::STRING as MASKING_FUNCTION,
-                    TRY_PARSE_JSON(car.DETAILS):"tags"::STRING as COLUMN_TAGS,
-                    TRY_PARSE_JSON(car.DETAILS):"sensitivity_score"::FLOAT as SENSITIVITY_SCORE,
-                    TRY_PARSE_JSON(car.DETAILS):"pii_relevant"::BOOLEAN as IS_PII,
-                    TRY_PARSE_JSON(car.DETAILS):"sox_relevant"::BOOLEAN as IS_SOX,
-                    TRY_PARSE_JSON(car.DETAILS):"gdpr_relevant"::BOOLEAN as IS_GDPR,
-                    TRY_PARSE_JSON(car.DETAILS):"hipaa_relevant"::BOOLEAN as IS_HIPAA,
-                    TRY_PARSE_JSON(car.DETAILS):"compliance_frameworks"::STRING as COMPLIANCE_FRAMEWORKS,
-                    TRY_PARSE_JSON(car.DETAILS):"classification_reason"::STRING as CLASSIFICATION_REASON,
-                    TRY_PARSE_JSON(car.DETAILS):"sample_values"::STRING as SAMPLE_VALUES,
-                    TRY_PARSE_JSON(car.DETAILS):"pattern_detected"::STRING as PATTERN_DETECTED,
-                    TRY_PARSE_JSON(car.DETAILS):"unique_values_count"::NUMBER as UNIQUE_VALUES_COUNT,
-                    TRY_PARSE_JSON(car.DETAILS):"null_percentage"::FLOAT as NULL_PERCENTAGE,
-                    car.MODEL_VERSION,
+                    car.PII_RELEVANT,
+                    car.SOX_RELEVANT,
+                    car.SOC2_RELEVANT,
+                    car.CONFIDENTIALITY_LEVEL,
+                    car.INTEGRITY_LEVEL,
+                    car.AVAILABILITY_LEVEL,
+                    car.IS_UPDATED,
                     car.CREATED_AT,
-                    car.UPDATED_AT
+                    'N/A' as DATA_TYPE,  -- Placeholder for new schema
+                    FALSE as IS_MASKED,   -- Placeholder for new schema
+                    'N/A' as MASKING_POLICY,
+                    'N/A' as MASKING_FUNCTION,
+                    'N/A' as COLUMN_TAGS,
+                    0.0 as SENSITIVITY_SCORE,
+                    sc.CATEGORY_NAME as AI_CATEGORY,
+                    sc.POLICY_GROUP as COMPLIANCE_GROUP
                 FROM {db_name}.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS car
-                WHERE car.TABLE_NAME IS NOT NULL
+                LEFT JOIN {db_name}.DATA_CLASSIFICATION_GOVERNANCE.SENSITIVITY_CATEGORIES sc
+                    ON car.SENSITIVITY_CATEGORY_ID = sc.CATEGORY_ID
+                WHERE car.ASSET_FULL_NAME IS NOT NULL
                   AND car.COLUMN_NAME IS NOT NULL
             ),
             asset_details AS (
                 SELECT 
-                    a.SCHEMA_NAME,
+                    a.FULLY_QUALIFIED_NAME,
                     a.ASSET_NAME,
                     a.ASSET_TYPE,
                     a.CLASSIFICATION_LABEL,
@@ -1925,54 +1481,52 @@ with tab_inv_browser:
                 cd.COLUMN_NAME as "Column Name",
                 cd.DATA_TYPE as "Data Type",
                 ad.ASSET_NAME as "Table Name",
-                cd.SCHEMA_NAME as "Schema",
+                SPLIT_PART(cd.ASSET_FULL_NAME, '.', 2) as "Schema",
                 cd.AI_CATEGORY as "AI Category",
-                cd.SEMANTIC_CATEGORY as "Native Recommendation",
-                cd.FINAL_CONFIDENCE_PERCENT as "Confidence %",
+                cd.AI_CATEGORY as "Native Recommendation",
+                100.0 as "Confidence %",  -- Fixed confidence for new schema
                 CASE 
                     WHEN cd.IS_MASKED = TRUE THEN '✅ Masked'
                     ELSE '❌ Not Masked'
                 END as "Masking Status",
                 ROUND(cd.SENSITIVITY_SCORE * 100, 1) as "Sensitivity Score %",
                 CASE 
-                    WHEN cd.SENSITIVITY_SCORE >= 0.9 THEN '🔴 Critical'
-                    WHEN cd.SENSITIVITY_SCORE >= 0.7 THEN '🟡 High'
-                    WHEN cd.SENSITIVITY_SCORE >= 0.5 THEN '🟠 Medium'
+                    WHEN cd.PII_RELEVANT = TRUE OR cd.SOX_RELEVANT = TRUE OR cd.SOC2_RELEVANT = TRUE THEN '🔴 Critical'
+                    WHEN cd.PII_RELEVANT = TRUE OR cd.SOX_RELEVANT = TRUE THEN '🟡 High'
+                    WHEN cd.SOX_RELEVANT = TRUE OR cd.SOC2_RELEVANT = TRUE THEN '🟠 Medium'
                     ELSE '🟢 Low'
                 END as "Sensitivity Level",
                 CASE 
-                    WHEN cd.IS_PII = TRUE THEN '🔴 PII'
+                    WHEN cd.PII_RELEVANT = TRUE THEN '🔴 PII'
                     WHEN UPPER(TRIM(cd.AI_CATEGORY)) IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER', 'PERSON', 'NAME', 'EMAIL', 'PHONE_NUMBER', 'SENSITIVE') THEN '🔴 PII'
                     ELSE ''
                 END as "PII Flag",
                 CASE 
-                    WHEN cd.IS_SOX = TRUE THEN '🟡 SOX'
-                    WHEN cd.AI_CATEGORY LIKE '%FINANCIAL%' THEN '🟡 SOX'
+                    WHEN cd.SOX_RELEVANT = TRUE THEN '🟡 SOX'
+                    WHEN UPPER(TRIM(cd.AI_CATEGORY)) LIKE '%FINANCIAL%' THEN '🟡 SOX'
                     ELSE ''
                 END as "SOX Flag",
                 ad.CLASSIFICATION_LABEL as "Table Classification",
                 ad.OVERALL_RISK_CLASSIFICATION as "Table Risk Level",
                 ad.DATA_OWNER as "Data Owner",
-                cd.UPDATED_AT as "Last Updated",
+                cd.CREATED_AT as "Last Updated",
                 CASE 
-                    WHEN cd.AI_CATEGORY IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER') THEN 'Metadata + Header'
-                    WHEN cd.SENSITIVITY_SCORE >= 0.7 THEN 'Metadata Tag'
+                    WHEN cd.PII_RELEVANT = TRUE OR cd.SOX_RELEVANT = TRUE OR cd.SOC2_RELEVANT = TRUE THEN 'Compliance Flags'
+                    WHEN cd.SENSITIVITY_CATEGORY_ID IS NOT NULL THEN 'Category Mapped'
                     ELSE 'General Metadata'
                 END as "Labeling Method",
                 CASE 
-                    WHEN cd.AI_CATEGORY = 'NAME' THEN 'Specific Label: Full Name'
-                    WHEN cd.AI_CATEGORY = 'PHONE_NUMBER' THEN 'Specific Label: Phone'
-                    WHEN cd.AI_CATEGORY = 'CREDIT_CARD' THEN 'Specific Label: Credit Card'
-                    WHEN cd.IS_PII = TRUE THEN 'Specific Label: PII'
+                    WHEN cd.PII_RELEVANT = TRUE THEN 'Specific Label: PII Detected'
+                    WHEN cd.SOX_RELEVANT = TRUE THEN 'Specific Label: SOX Relevant'
+                    WHEN cd.SOC2_RELEVANT = TRUE THEN 'Specific Label: SOC2 Relevant'
                     ELSE 'General Label: ' || COALESCE(ad.CLASSIFICATION_LABEL, 'Public')
                 END as "Standard Label"
             FROM column_details cd
             INNER JOIN asset_details ad 
-                ON cd.SCHEMA_NAME = ad.SCHEMA_NAME 
-                AND cd.TABLE_NAME = ad.ASSET_NAME
+                ON UPPER(TRIM(cd.ASSET_FULL_NAME)) = UPPER(TRIM(ad.FULLY_QUALIFIED_NAME))
             ORDER BY 
-                cd.SCHEMA_NAME,
-                cd.TABLE_NAME,
+                SPLIT_PART(cd.ASSET_FULL_NAME, '.', 2),
+                ad.ASSET_NAME,
                 cd.COLUMN_NAME
             LIMIT 5000
             """
@@ -2123,7 +1677,7 @@ with tab_inv_browser:
                 tagstr = str(tags_map.get(asset) or '')
                 tags_up = tagstr.upper()
                 has_pii = any(k in tags_up for k in ['PII','SSN','EMAIL','PHONE','DOB','ADDRESS','CUSTOMER','EMPLOYEE'])
-                regs = [r for r in ['GDPR','HIPAA','PCI','SOX'] if r in tags_up]
+                regs = [r for r in ['PII','SOX','SOC2'] if r in tags_up]
                 try:
                     ok, msg = _validate_decision_matrix(str(lab or ''), c, i, a, has_pii, regs)
                 except Exception:
@@ -2201,7 +1755,7 @@ with tab_inv_browser:
                 i = int(latest_dec.get('I') or 0) if latest_dec else int(assets_df.loc[assets_df['Location']==sel_asset,'I'].iloc[0]) if 'I' in assets_df.columns else 0
                 a = int(latest_dec.get('A') or 0) if latest_dec else int(assets_df.loc[assets_df['Location']==sel_asset,'A'].iloc[0]) if 'A' in assets_df.columns else 0
                 has_pii = any(k in (assets_df.loc[assets_df['Location']==sel_asset,'Tags'].iloc[0].upper() if 'Tags' in assets_df.columns and not assets_df.empty else '') for k in ['PII','SSN','EMAIL','PHONE','DOB','ADDRESS','CUSTOMER','EMPLOYEE'])
-                regs = [r for r in ['GDPR','HIPAA','PCI','SOX'] if r in (assets_df.loc[assets_df['Location']==sel_asset,'Tags'].iloc[0].upper() if 'Tags' in assets_df.columns and not assets_df.empty else '')]
+                regs = [r for r in ['PII','SOX','SOC2'] if r in (assets_df.loc[assets_df['Location']==sel_asset,'Tags'].iloc[0].upper() if 'Tags' in assets_df.columns and not assets_df.empty else '')]
                 ok, msg = _validate_decision_matrix((lab or str(assets_df.loc[assets_df['Location']==sel_asset,'Classification'].iloc[0]) if not lab else lab), c, i, a, has_pii, regs)
                 comp_badge = "✅ Compliant" if ok else f"❌ Non-compliant ({msg})"
                 cia_cols = st.columns(4)
@@ -2689,12 +2243,8 @@ with tab_inv_browser:
         if not mask_tags.any():
             if category_filter == "PII":
                 pattern = r"SSN|EMAIL|PHONE|ADDRESS|DOB|PII|CUSTOMER|PERSON|EMPLOYEE"
-            elif category_filter == "PHI":
-                pattern = r"PHI|HEALTH|MEDICAL|PATIENT"
-            elif category_filter == "Financial":
-                pattern = r"FINANCE|GL|LEDGER|INVOICE|PAYROLL|AR|AP|REVENUE|EXPENSE"
             else:  # Regulatory
-                pattern = r"SOX|REGULATORY|GDPR|HIPAA|PCI|IFRS|GAAP"
+                pattern = r"SOX|SOC2|PII"
             mask_tags = assets_df['Location'].str.upper().str.contains(pattern, na=False)
         assets_df = assets_df[mask_tags]
 
@@ -2777,14 +2327,8 @@ with tab_inv_browser:
             hits = []
             if "PII" in categories:
                 hits.append(any(k in n for k in ["SSN","EMAIL","PHONE","ADDRESS","DOB","PERSON","CUSTOMER","EMPLOYEE"]))
-            if "PHI" in categories:
-                hits.append(any(k in n for k in ["PHI","HEALTH","MEDICAL","PATIENT","DIAGNOSIS","RX"]))
-            if "PCI" in categories:
-                hits.append(any(k in n for k in ["CARD","PAN","CREDIT","CC_NUMBER"]))
-            if "Financial" in categories:
-                hits.append(any(k in n for k in ["GL","LEDGER","INVOICE","PAYROLL","AR","AP","REVENUE","EXPENSE"]))
             if "Regulatory" in categories:
-                hits.append(any(k in n for k in ["GDPR","HIPAA","PCI","SOX","IFRS","GAAP"]))
+                hits.append(any(k in n for k in ["PII", "SOX", "SOC2"]))
             return any(hits) if hits else True
 
         keep_assets = []

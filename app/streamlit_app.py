@@ -915,24 +915,70 @@ else:
                                 SELECT 
                                     COALESCE(DATABASE_NAME, 'DATA_CLASSIFICATION_DB') as DATABASE_NAME,
                                     SCHEMA_NAME,
-                                    OBJECT_NAME as ASSET_NAME,
+                                    ASSET_NAME,
                                     ASSET_TYPE,
                                     CASE 
                                         WHEN CLASSIFICATION_LABEL IS NOT NULL 
-                                             AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN ('', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW')
+                                             AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN (
+                                                 '', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 
+                                                 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'
+                                             )
                                         THEN 1 ELSE 0 
                                     END as IS_CLASSIFIED,
                                     CASE WHEN CLASSIFICATION_DATE IS NOT NULL THEN 1 ELSE 0 END as HAS_CLASSIFICATION_DATE,
                                     CASE WHEN CLASSIFICATION_DATE IS NOT NULL AND DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE) <= 5 THEN 1 ELSE 0 END as IS_CLASSIFIED_WITHIN_SLA,
                                     CASE WHEN DATA_OWNER IS NOT NULL AND DATA_OWNER != '' THEN 1 ELSE 0 END as HAS_OWNER,
-                                    CASE WHEN PII_RELEVANT = TRUE THEN 1 ELSE 0 END as IS_PII,
-                                    CASE WHEN SOX_RELEVANT = TRUE THEN 1 ELSE 0 END as IS_SOX,
-                                    CASE WHEN SOC2_RELEVANT = TRUE THEN 1 ELSE 0 END as IS_SOC2,
-                                    CASE WHEN REVIEW_STATUS IN ('Approved', 'Validated', 'Compliant') THEN 1 ELSE 0 END as IS_ACCURATE_CLASSIFICATION,
-                                    DATEDIFF(day, CREATED_TIMESTAMP, CURRENT_DATE()) as DAYS_SINCE_CREATION,
-                                    CASE WHEN CLASSIFICATION_DATE IS NOT NULL THEN DATEDIFF(day, CREATED_TIMESTAMP, CLASSIFICATION_DATE) ELSE NULL END as DAYS_TO_CLASSIFY
+                                    CASE 
+                                        WHEN PII_RELEVANT = TRUE THEN 1
+                                        WHEN FULLY_QUALIFIED_NAME IN (
+                                            SELECT DISTINCT ASSET_FULL_NAME
+                                            FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
+                                            WHERE PII_RELEVANT = TRUE
+                                        ) THEN 1
+                                        ELSE 0
+                                    END as IS_PII,
+                                    SOX_RELEVANT as IS_SOX,
+                                    SOC2_RELEVANT as IS_SOC2,
+                                    CASE 
+                                        WHEN CLASSIFICATION_LABEL IS NOT NULL 
+                                             AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN (
+                                                 '', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 
+                                                 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'
+                                             )
+                                             AND REVIEW_STATUS IN ('Approved', 'Validated') 
+                                        THEN 1 ELSE 0 
+                                    END as IS_ACCURATE_CLASSIFICATION,
+                                    DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CURRENT_DATE()) as DAYS_SINCE_CREATION,
+                                    CASE WHEN CLASSIFICATION_DATE IS NOT NULL THEN DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE) ELSE NULL END as DAYS_TO_CLASSIFY,
+                                    CASE 
+                                        WHEN UPPER(TRIM(COMPLIANCE_STATUS)) = 'COMPLIANT' THEN 'Compliant'
+                                        WHEN REVIEW_STATUS IN ('Approved', 'Validated') THEN 'Reviewed'
+                                        WHEN LAST_REVIEW_DATE IS NOT NULL AND DATEDIFF(day, LAST_REVIEW_DATE, CURRENT_DATE()) <= REVIEW_FREQUENCY_DAYS THEN 'Compliant'
+                                        WHEN NEXT_REVIEW_DATE < CURRENT_DATE() THEN 'Overdue'
+                                        ELSE 'Pending'
+                                    END as REVIEW_STATUS,
+                                    HAS_EXCEPTION,
+                                    BUSINESS_UNIT,
+                                    BUSINESS_DOMAIN,
+                                    LIFECYCLE
                                 FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-                                WHERE UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')
+                                WHERE UPPER(TRIM(ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE')
+                            ),
+                            column_metrics AS (
+                                SELECT 
+                                    'DATA_CLASSIFICATION_DB' as DATABASE_NAME,
+                                    SPLIT_PART(ASSET_FULL_NAME, '.', 2) as SCHEMA_NAME,
+                                    SPLIT_PART(ASSET_FULL_NAME, '.', 3) as TABLE_NAME,
+                                    COUNT(*) as TOTAL_COLUMNS,
+                                    COUNT(CASE WHEN PII_RELEVANT = TRUE THEN 1 END) as PII_COLUMNS,
+                                    COUNT(CASE WHEN SOX_RELEVANT = TRUE THEN 1 END) as SOX_COLUMNS,
+                                    COUNT(CASE WHEN SOC2_RELEVANT = TRUE THEN 1 END) as SOC2_COLUMNS,
+                                    'N/A' as DATA_TYPES,
+                                    0 as MASKED_COLUMNS,
+                                    'N/A' as COLUMN_TAGS
+                                FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
+                                WHERE ASSET_FULL_NAME IS NOT NULL AND COLUMN_NAME IS NOT NULL
+                                GROUP BY ASSET_FULL_NAME
                             )
                             SELECT 
                                 'DATABASE' as LEVEL,
@@ -940,42 +986,66 @@ else:
                                 NULL as "Schema",
                                 NULL as "Asset_Name",
                                 'DATABASE' as "Asset_Type",
+                                NULL as "Business_Unit",
+                                NULL as "Business_Domain",
+                                NULL as "Lifecycle",
                                 COUNT(*) as "Total_Assets",
                                 SUM(am.IS_CLASSIFIED) as "Classified",
                                 SUM(am.HAS_CLASSIFICATION_DATE) as "Has_Classification_Date",
-                                CASE WHEN COUNT(*) > 0 THEN CONCAT(ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '%') ELSE '0%' END as "Classification_Coverage",
+                                CASE WHEN COUNT(*) > 0 THEN CONCAT(ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '% ', CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 90 THEN '✅' WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 70 THEN '☑️' WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 50 THEN '⚠️' ELSE '❌' END) ELSE '0% ❌' END as "Classification_Coverage",
                                 CONCAT(ROUND(SUM(am.IS_ACCURATE_CLASSIFICATION) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Accuracy_Percent",
                                 CONCAT(ROUND(SUM(am.IS_CLASSIFIED_WITHIN_SLA) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Timeliness_Percent",
-                                CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent' ELSE '❌ Poor' END as "Compliance_Status",
+                                CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent' WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 70 THEN '☑️ Good' WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 50 THEN '⚠️ Fair' ELSE '❌ Poor' END as "Compliance_Status",
                                 CONCAT(ROUND(SUM(am.HAS_OWNER) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Owner_Coverage",
                                 COUNT(CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 END) as "SLA_Breach_Assets",
                                 COUNT(CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 END) as "New_Pending_Assets",
-                                CONCAT(SUM(am.IS_PII), ' PII, ', SUM(am.IS_SOX), ' SOX, ', SUM(am.IS_SOC2), ' SOC2') as "Sensitive_Columns",
+                                NULL as "Column_Stats",
+                                NULL as "Column_Classification_Percent",
+                                NULL as "Data_Types",
+                                NULL as "Masking_Status",
+                                NULL as "Column_Tags",
+                                CONCAT(SUM(am.IS_PII::INT), ' PII, ', SUM(am.IS_SOX::INT), ' SOX, ', SUM(am.IS_SOC2::INT), ' SOC2') as "Sensitive_Columns",
                                 ROUND(AVG(am.DAYS_TO_CLASSIFY), 1) as "Avg_Days_To_Classify"
-                            FROM asset_metrics am
-                            GROUP BY am.DATABASE_NAME
+                            FROM asset_metrics am GROUP BY am.DATABASE_NAME
                             UNION ALL
                             SELECT 
-                                'SCHEMA' as LEVEL,
-                                am.DATABASE_NAME,
-                                am.SCHEMA_NAME,
-                                NULL,
-                                'SCHEMA',
-                                COUNT(*),
-                                SUM(am.IS_CLASSIFIED),
-                                SUM(am.HAS_CLASSIFICATION_DATE),
-                                CASE WHEN COUNT(*) > 0 THEN CONCAT(ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '%') ELSE '0%' END,
+                                'SCHEMA' as LEVEL, am.DATABASE_NAME, am.SCHEMA_NAME, NULL, 'SCHEMA', NULL, NULL, NULL,
+                                COUNT(*), SUM(am.IS_CLASSIFIED), SUM(am.HAS_CLASSIFICATION_DATE),
+                                CASE WHEN COUNT(*) > 0 THEN CONCAT(ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '% ', CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 90 THEN '✅' WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 70 THEN '☑️' WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 50 THEN '⚠️' ELSE '❌' END) ELSE '0% ❌' END,
                                 CONCAT(ROUND(SUM(am.IS_ACCURATE_CLASSIFICATION) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
                                 CONCAT(ROUND(SUM(am.IS_CLASSIFIED_WITHIN_SLA) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
-                                CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent' ELSE '❌ Poor' END,
+                                CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent' WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 70 THEN '☑️ Good' WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 50 THEN '⚠️ Fair' ELSE '❌ Poor' END,
                                 CONCAT(ROUND(SUM(am.HAS_OWNER) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
                                 COUNT(CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 END),
                                 COUNT(CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 END),
-                                CONCAT(SUM(am.IS_PII), ' PII, ', SUM(am.IS_SOX), ' SOX, ', SUM(am.IS_SOC2), ' SOC2'),
+                                NULL, NULL, NULL, NULL, NULL,
+                                CONCAT(SUM(am.IS_PII::INT), ' PII, ', SUM(am.IS_SOX::INT), ' SOX, ', SUM(am.IS_SOC2::INT), ' SOC2'),
                                 ROUND(AVG(am.DAYS_TO_CLASSIFY), 1)
+                            FROM asset_metrics am WHERE am.SCHEMA_NAME IS NOT NULL GROUP BY am.DATABASE_NAME, am.SCHEMA_NAME
+                            UNION ALL
+                            SELECT 
+                                'ASSET' as LEVEL,
+                                am.DATABASE_NAME, am.SCHEMA_NAME, am.ASSET_NAME, am.ASSET_TYPE,
+                                am.BUSINESS_UNIT, am.BUSINESS_DOMAIN, am.LIFECYCLE,
+                                1, am.IS_CLASSIFIED, am.HAS_CLASSIFICATION_DATE,
+                                CONCAT(am.IS_CLASSIFIED * 100, '% ', CASE WHEN am.IS_CLASSIFIED = 1 THEN '✅' ELSE '❌' END),
+                                CONCAT(am.IS_ACCURATE_CLASSIFICATION * 100, '%'),
+                                CONCAT(am.IS_CLASSIFIED_WITHIN_SLA * 100, '%'),
+                                CASE WHEN am.IS_CLASSIFIED = 1 AND am.HAS_OWNER = 1 AND am.REVIEW_STATUS IN ('Compliant', 'Reviewed') AND am.HAS_EXCEPTION = 0 THEN '✅ Excellent' WHEN am.IS_CLASSIFIED = 1 AND am.HAS_OWNER = 1 AND am.REVIEW_STATUS NOT IN ('Overdue') THEN '☑️ Good' WHEN am.IS_CLASSIFIED = 1 OR am.HAS_OWNER = 1 THEN '⚠️ Fair' ELSE '❌ Poor' END,
+                                CONCAT(am.HAS_OWNER * 100, '%'),
+                                CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 ELSE 0 END,
+                                CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 ELSE 0 END,
+                                CASE WHEN cm.TOTAL_COLUMNS IS NOT NULL THEN CONCAT(cm.CLASSIFIED_COLUMNS, '/', cm.TOTAL_COLUMNS, ' cols') ELSE NULL END,
+                                CASE WHEN cm.TOTAL_COLUMNS IS NOT NULL THEN CONCAT(ROUND(cm.CLASSIFIED_COLUMNS * 100.0 / NULLIF(cm.TOTAL_COLUMNS, 0), 0), '%') ELSE NULL END,
+                                cm.DATA_TYPES,
+                                CASE WHEN cm.TOTAL_COLUMNS IS NOT NULL THEN CONCAT(cm.MASKED_COLUMNS, '/', cm.TOTAL_COLUMNS, ' masked') ELSE NULL END,
+                                cm.COLUMN_TAGS,
+                                CONCAT(COALESCE(am.IS_PII::INT, 0), ' PII, ', COALESCE(am.IS_SOX::INT, 0), ' SOX, ', COALESCE(am.IS_SOC2::INT, 0), ' SOC2'),
+                                am.DAYS_TO_CLASSIFY
                             FROM asset_metrics am
-                            GROUP BY am.DATABASE_NAME, am.SCHEMA_NAME
-                        """
+                            LEFT JOIN column_metrics cm ON am.DATABASE_NAME = cm.DATABASE_NAME AND am.SCHEMA_NAME = cm.SCHEMA_NAME AND am.ASSET_NAME = cm.ASSET_NAME
+                            WHERE am.ASSET_NAME IS NOT NULL AND UPPER(TRIM(am.ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE')
+                        """,
                     }
                     
                     created = 0

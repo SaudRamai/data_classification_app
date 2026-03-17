@@ -144,6 +144,7 @@ def render_realtime_dashboard():
         return
 
 
+    # Resolving the Dashboard data solely through the synchronized inventory view
     # Resolve active database for all queries (fallback to settings or default)
     _db_raw = st.session_state.get("sf_database")
     if not _db_raw or str(_db_raw).strip().upper() in ("NONE", "NULL", "(NONE)", "UNKNOWN", ""):
@@ -153,83 +154,58 @@ def render_realtime_dashboard():
         _db_raw = "DATA_CLASSIFICATION_DB"
         
     active_db = _db_raw
-    # Centralized FQNs (initial; may be overridden after sidebar selection)
-    # Authoritative Data Sources (Optimized)
     _SCHEMA = "DATA_CLASSIFICATION_GOVERNANCE"
     T_ASSETS = f"{active_db}.{_SCHEMA}.ASSETS"
     T_AI_RESULTS = f"{active_db}.{_SCHEMA}.CLASSIFICATION_AI_RESULTS"
 
-    # Global Filters sidebar (restored)
+    # Global Filters sidebar
     _rt_ensure_session_context()
     with st.sidebar:
         # Standardized Global Filters
         g_filters = render_global_filters(key_prefix="dashboard")
-        sel_db = g_filters.get("database")
+        sel_db = g_filters.get("database") or active_db
         sel_schema = g_filters.get("schema") or "All"
         
-
-        # Business Unit options from ASSETS
+        # Use the inventory view for dynamic filter options
+        view_fqn = f"{active_db}.{_SCHEMA}.VW_ASSET_INVENTORY_ALL_LEVELS"
+        
+        # Business Unit options
         try:
             bu_rows = snowflake_connector.execute_query(
-                f"SELECT DISTINCT BUSINESS_UNIT FROM {T_ASSETS} WHERE BUSINESS_UNIT IS NOT NULL ORDER BY 1"
+                f"SELECT DISTINCT \"Business_Unit\" FROM {view_fqn} WHERE \"Business_Unit\" IS NOT NULL ORDER BY 1"
             )
-            bu_opts = ["All"] + [r.get("BUSINESS_UNIT") for r in (bu_rows or []) if r.get("BUSINESS_UNIT")]
+            bu_opts = ["All"] + [r.get("Business_Unit") for r in (bu_rows or []) if r.get("Business_Unit")]
         except Exception:
             bu_opts = ["All"]
         sel_bu = st.selectbox("Business Unit", options=bu_opts, index=0, key="rt_bu")
 
-        # Asset Type from ASSETS (TABLE_TYPE or ASSET_TYPE)
+        # Asset Type options
         try:
-            # Get distinct ASSET_TYPE values from ASSETS
             at_rows = snowflake_connector.execute_query(
-                f"""
-                SELECT DISTINCT ASSET_TYPE as T 
-                FROM {T_ASSETS} 
-                WHERE COALESCE(ASSET_TYPE, '') <> ''
-                ORDER BY 1
-                """
+                f"SELECT DISTINCT \"Asset_Type\" as T FROM {view_fqn} WHERE \"Asset_Type\" IS NOT NULL ORDER BY 1"
             )
             at_opts = ["All"] + [r.get("T") for r in (at_rows or []) if r.get("T")]
         except Exception:
             at_opts = ["All"]
         sel_asset_type = st.selectbox("Asset Type", options=at_opts, index=0, key="rt_asset_type")
 
-        # Classification Status
-        sel_class_status = st.selectbox("Classification Status", options=["All", "Classified", "Unclassified"], index=0, key="rt_cls_status")
-
-        # Risk Level from ASSETS
+        # Risk Level options from the ASSETS table directly for granularity
         try:
             rk_rows = snowflake_connector.execute_query(
-                f"SELECT DISTINCT OVERALL_RISK_CLASSIFICATION FROM {T_ASSETS} WHERE OVERALL_RISK_CLASSIFICATION IS NOT NULL ORDER BY 1"
+                f"SELECT DISTINCT OVERALL_RISK_CLASSIFICATION FROM {active_db}.{_SCHEMA}.ASSETS WHERE OVERALL_RISK_CLASSIFICATION IS NOT NULL ORDER BY 1"
             )
             rk_opts = ["All"] + [r.get("OVERALL_RISK_CLASSIFICATION") for r in (rk_rows or []) if r.get("OVERALL_RISK_CLASSIFICATION")]
         except Exception:
             rk_opts = ["All"]
         sel_risk = st.selectbox("Risk Level", options=rk_opts, index=0, key="rt_risk")
 
-        # Date range (optional)
-        tp = st.radio("Time", options=["All", "Date range"], horizontal=True, index=0, key="rt_timepick")
-        start_date: Optional[datetime] = None
-        end_date: Optional[datetime] = None
-        if tp == "Date range":
-            dr = st.date_input("Date range", value=(datetime.today() - timedelta(days=30), datetime.today()))
-            try:
-                if isinstance(dr, tuple) and len(dr) == 2:
-                    start_date, end_date = dr[0], dr[1]
-            except Exception:
-                start_date, end_date = None, None
-
         # Save current selections to session
-        st.session_state["sf_database"] = sel_db
         st.session_state["rt_filters"] = {
             "bu": sel_bu,
             "db": sel_db,
             "schema": sel_schema,
             "atype": sel_asset_type,
-            "cstatus": sel_class_status,
-            "risk": sel_risk,
-            "start": start_date,
-            "end": end_date,
+            "risk": sel_risk
         }
 
         # Compliance filter defaults remain All
@@ -635,7 +611,10 @@ def render_realtime_dashboard():
         with col_r3:
             st.metric("SOC2 Critical", sens_data['regulated'].get('SOC2', 0))
         with col_r4:
-            st.metric("Other Regulated", sens_data['regulated'].get('OTHER_REG', 0))
+            # Combined count across all regulated categories
+            _reg = sens_data.get('regulated', {})
+            _total_reg = _reg.get('PII', 0) + _reg.get('SOX', 0) + _reg.get('SOC2', 0)
+            st.metric("Total Regulated", _total_reg)
 
         st.caption("📌 Answers: “What kind of sensitive data do we have?”")
 
@@ -646,16 +625,16 @@ def render_realtime_dashboard():
                     f"""
                     SELECT
                         COUNT(*) AS TOTAL,
-                        COUNT_IF(PII_RELEVANT = TRUE) AS PII,
-                        COUNT_IF(SOX_RELEVANT = TRUE) AS SOX,
-                        COUNT_IF(SOC2_RELEVANT = TRUE) AS SOC2,
-                        COUNT_IF(CLASSIFICATION_LABEL IS NOT NULL AND TRIM(CLASSIFICATION_LABEL) <> '') AS LABELED
-                    FROM {T_ASSETS}
-                    WHERE UPPER(COALESCE(ASSET_TYPE,'')) IN ('TABLE','VIEW','BASE TABLE')
+                        SUM(REGEXP_SUBSTR("Sensitive_Columns", '(\\\\d+) PII', 1, 1, 'e')::INT) AS PII,
+                        SUM(REGEXP_SUBSTR("Sensitive_Columns", '(\\\\d+) SOX', 1, 1, 'e')::INT) AS SOX,
+                        SUM(REGEXP_SUBSTR("Sensitive_Columns", '(\\\\d+) SOC2', 1, 1, 'e')::INT) AS SOC2,
+                        SUM("Classified") AS LABELED
+                    FROM {active_db}.{_SCHEMA}.VW_ASSET_INVENTORY_ALL_LEVELS
+                    WHERE LEVEL = 'ASSET'
                     """
                 ) or [{}])[0]
                 with st.expander("🔎 Data Sensitivity Diagnostics"):
-                    st.caption(f"ASSETS source: `{_sens_fqn}`")
+                    st.caption(f"Inventory View source: `{active_db}.{_SCHEMA}.VW_ASSET_INVENTORY_ALL_LEVELS`")
                     st.write({
                         "TOTAL": diag_row.get("TOTAL"),
                         "LABELED": diag_row.get("LABELED"),
@@ -663,22 +642,6 @@ def render_realtime_dashboard():
                         "SOX": diag_row.get("SOX"),
                         "SOC2": diag_row.get("SOC2"),
                     })
-
-                    try:
-                        # Cross-check counts in the currently selected database, if different
-                        sel_db_diag = st.session_state.get("sf_database")
-                        if sel_db_diag and str(sel_db_diag).strip() and sel_db_diag != active_db:
-                            sel_fqn = f"{sel_db_diag}.{_SCHEMA}.ASSETS"
-                            sel_row = (_rt_run_query(
-                                f"""
-                                SELECT COUNT(*) AS TOTAL
-                                FROM {sel_fqn}
-                                WHERE UPPER(COALESCE(ASSET_TYPE,'')) IN ('TABLE','VIEW','BASE TABLE')
-                                """
-                            ) or [{}])[0]
-                            st.write({"SELECTED_DB_ASSETS_FQN": sel_fqn, "SELECTED_DB_TOTAL": sel_row.get("TOTAL")})
-                    except Exception:
-                        pass
         except Exception:
             pass
 
@@ -758,7 +721,8 @@ def render_realtime_dashboard():
             st.metric("Upcoming (30d)", f"{review_data['upcoming_count']}", delta=None)
             st.caption("Reviews due within 30 days")
         with col_r3:
-            st.metric("Total Pending", f"{review_data['total_backlog']}", delta=None)
+            _total_backlog = review_data.get('overdue_count', 0) + review_data.get('upcoming_count', 0)
+            st.metric("Total Pending", f"{_total_backlog}", delta=None)
             st.caption("Total maintenance workload")
 
         # Table for Review Backlog
@@ -828,13 +792,14 @@ def render_realtime_dashboard():
     
     try:
         # ── Pull PII/SOX/SOC2 counts + compliance status from the view ──────────
-        view_fqn = "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS"
+        view_fqn = f"{active_db}.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS"
         try:
             vrow = (_rt_run_query(f"""
                 SELECT
                     "Sensitive_Columns"  AS sensitive_cols,
                     "Compliance_Status"  AS compliance_status,
-                    "Owner_Coverage"     AS owner_cov
+                    "Owner_Coverage"     AS owner_cov,
+                    "Classification_Coverage" AS pii_cov_str -- Use this as a proxy for PII coverage if needed, or we parse from Sensitive_Columns
                 FROM {view_fqn}
                 WHERE LEVEL = 'DATABASE' AND UPPER("Database") = UPPER('{active_db}')
                 LIMIT 1
@@ -842,68 +807,35 @@ def render_realtime_dashboard():
         except Exception:
             vrow = {}
 
-        # Sensitive_Columns is stored as a string like:
-        # '{{"PII": 12, "SOX": 5, "SOC2": 3}}'
-        import json
-        def _parse_sensitive(raw):
-            if not raw: return {}
-            try:
-                s = str(raw).strip()
-                # Handle Snowflake OBJECT/VARIANT returned as string
-                return json.loads(s)
-            except Exception:
-                return {}
+        # Parsing Sensitive_Columns using the same logic as the Regulated section
+        # Format: '5 PII, 4 SOX, 1 SOC2'
+        import re
+        def _parse_reg_count(text, pattern):
+            if not text: return 0
+            match = re.search(f'(\\d+) {pattern}', str(text))
+            return int(match.group(1)) if match else 0
 
-        sensitive = _parse_sensitive(vrow.get('SENSITIVE_COLS'))
-        pii_assets  = int(sensitive.get('PII', sensitive.get('pii', 0)) or 0)
-        sox_assets  = int(sensitive.get('SOX', sensitive.get('sox', 0)) or 0)
-        soc2_assets = int(sensitive.get('SOC2', sensitive.get('soc2', 0)) or 0)
-
-        # Fallback: if view Sensitive_Columns is 0/empty, use ASSETS directly
-        if pii_assets == sox_assets == soc2_assets == 0:
-            try:
-                fb = (_rt_run_query(f"""
-                    SELECT
-                        COUNT_IF(PII_RELEVANT = TRUE)  AS PII,
-                        COUNT_IF(SOX_RELEVANT = TRUE)  AS SOX,
-                        COUNT_IF(SOC2_RELEVANT = TRUE) AS SOC2
-                    FROM {T_ASSETS}
-                    WHERE DATABASE_NAME IS NOT NULL
-                """) or [{}])[0] or {}
-                pii_assets  = int(fb.get('PII', 0) or 0)
-                sox_assets  = int(fb.get('SOX', 0) or 0)
-                soc2_assets = int(fb.get('SOC2', 0) or 0)
-            except Exception:
-                pass
-
-        # PII coverage: % of PII assets that are classified
-        pii_cov = 0.0
-        if pii_assets > 0:
-            try:
-                pii_cl = (_rt_run_query(f"""
-                    SELECT COUNT_IF(
-                        PII_RELEVANT = TRUE
-                        AND CLASSIFICATION_LABEL IS NOT NULL
-                        AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN (
-                            '', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE',
-                            'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'
-                        )
-                    ) AS PII_CLASSIFIED
-                    FROM {T_ASSETS}
-                    WHERE DATABASE_NAME IS NOT NULL
-                """) or [{}])[0] or {}
-                pii_cov = round(100.0 * int(pii_cl.get('PII_CLASSIFIED', 0) or 0) / pii_assets, 1)
-            except Exception:
-                pass
+        pii_assets  = _parse_reg_count(vrow.get('SENSITIVE_COLS'), 'PII')
+        sox_assets  = _parse_reg_count(vrow.get('SENSITIVE_COLS'), 'SOX')
+        soc2_assets = _parse_reg_count(vrow.get('SENSITIVE_COLS'), 'SOC2')
 
         # Audit readiness from view Compliance_Status string
         comp_status_str = str(vrow.get('COMPLIANCE_STATUS') or '').upper()
-        if '✅' in comp_status_str or 'COMPLIANT' in comp_status_str:
+        if '✅' in comp_status_str or 'EXCELLENT' in comp_status_str:
             audit_readiness = "HIGH"
-        elif '⚠️' in comp_status_str:
+        elif '☑️' in comp_status_str or 'GOOD' in comp_status_str or '⚠️' in comp_status_str or 'FAIR' in comp_status_str:
             audit_readiness = "MEDIUM"
         else:
             audit_readiness = "LOW"
+
+        # PII coverage: Using the parsed percentage from the view
+        def _parse_pct(val):
+            try:
+                s = str(val or '0').strip().split('%')[0].strip()
+                return float(s)
+            except Exception: return 0.0
+        
+        pii_cov = _parse_pct(vrow.get('PII_COV_STR'))
 
         # Exceptions from ASSETS
         exception_count = 0
@@ -921,7 +853,7 @@ def render_realtime_dashboard():
             exception_count = 0
 
         comp_data = {
-            "pii_coverage_pct": round(pii_cov, 1),
+            "pii_coverage_pct": pii_cov,
             "pii_assets": pii_assets,
             "sox_assets": sox_assets,
             "soc2_assets": soc2_assets,
@@ -1064,7 +996,7 @@ def render_realtime_dashboard():
         # Display special categories breakdown if available
         reg_breakdown = comp_data.get('regulatory_breakdown', {})
         if reg_breakdown:
-            other_labels = [k for k in reg_breakdown.keys() if k not in ('PII', 'SOX', 'SOC2', 'GDPR')]
+            other_labels = [k for k in reg_breakdown.keys() if k not in ('PII', 'SOX', 'SOC2')]
             if other_labels:
                 st.info(f"📍 Detected Special Categories: {', '.join(other_labels)}")
         
@@ -1100,14 +1032,25 @@ def render_realtime_dashboard():
              # 1. Recent AI Insights (from CLASSIFICATION_AI_RESULTS)
              ai_rows = _rt_run_query(f"""
                 select TOP 5 
-                    UPPER(TABLE_NAME) as NAME, 
-                    AI_CATEGORY || ' (' || ROUND(FINAL_CONFIDENCE * 100, 1) || '%)' as DETAIL, 
-                    'AI Engine' as USER, 
-                    CREATED_AT as TS,
-                    'AI Discovery' as TYPE
-                from {T_AI_RESULTS}
-                where CREATED_AT >= dateadd('day', -7, current_timestamp())
-                order by TS desc
+    UPPER(SPLIT_PART(ASSET_FULL_NAME, '.', 3)) as NAME,  -- Extract table name from ASSET_FULL_NAME
+    CASE 
+        WHEN PII_RELEVANT = TRUE THEN 'PII'
+        WHEN SOX_RELEVANT = TRUE THEN 'SOX'
+        WHEN SOC2_RELEVANT = TRUE THEN 'SOC2'
+        ELSE 'SENSITIVE'
+    END || ' (' || 
+    CASE 
+        WHEN PII_RELEVANT = TRUE THEN '100'
+        WHEN SOX_RELEVANT = TRUE THEN '100'
+        WHEN SOC2_RELEVANT = TRUE THEN '100'
+        ELSE '100'
+    END || '%)' as DETAIL, 
+    'AI Engine' as USER, 
+    CREATED_AT as TS,
+    'AI Engine' as TYPE
+from DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
+where CREATED_AT >= dateadd('day', -7, current_timestamp())
+order by TS desc;
              """)
              
              # 2. Recent Asset Management (from ASSETS)

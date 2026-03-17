@@ -34,25 +34,37 @@ class MetadataCatalogService:
     def _x(self, sql: str, params: Optional[Dict[str, Any]] = None) -> int:
         return self.sf.execute_non_query(sql, params)
 
-    def run_asset_merge(self, database: str = "DATA_CLASSIFICATION_DB") -> Dict[str, Any]:
+    def run_asset_merge(self, database: Optional[str] = None) -> Dict[str, Any]:
         """
         Executes the stored procedure to merge newly discovered Snowflake assets
-        from INFORMATION_SCHEMA into the DATA_CLASSIFICATION_GOVERNANCE.ASSETS tables.
+        into the ASSETS table.
         """
-        logger.info(f"Running asset merge for {database}")
+        db = database or settings.SNOWFLAKE_DATABASE or "DATA_CLASSIFICATION_DB"
+        logger.info(f"Running asset merge for {db}")
         try:
-            # Call the SP
-            self._x(f"CALL {database}.DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS()")
+            # Call the SP and capture return message
+            # The query returns a single column with the result message
+            res = self._q(f"CALL {db}.DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS()")
+            msg = res[0].get('SP_MERGE_ASSETS', '') if res else ''
             
-            # Get count of newly inserted assets (version 1, created recently)
-            stats = self._q(f"SELECT COUNT(*) AS CNT FROM {database}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE CREATED_TIMESTAMP >= DATEADD(minute, -5, CURRENT_TIMESTAMP()) AND RECORD_VERSION = 1")
-            new_count = stats[0]['CNT'] if stats else 0
+            # Optional: Parse counts from message if format matches 'MERGE_COMPLETE — X inserted, Y updated'
+            inserted = 0
+            updated = 0
+            if "MERGE_COMPLETE" in msg:
+                try:
+                    parts = msg.split('—')[1].split(',')
+                    s_ins = re.search(r'(\d+)', parts[0])
+                    s_upd = re.search(r'(\d+)', parts[1])
+                    inserted = int(s_ins.group(1)) if s_ins else 0
+                    updated = int(s_upd.group(1)) if s_upd else 0
+                except Exception:
+                    # Fallback to current timestamp based counts if parsing fails
+                    stats = self._q(f"SELECT COUNT(*) AS CNT FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE CREATED_TIMESTAMP >= DATEADD(minute, -5, CURRENT_TIMESTAMP()) AND RECORD_VERSION = 1")
+                    inserted = stats[0]['CNT'] if stats else 0
+                    upd_stats = self._q(f"SELECT COUNT(*) AS CNT FROM {db}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE LAST_MODIFIED_TIMESTAMP >= DATEADD(minute, -5, CURRENT_TIMESTAMP()) AND RECORD_VERSION > 1")
+                    updated = upd_stats[0]['CNT'] if upd_stats else 0
             
-            # Get count of updated assets (version > 1, modified recently)
-            upd_stats = self._q(f"SELECT COUNT(*) AS CNT FROM {database}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS WHERE LAST_MODIFIED_TIMESTAMP >= DATEADD(minute, -5, CURRENT_TIMESTAMP()) AND RECORD_VERSION > 1")
-            upd_count = upd_stats[0]['CNT'] if upd_stats else 0
-            
-            return {"inserted": new_count, "updated": upd_count}
+            return {"inserted": inserted, "updated": updated, "message": msg}
         except Exception as e:
             logger.error(f"Asset merge failed: {e}")
             return {"error": str(e)}
@@ -87,9 +99,10 @@ class MetadataCatalogService:
             return {'total_assets': 0, 'classified_count': 0, 'unclassified_count': 0, 'coverage_pct': 0.0}
 
     def get_health_score_metrics(self, db: str, schema: str) -> Dict[str, Any]:
-        """Calculate Classification Health Program metrics."""
+        """Calculate Classification Health Program metrics using the standard view."""
         try:
-            view_fqn = "DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS"
+            db_val = db or settings.SNOWFLAKE_DATABASE or "DATA_CLASSIFICATION_DB"
+            view_fqn = f"{db_val}.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS"
             query = f"""
                 SELECT
                     "Total_Assets"               AS total,
@@ -100,13 +113,29 @@ class MetadataCatalogService:
                     "Accuracy_Percent"           AS accuracy_str,
                     "Timeliness_Percent"         AS timeliness_str,
                     "Owner_Coverage"             AS owner_cov_str,
-                    "Avg_Days_To_Classify"       AS avg_days
+                    "Avg_Days_To_Classify"       AS avg_days,
+                    "Classification_Coverage"    AS coverage_str
                 FROM {view_fqn}
                 WHERE LEVEL = 'DATABASE'
                   AND UPPER("Database") = UPPER('{db}')
                 LIMIT 1
             """
-            rows = self._q(query) or [{}]
+            rows = self._q(query)
+            if not rows:
+                # Try a broader query if specific database not found
+                query = f"""
+                    SELECT
+                        SUM("Total_Assets")            AS total,
+                        SUM("Classified")              AS classified,
+                        SUM("Has_Classification_Date") AS has_date,
+                        SUM("SLA_Breach_Assets")       AS sla_breach,
+                        SUM("New_Pending_Assets")      AS new_pending,
+                        AVG("Avg_Days_To_Classify")    AS avg_days
+                    FROM {view_fqn}
+                    WHERE LEVEL = 'DATABASE'
+                """
+                rows = self._q(query)
+            
             r = rows[0] if rows else {}
 
             def _parse_pct(val):
@@ -117,7 +146,7 @@ class MetadataCatalogService:
 
             total = int(r.get('TOTAL') or 0)
             classified = int(r.get('CLASSIFIED') or 0)
-            cov_pct = round(100.0 * classified / total, 1) if total > 0 else 0.0
+            cov_pct = _parse_pct(r.get('COVERAGE_STR')) if r.get('COVERAGE_STR') else (round(100.0 * classified / total, 1) if total > 0 else 0.0)
             acc_pct = _parse_pct(r.get('ACCURACY_STR'))
             tim_pct = _parse_pct(r.get('TIMELINESS_STR'))
             gov_pct = _parse_pct(r.get('OWNER_COV_STR'))
@@ -142,59 +171,62 @@ class MetadataCatalogService:
             logger.error(f"Error in get_health_score_metrics: {e}")
             return {'overall_score': 0, 'health_status': "Error"}
 
-    def get_sensitivity_overview(self, db: str, schema: str) -> Dict[str, Any]:
-        """Return asset counts grouped by sensitivity/risk level.
-        Consolidated to use the generic dashboard view.
-        """
-        return self.get_dashboard_sensitivity_overview(db, schema)
-
     def get_dashboard_sensitivity_overview(self, db: str, schema: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Fetch sensitivity distribution with optional filtering."""
+        """Fetch sensitivity distribution using the standardized inventory view."""
         try:
-            global_db = "DATA_CLASSIFICATION_DB"
-            fqn = f"{global_db}.{schema}.{T_ASSETS}"
-            where_conds = ["1=1"]
+            db_val = db or settings.SNOWFLAKE_DATABASE or "DATA_CLASSIFICATION_DB"
+            view_fqn = f"{db_val}.DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS"
+            
+            where_conds = ["LEVEL = 'ASSET'"]
             if filters:
                 f_db = filters.get("db")
-                if f_db and str(f_db) != "All": where_conds.append(f"DATABASE_NAME = '{f_db}'")
-                elif db and db != global_db and str(db).upper() not in ("ALL", ""): where_conds.append(f"DATABASE_NAME = '{db}'")
-                for k, v in [("SCHEMA_NAME", "schema"), ("ASSET_NAME", "table"), ("BUSINESS_UNIT", "bu"), ("ASSET_TYPE", "atype"), ("OVERALL_RISK_CLASSIFICATION", "risk")]:
-                    val = filters.get(v)
-                    if val and str(val) != "All": where_conds.append(f"{k} = '{val}'")
-            
+                if f_db and str(f_db) != "All": where_conds.append(f"\"Database\" = '{f_db}'")
+                elif db and db.upper() not in ("ALL", ""): where_conds.append(f"\"Database\" = '{db}'")
+                
+                if filters.get("schema") and filters["schema"] != "All":
+                    where_conds.append(f"\"Schema\" = '{filters['schema']}'")
+                if filters.get("table") and filters["table"] != "All":
+                    where_conds.append(f"\"Asset_Name\" = '{filters['table']}'")
+                if filters.get("bu") and filters["bu"] != "All":
+                    where_conds.append(f"\"Business_Unit\" = '{filters['bu']}'")
+                if filters.get("atype") and filters["atype"] != "All":
+                    where_conds.append(f"\"Asset_Type\" = '{filters['atype']}'")
+
             where_sql = " AND ".join(where_conds)
-            q = f"""
-                SELECT COUNT(*) AS TOTAL,
-                       COALESCE(SUM(CAST(PII_RELEVANT AS INT)), 0) AS PII,
-                       COALESCE(SUM(CAST(SOX_RELEVANT AS INT)), 0) AS SOX,
-                       COALESCE(SUM(CAST(SOC2_RELEVANT AS INT)), 0) AS SOC2,
-                       COALESCE(SUM(CASE WHEN PII_RELEVANT = TRUE OR SOX_RELEVANT = TRUE OR SOC2_RELEVANT = TRUE THEN 1 ELSE 0 END), 0) AS REG,
-                       COALESCE(SUM(CASE WHEN CLASSIFICATION_LABEL IS NOT NULL AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN {UNCLASSIFIED_VALS} THEN 1 ELSE 0 END), 0) AS LABELED
-                FROM {fqn}
-                WHERE {where_sql} AND DATABASE_NAME IS NOT NULL
-            """
-            r = (self._q(q) or [{}])[0]
-            total = int(r.get("TOTAL") or 0)
-            pii = int(r.get("PII") or 0)
             
-            q_lbl = f"""
-                SELECT
-                    CASE
-                        WHEN CLASSIFICATION_LABEL IS NULL OR TRIM(CLASSIFICATION_LABEL) = '' THEN 'UNCLASSIFIED'
-                        WHEN UPPER(TRIM(CLASSIFICATION_LABEL)) IN {UNCLASSIFIED_VALS} THEN 'UNCLASSIFIED'
-                        WHEN UPPER(TRIM(CLASSIFICATION_LABEL)) IN ('RESTRICTED', 'HIGH', 'H') THEN 'Restricted'
-                        WHEN UPPER(TRIM(CLASSIFICATION_LABEL)) IN ('CONFIDENTIAL', 'MEDIUM', 'M') THEN 'Confidential'
-                        WHEN UPPER(TRIM(CLASSIFICATION_LABEL)) IN ('INTERNAL', 'LOW', 'L') THEN 'Internal'
-                        ELSE CLASSIFICATION_LABEL
-                    END AS LABEL,
-                    COUNT(*) AS C
-                FROM {fqn}
-                WHERE {where_sql} AND DATABASE_NAME IS NOT NULL
+            # Fetch aggregated counts from the view
+            query = f"""
+                SELECT 
+                    COUNT(*) as TOTAL,
+                    SUM("Classified") as LABELED,
+                    -- Parsing Sensitive_Columns string (e.g., '1 PII, 0 SOX, 0 SOC2')
+                    SUM(REGEXP_SUBSTR("Sensitive_Columns", '(\\\\d+) PII', 1, 1, 'e')::INT) as PII,
+                    SUM(REGEXP_SUBSTR("Sensitive_Columns", '(\\\\d+) SOX', 1, 1, 'e')::INT) as SOX,
+                    SUM(REGEXP_SUBSTR("Sensitive_Columns", '(\\\\d+) SOC2', 1, 1, 'e')::INT) as SOC2
+                FROM {view_fqn}
+                WHERE {where_sql}
+            """
+            rows = self._q(query)
+            r = rows[0] if rows else {}
+            total = int(r.get('TOTAL') or 0)
+            pii = int(r.get('PII') or 0)
+            
+            # Fetch label distribution
+            # Note: The view doesn't explicitly store the raw CLASSIFICATION_LABEL in all versions, 
+            # but we can infer distribution or join back if needed. For now, let's use the ASSETS table 
+            # for the distribution to maintain granularity, but filter based on the same logic.
+            assets_fqn = f"{db_val}.DATA_CLASSIFICATION_GOVERNANCE.ASSETS"
+            dist_query = f"""
+                SELECT 
+                    COALESCE(CLASSIFICATION_LABEL, 'Unclassified') as LABEL,
+                    COUNT(*) as C
+                FROM {assets_fqn}
+                WHERE DATABASE_NAME = '{db}'
                 GROUP BY 1
             """
-            lbl_rows = self._q(q_lbl) or []
-            labels = {str(x.get("LABEL")): int(x.get("C") or 0) for x in lbl_rows if x.get("LABEL")}
-            
+            lbl_rows = self._q(dist_query)
+            labels = {str(x.get("LABEL")): int(x.get("C") or 0) for x in lbl_rows}
+
             return {
                 'total_assets': total, 
                 'labels': labels, 
@@ -204,10 +236,10 @@ class MetadataCatalogService:
                     'PII': pii, 
                     'SOX': int(r.get("SOX") or 0), 
                     'SOC2': int(r.get("SOC2") or 0),
-                    'OTHER_REG': int(r.get("REG") or 0)
+                    'OTHER_REG': int(r.get("PII") or 0) + int(r.get("SOX") or 0) + int(r.get("SOC2") or 0)
                 }
             }
-        except Exception as e: 
+        except Exception as e:
             logger.error(f"Error in get_dashboard_sensitivity_overview: {e}")
             return {'total_assets': 0, 'labels': {}}
 

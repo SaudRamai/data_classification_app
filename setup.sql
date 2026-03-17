@@ -122,24 +122,15 @@ CREATE OR REPLACE VIEW DATA_CLASSIFICATION_GOVERNANCE.VW_SPECIAL_CATEGORIES_COMP
 ) AS
 WITH ai_sensitive_assets AS (
     SELECT DISTINCT
-        a.SCHEMA_NAME,
-        a.TABLE_NAME,
-        CONCAT(CURRENT_DATABASE(), '.', a.SCHEMA_NAME, '.', a.TABLE_NAME) as ASSET_FULL_NAME,
-        MAX(CASE WHEN a.AI_CATEGORY IN ('PII', 'PERSONAL_DATA', 'IDENTIFIER') THEN 1 ELSE 0 END) as HAS_PII,
-        MAX(CASE WHEN a.AI_CATEGORY IN ('FINANCIAL', 'ACCOUNTING', 'FINANCE') OR
-                      UPPER(a.AI_CATEGORY) LIKE '%FINANCIAL%' OR
-                      UPPER(a.AI_CATEGORY) LIKE '%SOX%' OR
-                      (a.DETAILS IS NOT NULL AND a.DETAILS:"sox_relevant"::BOOLEAN = TRUE) THEN 1 ELSE 0 END) as HAS_SOX,
-        MAX(CASE WHEN UPPER(a.AI_CATEGORY) LIKE '%SECURITY%' OR
-                      UPPER(a.AI_CATEGORY) LIKE '%CONTROL%' OR
-                      UPPER(a.AI_CATEGORY) LIKE '%SOC2%' OR
-                      (a.DETAILS IS NOT NULL AND (
-                          a.DETAILS:"compliance_frameworks" LIKE '%SOC2%' OR
-                          a.DETAILS:"compliance_frameworks" LIKE '%SOC 2%'
-                      )) THEN 1 ELSE 0 END) as HAS_SOC2
+        a.ASSET_FULL_NAME,
+        -- Aggregate to table level using new schema
+        MAX(COALESCE(a.PII_RELEVANT, FALSE)) as HAS_PII,
+        MAX(COALESCE(a.SOX_RELEVANT, FALSE)) as HAS_SOX,
+        MAX(COALESCE(a.SOC2_RELEVANT, FALSE)) as HAS_SOC2
     FROM DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS a
-    WHERE a.FINAL_CONFIDENCE >= 0.7
-    GROUP BY a.SCHEMA_NAME, a.TABLE_NAME
+    -- Filter for table assets only
+    WHERE a.ASSET_FULL_NAME IS NOT NULL
+    GROUP BY a.ASSET_FULL_NAME
 ),
 asset_classifications AS (
     SELECT
@@ -307,6 +298,71 @@ CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.DAILY_AUDIT_DIGESTS (
 GRANT SELECT, INSERT, UPDATE ON TABLE DATA_CLASSIFICATION_GOVERNANCE.DAILY_AUDIT_DIGESTS TO APPLICATION ROLE app_public;
 GRANT SELECT, INSERT, UPDATE ON TABLE DATA_CLASSIFICATION_GOVERNANCE.DAILY_AUDIT_DIGESTS TO APPLICATION ROLE app_admin;
 
+-- Application Roles Management
+CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.ROLES (
+    ROLE_NAME STRING PRIMARY KEY,
+    DESCRIPTION STRING
+);
+
+CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS (
+    USER_EMAIL STRING,
+    ROLE_NAME STRING,
+    ASSIGNED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (USER_EMAIL, ROLE_NAME)
+);
+
+CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.IDP_GROUP_MAP (
+    GROUP_NAME STRING,
+    ROLE_NAME STRING,
+    ASSIGNED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (GROUP_NAME, ROLE_NAME)
+);
+
+-- Ensure correct columns in legacy tables
+ALTER TABLE IF EXISTS DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS ADD COLUMN IF NOT EXISTS USER_EMAIL STRING;
+ALTER TABLE IF EXISTS DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS ADD COLUMN IF NOT EXISTS ASSIGNED_AT TIMESTAMP_NTZ;
+
+-- Governance Engine Configuration
+CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.APP_SETTINGS (
+    KEY STRING PRIMARY KEY,
+    VALUE STRING
+);
+
+CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.IA_RULES (
+    TYPE STRING,
+    PATTERN STRING,
+    I_LEVEL NUMBER,
+    A_LEVEL NUMBER,
+    PRIORITY NUMBER,
+    UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Initial Business Units and Settings (Seeding)
+INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.ROLES (ROLE_NAME, DESCRIPTION)
+SELECT 'ADMIN', 'Full system administration' WHERE NOT EXISTS (SELECT 1 FROM DATA_CLASSIFICATION_GOVERNANCE.ROLES WHERE ROLE_NAME = 'ADMIN');
+INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.ROLES (ROLE_NAME, DESCRIPTION)
+SELECT 'CUSTODIAN', 'Data governance steward' WHERE NOT EXISTS (SELECT 1 FROM DATA_CLASSIFICATION_GOVERNANCE.ROLES WHERE ROLE_NAME = 'CUSTODIAN');
+
+INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.APP_SETTINGS (KEY, VALUE)
+SELECT 'enable_discovery', 'true' WHERE NOT EXISTS (SELECT 1 FROM DATA_CLASSIFICATION_GOVERNANCE.APP_SETTINGS WHERE KEY = 'enable_discovery');
+INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.APP_SETTINGS (KEY, VALUE)
+SELECT 'enable_workflow', 'true' WHERE NOT EXISTS (SELECT 1 FROM DATA_CLASSIFICATION_GOVERNANCE.APP_SETTINGS WHERE KEY = 'enable_workflow');
+
+GRANT SELECT ON TABLE DATA_CLASSIFICATION_GOVERNANCE.ROLES TO APPLICATION ROLE app_public;
+GRANT ALL ON TABLE DATA_CLASSIFICATION_GOVERNANCE.ROLES TO APPLICATION ROLE app_admin;
+
+GRANT SELECT ON TABLE DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS TO APPLICATION ROLE app_public;
+GRANT ALL ON TABLE DATA_CLASSIFICATION_GOVERNANCE.ROLE_ASSIGNMENTS TO APPLICATION ROLE app_admin;
+
+GRANT SELECT ON TABLE DATA_CLASSIFICATION_GOVERNANCE.IDP_GROUP_MAP TO APPLICATION ROLE app_public;
+GRANT ALL ON TABLE DATA_CLASSIFICATION_GOVERNANCE.IDP_GROUP_MAP TO APPLICATION ROLE app_admin;
+
+GRANT SELECT ON TABLE DATA_CLASSIFICATION_GOVERNANCE.APP_SETTINGS TO APPLICATION ROLE app_public;
+GRANT ALL ON TABLE DATA_CLASSIFICATION_GOVERNANCE.APP_SETTINGS TO APPLICATION ROLE app_admin;
+
+GRANT SELECT ON TABLE DATA_CLASSIFICATION_GOVERNANCE.IA_RULES TO APPLICATION ROLE app_public;
+GRANT ALL ON TABLE DATA_CLASSIFICATION_GOVERNANCE.IA_RULES TO APPLICATION ROLE app_admin;
+
 -- Reclassification Requests
 CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.RECLASSIFICATION_REQUESTS (
     REQUEST_ID STRING DEFAULT UUID_STRING(),
@@ -406,23 +462,28 @@ GRANT SELECT, INSERT ON TABLE DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECI
 
     -- CLASSIFICATION_AI_RESULTS table
     CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS (
-        RESULT_ID NUMBER IDENTITY(1,1),
-        DATABASE_NAME STRING,
-        SCHEMA_NAME STRING,
-        TABLE_NAME STRING,
-        COLUMN_NAME STRING,
-        AI_CATEGORY STRING,
-        SENSITIVITY_CATEGORY_ID STRING,
-        SEMANTIC_CATEGORY STRING,
-        FINAL_CONFIDENCE FLOAT,
+        RESULT_ID NUMBER(38,0) NOT NULL autoincrement start 1 increment 1 noorder,
+        ASSET_FULL_NAME STRING,
         PII_RELEVANT BOOLEAN DEFAULT FALSE,
         SOX_RELEVANT BOOLEAN DEFAULT FALSE,
         SOC2_RELEVANT BOOLEAN DEFAULT FALSE,
-        DETAILS VARIANT,
-        CREATED_TIMESTAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        CREATED_TIMESTAMP TIMESTAMP_NTZ(9),
+        primary key (RESULT_ID)
     );
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS TO APPLICATION ROLE app_public;
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS TO APPLICATION ROLE app_admin;
+
+    -- System Audit Log for general events (Syncs, Config changes)
+    CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AUDIT (
+        ID STRING DEFAULT UUID_STRING(),
+        RESOURCE_ID STRING,
+        ACTION STRING,
+        ACTION_TIMESTAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+        USER_ID STRING,
+        NEW_STATE VARIANT
+    );
+    GRANT SELECT, INSERT ON TABLE DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AUDIT TO APPLICATION ROLE app_public;
+    GRANT SELECT, INSERT ON TABLE DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AUDIT TO APPLICATION ROLE app_admin;
 
     -- View for user-specific classification tasks
     CREATE OR REPLACE VIEW DATA_CLASSIFICATION_GOVERNANCE.VW_MY_CLASSIFICATION_TASKS(
@@ -609,7 +670,7 @@ GRANT SELECT ON VIEW DATA_CLASSIFICATION_GOVERNANCE.VW_MY_CLASSIFICATION_TASKS T
     -- ============================================================================
 
     -- Stored Procedure for Automated Asset Discovery and Merge
-    CREATE OR REPLACE PROCEDURE DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS()
+    CREATE OR REPLACE PROCEDURE DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS()
     RETURNS STRING
     LANGUAGE SQL
     EXECUTE AS CALLER
@@ -619,96 +680,113 @@ DECLARE
     ts_start TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP();
     run_id STRING DEFAULT UUID_STRING();
     last_watermark TIMESTAMP_NTZ;
-    new_watermark TIMESTAMP_NTZ;
+    new_watermark TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP();
     db_name STRING;
+    rows_inserted INTEGER DEFAULT 0;
+    rows_updated INTEGER DEFAULT 0;
+    merge_query_id STRING;
 BEGIN
-    -- Initialize Watermark table if not exists (Fully Qualified)
-    CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.DISCOVERY_WATERMARK (
+    -- 1. Initialize Watermark table if not exists
+    CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.DISCOVERY_WATERMARK (
         LAST_WATERMARK TIMESTAMP_NTZ,
         LAST_RUN_ID STRING
     );
 
     SELECT COALESCE(MAX(LAST_WATERMARK), '2000-01-01 00:00:00') INTO :last_watermark 
-    FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.DISCOVERY_WATERMARK;
+    FROM DATA_CLASSIFICATION_GOVERNANCE.DISCOVERY_WATERMARK;
 
-    -- Discovery Staging (Fully Qualified)
-    CREATE OR REPLACE TEMPORARY TABLE DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (
-        DB STRING, SCHEMA STRING, NAME STRING, ASSET_TYPE STRING, FQN STRING, LAST_ALTERED TIMESTAMP_NTZ
+    -- 2. Cleanup: Remove forbidden system records from ASSETS
+    DELETE FROM DATA_CLASSIFICATION_GOVERNANCE.ASSETS
+    WHERE 
+        UPPER(DATABASE_NAME) IN ('SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA', 'INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
+        OR UPPER(SCHEMA_NAME) IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
+        OR UPPER(FULLY_QUALIFIED_NAME) REGEXP '^(SNOWFLAKE|SNOWFLAKE_SAMPLE_DATA|INFORMATION_SCHEMA|DATA_CLASSIFICATION_GOVERNANCE)\\..*';
+
+    -- 3. Discovery Staging
+    CREATE OR REPLACE TEMPORARY TABLE DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (
+        DB STRING NOT NULL,
+        SCHEMA STRING NOT NULL, 
+        NAME STRING NOT NULL,
+        ASSET_TYPE STRING NOT NULL,
+        FQN STRING,
+        DESCRIPTION STRING,
+        LAST_ALTERED TIMESTAMP_NTZ
     );
 
-    -- Phase 1: Database Discovery
+    -- Phase 1: Filtered Database Discovery
     SHOW DATABASES;
     LET rs_databases RESULTSET := (
         SELECT "name" AS DATABASE_NAME 
         FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) 
-        WHERE "name" NOT IN ('SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA', 'INFORMATION_SCHEMA')
+        WHERE COALESCE(UPPER("name"), '') NOT IN ('SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA', 'INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
     );
 
     FOR db_row IN rs_databases DO
         db_name := db_row.DATABASE_NAME;
         
-        -- Record Database as Asset
-        INSERT INTO DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, LAST_ALTERED)
-        VALUES (:db_name, '', :db_name, 'DATABASE', :db_name, CURRENT_TIMESTAMP());
+        INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, DESCRIPTION, LAST_ALTERED)
+        VALUES (:db_name, '', :db_name, 'DATABASE', :db_name, 'Database Object', CURRENT_TIMESTAMP());
         
-        -- 1. Tables
+        -- Tables & Views discovery
         BEGIN
             EXECUTE IMMEDIATE 'SHOW TABLES IN DATABASE "' || db_name || '"';
-            INSERT INTO DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, LAST_ALTERED)
+            INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, DESCRIPTION, LAST_ALTERED)
             SELECT "database_name", "schema_name", "name", "kind", 
-                   "database_name" || '.' || "schema_name" || '.' || "name", "created_on"
+                   "database_name" || '.' || "schema_name" || '.' || "name", 
+                   'Table/View Asset',
+                   COALESCE("last_altered", "created_on")
             FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
-            WHERE "schema_name" NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE');
+            WHERE COALESCE(UPPER("schema_name"), '') NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
+              AND "database_name" IS NOT NULL AND "schema_name" IS NOT NULL
+              AND COALESCE("last_altered", "created_on") > :last_watermark;
         EXCEPTION WHEN OTHER THEN NULL;
         END;
 
-        -- 2. Views
+        -- USER PROCEDURES (Native Exclusion of System SPs)
         BEGIN
-            EXECUTE IMMEDIATE 'SHOW VIEWS IN DATABASE "' || db_name || '"';
-            INSERT INTO DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, LAST_ALTERED)
-            SELECT "database_name", "schema_name", "name", 'VIEW', 
-                   "database_name" || '.' || "schema_name" || '.' || "name", "created_on"
-            FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
-            WHERE "schema_name" NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE');
-        EXCEPTION WHEN OTHER THEN NULL;
-        END;
-
-        -- 3. Stored Procedures
-        BEGIN
-            EXECUTE IMMEDIATE 'SHOW PROCEDURES IN DATABASE "' || db_name || '"';
-            INSERT INTO DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, LAST_ALTERED)
+            EXECUTE IMMEDIATE 'SHOW USER PROCEDURES IN DATABASE "' || db_name || '"';
+            INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, DESCRIPTION, LAST_ALTERED)
             SELECT "catalog_name", "schema_name", "name", 'STORED_PROCEDURE', 
-                   "catalog_name" || '.' || "schema_name" || '.' || "name", "created_on"
+                   "catalog_name" || '.' || "schema_name" || '.' || "name" || COALESCE("arguments", ''), 
+                   'Stored Procedure',
+                   "created_on"
             FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
-            WHERE "schema_name" NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE');
+            WHERE COALESCE(UPPER("schema_name"), '') NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
+              AND "catalog_name" IS NOT NULL AND "schema_name" IS NOT NULL
+              AND "created_on" > :last_watermark;
         EXCEPTION WHEN OTHER THEN NULL;
         END;
 
-        -- 4. Functions
+        -- USER FUNCTIONS (Native Exclusion of Built-in Functions)
         BEGIN
-            EXECUTE IMMEDIATE 'SHOW FUNCTIONS IN DATABASE "' || db_name || '"';
-            INSERT INTO DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, LAST_ALTERED)
+            EXECUTE IMMEDIATE 'SHOW USER FUNCTIONS IN DATABASE "' || db_name || '"';
+            INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, DESCRIPTION, LAST_ALTERED)
             SELECT "catalog_name", "schema_name", "name", 'FUNCTION', 
-                   "catalog_name" || '.' || "schema_name" || '.' || "name", "created_on"
+                   "catalog_name" || '.' || "schema_name" || '.' || "name" || COALESCE("arguments", ''),
+                   'Returns: ' || "returns",
+                   "created_on"
             FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
-            WHERE "schema_name" NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE');
-        EXCEPTION WHEN OTHER THEN NULL;
-        END;
-
-        -- 5. Stages
-        BEGIN
-            EXECUTE IMMEDIATE 'SHOW STAGES IN DATABASE "' || db_name || '"';
-            INSERT INTO DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING (DB, SCHEMA, NAME, ASSET_TYPE, FQN, LAST_ALTERED)
-            SELECT "database_name", "schema_name", "name", 'STAGE', 
-                   "database_name" || '.' || "schema_name" || '.' || "name", "created_on"
-            FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
-            WHERE "schema_name" NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE');
+            WHERE COALESCE(UPPER("schema_name"), '') NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
+              AND "catalog_name" IS NOT NULL AND "schema_name" IS NOT NULL
+              AND "created_on" > :last_watermark;
         EXCEPTION WHEN OTHER THEN NULL;
         END;
     END FOR;
 
-    -- Prepare Enriched Merge Source
-    CREATE OR REPLACE TEMPORARY TABLE DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_MERGE_SOURCE AS
+    -- 4. Enriched Merge Source
+    CREATE OR REPLACE TEMPORARY TABLE DATA_CLASSIFICATION_GOVERNANCE.TEMP_MERGE_SOURCE AS
+    WITH ai_results_agg AS (
+        -- Fixed: Use new ASSET_FULL_NAME schema
+        SELECT 
+            ASSET_FULL_NAME,
+            -- Aggregate to Table Level: TRUE if ANY column is TRUE
+            MAX(COALESCE(PII_RELEVANT, FALSE)) as PII_RELEVANT,
+            MAX(COALESCE(SOX_RELEVANT, FALSE)) as SOX_RELEVANT,
+            MAX(COALESCE(SOC2_RELEVANT, FALSE)) as SOC2_RELEVANT
+        FROM DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
+        WHERE ASSET_FULL_NAME IS NOT NULL
+        GROUP BY ASSET_FULL_NAME
+    )
     SELECT 
         MD5(UPPER(TRIM(s.FQN))) as ASSET_ID,
         s.NAME as ASSET_NAME,
@@ -718,41 +796,60 @@ BEGIN
         s.NAME as OBJECT_NAME,
         s.FQN as FULLY_QUALIFIED_NAME,
         'SYSTEM' as DATA_OWNER,
-        COALESCE(ar.PII_RELEVANT, FALSE) as PII_RELEVANT,
-        COALESCE(ar.SOX_RELEVANT, FALSE) as SOX_RELEVANT,
-        COALESCE(ar.SOC2_RELEVANT, FALSE) as SOC2_RELEVANT,
+        s.DESCRIPTION as DATA_DESCRIPTION,
+        -- Apply AI join only for Tables/Views
+        CASE WHEN s.ASSET_TYPE IN ('TABLE', 'BASE TABLE', 'VIEW') THEN ar.PII_RELEVANT ELSE NULL END as PII_RELEVANT, -- Use AI result if available, else existing
+        CASE WHEN s.ASSET_TYPE IN ('TABLE', 'BASE TABLE', 'VIEW') THEN ar.SOX_RELEVANT ELSE NULL END as SOX_RELEVANT, -- Use AI result if available, else existing
+        CASE WHEN s.ASSET_TYPE IN ('TABLE', 'BASE TABLE', 'VIEW') THEN ar.SOC2_RELEVANT ELSE NULL END as SOC2_RELEVANT, -- Use AI result if available, else existing
         COALESCE(cd.LABEL, 'Unclassified') as CLASSIFICATION_LABEL,
         COALESCE(CAST(cd.C AS STRING), 'C1') as CONFIDENTIALITY_LEVEL,
         COALESCE(CAST(cd.I AS STRING), 'I1') as INTEGRITY_LEVEL,
         COALESCE(CAST(cd.A AS STRING), 'A1') as AVAILABILITY_LEVEL,
         CASE WHEN cd.LABEL IS NOT NULL THEN 'MANUAL' ELSE 'AUTO_DISCOVERY' END as CLASSIFICATION_METHOD
-    FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING s
+    FROM DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING s
     LEFT JOIN (
-        SELECT ASSET_FULL_NAME, LABEL, C, I, A
-        FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS
-        WHERE STATUS = 'APPROVED'
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY ASSET_FULL_NAME ORDER BY COALESCE(DECISION_TIMESTAMP, CREATED_AT) DESC) = 1
-    ) cd ON cd.ASSET_FULL_NAME = s.FQN
-    LEFT JOIN (
-        SELECT DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, PII_RELEVANT, SOX_RELEVANT, SOC2_RELEVANT
-        FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME ORDER BY COALESCE(CREATED_TIMESTAMP, UPDATED_AT) DESC) = 1
-    ) ar ON ar.DATABASE_NAME = s.DB AND ar.SCHEMA_NAME = s.SCHEMA AND ar.TABLE_NAME = s.NAME;
+        SELECT ASSET_FULL_NAME, LABEL, CONFIDENTIALITY_LEVEL AS C, INTEGRITY_LEVEL AS I, AVAILABILITY_LEVEL AS A
+        FROM DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS
+        WHERE STATUS = 'Approved'
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY UPPER(ASSET_FULL_NAME) ORDER BY DECISION_TIMESTAMP DESC) = 1
+    ) cd ON UPPER(cd.ASSET_FULL_NAME) = UPPER(s.FQN)
+    -- Fixed: FQN-based join with new schema
+    LEFT JOIN ai_results_agg ar 
+        ON UPPER(TRIM(ar.ASSET_FULL_NAME)) = UPPER(TRIM(s.FQN))
+    WHERE COALESCE(UPPER(s.DB), '') NOT IN ('SNOWFLAKE', 'SNOWFLAKE_SAMPLE_DATA', 'INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE')
+      AND COALESCE(UPPER(s.SCHEMA), '') NOT IN ('INFORMATION_SCHEMA', 'DATA_CLASSIFICATION_GOVERNANCE');
 
+    -- 5. Optional Debug Table for unmatched joins
+    CREATE OR REPLACE TABLE DATA_CLASSIFICATION_GOVERNANCE.DEBUG_UNMATCHED_AI_RESULTS AS
+    SELECT ar.*
+    FROM (
+        SELECT DISTINCT 
+            ASSET_FULL_NAME
+        FROM DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
+        WHERE ASSET_FULL_NAME IS NOT NULL
+    ) ar
+    LEFT JOIN DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING s
+        ON UPPER(TRIM(ar.ASSET_FULL_NAME)) = UPPER(TRIM(s.FQN))
+    WHERE s.FQN IS NULL;
 
-    -- Merge Logic
-    MERGE INTO DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS AS t
+    -- 6. Final MERGE with Change Detection
+    MERGE INTO DATA_CLASSIFICATION_GOVERNANCE.ASSETS AS t
     USING DATA_CLASSIFICATION_GOVERNANCE.TEMP_MERGE_SOURCE AS s
     ON t.FULLY_QUALIFIED_NAME = s.FULLY_QUALIFIED_NAME
     WHEN MATCHED AND (
         t.ASSET_TYPE != s.ASSET_TYPE OR
-        COALESCE(t.CLASSIFICATION_LABEL, '') != COALESCE(s.CLASSIFICATION_LABEL, '') OR
-        COALESCE(t.PII_RELEVANT, FALSE) != COALESCE(s.PII_RELEVANT, FALSE) OR
-        COALESCE(t.SOX_RELEVANT, FALSE) != COALESCE(s.SOX_RELEVANT, FALSE) OR 
-        COALESCE(t.SOC2_RELEVANT, FALSE) != COALESCE(s.SOC2_RELEVANT, FALSE)
+        (t.PII_RELEVANT IS DISTINCT FROM s.PII_RELEVANT) OR
+        (t.SOX_RELEVANT IS DISTINCT FROM s.SOX_RELEVANT) OR
+        (t.SOC2_RELEVANT IS DISTINCT FROM s.SOC2_RELEVANT) OR
+        t.CLASSIFICATION_LABEL != s.CLASSIFICATION_LABEL OR
+        t.CONFIDENTIALITY_LEVEL != s.CONFIDENTIALITY_LEVEL OR
+        t.INTEGRITY_LEVEL != s.INTEGRITY_LEVEL OR
+        t.AVAILABILITY_LEVEL != s.AVAILABILITY_LEVEL OR
+        COALESCE(t.DATA_DESCRIPTION, '') != COALESCE(s.DATA_DESCRIPTION, '')
     ) THEN
         UPDATE SET 
             t.ASSET_TYPE = s.ASSET_TYPE,
+            t.DATA_DESCRIPTION = s.DATA_DESCRIPTION,
             t.PII_RELEVANT = s.PII_RELEVANT,
             t.SOX_RELEVANT = s.SOX_RELEVANT,
             t.SOC2_RELEVANT = s.SOC2_RELEVANT,
@@ -766,114 +863,391 @@ BEGIN
     WHEN NOT MATCHED THEN
         INSERT (
             ASSET_ID, ASSET_NAME, ASSET_TYPE, DATABASE_NAME, SCHEMA_NAME, OBJECT_NAME, 
-            FULLY_QUALIFIED_NAME, DATA_OWNER, PII_RELEVANT, SOX_RELEVANT, SOC2_RELEVANT,
+            FULLY_QUALIFIED_NAME, DATA_OWNER, DATA_DESCRIPTION, PII_RELEVANT, SOX_RELEVANT, SOC2_RELEVANT,
             CLASSIFICATION_LABEL, CONFIDENTIALITY_LEVEL, INTEGRITY_LEVEL, AVAILABILITY_LEVEL,
             CLASSIFICATION_METHOD, CREATED_TIMESTAMP, LAST_MODIFIED_TIMESTAMP, RECORD_VERSION, CREATED_BY, LAST_MODIFIED_BY
         )
         VALUES (
             s.ASSET_ID, s.ASSET_NAME, s.ASSET_TYPE, s.DATABASE_NAME, s.SCHEMA_NAME, s.OBJECT_NAME,
-            s.FULLY_QUALIFIED_NAME, s.DATA_OWNER, s.PII_RELEVANT, s.SOX_RELEVANT, s.SOC2_RELEVANT,
+            s.FULLY_QUALIFIED_NAME, s.DATA_OWNER, s.DATA_DESCRIPTION, s.PII_RELEVANT, s.SOX_RELEVANT, s.SOC2_RELEVANT,
             s.CLASSIFICATION_LABEL, s.CONFIDENTIALITY_LEVEL, s.INTEGRITY_LEVEL, s.AVAILABILITY_LEVEL,
             s.CLASSIFICATION_METHOD, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 1, CURRENT_USER(), CURRENT_USER()
         );
 
-    -- Update Watermark
-    SELECT MAX(LAST_ALTERED) INTO :new_watermark FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.TEMP_DISCOVERY_STAGING;
-    IF (new_watermark IS NOT NULL) THEN
-        INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.DISCOVERY_WATERMARK (LAST_WATERMARK, LAST_RUN_ID)
-        VALUES (:new_watermark, :run_id);
-    END IF;
+    merge_query_id := LAST_QUERY_ID();
+    SELECT "number of rows inserted", "number of rows updated" INTO :rows_inserted, :rows_updated
+    FROM TABLE(RESULT_SCAN(:merge_query_id));
 
-    RETURN 'Success: Discovered objects across account.';
+    -- 7. Update Watermark
+    INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.DISCOVERY_WATERMARK (LAST_WATERMARK, LAST_RUN_ID)
+    VALUES (:new_watermark, :run_id);
+
+    RETURN 'MERGE_COMPLETE: ' || :rows_inserted || ' inserted, ' || :rows_updated || ' updated.';
+EXCEPTION
+    WHEN OTHER THEN
+        RETURN 'MERGE_FAILED: ' || SQLERRM;
 END;
 $$;
 
     -- Inventory All Levels View (Consolidated for Dashboard and Inventory pages)
-    CREATE OR REPLACE VIEW DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS AS
+    CREATE OR REPLACE VIEW DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS (
+        LEVEL,
+        "Database",
+        "Schema",
+        "Asset_Name",
+        "Asset_Type",
+        "Business_Unit",
+        "Business_Domain",
+        "Lifecycle",
+        "Total_Assets",
+        "Classified",
+        "Has_Classification_Date",
+        "Classification_Coverage",
+        "Accuracy_Percent",
+        "Timeliness_Percent",
+        "Compliance_Status",
+        "Owner_Coverage",
+        "SLA_Breach_Assets",
+        "New_Pending_Assets",
+        "Column_Stats",
+        "Column_Classification_Percent",
+        "Data_Types",
+        "Masking_Status",
+        "Column_Tags",
+        "Sensitive_Columns",
+        "Avg_Days_To_Classify"
+    ) AS
     WITH asset_metrics AS (
         SELECT 
-            DATABASE_NAME, SCHEMA_NAME, OBJECT_NAME as ASSET_NAME, ASSET_TYPE,
+            COALESCE(DATABASE_NAME, 'DATA_CLASSIFICATION_DB') as DATABASE_NAME,
+            SCHEMA_NAME,
+            ASSET_NAME,
+            ASSET_TYPE,
+            
+            -- FIXED: Classification check matching dashboard logic
+            -- An asset is classified if CLASSIFICATION_LABEL is not null and not in unclassified values
             CASE 
                 WHEN CLASSIFICATION_LABEL IS NOT NULL 
-                     AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN ('', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW')
-                THEN 1 ELSE 0 
+                     AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN (
+                         '', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 
+                         'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'
+                     )
+                THEN 1 
+                ELSE 0 
             END as IS_CLASSIFIED,
+            
+            -- Also track if there's a classification date for SLA calculation
             CASE WHEN CLASSIFICATION_DATE IS NOT NULL THEN 1 ELSE 0 END as HAS_CLASSIFICATION_DATE,
-            CASE WHEN CLASSIFICATION_DATE IS NOT NULL AND DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE) <= 5 THEN 1 ELSE 0 END as IS_CLASSIFIED_WITHIN_SLA,
+            
+            -- Check for SLA compliance (classified within 5 days)
+            CASE 
+                WHEN CLASSIFICATION_DATE IS NOT NULL 
+                     AND DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE) <= 5 
+                THEN 1
+                ELSE 0
+            END as IS_CLASSIFIED_WITHIN_SLA,
+            
+            -- Owner check
             CASE WHEN DATA_OWNER IS NOT NULL AND DATA_OWNER != '' THEN 1 ELSE 0 END as HAS_OWNER,
-            CASE WHEN PII_RELEVANT = TRUE THEN 1 ELSE 0 END as IS_PII,
-            CASE WHEN SOX_RELEVANT = TRUE THEN 1 ELSE 0 END as IS_SOX,
-            CASE WHEN SOC2_RELEVANT = TRUE THEN 1 ELSE 0 END as IS_SOC2,
-            CASE WHEN REVIEW_STATUS IN ('Approved', 'Validated', 'Compliant') THEN 1 ELSE 0 END as IS_ACCURATE_CLASSIFICATION,
-            DATEDIFF(day, CREATED_TIMESTAMP, CURRENT_DATE()) as DAYS_SINCE_CREATION,
-            CASE WHEN CLASSIFICATION_DATE IS NOT NULL THEN DATEDIFF(day, CREATED_TIMESTAMP, CLASSIFICATION_DATE) ELSE NULL END as DAYS_TO_CLASSIFY
+            
+            -- Compliance flags enriched with native Snowflake PII discovery (EXTRACT_SEMANTIC_CATEGORIES results)
+            CASE 
+                WHEN PII_RELEVANT = TRUE THEN 1
+                ELSE 0
+            END as IS_PII,
+            COALESCE(SOX_RELEVANT, FALSE) as IS_SOX,
+            COALESCE(SOC2_RELEVANT, FALSE) as IS_SOC2,
+            
+            -- Classification details
+            CLASSIFICATION_LABEL,
+            CONFIDENTIALITY_LEVEL,
+            INTEGRITY_LEVEL,
+            AVAILABILITY_LEVEL,
+            OVERALL_RISK_CLASSIFICATION,
+            
+            -- Review status (matching dashboard logic)
+            CASE 
+                WHEN UPPER(TRIM(COMPLIANCE_STATUS)) = 'COMPLIANT' THEN 'Compliant'
+                WHEN REVIEW_STATUS IN ('Approved', 'Validated') THEN 'Reviewed'
+                WHEN LAST_REVIEW_DATE IS NOT NULL 
+                     AND DATEDIFF(day, LAST_REVIEW_DATE, CURRENT_DATE()) <= REVIEW_FREQUENCY_DAYS 
+                THEN 'Compliant'
+                WHEN NEXT_REVIEW_DATE < CURRENT_DATE() THEN 'Overdue'
+                ELSE 'Pending'
+            END as REVIEW_STATUS,
+            
+            HAS_EXCEPTION,
+            
+            -- Classification accuracy (from dashboard logic)
+            CASE 
+                WHEN CLASSIFICATION_LABEL IS NOT NULL 
+                     AND UPPER(TRIM(CLASSIFICATION_LABEL)) NOT IN (
+                         '', 'UNCLASSIFIED', 'UNKNOWN', 'PENDING', 'NONE', 
+                         'NULL', 'N/A', 'TBD', 'ACTION REQUIRED', 'PENDING REVIEW'
+                     )
+                     AND REVIEW_STATUS IN ('Approved', 'Validated') 
+                THEN 1 
+                ELSE 0 
+            END as IS_ACCURATE_CLASSIFICATION,
+            
+            -- Days since creation for SLA tracking
+            DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CURRENT_DATE()) as DAYS_SINCE_CREATION,
+            
+            -- Days to classify (if classified)
+            CASE 
+                WHEN CLASSIFICATION_DATE IS NOT NULL 
+                THEN DATEDIFF(day, COALESCE(DATA_CREATION_DATE, CREATED_TIMESTAMP), CLASSIFICATION_DATE)
+                ELSE NULL
+            END as DAYS_TO_CLASSIFY,
+            
+            BUSINESS_UNIT,
+            BUSINESS_DOMAIN,
+            LIFECYCLE
+            
         FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-        WHERE UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE', 'DATABASE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE')
+        WHERE UPPER(TRIM(ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE', 'DATABASE', 'STORED_PROCEDURE', 'FUNCTION')
     ),
-    column_stats AS (
+    column_metrics AS (
         SELECT 
-            DATABASE_NAME, SCHEMA_NAME, OBJECT_NAME,
-            CONCAT(COUNT(*), ' columns') as COLUMN_STATS,
-            CONCAT(SUM(CASE WHEN PII_RELEVANT THEN 1 ELSE 0 END), ' PII, ',
-                   SUM(CASE WHEN SOX_RELEVANT THEN 1 ELSE 0 END), ' SOX, ',
-                   SUM(CASE WHEN SOC2_RELEVANT THEN 1 ELSE 0 END), ' SOC2') as SENSITIVE_COLUMNS
-        FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.ASSETS
-        WHERE UPPER(ASSET_TYPE) IN ('TABLE', 'VIEW', 'BASE TABLE')
-        GROUP BY 1, 2, 3
+            -- Extract database, schema, and table from ASSET_FULL_NAME
+            SPLIT_PART(ASSET_FULL_NAME, '.', 1) as DATABASE_NAME,
+            SPLIT_PART(ASSET_FULL_NAME, '.', 2) as SCHEMA_NAME,
+            SPLIT_PART(ASSET_FULL_NAME, '.', 3) as ASSET_NAME,
+            
+            -- Column counts
+            COUNT(*) as TOTAL_COLUMNS,
+            COUNT(CASE WHEN SENSITIVITY_CATEGORY_ID IS NOT NULL THEN 1 END) as CLASSIFIED_COLUMNS,
+            COUNT(CASE WHEN PII_RELEVANT = TRUE THEN 1 END) as PII_COLUMNS,
+            
+            -- Data types (if available in the table, otherwise NULL)
+            NULL as DATA_TYPES,
+            
+            -- Masking status (if available in the table, otherwise 0)
+            0 as MASKED_COLUMNS,
+            
+            -- Tags (if available in the table, otherwise NULL)
+            NULL as COLUMN_TAGS
+            
+        FROM DATA_CLASSIFICATION_DB.DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_AI_RESULTS
+        WHERE ASSET_FULL_NAME IS NOT NULL
+          AND COLUMN_NAME IS NOT NULL
+        GROUP BY 
+            SPLIT_PART(ASSET_FULL_NAME, '.', 1),
+            SPLIT_PART(ASSET_FULL_NAME, '.', 2),
+            SPLIT_PART(ASSET_FULL_NAME, '.', 3)
     )
     SELECT 
-        'DATABASE' as LEVEL, am.DATABASE_NAME as "Database", NULL as "Schema", NULL as "Asset_Name", 'DATABASE' as "Asset_Type",
-        COUNT(*) as "Total_Assets", SUM(am.IS_CLASSIFIED) as "Classified", SUM(am.HAS_CLASSIFICATION_DATE) as "Has_Classification_Date",
-        CASE WHEN COUNT(*) > 0 THEN CONCAT(ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '%') ELSE '0%' END as "Classification_Coverage",
+        'DATABASE' as LEVEL,
+        am.DATABASE_NAME as "Database",
+        NULL as "Schema",
+        NULL as "Asset_Name",
+        'DATABASE' as "Asset_Type",
+        NULL as "Business_Unit",
+        NULL as "Business_Domain",
+        NULL as "Lifecycle",
+        COUNT(*) as "Total_Assets",
+        SUM(am.IS_CLASSIFIED) as "Classified",
+        SUM(am.HAS_CLASSIFICATION_DATE) as "Has_Classification_Date",
+        
+        -- FIXED: Classification percentage with emoji
+        CASE 
+            WHEN COUNT(*) > 0 THEN
+                CONCAT(
+                    ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '% ',
+                    CASE 
+                        WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 90 THEN '✅'
+                        WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 70 THEN '☑️'
+                        WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 50 THEN '⚠️'
+                        ELSE '❌'
+                    END
+                )
+            ELSE '0% ❌'
+        END as "Classification_Coverage",
+        
+        -- Additional metrics from dashboard
         CONCAT(ROUND(SUM(am.IS_ACCURATE_CLASSIFICATION) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Accuracy_Percent",
         CONCAT(ROUND(SUM(am.IS_CLASSIFIED_WITHIN_SLA) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Timeliness_Percent",
-        CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent' ELSE '❌ Poor' END as "Compliance_Status",
+        
+        -- Compliance Status - using combined score like dashboard
+        CASE 
+            WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent'
+            WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 70 THEN '☑️ Good'
+            WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 50 THEN '⚠️ Fair'
+            ELSE '❌ Poor'
+        END as "Compliance_Status",
+        
         CONCAT(ROUND(SUM(am.HAS_OWNER) * 100.0 / NULLIF(COUNT(*), 0), 0), '%') as "Owner_Coverage",
+        
+        -- SLA Status
         COUNT(CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 END) as "SLA_Breach_Assets",
         COUNT(CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 END) as "New_Pending_Assets",
-        CONCAT(SUM(am.IS_PII), ' PII, ', SUM(am.IS_SOX), ' SOX, ', SUM(am.IS_SOC2), ' SOC2') as "Sensitive_Columns",
-        ROUND(AVG(am.DAYS_TO_CLASSIFY), 1) as "Avg_Days_To_Classify",
-        NULL as "Column_Stats"
-    FROM asset_metrics am GROUP BY am.DATABASE_NAME
+        
+        NULL as "Column_Stats",
+        NULL as "Column_Classification_Percent",
+        NULL as "Data_Types",
+        NULL as "Masking_Status",
+        NULL as "Column_Tags",
+        CONCAT(SUM(am.IS_PII::INT), ' PII, ', SUM(am.IS_SOX::INT), ' SOX, ', SUM(am.IS_SOC2::INT), ' SOC2') as "Sensitive_Columns",
+        
+        -- Average days to classify (for classified assets)
+        ROUND(AVG(am.DAYS_TO_CLASSIFY), 1) as "Avg_Days_To_Classify"
+        
+    FROM asset_metrics am
+    GROUP BY am.DATABASE_NAME
+
     UNION ALL
+
     SELECT 
-        'SCHEMA' as LEVEL, am.DATABASE_NAME, am.SCHEMA_NAME, NULL, 'SCHEMA',
-        COUNT(*), SUM(am.IS_CLASSIFIED), SUM(am.HAS_CLASSIFICATION_DATE),
-        CASE WHEN COUNT(*) > 0 THEN CONCAT(ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '%') ELSE '0%' END,
+        'SCHEMA' as LEVEL,
+        am.DATABASE_NAME,
+        am.SCHEMA_NAME,
+        NULL,
+        'SCHEMA',
+        NULL,
+        NULL,
+        NULL,
+        COUNT(*),
+        SUM(am.IS_CLASSIFIED),
+        SUM(am.HAS_CLASSIFICATION_DATE),
+        
+        -- Schema Classification Coverage with emoji
+        CASE 
+            WHEN COUNT(*) > 0 THEN
+                CONCAT(
+                    ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0), '% ',
+                    CASE 
+                        WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 90 THEN '✅'
+                        WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 70 THEN '☑️'
+                        WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / COUNT(*), 0) >= 50 THEN '⚠️'
+                        ELSE '❌'
+                    END
+                )
+            ELSE '0% ❌'
+        END,
+        
         CONCAT(ROUND(SUM(am.IS_ACCURATE_CLASSIFICATION) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
         CONCAT(ROUND(SUM(am.IS_CLASSIFIED_WITHIN_SLA) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
-        CASE WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent' ELSE '❌ Poor' END,
+        
+        CASE 
+            WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 90 THEN '✅ Excellent'
+            WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 70 THEN '☑️ Good'
+            WHEN ROUND(SUM(am.IS_CLASSIFIED) * 100.0 / NULLIF(COUNT(*), 0), 0) >= 50 THEN '⚠️ Fair'
+            ELSE '❌ Poor'
+        END,
+        
         CONCAT(ROUND(SUM(am.HAS_OWNER) * 100.0 / NULLIF(COUNT(*), 0), 0), '%'),
+        
         COUNT(CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 END),
         COUNT(CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 END),
-        CONCAT(SUM(am.IS_PII), ' PII, ', SUM(am.IS_SOX), ' SOX, ', SUM(am.IS_SOC2), ' SOC2'),
-        ROUND(AVG(am.DAYS_TO_CLASSIFY), 1),
-        NULL
-    FROM asset_metrics am WHERE am.SCHEMA_NAME IS NOT NULL AND am.SCHEMA_NAME != '' GROUP BY am.DATABASE_NAME, am.SCHEMA_NAME
-    UNION ALL
-    SELECT 
-        'ASSET' as LEVEL, am.DATABASE_NAME, am.SCHEMA_NAME, am.ASSET_NAME, am.ASSET_TYPE,
-        1, am.IS_CLASSIFIED, am.HAS_CLASSIFICATION_DATE,
-        CASE WHEN am.IS_CLASSIFIED = 1 THEN '100%' ELSE '0%' END,
-        CASE WHEN am.IS_ACCURATE_CLASSIFICATION = 1 THEN '100%' ELSE '0%' END,
-        CASE WHEN am.IS_CLASSIFIED_WITHIN_SLA = 1 THEN '100%' ELSE '0%' END,
-        CASE WHEN am.IS_CLASSIFIED = 1 THEN '✅ Compliant' ELSE '❌ Pending' END,
-        CASE WHEN am.HAS_OWNER = 1 THEN '100%' ELSE '0%' END,
-        CASE WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1 ELSE 0 END,
-        CASE WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1 ELSE 0 END,
-        COALESCE(cs.SENSITIVE_COLUMNS, CONCAT(am.IS_PII, ' PII, ', am.IS_SOX, ' SOX, ', am.IS_SOC2, ' SOC2')),
-        am.DAYS_TO_CLASSIFY,
-        cs.COLUMN_STATS
+        
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        CONCAT(SUM(am.IS_PII::INT), ' PII, ', SUM(am.IS_SOX::INT), ' SOX, ', SUM(am.IS_SOC2::INT), ' SOC2'),
+        
+        ROUND(AVG(am.DAYS_TO_CLASSIFY), 1)
+        
     FROM asset_metrics am
-    LEFT JOIN column_stats cs ON am.DATABASE_NAME = cs.DATABASE_NAME AND am.SCHEMA_NAME = cs.SCHEMA_NAME AND am.ASSET_NAME = cs.OBJECT_NAME
-    WHERE am.ASSET_NAME IS NOT NULL AND am.ASSET_NAME != '';
+    WHERE am.SCHEMA_NAME IS NOT NULL
+    GROUP BY am.DATABASE_NAME, am.SCHEMA_NAME
 
-    GRANT SELECT ON VIEW DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS TO APPLICATION ROLE app_public;
-    GRANT SELECT ON VIEW DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS TO APPLICATION ROLE app_admin;
+    UNION ALL
 
-    GRANT USAGE ON PROCEDURE DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS() TO APPLICATION ROLE app_public;
-    GRANT USAGE ON PROCEDURE DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS() TO APPLICATION ROLE app_admin;
+    SELECT 
+        'ASSET' as LEVEL,
+        am.DATABASE_NAME,
+        am.SCHEMA_NAME,
+        am.ASSET_NAME,
+        am.ASSET_TYPE,
+        am.BUSINESS_UNIT,
+        am.BUSINESS_DOMAIN,
+        am.LIFECYCLE,
+        1,
+        am.IS_CLASSIFIED,
+        am.HAS_CLASSIFICATION_DATE,
+        
+        -- Asset Classification Coverage with emoji
+        CONCAT(
+            am.IS_CLASSIFIED * 100, '% ',
+            CASE 
+                WHEN am.IS_CLASSIFIED = 1 THEN '✅'
+                ELSE '❌'
+            END
+        ),
+        
+        CONCAT(am.IS_ACCURATE_CLASSIFICATION * 100, '%'),
+        CONCAT(am.IS_CLASSIFIED_WITHIN_SLA * 100, '%'),
+        
+        -- Asset-level compliance status
+        CASE 
+            WHEN am.IS_CLASSIFIED = 1 AND am.HAS_OWNER = 1 AND am.REVIEW_STATUS IN ('Compliant', 'Reviewed') AND COALESCE(am.HAS_EXCEPTION, FALSE) = FALSE
+            THEN '✅ Excellent'
+            WHEN am.IS_CLASSIFIED = 1 AND am.HAS_OWNER = 1 AND am.REVIEW_STATUS NOT IN ('Overdue')
+            THEN '☑️ Good'
+            WHEN am.IS_CLASSIFIED = 1 OR am.HAS_OWNER = 1
+            THEN '⚠️ Fair'
+            ELSE '❌ Poor'
+        END,
+        
+        CONCAT(am.HAS_OWNER * 100, '%'),
+        
+        -- Asset SLA status
+        CASE 
+            WHEN am.DAYS_SINCE_CREATION > 5 AND am.IS_CLASSIFIED = 0 THEN 1
+            ELSE 0
+        END as "SLA_Breach_Assets",
+        
+        CASE 
+            WHEN am.DAYS_SINCE_CREATION <= 5 AND am.IS_CLASSIFIED = 0 THEN 1
+            ELSE 0
+        END as "New_Pending_Assets",
+        
+        -- Column metrics
+        CASE 
+            WHEN cm.TOTAL_COLUMNS IS NOT NULL 
+            THEN CONCAT(cm.CLASSIFIED_COLUMNS, '/', cm.TOTAL_COLUMNS, ' cols')
+            ELSE NULL
+        END as "Column_Stats",
+        
+        CASE 
+            WHEN cm.TOTAL_COLUMNS IS NOT NULL 
+            THEN CONCAT(ROUND(cm.CLASSIFIED_COLUMNS * 100.0 / NULLIF(cm.TOTAL_COLUMNS, 0), 0), '%')
+            ELSE NULL
+        END as "Column_Classification_Percent",
+        
+        cm.DATA_TYPES,
+        
+        CASE 
+            WHEN cm.TOTAL_COLUMNS IS NOT NULL 
+            THEN CONCAT(cm.MASKED_COLUMNS, '/', cm.TOTAL_COLUMNS, ' masked')
+            ELSE NULL
+        END as "Masking_Status",
+        
+        cm.COLUMN_TAGS,
+        
+        CONCAT(
+            COALESCE(am.IS_PII::INT, 0), ' PII, ',
+            COALESCE(am.IS_SOX::INT, 0), ' SOX, ',
+            COALESCE(am.IS_SOC2::INT, 0), ' SOC2'
+        ) as "Sensitive_Columns",
+        
+        am.DAYS_TO_CLASSIFY as "Avg_Days_To_Classify"
+        
+    FROM asset_metrics am
+    LEFT JOIN column_metrics cm 
+        ON am.DATABASE_NAME = cm.DATABASE_NAME 
+        AND am.SCHEMA_NAME = cm.SCHEMA_NAME 
+        AND am.ASSET_NAME = cm.ASSET_NAME
+    WHERE am.ASSET_NAME IS NOT NULL
+      AND UPPER(TRIM(am.ASSET_TYPE)) IN ('TABLE', 'VIEW', 'BASE TABLE', 'STORED_PROCEDURE', 'FUNCTION', 'STAGE');
 
+GRANT SELECT ON VIEW DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS TO APPLICATION ROLE app_public;
+GRANT SELECT ON VIEW DATA_CLASSIFICATION_GOVERNANCE.VW_ASSET_INVENTORY_ALL_LEVELS TO APPLICATION ROLE app_admin;
+GRANT USAGE ON PROCEDURE DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS() TO APPLICATION ROLE app_admin;
+
+    -- ... (rest of the code remains the same)
     -- Snowflake Task to trigger the merge automatically (Daily at 2 AM)
     CREATE OR REPLACE TASK DATA_CLASSIFICATION_GOVERNANCE.TASK_DISCOVERY_SYNC
       WAREHOUSE = (SELECT CURRENT_WAREHOUSE())
@@ -881,28 +1255,24 @@ $$;
     AS
       CALL DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS();
 
-    -- Stream on CLASSIFICATION_DECISIONS to track new decisions
-    CREATE OR REPLACE STREAM DATA_CLASSIFICATION_GOVERNANCE.STR_CLASSIFICATION_DECISIONS
-      ON TABLE DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS
-      APPEND_ONLY = TRUE;
+    -- Stream for tracking new classification decisions
+    CREATE OR REPLACE STREAM DATA_CLASSIFICATION_GOVERNANCE.STR_CLASSIFICATION_DECISIONS 
+      ON TABLE DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS;
 
-    -- Dummy sink to advance the stream
-    CREATE TABLE IF NOT EXISTS DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS_SINK (
-      DECISION_ID STRING
-    );
-
-    -- Task triggered by stream to immediately run discovery & merge
+    -- Task to trigger merge when new decisions are made (Near Real-Time)
     CREATE OR REPLACE TASK DATA_CLASSIFICATION_GOVERNANCE.TSK_MERGE_ASSETS_ON_DECISION
       WAREHOUSE = (SELECT CURRENT_WAREHOUSE())
       SCHEDULE = '1 MINUTE'
       WHEN SYSTEM$STREAM_HAS_DATA('DATA_CLASSIFICATION_GOVERNANCE.STR_CLASSIFICATION_DECISIONS')
     AS
-    BEGIN
-      INSERT INTO DATA_CLASSIFICATION_GOVERNANCE.CLASSIFICATION_DECISIONS_SINK
-      SELECT DECISION_ID FROM DATA_CLASSIFICATION_GOVERNANCE.STR_CLASSIFICATION_DECISIONS;
-
       CALL DATA_CLASSIFICATION_GOVERNANCE.SP_MERGE_ASSETS();
-    END;
+
+    -- Resume tasks
+    ALTER TASK DATA_CLASSIFICATION_GOVERNANCE.TASK_DISCOVERY_SYNC RESUME;
+    ALTER TASK DATA_CLASSIFICATION_GOVERNANCE.TSK_MERGE_ASSETS_ON_DECISION RESUME;
+
+    GRANT SELECT ON STREAM DATA_CLASSIFICATION_GOVERNANCE.STR_CLASSIFICATION_DECISIONS TO APPLICATION ROLE app_public;
+    GRANT SELECT ON STREAM DATA_CLASSIFICATION_GOVERNANCE.STR_CLASSIFICATION_DECISIONS TO APPLICATION ROLE app_admin;
 
     -- ============================================================================
     -- SETUP COMPLETE

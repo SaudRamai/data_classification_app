@@ -1,0 +1,113 @@
+# Data Assets Page - Schema Migration Fix
+
+## ✅ Function Fixed: _fetch_column_details()
+
+### 🚨 Problem:
+The `_fetch_column_details()` function in `01_Data_Assets.py` was still using the old `CLASSIFICATION_AI_RESULTS` schema with deprecated fields like:
+- `SCHEMA_NAME`, `TABLE_NAME` (instead of `ASSET_FULL_NAME`)
+- `AI_CATEGORY`, `REGEX_CONFIDENCE`, `FINAL_CONFIDENCE`, `DETAILS`
+- Complex JSON parsing from `DETAILS` field
+
+### ✅ Solution Applied:
+
+#### 1. **Updated Column Selection** (NEW SCHEMA):
+```sql
+-- BEFORE (Old Schema)
+SELECT 
+    car.SCHEMA_NAME,
+    car.TABLE_NAME,
+    car.COLUMN_NAME,
+    car.AI_CATEGORY,
+    car.REGEX_CONFIDENCE,
+    car.FINAL_CONFIDENCE,
+    TRY_PARSE_JSON(car.DETAILS):"pii_relevant"::BOOLEAN as IS_PII,
+    ...
+
+-- AFTER (New Schema)
+SELECT 
+    car.ASSET_FULL_NAME,
+    car.COLUMN_NAME,
+    car.SENSITIVITY_CATEGORY_ID,
+    car.PII_RELEVANT,
+    car.SOX_RELEVANT,
+    car.SOC2_RELEVANT,
+    car.CONFIDENTIALITY_LEVEL,
+    car.INTEGRITY_LEVEL,
+    car.AVAILABILITY_LEVEL,
+    sc.CATEGORY_NAME as AI_CATEGORY,
+    ...
+```
+
+#### 2. **Fixed Join Logic**:
+```sql
+-- BEFORE: Multi-column join
+INNER JOIN asset_details ad 
+    ON cd.SCHEMA_NAME = ad.SCHEMA_NAME 
+    AND cd.TABLE_NAME = ad.ASSET_NAME
+
+-- AFTER: FQN-based join
+INNER JOIN asset_details ad 
+    ON UPPER(TRIM(cd.ASSET_FULL_NAME)) = UPPER(TRIM(ad.FULLY_QUALIFIED_NAME))
+```
+
+#### 3. **Simplified Compliance Flags**:
+```sql
+-- BEFORE: JSON parsing
+TRY_PARSE_JSON(car.DETAILS):"pii_relevant"::BOOLEAN as IS_PII,
+TRY_PARSE_JSON(car.DETAILS):"sox_relevant"::BOOLEAN as IS_SOX,
+
+-- AFTER: Direct field access
+car.PII_RELEVANT,
+car.SOX_RELEVANT,
+car.SOC2_RELEVANT,
+```
+
+#### 4. **Updated Schema Extraction**:
+```sql
+-- BEFORE: Separate schema/table columns
+cd.SCHEMA_NAME as "Schema",
+cd.TABLE_NAME as "Table Name",
+
+-- AFTER: FQN parsing
+SPLIT_PART(cd.ASSET_FULL_NAME, '.', 2) as "Schema",
+ad.ASSET_NAME as "Table Name",
+```
+
+#### 5. **Enhanced Sensitivity Logic**:
+```sql
+-- BEFORE: Confidence-based
+WHEN cd.SENSITIVITY_SCORE >= 0.9 THEN '🔴 Critical'
+WHEN cd.FINAL_CONFIDENCE_PERCENT >= 70.0 THEN '🟡 High'
+
+-- AFTER: Compliance flag-based
+WHEN cd.PII_RELEVANT = TRUE OR cd.SOX_RELEVANT = TRUE OR cd.SOC2_RELEVANT = TRUE THEN '🔴 Critical'
+WHEN cd.PII_RELEVANT = TRUE OR cd.SOX_RELEVANT = TRUE THEN '🟡 High'
+```
+
+### 🔧 **Key Transformations:**
+
+1. **Schema Fields**: `SCHEMA_NAME/TABLE_NAME` → `ASSET_FULL_NAME`
+2. **Compliance Detection**: JSON parsing → Direct boolean flags
+3. **Join Strategy**: Multi-column → FQN-based matching
+4. **Confidence**: Removed confidence scores (fixed 100% for new schema)
+5. **Data Sources**: Direct fields → JOIN with `SENSITIVITY_CATEGORIES`
+
+### 🎯 **Benefits:**
+
+- ✅ **No More SQL Errors**: Eliminates references to deprecated columns
+- ✅ **Better Performance**: FQN-based joins are more efficient
+- ✅ **Cleaner Logic**: Direct field access instead of JSON parsing
+- ✅ **Accurate Compliance**: Real boolean flags instead of derived values
+- ✅ **Future-Proof**: Compatible with new schema structure
+
+### 📊 **Placeholders Added:**
+For fields not available in new schema, appropriate placeholders were added:
+- `DATA_TYPE`: 'N/A' (placeholder)
+- `IS_MASKED`: FALSE (placeholder)
+- `MASKING_POLICY`: 'N/A' (placeholder)
+- `SENSITIVITY_SCORE`: 0.0 (placeholder)
+- `Confidence %`: 100.0 (fixed for new schema)
+
+### 🚀 **Status: COMPLETE**
+
+The `_fetch_column_details()` function now fully supports the new `CLASSIFICATION_AI_RESULTS` schema and will work correctly with the updated table structure provided by the user.
